@@ -64,12 +64,12 @@ Required evidence:
 
 This repo now has a dedicated false-positive control set:
 
-- [known-good-corpus.json](/Users/spencerlee/court-jester-mcp/bench/task_sets/known-good-corpus.json)
+- [known-good-corpus.json](../bench/task_sets/known-good-corpus.json)
 
 Current initial tasks:
 
-- [ts-lodash-array-slice-1-known-good.json](/Users/spencerlee/court-jester-mcp/bench/tasks/ts-lodash-array-slice-1-known-good.json)
-- [ts-lodash-object-slice-1-known-good.json](/Users/spencerlee/court-jester-mcp/bench/tasks/ts-lodash-object-slice-1-known-good.json)
+- [ts-lodash-array-slice-1-known-good.json](../bench/tasks/ts-lodash-array-slice-1-known-good.json)
+- [ts-lodash-object-slice-1-known-good.json](../bench/tasks/ts-lodash-object-slice-1-known-good.json)
 
 Suggested minimum bar:
 
@@ -178,7 +178,7 @@ Current evidence does not yet justify a broad public claim that Court Jester is 
 
 Updated false-positive control result on 2026-04-09:
 
-- initial run exposed a real blocker: [ts-lodash-object-slice-1-known-good.json](/Users/spencerlee/court-jester-mcp/bench/tasks/ts-lodash-object-slice-1-known-good.json) failed with `verify_stronger_than_eval`
+- initial run exposed a real blocker: [ts-lodash-object-slice-1-known-good.json](../bench/tasks/ts-lodash-object-slice-1-known-good.json) failed with `verify_stronger_than_eval`
 - root cause: TypeScript fuzz synthesis treated unresolved named aliases such as `PathValue` as generic objects, producing impossible inputs for same-file helper functions
 - after fixing synthesis and rebuilding the release binary, the known-good corpus passed `2/2` under `noop + required-final`
 

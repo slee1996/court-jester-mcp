@@ -29,7 +29,7 @@ The current evidence does not yet support:
 - a claim that false positives are already well-characterized across a large known-good corpus
 - a production-readiness claim for arbitrary repos or agent workflows
 
-The release bar and current read are documented in [release-readiness-private-beta.md](/Users/spencerlee/court-jester-mcp/docs/release-readiness-private-beta.md).
+The release bar and current read are documented in [release-readiness-private-beta.md](docs/release-readiness-private-beta.md).
 
 ## What The Server Exposes
 
@@ -38,14 +38,14 @@ The release bar and current read are documented in [release-readiness-private-be
 - `execute`: sandboxed subprocess execution with memory and timeout limits
 - `verify`: parse, lint, synthesize, execute, and optional test execution in one verdict
 
-The MCP server entrypoint is in [main.rs](/Users/spencerlee/court-jester-mcp/src/main.rs), and the tool parameter definitions live in [lib.rs](/Users/spencerlee/court-jester-mcp/src/lib.rs).
+The MCP server entrypoint is in [main.rs](src/main.rs), and the tool parameter definitions live in [lib.rs](src/lib.rs).
 
 ## Repo Layout
 
-- [src/](/Users/spencerlee/court-jester-mcp/src): Rust MCP server and tool implementations
-- [tests/](/Users/spencerlee/court-jester-mcp/tests): Rust integration tests
-- [bench/](/Users/spencerlee/court-jester-mcp/bench): benchmark harness, fixtures, evaluators, and model/provider adapters
-- [docs/](/Users/spencerlee/court-jester-mcp/docs): design notes, benchmark writeups, and release planning
+- [src/](src): Rust MCP server and tool implementations
+- [tests/](tests): Rust integration tests
+- [bench/](bench): benchmark harness, fixtures, evaluators, and model/provider adapters
+- [docs/](docs): design notes, benchmark writeups, and release planning
 
 ## Requirements
 
@@ -85,7 +85,7 @@ Summarize benchmark output:
 python -m bench.summarize_runs <output-dir>
 ```
 
-More benchmark detail is in [bench/README.md](/Users/spencerlee/court-jester-mcp/bench/README.md).
+More benchmark detail is in [bench/README.md](bench/README.md).
 
 ## Benchmark Positioning
 
@@ -101,10 +101,10 @@ That means the important comparisons in this repo are:
 
 Recent benchmark and design docs:
 
-- [docs/README.md](/Users/spencerlee/court-jester-mcp/docs/README.md)
-- [court-jester-overview.md](/Users/spencerlee/court-jester-mcp/docs/court-jester-overview.md)
-- [benchmark-2026-03-26.md](/Users/spencerlee/court-jester-mcp/docs/benchmark-2026-03-26.md)
-- [release-readiness-private-beta.md](/Users/spencerlee/court-jester-mcp/docs/release-readiness-private-beta.md)
+- [docs/README.md](docs/README.md)
+- [court-jester-overview.md](docs/court-jester-overview.md)
+- [benchmark-2026-03-26.md](docs/benchmark-2026-03-26.md)
+- [release-readiness-private-beta.md](docs/release-readiness-private-beta.md)
 
 ## Model Providers In The Harness
 
@@ -115,7 +115,7 @@ The benchmark harness currently supports:
 - deterministic replay and noop providers
 - OpenAI-compatible chat endpoints via `openai_compat_chat`
 
-The repo already includes Actual-backed manifests in [actual-api-qwen3-14b.json](/Users/spencerlee/court-jester-mcp/bench/models/actual-api-qwen3-14b.json) and [actual-api-qwen3-vl-30b.json](/Users/spencerlee/court-jester-mcp/bench/models/actual-api-qwen3-vl-30b.json).
+The repo already includes Actual-backed manifests in [actual-api-qwen3-14b.json](bench/models/actual-api-qwen3-14b.json) and [actual-api-qwen3-vl-30b.json](bench/models/actual-api-qwen3-vl-30b.json).
 
 ## Publishing Guidance
 
