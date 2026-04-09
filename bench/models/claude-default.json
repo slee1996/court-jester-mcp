@@ -1,0 +1,9 @@
+{
+  "id": "claude-default",
+  "title": "Claude Code default model",
+  "provider": "claude_cli",
+  "enabled_by_default": false,
+  "metadata": {
+    "timeout_seconds": 240
+  }
+}

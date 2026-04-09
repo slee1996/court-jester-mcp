@@ -1,0 +1,10 @@
+{
+  "id": "codex-default",
+  "title": "Codex CLI GPT-5.1 default model",
+  "provider": "codex_cli",
+  "model": "gpt-5.1-codex-max",
+  "enabled_by_default": false,
+  "metadata": {
+    "timeout_seconds": 240
+  }
+}

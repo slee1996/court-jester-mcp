@@ -1,0 +1,31 @@
+{
+  "id": "ts-preferred-timezone-missing",
+  "title": "Preferred timezone with missing preferences",
+  "repo_fixture": "mini_ts_timezone_service",
+  "prompt": "Fix preferred timezone formatting when profile preference data is missing. Missing or blank timezone should return \"UTC\".",
+  "language": "typescript",
+  "bucket": "nested_fallback",
+  "verify_paths": [
+    "timezone.ts"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.ts",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_preferred_timezone_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "timezone.ts"
+  ],
+  "tags": [
+    "typescript",
+    "nested_fallback",
+    "whitespace"
+  ]
+}

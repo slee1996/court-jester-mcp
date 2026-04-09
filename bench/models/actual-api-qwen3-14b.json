@@ -1,0 +1,14 @@
+{
+  "id": "actual-api-qwen3-14b",
+  "title": "Actual API Qwen3 14B",
+  "provider": "openai_compat_chat",
+  "model": "Qwen3-14B-Q4_K_M",
+  "enabled_by_default": false,
+  "metadata": {
+    "base_url": "https://api.actual.inc/v1",
+    "api_key_env": "ACTUAL_API_KEY",
+    "temperature": 0.2,
+    "max_tokens": 4000,
+    "timeout_seconds": 180
+  }
+}

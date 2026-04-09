@@ -1,0 +1,34 @@
+{
+  "id": "ts-feature-flag-explicit-false",
+  "title": "Feature flags preserve explicit false overrides",
+  "repo_fixture": "mini_ts_feature_flag_service",
+  "prompt": "Fix feature-flag resolution so explicit false overrides inherited defaults, while missing or null values still fall back to the default flags.",
+  "language": "typescript",
+  "bucket": "swebench_contract_drift",
+  "verify_paths": [
+    "flags.ts",
+    "defaults.ts"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.ts",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_feature_flag_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "flags.ts",
+    "defaults.ts"
+  ],
+  "tags": [
+    "typescript",
+    "falsey_override",
+    "cross_file",
+    "feature_flag"
+  ]
+}

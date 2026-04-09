@@ -1,0 +1,9 @@
+{
+  "id": "baseline",
+  "title": "Baseline",
+  "description": "Do not call court-jester during the run.",
+  "court_jester_mode": "none",
+  "required_tools": [],
+  "block_on_failed_verify": false,
+  "max_repair_rounds": 0
+}

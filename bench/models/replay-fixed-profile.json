@@ -1,0 +1,12 @@
+{
+  "id": "replay-fixed-profile",
+  "title": "Replay profile fix",
+  "provider": "replay",
+  "enabled_by_default": true,
+  "replay_edits": [
+    {
+      "path": "profile.py",
+      "content_path": "bench/replays/mini_py_service/profile.fixed.py"
+    }
+  ]
+}

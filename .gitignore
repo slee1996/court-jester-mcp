@@ -1,0 +1,9 @@
+/target
+bench/results
+__pycache__
+.DS_Store
+.claude/
+.npm/
+.playwright-mcp/
+.ruff_cache/
+Library/

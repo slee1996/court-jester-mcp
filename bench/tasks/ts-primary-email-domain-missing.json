@@ -1,0 +1,30 @@
+{
+  "id": "ts-primary-email-domain-missing",
+  "title": "Primary email domain with missing data",
+  "repo_fixture": "mini_ts_email_service",
+  "prompt": "Fix primary email domain parsing when account data is incomplete. Missing or malformed emails should return \"unknown\".",
+  "language": "typescript",
+  "bucket": "null_property_access",
+  "verify_paths": [
+    "email.ts"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.ts",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_primary_email_domain_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "email.ts"
+  ],
+  "tags": [
+    "typescript",
+    "string_parsing"
+  ]
+}

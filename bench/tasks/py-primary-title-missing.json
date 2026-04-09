@@ -1,0 +1,31 @@
+{
+  "id": "py-primary-title-missing",
+  "title": "Primary title with empty inputs",
+  "repo_fixture": "mini_py_title_service",
+  "prompt": "Fix primary title formatting when no titles are present. Missing or blank titles should return \"Untitled\".",
+  "language": "python",
+  "bucket": "array_bounds",
+  "verify_paths": [
+    "titles.py"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.py",
+  "public_check_commands": [
+    [
+      "python",
+      "tests/public_checks.py"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/py_primary_title_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "titles.py"
+  ],
+  "tags": [
+    "python",
+    "array_bounds",
+    "title"
+  ]
+}

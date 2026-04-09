@@ -1,0 +1,31 @@
+{
+  "id": "py-preferred-timezone-missing",
+  "title": "Preferred timezone with missing preferences",
+  "repo_fixture": "mini_py_timezone_service",
+  "prompt": "Fix preferred timezone formatting when profile preference data is missing. Missing or blank timezone should return \"UTC\".",
+  "language": "python",
+  "bucket": "nested_fallback",
+  "verify_paths": [
+    "settings.py"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.py",
+  "public_check_commands": [
+    [
+      "python",
+      "tests/public_checks.py"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/py_preferred_timezone_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "settings.py"
+  ],
+  "tags": [
+    "python",
+    "nested_fallback",
+    "whitespace"
+  ]
+}

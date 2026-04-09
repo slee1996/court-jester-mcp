@@ -1,0 +1,30 @@
+{
+  "id": "py-runtime-average-order-zero-count",
+  "title": "Average order value on empty batches",
+  "repo_fixture": "mini_py_average_service",
+  "prompt": "Fix the crash when average order value is requested for an empty batch. For empty batches, return 0.0.",
+  "language": "python",
+  "bucket": "runtime_crash",
+  "verify_paths": [
+    "metrics.py"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.py",
+  "public_check_commands": [
+    [
+      "python",
+      "tests/public_checks.py"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/average_order_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "metrics.py"
+  ],
+  "tags": [
+    "division_by_zero",
+    "numeric_edge_case"
+  ]
+}

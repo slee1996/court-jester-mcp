@@ -1,0 +1,30 @@
+{
+  "id": "py-unicode-export-filename",
+  "title": "Unicode-safe export filenames",
+  "repo_fixture": "mini_py_export_service",
+  "prompt": "Fix export filename generation so non-ASCII titles do not crash. Normalize accented characters to ASCII where possible.",
+  "language": "python",
+  "bucket": "unicode_handling",
+  "verify_paths": [
+    "export_name.py"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.py",
+  "public_check_commands": [
+    [
+      "python",
+      "tests/public_checks.py"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/export_filename_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "export_name.py"
+  ],
+  "tags": [
+    "unicode",
+    "encoding_crash"
+  ]
+}

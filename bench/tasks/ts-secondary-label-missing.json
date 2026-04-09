@@ -1,0 +1,30 @@
+{
+  "id": "ts-secondary-label-missing",
+  "title": "Secondary label fallback",
+  "repo_fixture": "mini_ts_label_service",
+  "prompt": "Fix the label formatter when there is only one label. If a secondary label is missing, return \"general\".",
+  "language": "typescript",
+  "bucket": "array_bounds",
+  "verify_paths": [
+    "labels.ts"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.ts",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_secondary_label_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "labels.ts"
+  ],
+  "tags": [
+    "typescript",
+    "array_bounds"
+  ]
+}

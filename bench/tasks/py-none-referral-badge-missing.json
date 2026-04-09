@@ -1,0 +1,30 @@
+{
+  "id": "py-none-referral-badge-missing",
+  "title": "Badge calculation with missing referrals",
+  "repo_fixture": "mini_py_badge_service",
+  "prompt": "Fix member badge calculation when referral counts are missing. Missing referrals should be treated as zero.",
+  "language": "python",
+  "bucket": "none_propagation",
+  "verify_paths": [
+    "badges.py"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.py",
+  "public_check_commands": [
+    [
+      "python",
+      "tests/public_checks.py"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/referral_badge_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "badges.py"
+  ],
+  "tags": [
+    "none_propagation",
+    "comparison_crash"
+  ]
+}

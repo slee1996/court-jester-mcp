@@ -1,0 +1,49 @@
+{
+  "id": "py-query-string-canonicalization",
+  "title": "Canonical query strings skip blanks and normalize accents",
+  "repo_fixture": "mini_py_query_string_service",
+  "prompt": "Fix query-string canonicalization so it skips blank values, preserves list order, and normalizes accented characters to ASCII before URL encoding.",
+  "language": "python",
+  "bucket": "swebench_serialization",
+  "verify_paths": [
+    "query.py"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.py",
+  "public_check_commands": [
+    [
+      "python",
+      "tests/public_checks.py"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/py_query_string_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "query.py"
+  ],
+  "family": "micro",
+  "bug_class": "non_scalar_input_leak",
+  "bug_surface": "serialization",
+  "difficulty": "medium",
+  "golden_patch_description": "Emit canonical query strings from scalar values only, skipping blank/nullish values and normalizing accent-bearing text to ASCII.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "execute"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": false,
+  "uses_project_dir": false,
+  "uses_relative_imports": false,
+  "cross_file": false,
+  "tags": [
+    "python",
+    "serialization",
+    "query_string",
+    "normalization",
+    "typed_edge_case",
+    "nullish_handling",
+    "semantic_normalization"
+  ]
+}

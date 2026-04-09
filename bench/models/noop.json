@@ -1,0 +1,6 @@
+{
+  "id": "noop",
+  "title": "No-op provider",
+  "provider": "noop",
+  "enabled_by_default": true
+}

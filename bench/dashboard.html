@@ -1,0 +1,1277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Court Jester Bench</title>
+<style>
+:root {
+  --bg: #0d1117;
+  --surface: #161b22;
+  --surface-2: #21262d;
+  --border: #30363d;
+  --text: #e6edf3;
+  --text-dim: #8b949e;
+  --text-bright: #f0f6fc;
+  --green: #3fb950;
+  --green-dim: rgba(63, 185, 80, 0.15);
+  --red: #f85149;
+  --red-dim: rgba(248, 81, 73, 0.15);
+  --yellow: #d29922;
+  --yellow-dim: rgba(210, 153, 34, 0.15);
+  --blue: #58a6ff;
+  --blue-dim: rgba(88, 166, 255, 0.15);
+  --purple: #bc8cff;
+  --purple-dim: rgba(188, 140, 255, 0.15);
+  --orange: #f0883e;
+  --mono: 'SF Mono', 'Menlo', 'Monaco', 'Consolas', monospace;
+  --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: var(--sans);
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.5;
+  overflow-x: hidden;
+}
+
+/* ─── Header ─── */
+.header {
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  padding: 12px 24px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+
+.header h1 { font-size: 16px; font-weight: 600; letter-spacing: -0.3px; white-space: nowrap; }
+.header h1 span { color: var(--purple); }
+
+.header-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-left: auto;
+  font-size: 13px;
+}
+
+.header-controls label { color: var(--text-dim); }
+
+.pulse {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--green);
+  animation: pulse 2s infinite;
+}
+
+.pulse.paused { background: var(--text-dim); animation: none; }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+.btn {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 4px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: var(--sans);
+  transition: background 0.15s;
+}
+
+.btn:hover { background: var(--border); }
+.btn.active { background: var(--blue-dim); border-color: var(--blue); color: var(--blue); }
+
+/* ─── Layout ─── */
+.main {
+  max-width: 1600px;
+  margin: 0 auto;
+  padding: 20px 24px;
+}
+
+/* ─── Summary Cards ─── */
+.summary-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+  margin-bottom: 24px;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.card-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+
+.card-value {
+  font-size: 28px;
+  font-weight: 700;
+  font-family: var(--mono);
+  letter-spacing: -1px;
+}
+
+.card-value.green { color: var(--green); }
+.card-value.red { color: var(--red); }
+.card-value.yellow { color: var(--yellow); }
+.card-value.blue { color: var(--blue); }
+
+.card-sub { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
+
+/* ─── Tabs ─── */
+.tabs {
+  display: flex;
+  gap: 2px;
+  margin-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.tab {
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-dim);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  transition: color 0.15s;
+  background: none;
+  border-top: none;
+  border-left: none;
+  border-right: none;
+  font-family: var(--sans);
+}
+
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--text-bright); border-bottom-color: var(--purple); }
+
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+
+/* ─── Filters ─── */
+.filters {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.filter-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.filter-group label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+  margin-right: 4px;
+}
+
+select {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-family: var(--sans);
+}
+
+/* ─── Training View ─── */
+.training-hero {
+  text-align: center;
+  padding: 32px 0 24px;
+}
+
+.training-hero .big-rate {
+  font-size: 72px;
+  font-weight: 800;
+  font-family: var(--mono);
+  letter-spacing: -4px;
+  line-height: 1;
+  margin-bottom: 4px;
+}
+
+.training-hero .big-label {
+  font-size: 14px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+.progress-bar-container {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 20px;
+  margin-bottom: 16px;
+}
+
+.progress-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+
+.progress-meta .count { font-family: var(--mono); font-weight: 600; }
+.progress-meta .elapsed { color: var(--text-dim); font-family: var(--mono); font-size: 12px; }
+
+.progress-track {
+  width: 100%;
+  height: 28px;
+  background: var(--surface-2);
+  border-radius: 6px;
+  overflow: hidden;
+  position: relative;
+}
+
+.progress-fill {
+  height: 100%;
+  border-radius: 6px;
+  transition: width 0.5s ease-out;
+  position: relative;
+  overflow: hidden;
+}
+
+.progress-fill.active {
+  background: linear-gradient(90deg, var(--purple), var(--blue));
+}
+
+.progress-fill.active::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -100%;
+  width: 200%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.1), transparent);
+  animation: shimmer 2s infinite;
+}
+
+.progress-fill.done {
+  background: var(--green);
+}
+
+@keyframes shimmer {
+  0% { transform: translateX(-50%); }
+  100% { transform: translateX(50%); }
+}
+
+.progress-pct {
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 12px;
+  font-family: var(--mono);
+  font-weight: 700;
+  color: var(--text-bright);
+  text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+}
+
+.training-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.training-stats .card { padding: 12px; }
+.training-stats .card-value { font-size: 22px; }
+
+/* latest result */
+.latest-result {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px 20px;
+  margin-bottom: 16px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.latest-result.pass { border-left: 4px solid var(--green); }
+.latest-result.fail { border-left: 4px solid var(--red); }
+.latest-result.dry { border-left: 4px solid var(--blue); }
+
+.latest-dot {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.latest-dot.pass { background: var(--green); box-shadow: 0 0 8px rgba(63,185,80,0.4); }
+.latest-dot.fail { background: var(--red); box-shadow: 0 0 8px rgba(248,81,73,0.4); }
+.latest-dot.dry { background: var(--blue); }
+
+.latest-info { flex: 1; min-width: 0; }
+.latest-task { font-family: var(--mono); font-size: 13px; font-weight: 600; }
+.latest-meta { font-size: 12px; color: var(--text-dim); }
+.latest-category { font-family: var(--mono); font-size: 12px; padding: 2px 8px; border-radius: 4px; white-space: nowrap; }
+.latest-category.pass { background: var(--green-dim); color: var(--green); }
+.latest-category.fail { background: var(--red-dim); color: var(--red); }
+
+/* feed */
+.feed-header {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+  margin-bottom: 8px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+}
+
+.feed { list-style: none; }
+
+.feed-item {
+  display: grid;
+  grid-template-columns: 8px 1fr auto auto;
+  gap: 10px;
+  align-items: center;
+  padding: 6px 10px;
+  border-radius: 4px;
+  margin-bottom: 1px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+
+.feed-item:hover { background: var(--surface-2); }
+
+.feed-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.feed-dot.pass { background: var(--green); }
+.feed-dot.fail { background: var(--red); }
+.feed-dot.dry { background: var(--blue); }
+
+.feed-task { font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.feed-badge {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-family: var(--mono);
+}
+
+.feed-badge.pass { background: var(--green-dim); color: var(--green); }
+.feed-badge.fail { background: var(--red-dim); color: var(--red); }
+.feed-badge.dry { background: var(--blue-dim); color: var(--blue); }
+
+.feed-time { color: var(--text-dim); font-family: var(--mono); font-size: 11px; }
+
+.feed-item.new-entry {
+  animation: slideIn 0.3s ease-out;
+}
+
+@keyframes slideIn {
+  from { opacity: 0; transform: translateY(-8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* ─── Matrix ─── */
+.matrix-container { overflow-x: auto; margin-bottom: 8px; }
+
+.matrix {
+  border-collapse: separate;
+  border-spacing: 2px;
+  font-size: 12px;
+  table-layout: fixed;
+}
+
+.matrix th {
+  padding: 6px 10px;
+  text-align: center;
+  font-weight: 600;
+  color: var(--text-dim);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+}
+
+.matrix th.row-header {
+  text-align: left;
+  font-size: 12px;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text);
+  width: 300px;
+  min-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.matrix th.col-header { width: 120px; min-width: 100px; }
+
+.matrix td {
+  padding: 8px 10px;
+  text-align: center;
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.1s, box-shadow 0.1s;
+  position: relative;
+  width: 120px;
+  min-width: 100px;
+}
+
+.matrix td:hover { transform: scale(1.05); box-shadow: 0 0 0 2px var(--blue); z-index: 10; }
+
+.matrix td.success { background: var(--green-dim); color: var(--green); }
+.matrix td.failure { background: var(--red-dim); color: var(--red); }
+.matrix td.partial { background: var(--yellow-dim); color: var(--yellow); }
+.matrix td.empty { background: var(--surface); color: var(--text-dim); cursor: default; }
+.matrix td.empty:hover { transform: none; box-shadow: none; }
+.matrix td.dry-run { background: var(--blue-dim); color: var(--blue); }
+
+.matrix td .cell-detail { display: block; font-size: 10px; font-weight: 400; opacity: 0.7; margin-top: 1px; }
+
+/* ─── Bucket badge ─── */
+.bucket-badge {
+  display: inline-block;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 10px;
+  font-weight: 500;
+  margin-left: 8px;
+  vertical-align: middle;
+  background: var(--surface-2);
+  color: var(--text-dim);
+}
+
+/* ─── Run List ─── */
+.run-list { list-style: none; }
+
+.run-item {
+  display: grid;
+  grid-template-columns: 10px 1fr 120px 120px 100px 80px;
+  gap: 12px;
+  align-items: center;
+  padding: 10px 14px;
+  border-radius: 6px;
+  margin-bottom: 2px;
+  cursor: pointer;
+  transition: background 0.1s;
+  font-size: 13px;
+}
+
+.run-item:hover { background: var(--surface-2); }
+
+.run-dot { width: 10px; height: 10px; border-radius: 50%; }
+.run-dot.success { background: var(--green); }
+.run-dot.failure { background: var(--red); }
+.run-dot.dry_run { background: var(--blue); }
+.run-dot.running { background: var(--yellow); animation: pulse 1.5s infinite; }
+.run-dot.provider_error { background: var(--orange); }
+
+.run-task { font-weight: 500; font-family: var(--mono); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.run-model { color: var(--text-dim); font-size: 12px; }
+.run-policy { color: var(--text-dim); font-size: 12px; }
+
+.run-category { font-size: 11px; font-family: var(--mono); padding: 2px 6px; border-radius: 4px; text-align: center; }
+.run-category.success { background: var(--green-dim); color: var(--green); }
+.run-category.hidden_semantic_miss { background: var(--red-dim); color: var(--red); }
+.run-category.verify_caught_hidden_bug { background: var(--yellow-dim); color: var(--yellow); }
+.run-category.verify_false_positive { background: rgba(240, 136, 62, 0.15); color: var(--orange); }
+.run-category.public_check_failure { background: var(--red-dim); color: var(--red); }
+.run-category.dry_run { background: var(--blue-dim); color: var(--blue); }
+.run-category.provider_error, .run-category.provider_auth_error { background: rgba(240, 136, 62, 0.15); color: var(--orange); }
+
+.run-time { color: var(--text-dim); font-size: 11px; font-family: var(--mono); text-align: right; }
+
+/* ─── Detail Panel ─── */
+.detail-overlay {
+  position: fixed;
+  top: 0; right: 0; bottom: 0;
+  width: 580px;
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  z-index: 200;
+  transform: translateX(100%);
+  transition: transform 0.2s ease-out;
+  overflow-y: auto;
+  box-shadow: -8px 0 32px rgba(0, 0, 0, 0.4);
+}
+
+.detail-overlay.open { transform: translateX(0); }
+
+.detail-header {
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  position: sticky;
+  top: 0;
+  background: var(--surface);
+  z-index: 5;
+}
+
+.detail-close { background: none; border: none; color: var(--text-dim); font-size: 20px; cursor: pointer; padding: 4px; line-height: 1; }
+.detail-close:hover { color: var(--text); }
+
+.detail-body { padding: 16px 20px; }
+.detail-section { margin-bottom: 20px; }
+
+.detail-section h3 {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+  margin-bottom: 8px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+}
+
+.detail-grid { display: grid; grid-template-columns: 140px 1fr; gap: 4px 12px; font-size: 13px; }
+.detail-grid dt { color: var(--text-dim); }
+.detail-grid dd { font-family: var(--mono); font-size: 12px; word-break: break-all; }
+
+.stage-row { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 4px; margin-bottom: 2px; font-size: 13px; }
+.stage-row.ok { background: var(--green-dim); }
+.stage-row.fail { background: var(--red-dim); }
+.stage-row.skip { background: var(--surface-2); }
+.stage-icon { font-size: 14px; width: 18px; text-align: center; }
+.stage-name { font-weight: 600; flex: 1; }
+.stage-time { color: var(--text-dim); font-family: var(--mono); font-size: 11px; }
+
+.fuzz-failure {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 6px;
+  font-size: 12px;
+}
+
+.fuzz-failure code { font-family: var(--mono); background: rgba(0,0,0,0.3); padding: 1px 4px; border-radius: 3px; }
+
+/* ─── Bar chart ─── */
+.bar-chart { display: flex; flex-direction: column; gap: 4px; }
+.bar-row { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.bar-label { width: 180px; text-align: right; color: var(--text-dim); font-family: var(--mono); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bar-track { flex: 1; height: 18px; background: var(--surface-2); border-radius: 3px; overflow: hidden; }
+.bar-fill { height: 100%; border-radius: 3px; transition: width 0.3s; }
+.bar-fill.success { background: var(--green); }
+.bar-fill.failure { background: var(--red); }
+.bar-fill.warning { background: var(--yellow); }
+.bar-count { width: 40px; font-family: var(--mono); font-size: 12px; color: var(--text-dim); }
+
+/* ─── Empty state ─── */
+.empty-state { text-align: center; padding: 60px 20px; color: var(--text-dim); }
+.empty-state h2 { font-size: 18px; margin-bottom: 8px; color: var(--text); }
+
+/* ─── Responsive ─── */
+@media (max-width: 900px) {
+  .run-item { grid-template-columns: 10px 1fr 100px; }
+  .run-model, .run-policy, .run-time { display: none; }
+  .detail-overlay { width: 100%; }
+  .training-hero .big-rate { font-size: 48px; }
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1><span>&#9878;</span> Court Jester Bench</h1>
+  <div class="header-controls">
+    <span class="pulse" id="pulse-dot"></span>
+    <label id="run-count-label">0 runs</label>
+    <button class="btn" id="btn-live" onclick="toggleLive()">Live</button>
+    <button class="btn" onclick="fetchAll()">Refresh</button>
+  </div>
+</div>
+
+<div class="main">
+  <div class="tabs">
+    <button class="tab active" data-tab="training">Training</button>
+    <button class="tab" data-tab="matrix">Matrix</button>
+    <button class="tab" data-tab="runs">Runs</button>
+    <button class="tab" data-tab="categories">Categories</button>
+    <button class="tab" data-tab="buckets">Buckets</button>
+  </div>
+
+  <div id="tab-training" class="tab-panel active"></div>
+
+  <div id="tab-matrix" class="tab-panel">
+    <div class="filters" id="filters">
+      <div class="filter-group">
+        <label>Model</label>
+        <select id="filter-model"><option value="">All</option></select>
+      </div>
+      <div class="filter-group">
+        <label>Policy</label>
+        <select id="filter-policy"><option value="">All</option></select>
+      </div>
+      <div class="filter-group">
+        <label>Bucket</label>
+        <select id="filter-bucket"><option value="">All</option></select>
+      </div>
+      <div class="filter-group">
+        <label>Status</label>
+        <select id="filter-status">
+          <option value="">All</option>
+          <option value="completed">Completed</option>
+          <option value="dry_run">Dry Run</option>
+        </select>
+      </div>
+    </div>
+    <div id="matrix-content"></div>
+  </div>
+
+  <div id="tab-runs" class="tab-panel"></div>
+  <div id="tab-categories" class="tab-panel"></div>
+  <div id="tab-buckets" class="tab-panel"></div>
+</div>
+
+<div class="detail-overlay" id="detail-panel">
+  <div class="detail-header">
+    <button class="detail-close" onclick="closeDetail()">&times;</button>
+    <h2 id="detail-title" style="font-size:14px; font-family:var(--mono)"></h2>
+  </div>
+  <div class="detail-body" id="detail-body"></div>
+</div>
+
+<script>
+// ─── State ───
+let allRuns = [];
+let prevRunCount = 0;
+let manifests = { tasks: [], policies: [], models: [] };
+let liveMode = true;
+let liveTimer = null;
+let runStartTime = null;
+const POLL_MS = 2000;
+
+// ─── Boot ───
+document.addEventListener('DOMContentLoaded', () => {
+  setupTabs();
+  fetchManifests().then(fetchAll);
+  startLive();
+});
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeDetail();
+});
+
+// ─── Tabs ───
+function setupTabs() {
+  document.querySelectorAll('.tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+      tab.classList.add('active');
+      document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
+    });
+  });
+}
+
+// ─── Data fetching ───
+async function fetchManifests() {
+  try {
+    const resp = await fetch('/api/manifests');
+    manifests = await resp.json();
+  } catch (e) { console.warn('Failed to fetch manifests', e); }
+}
+
+async function fetchAll() {
+  try {
+    const resp = await fetch('/api/runs');
+    const newRuns = await resp.json();
+    prevRunCount = allRuns.length;
+    allRuns = newRuns;
+    if (!runStartTime && allRuns.length > 0) {
+      const earliest = Math.min(...allRuns.map(r => r.timestamps?.started_at_epoch_ms || Infinity));
+      if (earliest < Infinity) runStartTime = earliest;
+    }
+    populateFilters();
+    render();
+  } catch (e) { console.warn('Failed to fetch runs', e); }
+}
+
+function toggleLive() {
+  liveMode = !liveMode;
+  document.getElementById('btn-live').classList.toggle('active', liveMode);
+  document.getElementById('pulse-dot').classList.toggle('paused', !liveMode);
+  if (liveMode) startLive(); else stopLive();
+}
+
+function startLive() {
+  stopLive();
+  liveTimer = setInterval(fetchAll, POLL_MS);
+  document.getElementById('btn-live').classList.add('active');
+}
+
+function stopLive() {
+  if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
+}
+
+// ─── Filters ───
+function populateFilters() {
+  populateSelect('filter-model', unique(allRuns, 'model_id'));
+  populateSelect('filter-policy', unique(allRuns, 'policy_id'));
+  populateSelect('filter-bucket', unique(allRuns, 'bucket'));
+}
+
+function populateSelect(id, values) {
+  const sel = document.getElementById(id);
+  const current = sel.value;
+  const opts = sel.querySelectorAll('option:not(:first-child)');
+  opts.forEach(o => o.remove());
+  values.forEach(v => {
+    const opt = document.createElement('option');
+    opt.value = v; opt.textContent = v;
+    sel.appendChild(opt);
+  });
+  sel.value = current;
+}
+
+document.querySelectorAll('#filters select').forEach(sel => {
+  sel.addEventListener('change', render);
+});
+
+function getFiltered() {
+  const model = document.getElementById('filter-model').value;
+  const policy = document.getElementById('filter-policy').value;
+  const bucket = document.getElementById('filter-bucket').value;
+  const status = document.getElementById('filter-status').value;
+  return allRuns.filter(r => {
+    if (model && r.model_id !== model) return false;
+    if (policy && r.policy_id !== policy) return false;
+    if (bucket && r.bucket !== bucket) return false;
+    if (status && r.status !== status) return false;
+    return true;
+  });
+}
+
+// ─── Render ───
+function render() {
+  const runs = getFiltered();
+  document.getElementById('run-count-label').textContent = `${allRuns.length} runs`;
+  renderTraining(allRuns);
+  renderMatrix(runs);
+  renderRunList(runs);
+  renderCategories(runs);
+  renderBuckets(runs);
+}
+
+// ─── Training View ───
+function renderTraining(runs) {
+  const container = document.getElementById('tab-training');
+
+  // Compute expected total from manifests
+  const enabledModels = manifests.models.filter(m => m.enabled_by_default);
+  const modelCount = enabledModels.length || unique(runs, 'model_id').length || 1;
+  const taskCount = manifests.tasks.length || unique(runs, 'task_id').length || 1;
+  const policyCount = manifests.policies.length || unique(runs, 'policy_id').length || 1;
+  const expectedTotal = taskCount * modelCount * policyCount;
+
+  const completed = runs.filter(r => r.status === 'completed');
+  const total = runs.length;
+  const successes = completed.filter(r => r.success).length;
+  const failures = completed.filter(r => !r.success).length;
+  const completedCount = completed.length;
+  const dryCount = runs.filter(r => r.status === 'dry_run').length;
+  const rate = completedCount > 0 ? ((successes / completedCount) * 100) : 0;
+  const repaired = completed.filter(r => r.repaired_after_verify_failure || r.repaired_after_public_failure).length;
+
+  // Is run active? Check if latest result is recent (within 60s)
+  const now = Date.now();
+  const latestTs = Math.max(...runs.map(r => r.timestamps?.finished_at_epoch_ms || r.timestamps?.started_at_epoch_ms || 0));
+  const isActive = total > 0 && (now - latestTs < 60000);
+  const progressPct = expectedTotal > 0 ? Math.min((total / expectedTotal) * 100, 100) : 0;
+  const isDone = total >= expectedTotal && !isActive;
+
+  // Elapsed time
+  const elapsed = runStartTime ? now - runStartTime : 0;
+  const elapsedStr = formatElapsed(elapsed);
+  const etaStr = total > 0 && isActive && progressPct > 0
+    ? formatElapsed((elapsed / progressPct) * (100 - progressPct))
+    : '—';
+
+  // Sort runs newest first
+  const sorted = [...runs].sort((a, b) => {
+    const ta = a.timestamps?.started_at_epoch_ms || 0;
+    const tb = b.timestamps?.started_at_epoch_ms || 0;
+    return tb - ta;
+  });
+
+  const latest = sorted[0];
+
+  // Rate color
+  const rateColor = completedCount === 0 ? 'var(--text-dim)' : rate >= 70 ? 'var(--green)' : rate >= 40 ? 'var(--yellow)' : 'var(--red)';
+
+  let html = '';
+
+  // Hero success rate
+  html += `<div class="training-hero">
+    <div class="big-rate" style="color:${rateColor}">${completedCount > 0 ? rate.toFixed(1) + '%' : '—'}</div>
+    <div class="big-label">${completedCount > 0 ? 'success rate' : 'waiting for completed runs'}</div>
+  </div>`;
+
+  // Progress bar
+  html += `<div class="progress-bar-container">
+    <div class="progress-meta">
+      <span class="count">${total} / ${expectedTotal} runs</span>
+      <span class="elapsed">${isActive ? 'elapsed ' + elapsedStr + ' &middot; eta ' + etaStr : isDone ? 'finished in ' + elapsedStr : elapsedStr}</span>
+    </div>
+    <div class="progress-track">
+      <div class="progress-fill ${isDone ? 'done' : 'active'}" style="width:${progressPct.toFixed(1)}%">
+        ${progressPct > 8 ? `<span class="progress-pct">${progressPct.toFixed(0)}%</span>` : ''}
+      </div>
+    </div>
+  </div>`;
+
+  // Stats row
+  html += `<div class="training-stats">
+    <div class="card">
+      <div class="card-label">Completed</div>
+      <div class="card-value blue">${completedCount}</div>
+      <div class="card-sub">of ${total} total</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Passed</div>
+      <div class="card-value green">${successes}</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Failed</div>
+      <div class="card-value red">${failures}</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Repaired</div>
+      <div class="card-value yellow">${repaired}</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Dry Run</div>
+      <div class="card-value" style="color:var(--text-dim)">${dryCount}</div>
+    </div>
+  </div>`;
+
+  // Latest result
+  if (latest) {
+    const lCat = latest.failure_category || latest.status || 'unknown';
+    const lPass = latest.success;
+    const lDry = latest.status === 'dry_run';
+    const lCls = lDry ? 'dry' : lPass ? 'pass' : 'fail';
+    html += `<div class="latest-result ${lCls}">
+      <div class="latest-dot ${lCls}"></div>
+      <div class="latest-info">
+        <div class="latest-task">${latest.task_id}</div>
+        <div class="latest-meta">${latest.model_id} &middot; ${latest.policy_id} &middot; ${latest.bucket || ''}</div>
+      </div>
+      <span class="latest-category ${lCls}">${lCat}</span>
+    </div>`;
+  }
+
+  // Result feed
+  html += '<div class="feed-header">Run Feed</div>';
+  html += '<ul class="feed">';
+  const feedItems = sorted.slice(0, 100);
+  feedItems.forEach((r, i) => {
+    const isNew = i === 0 && total > prevRunCount && prevRunCount > 0;
+    const cat = r.failure_category || r.status || '?';
+    const pass = r.success;
+    const dry = r.status === 'dry_run';
+    const cls = dry ? 'dry' : pass ? 'pass' : 'fail';
+    const elapsed = formatDuration(r.timestamps);
+    html += `<li class="feed-item${isNew ? ' new-entry' : ''}" onclick='showDetail(${JSON.stringify(r).replace(/'/g, "&#39;")})'>
+      <span class="feed-dot ${cls}"></span>
+      <span class="feed-task">${r.task_id} <span style="color:var(--text-dim)">${r.model_id} / ${r.policy_id}</span></span>
+      <span class="feed-badge ${cls}">${cat}</span>
+      <span class="feed-time">${elapsed}</span>
+    </li>`;
+  });
+  html += '</ul>';
+
+  container.innerHTML = html;
+}
+
+// ─── Matrix ───
+function renderMatrix(runs) {
+  const container = document.getElementById('matrix-content');
+  if (!runs.length) {
+    container.innerHTML = '<div class="empty-state"><h2>No runs found</h2><p>Start a bench run to see results here.</p></div>';
+    return;
+  }
+
+  const tasks = unique(runs, 'task_id');
+  // Always use ALL policies from manifests for columns, not just filtered ones
+  const allPolicies = manifests.policies.length > 0
+    ? manifests.policies.map(p => p.id)
+    : unique(runs, 'policy_id');
+  const policyOrder = ['baseline', 'required-final', 'advisory', 'repair-loop', 'repair-loop-2'];
+  const policies = [...allPolicies].sort((a, b) => {
+    const ai = policyOrder.indexOf(a), bi = policyOrder.indexOf(b);
+    return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+  });
+
+  const taskBuckets = {};
+  runs.forEach(r => { taskBuckets[r.task_id] = r.bucket || 'unknown'; });
+
+  // Group by task+policy
+  const grouped = {};
+  runs.forEach(r => {
+    const key = `${r.task_id}::${r.policy_id}`;
+    if (!grouped[key]) grouped[key] = [];
+    grouped[key].push(r);
+  });
+
+  let html = '<div class="matrix-container"><table class="matrix"><thead><tr><th class="row-header"></th>';
+  policies.forEach(p => { html += `<th class="col-header">${p}</th>`; });
+  html += '</tr></thead><tbody>';
+
+  tasks.sort((a, b) => {
+    const ba = taskBuckets[a] || '', bb = taskBuckets[b] || '';
+    return ba.localeCompare(bb) || a.localeCompare(b);
+  });
+
+  tasks.forEach(task => {
+    const bucket = taskBuckets[task] || 'unknown';
+    html += `<tr><th class="row-header">${escapeHtml(task)}<span class="bucket-badge">${bucket}</span></th>`;
+    policies.forEach(policy => {
+      const key = `${task}::${policy}`;
+      const items = grouped[key] || [];
+      if (!items.length) {
+        html += '<td class="empty">&mdash;</td>';
+        return;
+      }
+      const completed = items.filter(r => r.status === 'completed');
+      if (!completed.length) {
+        html += `<td class="dry-run" onclick="showCellRuns('${escapeHtml(task)}','${escapeHtml(policy)}')">dry<span class="cell-detail">${items.length} runs</span></td>`;
+        return;
+      }
+      const successes = completed.filter(r => r.success).length;
+      const rate = (successes / completed.length * 100);
+      const cls = rate === 100 ? 'success' : rate === 0 ? 'failure' : 'partial';
+      html += `<td class="${cls}" onclick="showCellRuns('${escapeHtml(task)}','${escapeHtml(policy)}')">${rate.toFixed(0)}%<span class="cell-detail">${successes}/${completed.length}</span></td>`;
+    });
+    html += '</tr>';
+  });
+
+  html += '</tbody></table></div>';
+  container.innerHTML = html;
+}
+
+function showCellRuns(task, policy) {
+  const runs = getFiltered().filter(r => r.task_id === task && r.policy_id === policy);
+  if (runs.length === 1) {
+    showDetail(runs[0]);
+  } else if (runs.length > 1) {
+    showDetail(runs[runs.length - 1]);
+  }
+}
+
+// ─── Run List ───
+function renderRunList(runs) {
+  const container = document.getElementById('tab-runs');
+  if (!runs.length) {
+    container.innerHTML = '<div class="empty-state"><h2>No runs found</h2></div>';
+    return;
+  }
+
+  const sorted = [...runs].sort((a, b) => {
+    const ta = a.timestamps?.started_at_epoch_ms || 0;
+    const tb = b.timestamps?.started_at_epoch_ms || 0;
+    return tb - ta;
+  });
+
+  let html = '<ul class="run-list">';
+  sorted.forEach(r => {
+    const dotCls = r.status === 'dry_run' ? 'dry_run' :
+      r.status === 'provider_error' || r.status === 'provider_auth_error' ? 'provider_error' :
+      r.success ? 'success' : 'failure';
+    const category = r.failure_category || r.status || 'unknown';
+    const catCls = category.replace(/[^a-z_]/g, '');
+    const elapsed = formatDuration(r.timestamps);
+    html += `
+      <li class="run-item" onclick='showDetail(${JSON.stringify(r).replace(/'/g, "&#39;")})'>
+        <span class="run-dot ${dotCls}"></span>
+        <span class="run-task">${r.task_id}</span>
+        <span class="run-model">${r.model_id}</span>
+        <span class="run-policy">${r.policy_id}</span>
+        <span class="run-category ${catCls}">${category}</span>
+        <span class="run-time">${elapsed}</span>
+      </li>`;
+  });
+  html += '</ul>';
+  container.innerHTML = html;
+}
+
+// ─── Failure Categories ───
+function renderCategories(runs) {
+  const container = document.getElementById('tab-categories');
+  const completed = runs.filter(r => r.status === 'completed' || r.failure_category);
+  if (!completed.length) {
+    container.innerHTML = '<div class="empty-state"><h2>No completed runs</h2></div>';
+    return;
+  }
+
+  const counts = {};
+  completed.forEach(r => {
+    const cat = r.failure_category || 'unknown';
+    counts[cat] = (counts[cat] || 0) + 1;
+  });
+
+  const max = Math.max(...Object.values(counts));
+  const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+
+  let html = '<div class="card" style="margin-bottom:20px"><h3 style="font-size:13px; margin-bottom:12px">Failure Category Distribution</h3><div class="bar-chart">';
+  sorted.forEach(([cat, count]) => {
+    const pct = (count / max * 100).toFixed(0);
+    const cls = cat === 'success' ? 'success' : cat.includes('verify') ? 'warning' : 'failure';
+    html += `<div class="bar-row">
+      <span class="bar-label">${cat}</span>
+      <div class="bar-track"><div class="bar-fill ${cls}" style="width:${pct}%"></div></div>
+      <span class="bar-count">${count}</span>
+    </div>`;
+  });
+  html += '</div></div>';
+  container.innerHTML = html;
+}
+
+// ─── Buckets ───
+function renderBuckets(runs) {
+  const container = document.getElementById('tab-buckets');
+  const completed = runs.filter(r => r.status === 'completed');
+  if (!completed.length) {
+    container.innerHTML = '<div class="empty-state"><h2>No completed runs</h2></div>';
+    return;
+  }
+
+  const byBucket = {};
+  completed.forEach(r => {
+    const b = r.bucket || 'unknown';
+    if (!byBucket[b]) byBucket[b] = { total: 0, successes: 0, repaired: 0 };
+    byBucket[b].total++;
+    if (r.success) byBucket[b].successes++;
+    if (r.repaired_after_verify_failure || r.repaired_after_public_failure) byBucket[b].repaired++;
+  });
+
+  let html = '<div class="summary-row">';
+  Object.entries(byBucket).sort().forEach(([bucket, data]) => {
+    const rate = (data.successes / data.total * 100).toFixed(0);
+    html += `<div class="card">
+      <div class="card-label"><span class="bucket-badge">${bucket}</span></div>
+      <div class="card-value ${parseFloat(rate) >= 50 ? 'green' : 'red'}">${rate}%</div>
+      <div class="card-sub">${data.successes}/${data.total} pass, ${data.repaired} repaired</div>
+    </div>`;
+  });
+  html += '</div>';
+
+  const policies = unique(completed, 'policy_id');
+  const policyOrder = ['baseline', 'required-final', 'advisory', 'repair-loop', 'repair-loop-2'];
+  policies.sort((a, b) => {
+    const ai = policyOrder.indexOf(a), bi = policyOrder.indexOf(b);
+    return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+  });
+
+  const grouped = {};
+  completed.forEach(r => {
+    const key = `${r.bucket || 'unknown'}::${r.policy_id}`;
+    if (!grouped[key]) grouped[key] = { total: 0, successes: 0 };
+    grouped[key].total++;
+    if (r.success) grouped[key].successes++;
+  });
+
+  html += '<div class="matrix-container"><table class="matrix"><thead><tr><th class="row-header">Bucket</th>';
+  policies.forEach(p => { html += `<th class="col-header">${p}</th>`; });
+  html += '</tr></thead><tbody>';
+
+  Object.keys(byBucket).sort().forEach(bucket => {
+    html += `<tr><th class="row-header"><span class="bucket-badge">${bucket}</span></th>`;
+    policies.forEach(policy => {
+      const key = `${bucket}::${policy}`;
+      const data = grouped[key];
+      if (!data) { html += '<td class="empty">&mdash;</td>'; return; }
+      const rate = (data.successes / data.total * 100);
+      const cls = rate === 100 ? 'success' : rate === 0 ? 'failure' : 'partial';
+      html += `<td class="${cls}">${rate.toFixed(0)}%<span class="cell-detail">${data.successes}/${data.total}</span></td>`;
+    });
+    html += '</tr>';
+  });
+  html += '</tbody></table></div>';
+  container.innerHTML = html;
+}
+
+// ─── Detail Panel ───
+function showDetail(run) {
+  const panel = document.getElementById('detail-panel');
+  document.getElementById('detail-title').textContent = run.run_id || run.task_id;
+
+  let html = '';
+
+  html += '<div class="detail-section"><h3>Overview</h3><dl class="detail-grid">';
+  html += kv('Task', run.task_id);
+  html += kv('Model', run.model_id);
+  html += kv('Policy', run.policy_id);
+  html += kv('Bucket', run.bucket);
+  html += kv('Status', run.status);
+  html += kv('Success', run.success ? 'Yes' : 'No');
+  html += kv('Category', run.failure_category || '—');
+  html += kv('Attempts', run.attempt_count || '—');
+  html += kv('Dry Run', run.dry_run ? 'Yes' : 'No');
+  html += kv('Duration', formatDuration(run.timestamps));
+  if (run.repair_attempted) html += kv('Repair', 'Yes');
+  if (run.repair_trigger_source) html += kv('Repair Trigger', run.repair_trigger_source);
+  html += '</dl></div>';
+
+  if (run.status === 'completed') {
+    html += '<div class="detail-section"><h3>Check Results</h3><dl class="detail-grid">';
+    html += kvBool('Verify Gate', run.verify_gate_ok);
+    html += kvBool('Public Checks', run.public_checks_pass);
+    html += kvBool('Hidden Checks', run.hidden_checks_pass);
+    html += kv('Verify Failed', run.verify_failed ? 'Yes' : 'No');
+    html += kv('Hidden Ran', run.hidden_checks_ran ? 'Yes' : 'No');
+    html += '</dl></div>';
+  }
+
+  const cjResults = run.court_jester?.results || run.attempts?.flatMap(a => a.court_jester?.results || []) || [];
+  if (cjResults.length) {
+    html += '<div class="detail-section"><h3>Court Jester Verify</h3>';
+    cjResults.forEach(item => {
+      html += `<div style="margin-bottom:12px"><strong style="font-family:var(--mono); font-size:12px">${escapeHtml(item.path)}</strong>`;
+      const response = item.response;
+      if (response && response.stages) {
+        response.stages.forEach(stage => {
+          const icon = stage.ok ? '\u2713' : '\u2717';
+          const cls = stage.ok ? 'ok' : 'fail';
+          const time = stage.duration_ms != null ? `${stage.duration_ms}ms` : '';
+          html += `<div class="stage-row ${cls}"><span class="stage-icon">${icon}</span><span class="stage-name">${stage.name}</span><span class="stage-time">${time}</span></div>`;
+          if (stage.detail?.fuzz_failures?.length) {
+            stage.detail.fuzz_failures.forEach(ff => {
+              html += `<div class="fuzz-failure">
+                <strong>${escapeHtml(ff.function || '')}</strong>(${escapeHtml(ff.input || '?')})
+                &rarr; <code>${escapeHtml(ff.error_type || ff.severity || '')}</code>
+                ${ff.message ? '<br>' + escapeHtml(ff.message) : ''}
+              </div>`;
+            });
+          }
+        });
+      } else if (response) {
+        html += `<div style="font-size:12px; color:var(--text-dim)">overall_ok: ${response.overall_ok}</div>`;
+      }
+      html += '</div>';
+    });
+    html += '</div>';
+  }
+
+  if (run.attempts?.length > 1) {
+    html += '<div class="detail-section"><h3>Attempts</h3>';
+    run.attempts.forEach((att, i) => {
+      const provOk = !att.provider_result?.failed;
+      const vjFailed = att.court_jester?.verify_failed;
+      const pubFailed = att.public_failed;
+      const trigger = att.repair_trigger_source;
+      html += `<div style="padding:6px 10px; background:var(--surface-2); border-radius:4px; margin-bottom:4px; font-size:12px">
+        <strong>Attempt ${i + 1}</strong>
+        ${!provOk ? ' — provider failed' : vjFailed ? ' — verify failed' : pubFailed ? ' — public failed' : ' — passed'}
+        ${trigger ? ` (trigger: ${trigger})` : ''}
+      </div>`;
+    });
+    html += '</div>';
+  }
+
+  if (run.failure_details && Object.keys(run.failure_details).length) {
+    html += '<div class="detail-section"><h3>Failure Details</h3><dl class="detail-grid">';
+    Object.entries(run.failure_details).forEach(([k, v]) => {
+      if (v != null) html += kv(k, typeof v === 'object' ? JSON.stringify(v) : String(v));
+    });
+    html += '</dl></div>';
+  }
+
+  if (run.provider) {
+    html += '<div class="detail-section"><h3>Provider</h3><dl class="detail-grid">';
+    html += kv('ID', run.provider.id);
+    if (run.provider.model) html += kv('Model', run.provider.model);
+    if (run.provider.reasoning_effort) html += kv('Reasoning', run.provider.reasoning_effort);
+    html += '</dl></div>';
+  }
+
+  document.getElementById('detail-body').innerHTML = html;
+  panel.classList.add('open');
+}
+
+function closeDetail() {
+  document.getElementById('detail-panel').classList.remove('open');
+}
+
+// ─── Helpers ───
+function unique(arr, key) {
+  return [...new Set(arr.map(r => r[key]).filter(Boolean))].sort();
+}
+
+function formatDuration(timestamps) {
+  if (!timestamps) return '—';
+  const start = timestamps.started_at_epoch_ms;
+  const end = timestamps.finished_at_epoch_ms;
+  if (!start || !end) return '—';
+  const ms = end - start;
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
+  return `${(ms / 60000).toFixed(1)}m`;
+}
+
+function formatElapsed(ms) {
+  if (!ms || ms <= 0) return '0s';
+  const secs = Math.floor(ms / 1000);
+  if (secs < 60) return `${secs}s`;
+  const mins = Math.floor(secs / 60);
+  const remSecs = secs % 60;
+  if (mins < 60) return `${mins}m ${remSecs}s`;
+  const hrs = Math.floor(mins / 60);
+  const remMins = mins % 60;
+  return `${hrs}h ${remMins}m`;
+}
+
+function kv(label, value) {
+  return `<dt>${label}</dt><dd>${escapeHtml(String(value ?? '—'))}</dd>`;
+}
+
+function kvBool(label, value) {
+  const color = value ? 'var(--green)' : 'var(--red)';
+  const text = value ? 'Pass' : 'Fail';
+  return `<dt>${label}</dt><dd style="color:${color}">${text}</dd>`;
+}
+
+function escapeHtml(str) {
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+</script>
+</body>
+</html>

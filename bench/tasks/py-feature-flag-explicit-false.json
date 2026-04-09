@@ -1,0 +1,34 @@
+{
+  "id": "py-feature-flag-explicit-false",
+  "title": "Feature flags preserve explicit false overrides",
+  "repo_fixture": "mini_py_feature_flag_service",
+  "prompt": "Fix feature-flag resolution so explicit false overrides inherited defaults, while missing or null values still fall back to the default flags.",
+  "language": "python",
+  "bucket": "swebench_contract_drift",
+  "verify_paths": [
+    "flags.py",
+    "defaults.py"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.py",
+  "public_check_commands": [
+    [
+      "python",
+      "tests/public_checks.py"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/py_feature_flag_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "flags.py",
+    "defaults.py"
+  ],
+  "tags": [
+    "python",
+    "falsey_override",
+    "cross_file",
+    "feature_flag"
+  ]
+}

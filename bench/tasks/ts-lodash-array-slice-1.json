@@ -1,0 +1,52 @@
+{
+  "id": "ts-lodash-array-slice-1",
+  "title": "Lodash array shard matches chunk, flatten, and uniq behavior",
+  "repo_fixture": "mini_ts_lodash_array_service",
+  "prompt": "Fix this upstream-derived lodash array shard so chunk follows lodash 4.17.21 size coercion and falsey handling, flatten removes exactly one nesting level and returns [] for non-array-like inputs, and uniq uses SameValueZero while preserving first occurrence order.",
+  "language": "typescript",
+  "bucket": "library_spec_slice",
+  "verify_paths": [
+    "array.ts",
+    "internals.ts"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.ts",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_lodash_array_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "array.ts",
+    "internals.ts"
+  ],
+  "family": "library_slice",
+  "bug_class": "spec_conformance",
+  "bug_surface": "cross_file",
+  "difficulty": "medium",
+  "golden_patch_description": "Match lodash 4.17.21 semantics for chunk size coercion, shallow flattening, and SameValueZero-based uniq.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": false,
+  "cross_file": true,
+  "tags": [
+    "typescript",
+    "library",
+    "lodash",
+    "array",
+    "spec_conformance",
+    "same_value_zero",
+    "upstream_derived",
+    "cross_file"
+  ]
+}

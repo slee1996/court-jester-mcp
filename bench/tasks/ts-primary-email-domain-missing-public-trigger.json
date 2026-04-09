@@ -1,0 +1,30 @@
+{
+  "id": "ts-primary-email-domain-missing-public-trigger",
+  "title": "Primary email domain without verify public examples",
+  "repo_fixture": "mini_ts_email_service",
+  "prompt": "Fix primary email domain parsing when account data is incomplete. Missing or malformed emails should return \"unknown\".",
+  "language": "typescript",
+  "bucket": "public_trigger_probe",
+  "verify_paths": [
+    "email.ts"
+  ],
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_primary_email_domain_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "email.ts"
+  ],
+  "tags": [
+    "public-trigger",
+    "typescript",
+    "string_parsing"
+  ]
+}

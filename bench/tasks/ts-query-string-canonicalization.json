@@ -1,0 +1,32 @@
+{
+  "id": "ts-query-string-canonicalization",
+  "title": "Canonical query strings skip blanks and normalize accents",
+  "repo_fixture": "mini_ts_query_string_service",
+  "prompt": "Fix query-string canonicalization so it skips blank values, preserves list order, and normalizes accented characters to ASCII before URL encoding.",
+  "language": "typescript",
+  "bucket": "swebench_serialization",
+  "verify_paths": [
+    "query.ts"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.ts",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_query_string_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "query.ts"
+  ],
+  "tags": [
+    "typescript",
+    "serialization",
+    "query_string",
+    "normalization"
+  ]
+}

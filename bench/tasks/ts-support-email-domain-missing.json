@@ -1,0 +1,31 @@
+{
+  "id": "ts-support-email-domain-missing",
+  "title": "Support email domain with malformed contact data",
+  "repo_fixture": "mini_ts_support_service",
+  "prompt": "Fix support email domain parsing when team contact data is incomplete. Missing or malformed support emails should return \"unknown\".",
+  "language": "typescript",
+  "bucket": "string_parsing",
+  "verify_paths": [
+    "support.ts"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.ts",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_support_email_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "support.ts"
+  ],
+  "tags": [
+    "typescript",
+    "string_parsing",
+    "malformed_input"
+  ]
+}

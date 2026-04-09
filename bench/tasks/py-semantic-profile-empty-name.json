@@ -1,0 +1,30 @@
+{
+  "id": "py-semantic-profile-empty-name",
+  "title": "Empty display name hidden regression",
+  "repo_fixture": "mini_py_service",
+  "prompt": "Fix the bug where empty or whitespace-only display names crash normalization.",
+  "language": "python",
+  "bucket": "semantic_bug",
+  "verify_paths": [
+    "profile.py"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.py",
+  "public_check_commands": [
+    [
+      "python",
+      "tests/public_checks.py"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/profile_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "profile.py"
+  ],
+  "tags": [
+    "null_handling",
+    "hidden_edge_case"
+  ]
+}

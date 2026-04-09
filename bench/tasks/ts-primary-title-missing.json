@@ -1,0 +1,31 @@
+{
+  "id": "ts-primary-title-missing",
+  "title": "Primary title with empty inputs",
+  "repo_fixture": "mini_ts_title_service",
+  "prompt": "Fix primary title formatting when no titles are present. Missing or blank titles should return \"Untitled\".",
+  "language": "typescript",
+  "bucket": "array_bounds",
+  "verify_paths": [
+    "title.ts"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.ts",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_primary_title_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "title.ts"
+  ],
+  "tags": [
+    "typescript",
+    "array_bounds",
+    "title"
+  ]
+}

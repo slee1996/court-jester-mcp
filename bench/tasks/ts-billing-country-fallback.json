@@ -1,0 +1,32 @@
+{
+  "id": "ts-billing-country-fallback",
+  "title": "Billing country with missing billing data",
+  "repo_fixture": "mini_ts_billing_service",
+  "prompt": "Fix billing country formatting when billing data is missing. Missing or blank country should return \"US\".",
+  "language": "typescript",
+  "bucket": "adversarial_nested",
+  "verify_paths": [
+    "billing.ts"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.ts",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_billing_country_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "billing.ts"
+  ],
+  "tags": [
+    "typescript",
+    "adversarial_nested",
+    "country",
+    "fallback"
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "id": "ts-secondary-support-email-sparse",
+  "title": "Secondary support email with sparse email list",
+  "repo_fixture": "mini_ts_secondary_email_service",
+  "prompt": "Fix secondary support email formatting when contacts or the second email is missing. Missing or blank values should return \"help@example.com\".",
+  "language": "typescript",
+  "bucket": "adversarial_sparse_array",
+  "verify_paths": [
+    "contact.ts"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.ts",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_secondary_support_email_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "contact.ts"
+  ],
+  "tags": [
+    "typescript",
+    "adversarial_sparse_array",
+    "email",
+    "fallback"
+  ]
+}

@@ -1,0 +1,50 @@
+{
+  "id": "ts-primary-plan-code-cross-file",
+  "title": "Primary plan code across helper and caller",
+  "repo_fixture": "mini_ts_plan_code_service",
+  "prompt": "Fix primary plan code selection so it returns the first usable normalized plan code and falls back to \"FREE\" when plans are missing or blank.",
+  "language": "typescript",
+  "bucket": "adversarial_cross_file",
+  "verify_paths": [
+    "plans.ts",
+    "normalizers.ts"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.ts",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_primary_plan_code_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "plans.ts",
+    "normalizers.ts"
+  ],
+  "family": "module",
+  "bug_class": "cross_file_contract",
+  "bug_surface": "semantic",
+  "difficulty": "medium",
+  "golden_patch_description": "Scan plans across helper/caller boundaries until the first usable normalized code, otherwise return FREE.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": false,
+  "cross_file": true,
+  "tags": [
+    "typescript",
+    "adversarial_cross_file",
+    "plan",
+    "helper",
+    "nullish_handling",
+    "first_usable_selection"
+  ]
+}

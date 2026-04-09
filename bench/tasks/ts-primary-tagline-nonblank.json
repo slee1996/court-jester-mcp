@@ -1,0 +1,32 @@
+{
+  "id": "ts-primary-tagline-nonblank",
+  "title": "Primary tagline skips blank segments",
+  "repo_fixture": "mini_ts_tagline_service",
+  "prompt": "Fix primary tagline selection so it returns the first non-blank segment. If no usable segment exists, return \"general\".",
+  "language": "typescript",
+  "bucket": "adversarial_sparse_array",
+  "verify_paths": [
+    "tagline.ts"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.ts",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_primary_tagline_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "tagline.ts"
+  ],
+  "tags": [
+    "typescript",
+    "adversarial_sparse_array",
+    "tagline",
+    "whitespace"
+  ]
+}

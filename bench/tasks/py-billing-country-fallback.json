@@ -1,0 +1,32 @@
+{
+  "id": "py-billing-country-fallback",
+  "title": "Billing country with missing billing data",
+  "repo_fixture": "mini_py_billing_service",
+  "prompt": "Fix billing country formatting when billing data is missing. Missing or blank country should return \"US\".",
+  "language": "python",
+  "bucket": "adversarial_nested",
+  "verify_paths": [
+    "billing.py"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.py",
+  "public_check_commands": [
+    [
+      "python",
+      "tests/public_checks.py"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/py_billing_country_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "billing.py"
+  ],
+  "tags": [
+    "python",
+    "adversarial_nested",
+    "country",
+    "fallback"
+  ]
+}

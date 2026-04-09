@@ -1,0 +1,30 @@
+{
+  "id": "ts-null-primary-city",
+  "title": "Primary city with missing address data",
+  "repo_fixture": "mini_ts_city_service",
+  "prompt": "Fix profile location formatting when address data is missing. Missing city should return \"Unknown\".",
+  "language": "typescript",
+  "bucket": "null_property_access",
+  "verify_paths": [
+    "location.ts"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.ts",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_primary_city_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "location.ts"
+  ],
+  "tags": [
+    "typescript",
+    "optional_chaining"
+  ]
+}

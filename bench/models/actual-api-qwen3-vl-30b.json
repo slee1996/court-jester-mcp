@@ -1,0 +1,14 @@
+{
+  "id": "actual-api-qwen3-vl-30b",
+  "title": "Actual API Qwen3 VL 30B",
+  "provider": "openai_compat_chat",
+  "model": "Qwen3-VL-30B-A3B-Instruct-Q5_K_M",
+  "enabled_by_default": false,
+  "metadata": {
+    "base_url": "https://api.actual.inc/v1",
+    "api_key_env": "ACTUAL_API_KEY",
+    "temperature": 0.2,
+    "max_tokens": 4000,
+    "timeout_seconds": 180
+  }
+}

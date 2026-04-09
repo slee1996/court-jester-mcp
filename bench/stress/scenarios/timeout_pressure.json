@@ -1,0 +1,28 @@
+{
+  "id": "timeout_pressure",
+  "title": "Timeout pressure workload",
+  "mode": "per_agent_server",
+  "concurrency": 2,
+  "requests_per_worker": 6,
+  "request_timeout_seconds": 120.0,
+  "request_mix": [
+    {
+      "tool": "execute",
+      "weight": 1
+    }
+  ],
+  "payloads": [
+    {
+      "language": "python",
+      "timeout_seconds": 1.0,
+      "memory_mb": 128,
+      "code": "while True:\\n    pass\\n"
+    },
+    {
+      "language": "typescript",
+      "timeout_seconds": 1.0,
+      "memory_mb": 128,
+      "code": "while (true) {}\\n"
+    }
+  ]
+}

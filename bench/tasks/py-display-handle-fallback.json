@@ -1,0 +1,32 @@
+{
+  "id": "py-display-handle-fallback",
+  "title": "Display handle with fallback chain",
+  "repo_fixture": "mini_py_handle_service",
+  "prompt": "Fix display handle selection so it prefers a non-blank profile handle, falls back to username, and otherwise returns \"guest\".",
+  "language": "python",
+  "bucket": "adversarial_fallback_chain",
+  "verify_paths": [
+    "handle.py"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.py",
+  "public_check_commands": [
+    [
+      "python",
+      "tests/public_checks.py"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/py_display_handle_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "handle.py"
+  ],
+  "tags": [
+    "python",
+    "adversarial_fallback_chain",
+    "handle",
+    "nested"
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "id": "replay-export-public-fail",
+  "title": "Replay export public failure",
+  "provider": "replay",
+  "enabled_by_default": true,
+  "replay_edits": [
+    {
+      "path": "export_name.py",
+      "content_path": "bench/replays/mini_py_export_service/export_name.public_fail.py"
+    }
+  ]
+}

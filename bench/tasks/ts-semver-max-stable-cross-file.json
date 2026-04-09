@@ -1,0 +1,50 @@
+{
+  "id": "ts-semver-max-stable-cross-file",
+  "title": "Pick the highest stable semver across files",
+  "repo_fixture": "mini_ts_semver_max_service",
+  "prompt": "Fix max stable semver selection so it ignores prereleases, normalizes leading v/build metadata, and returns the highest stable canonical version.",
+  "language": "typescript",
+  "bucket": "semver_cross_file",
+  "verify_paths": [
+    "versions.ts",
+    "compare.ts"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.ts",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_semver_max_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "versions.ts",
+    "compare.ts"
+  ],
+  "family": "module",
+  "bug_class": "semantic_normalization",
+  "bug_surface": "cross_file",
+  "difficulty": "hard",
+  "golden_patch_description": "Normalize candidate versions across files, ignore prereleases, strip build metadata, and return the highest stable canonical version.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": false,
+  "cross_file": true,
+  "tags": [
+    "typescript",
+    "semver",
+    "cross_file",
+    "max",
+    "cross_file_contract",
+    "semantic_normalization"
+  ]
+}

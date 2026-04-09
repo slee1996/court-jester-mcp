@@ -1,0 +1,47 @@
+{
+  "id": "ts-lodash-array-slice-1-known-good",
+  "title": "Known-good lodash array shard should pass without repair",
+  "repo_fixture": "mini_ts_lodash_array_service_fixed",
+  "prompt": "The implementation in this workspace is expected to already satisfy the upstream-derived lodash array shard. Make no behavior change unless you find a real spec mismatch.",
+  "language": "typescript",
+  "bucket": "known_good_corpus",
+  "verify_paths": [
+    "array.ts",
+    "internals.ts"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.ts",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_lodash_array_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "array.ts",
+    "internals.ts"
+  ],
+  "family": "known_good",
+  "bug_class": "false_positive_control",
+  "bug_surface": "cross_file",
+  "difficulty": "easy",
+  "golden_patch_description": "No semantic change required; this fixture is already correct.",
+  "expected_verify_outcome": "pass",
+  "expected_verify_failure_kinds": [],
+  "expected_hidden_failure_without_fix": false,
+  "expected_public_failure_without_fix": false,
+  "uses_project_dir": false,
+  "uses_relative_imports": false,
+  "cross_file": true,
+  "tags": [
+    "typescript",
+    "known_good",
+    "library",
+    "lodash",
+    "false_positive_control"
+  ]
+}

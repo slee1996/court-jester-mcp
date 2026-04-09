@@ -1,0 +1,28 @@
+{
+  "id": "memory_pressure",
+  "title": "Memory pressure workload",
+  "mode": "per_agent_server",
+  "concurrency": 2,
+  "requests_per_worker": 6,
+  "request_timeout_seconds": 120.0,
+  "request_mix": [
+    {
+      "tool": "execute",
+      "weight": 1
+    }
+  ],
+  "payloads": [
+    {
+      "language": "python",
+      "timeout_seconds": 10.0,
+      "memory_mb": 64,
+      "code": "chunks = []\\nwhile True:\\n    chunks.append('x' * 1024 * 1024)\\n"
+    },
+    {
+      "language": "python",
+      "timeout_seconds": 10.0,
+      "memory_mb": 64,
+      "code": "items = []\\nwhile True:\\n    items.append(list(range(50000)))\\n"
+    }
+  ]
+}

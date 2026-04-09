@@ -1,0 +1,32 @@
+{
+  "id": "ts-semver-caret-prerelease",
+  "title": "Caret ranges handle prereleases and zero-major semantics",
+  "repo_fixture": "mini_ts_semver_caret_service",
+  "prompt": "Fix caret-range matching so it excludes prereleases from normal stable ranges and respects the narrower upper bound for zero-major versions.",
+  "language": "typescript",
+  "bucket": "semver_range",
+  "verify_paths": [
+    "range.ts"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.ts",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_semver_caret_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "range.ts"
+  ],
+  "tags": [
+    "typescript",
+    "semver",
+    "range",
+    "caret"
+  ]
+}

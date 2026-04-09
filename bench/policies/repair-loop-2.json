@@ -1,0 +1,11 @@
+{
+  "id": "repair-loop-2",
+  "title": "Repair loop x2",
+  "description": "Allow two repair rounds after failed verify so the model can iterate against concrete repros.",
+  "court_jester_mode": "required",
+  "required_tools": [
+    "verify"
+  ],
+  "block_on_failed_verify": true,
+  "max_repair_rounds": 2
+}

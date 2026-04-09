@@ -1,0 +1,8 @@
+{
+  "id": "gpt-5.4-mini",
+  "title": "GPT-5.4 Mini",
+  "provider": "openai_responses",
+  "model": "gpt-5.4-mini",
+  "reasoning_effort": "medium",
+  "enabled_by_default": false
+}

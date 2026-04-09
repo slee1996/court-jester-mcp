@@ -1,0 +1,31 @@
+{
+  "id": "py-support-email-domain-missing",
+  "title": "Support email domain with malformed contact data",
+  "repo_fixture": "mini_py_support_service",
+  "prompt": "Fix support email domain parsing when team contact data is incomplete. Missing or malformed support emails should return \"unknown\".",
+  "language": "python",
+  "bucket": "string_parsing",
+  "verify_paths": [
+    "support.py"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.py",
+  "public_check_commands": [
+    [
+      "python",
+      "tests/public_checks.py"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/py_support_email_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "support.py"
+  ],
+  "tags": [
+    "python",
+    "string_parsing",
+    "malformed_input"
+  ]
+}

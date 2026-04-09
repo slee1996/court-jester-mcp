@@ -1,0 +1,32 @@
+{
+  "id": "py-secondary-support-email-sparse",
+  "title": "Secondary support email with sparse email list",
+  "repo_fixture": "mini_py_secondary_email_service",
+  "prompt": "Fix secondary support email formatting when contacts or the second email is missing. Missing or blank values should return \"help@example.com\".",
+  "language": "python",
+  "bucket": "adversarial_sparse_array",
+  "verify_paths": [
+    "contact.py"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.py",
+  "public_check_commands": [
+    [
+      "python",
+      "tests/public_checks.py"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/py_secondary_support_email_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "contact.py"
+  ],
+  "tags": [
+    "python",
+    "adversarial_sparse_array",
+    "email",
+    "fallback"
+  ]
+}

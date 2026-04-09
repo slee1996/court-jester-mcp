@@ -1,0 +1,30 @@
+{
+  "id": "py-unicode-export-filename-tilde-public-trigger",
+  "title": "Unicode-safe export filenames with tilde separators",
+  "repo_fixture": "mini_py_export_tilde_service",
+  "prompt": "Fix export filename generation so non-ASCII titles do not crash. Normalize accented characters to ASCII where possible, and join words with a tilde instead of a hyphen.",
+  "language": "python",
+  "bucket": "public_trigger_probe",
+  "verify_paths": [
+    "export_name.py"
+  ],
+  "public_check_commands": [
+    [
+      "python",
+      "tests/public_checks.py"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/export_filename_tilde_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "export_name.py"
+  ],
+  "tags": [
+    "public-trigger",
+    "unicode",
+    "separator_format"
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "id": "gpt-5.4",
+  "title": "GPT-5.4",
+  "provider": "openai_responses",
+  "model": "gpt-5.4",
+  "reasoning_effort": "high",
+  "enabled_by_default": false
+}

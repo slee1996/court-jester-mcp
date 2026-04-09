@@ -1,0 +1,9 @@
+{
+  "id": "known-good-corpus",
+  "title": "Known-good false-positive control set",
+  "goal": "Measure whether Court Jester wrongly fails already-correct implementations under gating and repair policies.",
+  "task_ids": [
+    "ts-lodash-array-slice-1-known-good",
+    "ts-lodash-object-slice-1-known-good"
+  ]
+}

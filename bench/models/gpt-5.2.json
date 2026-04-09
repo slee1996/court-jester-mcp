@@ -1,0 +1,8 @@
+{
+  "id": "gpt-5.2",
+  "title": "GPT-5.2",
+  "provider": "openai_responses",
+  "model": "gpt-5.2",
+  "reasoning_effort": "medium",
+  "enabled_by_default": false
+}

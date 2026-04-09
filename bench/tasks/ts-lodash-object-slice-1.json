@@ -1,0 +1,51 @@
+{
+  "id": "ts-lodash-object-slice-1",
+  "title": "Lodash object shard matches defaults, omit, and pick behavior",
+  "repo_fixture": "mini_ts_lodash_object_service",
+  "prompt": "Fix this upstream-derived lodash object shard so defaults preserves existing non-undefined values while reading inherited enumerable source keys, and pick and omit flatten path arguments, support deep paths, coerce numeric paths to strings, and prefer direct keys like 'a.b' over deep traversal.",
+  "language": "typescript",
+  "bucket": "library_spec_slice",
+  "verify_paths": [
+    "object.ts",
+    "internals.ts"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.ts",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_lodash_object_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "object.ts",
+    "internals.ts"
+  ],
+  "family": "library_slice",
+  "bug_class": "spec_conformance",
+  "bug_surface": "cross_file",
+  "difficulty": "medium",
+  "golden_patch_description": "Match lodash 4.17.21 defaults, omit, and pick semantics for inherited defaults, flat path args, deep paths, and key-over-path handling.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": false,
+  "cross_file": true,
+  "tags": [
+    "typescript",
+    "library",
+    "lodash",
+    "object",
+    "spec_conformance",
+    "upstream_derived",
+    "cross_file"
+  ]
+}

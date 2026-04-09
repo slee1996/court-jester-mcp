@@ -1,0 +1,30 @@
+{
+  "id": "ts-display-initials-badge-public-trigger",
+  "title": "Display initials badge formatting without verify public examples",
+  "repo_fixture": "mini_ts_initials_badge_service",
+  "prompt": "Fix initials generation when the display name is empty or missing. Return \"A.N\" for anonymous, and use dot-separated initials for multi-word names.",
+  "language": "typescript",
+  "bucket": "public_trigger_probe",
+  "verify_paths": [
+    "initials.ts"
+  ],
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_display_initials_badge_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "initials.ts"
+  ],
+  "tags": [
+    "public-trigger",
+    "typescript",
+    "formatting"
+  ]
+}

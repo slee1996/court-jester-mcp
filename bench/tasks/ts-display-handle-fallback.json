@@ -1,0 +1,32 @@
+{
+  "id": "ts-display-handle-fallback",
+  "title": "Display handle with fallback chain",
+  "repo_fixture": "mini_ts_handle_service",
+  "prompt": "Fix display handle selection so it prefers a non-blank profile handle, falls back to username, and otherwise returns \"guest\".",
+  "language": "typescript",
+  "bucket": "adversarial_fallback_chain",
+  "verify_paths": [
+    "handle.ts"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.ts",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_display_handle_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "handle.ts"
+  ],
+  "tags": [
+    "typescript",
+    "adversarial_fallback_chain",
+    "handle",
+    "nested"
+  ]
+}

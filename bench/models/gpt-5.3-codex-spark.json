@@ -1,0 +1,8 @@
+{
+  "id": "gpt-5.3-codex-spark",
+  "title": "GPT-5.3 Codex Spark",
+  "provider": "openai_responses",
+  "model": "gpt-5.3-codex-spark",
+  "reasoning_effort": "high",
+  "enabled_by_default": false
+}

@@ -1,0 +1,36 @@
+{
+  "id": "mixed_verify",
+  "title": "Mixed verify workload",
+  "mode": "per_agent_server",
+  "concurrency": 4,
+  "requests_per_worker": 10,
+  "request_timeout_seconds": 120.0,
+  "request_mix": [
+    {
+      "tool": "verify",
+      "weight": 8
+    },
+    {
+      "tool": "lint",
+      "weight": 1
+    },
+    {
+      "tool": "execute",
+      "weight": 1
+    }
+  ],
+  "payloads": [
+    {
+      "language": "python",
+      "code": "def display_name(name):\n    return name.strip().title()\n\nprint(display_name('  alice  '))\n"
+    },
+    {
+      "language": "python",
+      "code": "def average(items):\n    return sum(items) / len(items)\n\nprint(average([]))\n"
+    },
+    {
+      "language": "typescript",
+      "code": "function initials(name?: string): string {\n  return name!.split(/\\s+/).map((part) => part[0]).join('');\n}\n\nconsole.log(initials('Ada Lovelace'));\n"
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "id": "ts-semver-compare-prerelease",
+  "title": "Semver compare handles prereleases",
+  "repo_fixture": "mini_ts_semver_compare_service",
+  "prompt": "Fix semantic version comparison so prerelease identifiers sort correctly, prereleases are lower than the matching release, and build metadata does not affect ordering.",
+  "language": "typescript",
+  "bucket": "semver_compare",
+  "verify_paths": [
+    "compare.ts"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.ts",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_semver_compare_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "compare.ts"
+  ],
+  "tags": [
+    "typescript",
+    "semver",
+    "comparison",
+    "prerelease"
+  ]
+}

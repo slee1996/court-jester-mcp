@@ -1,0 +1,32 @@
+{
+  "id": "py-primary-tagline-nonblank",
+  "title": "Primary tagline skips blank segments",
+  "repo_fixture": "mini_py_tagline_service",
+  "prompt": "Fix primary tagline selection so it returns the first non-blank segment. If no usable segment exists, return \"general\".",
+  "language": "python",
+  "bucket": "adversarial_sparse_array",
+  "verify_paths": [
+    "tagline.py"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.py",
+  "public_check_commands": [
+    [
+      "python",
+      "tests/public_checks.py"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/py_primary_tagline_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "tagline.py"
+  ],
+  "tags": [
+    "python",
+    "adversarial_sparse_array",
+    "tagline",
+    "whitespace"
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "id": "py-missing-plan-fallback",
+  "title": "Plan fallback for missing imports",
+  "repo_fixture": "mini_py_plan_service",
+  "prompt": "Fix checkout when imported plans are missing or blank. Unknown plans should fall back to the starter plan.",
+  "language": "python",
+  "bucket": "key_lookup",
+  "verify_paths": [
+    "billing.py"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.py",
+  "public_check_commands": [
+    [
+      "python",
+      "tests/public_checks.py"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/plan_price_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "billing.py"
+  ],
+  "tags": [
+    "key_error",
+    "fallback_logic"
+  ]
+}

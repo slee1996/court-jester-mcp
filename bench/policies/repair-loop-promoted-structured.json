@@ -1,0 +1,13 @@
+{
+  "id": "repair-loop-promoted-structured",
+  "title": "Repair loop with promoted repros and structured first-party feedback",
+  "description": "Reserve one repair round after a failed verify, promote the failed repros into the next verify attempt, and add a structured repair checklist generated from Court Jester's own signals.",
+  "court_jester_mode": "required",
+  "required_tools": [
+    "verify"
+  ],
+  "block_on_failed_verify": true,
+  "max_repair_rounds": 1,
+  "promote_verify_repros": true,
+  "structured_first_party_feedback": true
+}

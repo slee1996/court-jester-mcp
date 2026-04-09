@@ -1,0 +1,32 @@
+{
+  "id": "soak",
+  "title": "Steady-state soak workload",
+  "mode": "per_agent_server",
+  "concurrency": 2,
+  "requests_per_worker": 100,
+  "request_timeout_seconds": 120.0,
+  "request_mix": [
+    {
+      "tool": "verify",
+      "weight": 7
+    },
+    {
+      "tool": "lint",
+      "weight": 2
+    },
+    {
+      "tool": "execute",
+      "weight": 1
+    }
+  ],
+  "payloads": [
+    {
+      "language": "python",
+      "code": "def normalize_email(email):\n    return email.strip().lower()\n\nprint(normalize_email(' TEST@example.com '))\n"
+    },
+    {
+      "language": "typescript",
+      "code": "function canonicalize(value: string): string {\n  return value.trim().toLowerCase();\n}\n\nconsole.log(canonicalize(' Hello '));\n"
+    }
+  ]
+}

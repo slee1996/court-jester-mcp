@@ -1,0 +1,11 @@
+{
+  "id": "advisory",
+  "title": "Advisory",
+  "description": "Run court-jester and record the result, but do not block completion.",
+  "court_jester_mode": "advisory",
+  "required_tools": [
+    "verify"
+  ],
+  "block_on_failed_verify": false,
+  "max_repair_rounds": 0
+}
