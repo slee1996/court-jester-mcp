@@ -1,6 +1,13 @@
 /target
 bench/results
-__pycache__
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+node_modules/
+coverage/
+.coverage
+htmlcov/
 .DS_Store
 .claude/
 .npm/
