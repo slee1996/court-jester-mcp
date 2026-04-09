@@ -5,6 +5,6 @@
   "model": "gpt-5.1-codex-max",
   "enabled_by_default": false,
   "metadata": {
-    "timeout_seconds": 240
+    "timeout_seconds": 420
   }
 }

@@ -88,7 +88,7 @@ Model manifest:
   "provider": "claude_cli",
   "enabled_by_default": false,
   "metadata": {
-    "timeout_seconds": 240
+    "timeout_seconds": 420
   }
 }
 ```
