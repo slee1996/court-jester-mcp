@@ -51,12 +51,22 @@ fi
 
 tar xzf "${TMPDIR}/${ASSET}" -C "${TMPDIR}"
 
-# Install
-mkdir -p "${INSTALL_DIR}"
-mv "${TMPDIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
-chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
+# Find the binary — tarball may contain a subdirectory
+EXTRACTED="$(find "${TMPDIR}" -name "${BINARY_NAME}" -type f | head -1)"
+if [ -z "${EXTRACTED}" ]; then
+  echo "Archive did not contain ${BINARY_NAME}" >&2
+  exit 1
+fi
+EXTRACTED_DIR="$(dirname "${EXTRACTED}")"
 
-echo "Installed to ${INSTALL_DIR}/${BINARY_NAME}"
+# Install binary + any bundled tools (ruff, biome)
+mkdir -p "${INSTALL_DIR}"
+for f in "${EXTRACTED_DIR}"/*; do
+  mv "${f}" "${INSTALL_DIR}/$(basename "${f}")"
+  chmod +x "${INSTALL_DIR}/$(basename "${f}")"
+done
+
+echo "Installed to ${INSTALL_DIR}/"
 
 # Check PATH
 case ":${PATH}:" in
