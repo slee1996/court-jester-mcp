@@ -28,16 +28,17 @@ The false-positive control (known-good code, 20 runs) passes 20/20.
 
 ### 1. Install
 
-**Download a release binary** from [GitHub Releases](https://github.com/slee1996/court-jester-mcp/releases) (macOS Apple Silicon available now).
-
-Or **build from source** (any platform):
+**Build from source** (any platform):
 
 ```bash
 # Requires Rust 1.85+ — install via https://rustup.rs if needed
 git clone https://github.com/slee1996/court-jester-mcp.git && cd court-jester-mcp
-cargo build --release
-# binary at ./target/release/court-jester-mcp
+cargo install --path .
 ```
+
+This puts `court-jester-mcp` in `~/.cargo/bin/`, which is already on your PATH.
+
+Pre-built binaries are also available on [GitHub Releases](https://github.com/slee1996/court-jester-mcp/releases) (macOS Apple Silicon).
 
 Optional tools (Court Jester works without them — lint becomes advisory):
 - [ruff](https://docs.astral.sh/ruff/installation/) (Python lint)
@@ -46,13 +47,11 @@ Optional tools (Court Jester works without them — lint becomes advisory):
 
 ### 2. Connect to your agent
 
-Point your agent at the binary. If you built from source, the path is `$(pwd)/target/release/court-jester-mcp`. If you downloaded the release, use the full path to wherever you extracted it.
-
 <details>
 <summary><strong>Claude Code</strong></summary>
 
 ```bash
-claude mcp add court-jester -- $(pwd)/target/release/court-jester-mcp
+claude mcp add court-jester -- court-jester-mcp
 ```
 
 Use `-s project` instead of the default to commit the config into your repo for your team.
@@ -62,7 +61,7 @@ Use `-s project` instead of the default to commit the config into your repo for 
 <summary><strong>Codex CLI</strong></summary>
 
 ```bash
-codex mcp add court-jester -- $(pwd)/target/release/court-jester-mcp
+codex mcp add court-jester -- court-jester-mcp
 ```
 </details>
 
@@ -75,7 +74,7 @@ Add to `.cursor/mcp.json` in your project root (or `~/.cursor/mcp.json` for glob
 {
   "mcpServers": {
     "court-jester": {
-      "command": "/full/path/to/court-jester-mcp"
+      "command": "court-jester-mcp"
     }
   }
 }
@@ -91,7 +90,7 @@ Add to `.vscode/mcp.json` in your workspace:
 {
   "servers": {
     "court-jester": {
-      "command": "/full/path/to/court-jester-mcp"
+      "command": "court-jester-mcp"
     }
   }
 }
@@ -107,7 +106,7 @@ Add to `~/.codeium/windsurf/mcp_config.json`:
 {
   "mcpServers": {
     "court-jester": {
-      "command": "/full/path/to/court-jester-mcp"
+      "command": "court-jester-mcp"
     }
   }
 }
@@ -123,7 +122,7 @@ Open Cline settings in VS Code, go to MCP Servers, and add:
 {
   "mcpServers": {
     "court-jester": {
-      "command": "/full/path/to/court-jester-mcp"
+      "command": "court-jester-mcp"
     }
   }
 }
@@ -137,7 +136,7 @@ Court Jester is a stdio MCP server. The standard config shape works everywhere:
 
 ```json
 {
-  "command": "/full/path/to/court-jester-mcp"
+  "command": "court-jester-mcp"
 }
 ```
 </details>
