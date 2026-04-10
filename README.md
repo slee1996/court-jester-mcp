@@ -28,26 +28,21 @@ The false-positive control (known-good code, 20 runs) passes 20/20.
 
 ### 1. Install
 
-**Download the release binary** (macOS Apple Silicon):
+**Download a release binary** from [GitHub Releases](https://github.com/slee1996/court-jester-mcp/releases) (macOS Apple Silicon available now).
+
+Or **build from source** (any platform):
 
 ```bash
-curl -L https://github.com/slee1996/court-jester-mcp/releases/latest/download/court-jester-v0.1.2-darwin-arm64.tar.gz | tar xz
-# move the binary somewhere on PATH
-mv court-jester-mcp /usr/local/bin/
+# Requires Rust 1.85+ — install via https://rustup.rs if needed
+git clone https://github.com/slee1996/court-jester-mcp.git && cd court-jester-mcp
+cargo build --release
+# binary at ./target/release/court-jester-mcp
 ```
 
-Or **build from source** (any platform, requires Rust 1.85+):
-
-```bash
-git clone https://github.com/slee1996/court-jester-mcp.git
-cd court-jester-mcp
-cargo install --path .
-```
-
-Optional lint tools (advisory — Court Jester works without them):
-- Python lint: `pip install ruff` or `brew install ruff`
-- TypeScript lint: `npm i -g @biomejs/biome` or `brew install biome`
-- TypeScript fuzz execution: [bun](https://bun.sh)
+Optional tools (Court Jester works without them — lint becomes advisory):
+- [ruff](https://docs.astral.sh/ruff/installation/) (Python lint)
+- [biome](https://biomejs.dev/guides/getting-started/) (TypeScript lint)
+- [bun](https://bun.sh) (required for TypeScript fuzz execution)
 
 ### 2. Connect to your agent
 
