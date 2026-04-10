@@ -10,6 +10,16 @@ The job is narrow on purpose:
 
 Court Jester works on **Python** and **TypeScript**. It is not a general CI replacement, and it is not a secure hidden-judge system. See [Status](#status) for an honest read of what it is and is not proven to do.
 
+Current strongest evidence:
+
+- clean `core-current` run:
+  - `claude-default`: `106 / 117` baseline -> `116 / 117` repair-loop
+  - `codex-default`: `108 / 117` baseline -> `117 / 117` repair-loop
+- clean known-good control:
+  - `20 / 20` success under `noop + required-final`
+- current caveat:
+  - fresh Codex and Spark reruns on `2026-04-10` are provider-outage-contaminated and currently fail as fast `provider_infra_error`, not code-quality misses
+
 ## Contents
 - [How it works](#how-it-works)
 - [Install](#install)
@@ -24,6 +34,7 @@ Court Jester works on **Python** and **TypeScript**. It is not a general CI repl
 - [Troubleshooting](#troubleshooting)
 - [Development commands](#development-commands)
 - [Repo layout](#repo-layout)
+- [Benchmark Evidence](#benchmark-evidence)
 - [Status](#status)
 - [Further reading](#further-reading)
 - [License](#license)
@@ -460,6 +471,75 @@ More benchmark detail is in [bench/README.md](bench/README.md). Repository conve
 - [AGENTS.md](AGENTS.md) — repository guidelines for contributors and agents
 - [justfile](justfile) — canonical build/test/run recipes
 
+## Benchmark Evidence
+
+The current benchmark story is stronger than the earlier six-task slice and should be the main public read.
+
+### Clean utility result
+
+The strongest clean release-evidence run currently available is the `core-current` matrix:
+
+- tasks: `39`
+- models: `claude-default`, `codex-default`
+- policies: `baseline`, `repair-loop`
+- repeats: `3`
+
+That produces `117` runs per model-policy pair.
+
+Results:
+
+- `claude-default`
+  - baseline: `106 / 117`
+  - repair-loop: `116 / 117`
+- `codex-default`
+  - baseline: `108 / 117`
+  - repair-loop: `117 / 117`
+
+That is real lift, not just better bug observability:
+
+- Claude improved by `+10` tasks
+- Codex improved by `+9` tasks
+
+On the clean core run, Claude reduced hidden semantic misses from `11` to `1`, and Codex reduced them from `8` plus `1` provider failure to `0`.
+
+### False-positive control
+
+The current known-good control corpus is still small, but it is clean:
+
+- task set: `known-good-corpus`
+- policy: `required-final`
+- model: `noop`
+- repeats: `10`
+- result: `20 / 20`
+
+That matters because an earlier run exposed a real TypeScript false-positive bug in alias handling. The current control corpus now passes after the synthesis fix.
+
+### Provider-health caveat
+
+Fresh same-day reruns are currently limited by provider stability, not by benchmark logic.
+
+After adding early aborts, retries, and better failure classification, current reruns show:
+
+- fresh Codex reruns failing broadly as fast `provider_infra_error`
+- fresh Spark reruns failing the same way
+- common signature: `Transport channel closed` plus `Internal server error`
+
+This is the right outcome operationally because the harness now fails fast and labels the issue honestly, but it means fresh Codex/Spark reruns on `2026-04-10` are not clean quality evidence.
+
+### What this means
+
+The current evidence supports:
+
+- Court Jester can improve final task success in an agent loop on a larger suite than the original six-task report
+- the current known-good corpus does not show a false-positive blocker
+- the harness now distinguishes provider outages from code-quality failures much better than before
+
+The current evidence does not yet support:
+
+- a claim that all frontier-model reruns are clean at any given moment
+- a claim that false positives are fully characterized beyond the current small known-good corpus
+- a production-readiness claim for arbitrary repos or workflows
+
 ## Status
 
 Court Jester is **experimental / research-driven / private-beta-prep**. It is not a production-ready verifier, a broadly proven tool for all users, or a complete CI replacement.
@@ -468,12 +548,12 @@ What the current evidence supports:
 
 - a working MCP verifier with `analyze`, `lint`, `execute`, and `verify`
 - a benchmark harness for `baseline`, `required-final`, and `repair-loop` comparisons
-- a small known-good control corpus that currently passes after a TypeScript alias-resolution fix
-- benchmark evidence that Court Jester can improve outcomes for weaker models on the established suite
+- a clean larger benchmark result showing `repair-loop` beating `baseline` on both Claude and Codex
+- a small known-good control corpus that currently passes cleanly
 
 What the current evidence does **not** yet support:
 
-- a broad claim that Court Jester improves frontier-model outcomes in general
+- a broad claim that every fresh frontier-model rerun is stable and clean at provider time
 - a claim that false positives are already well-characterized across a large known-good corpus
 - a production-readiness claim for arbitrary repos or agent workflows
 
@@ -497,7 +577,8 @@ That means the important comparisons in this repo are:
 - [docs/court-jester-overview.md](docs/court-jester-overview.md) — why Court Jester exists and what the benchmark is meant to answer
 - [docs/system-flow.md](docs/system-flow.md) — detailed architecture and runner flow
 - [docs/tool-flow-diagram.md](docs/tool-flow-diagram.md) — compact flow diagram companion
-- [docs/benchmark-2026-03-26.md](docs/benchmark-2026-03-26.md) — strongest current benchmark summary
+- [docs/benchmark-2026-04-10.md](docs/benchmark-2026-04-10.md) — current strongest benchmark summary
+- [docs/benchmark-2026-03-26.md](docs/benchmark-2026-03-26.md) — earlier six-task benchmark report
 - [docs/big-benchmark-runbook.md](docs/big-benchmark-runbook.md) — commands and pass/fail criteria for the large release-evidence run
 - [docs/release-readiness-private-beta.md](docs/release-readiness-private-beta.md) — release bar and current read
 

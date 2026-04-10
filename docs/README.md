@@ -6,7 +6,8 @@ This folder now has a small canonical set at the top level, with older planning 
 
 - [court-jester-overview.md](court-jester-overview.md): what Court Jester is, why it exists, and how the benchmark is meant to answer product questions
 - [release-readiness-private-beta.md](release-readiness-private-beta.md): current release bar and honest status read
-- [benchmark-2026-03-26.md](benchmark-2026-03-26.md): strongest current benchmark summary
+- [benchmark-2026-04-10.md](benchmark-2026-04-10.md): current strongest benchmark summary
+- [benchmark-2026-03-26.md](benchmark-2026-03-26.md): earlier six-task benchmark summary
 - [big-benchmark-runbook.md](big-benchmark-runbook.md): exact commands and pass/fail criteria for the large release-evidence run
 - [system-flow.md](system-flow.md): detailed architecture and runner flow
 - [tool-flow-diagram.md](tool-flow-diagram.md): compact diagram companion to `system-flow`

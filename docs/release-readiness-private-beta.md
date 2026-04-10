@@ -176,6 +176,23 @@ Current evidence supports continuing toward a private beta.
 
 Current evidence does not yet justify a broad public claim that Court Jester is generally ready for all users and all agent workflows.
 
+Updated utility and reliability read on 2026-04-10:
+
+- clean `core-current` utility run:
+  - `claude-default`: `106 / 117` baseline -> `116 / 117` repair-loop
+  - `codex-default`: `108 / 117` baseline -> `117 / 117` repair-loop
+- known-good control:
+  - `20 / 20` success under `noop + required-final`
+- provider caveat:
+  - fresh Codex and Spark reruns on 2026-04-10 are currently provider-outage-contaminated and fail as `provider_infra_error`
+  - after runner fixes, those failures now abort quickly and classify correctly instead of consuming the full timeout budget
+
+Interpretation:
+
+- the clean utility evidence is stronger than it was in March
+- the immediate known-good false-positive blocker remains cleared on the current small control corpus
+- current external provider health is still a separate release risk because it can contaminate fresh reruns even when the benchmark logic is sound
+
 Updated false-positive control result on 2026-04-09:
 
 - initial run exposed a real blocker: [ts-lodash-object-slice-1-known-good.json](../bench/tasks/ts-lodash-object-slice-1-known-good.json) failed with `verify_stronger_than_eval`
