@@ -29,11 +29,20 @@ The false-positive control (known-good code, 20 runs) passes 20/20.
 ### 1. Install
 
 ```bash
-# Requires Rust 1.85+ — install via https://rustup.rs if needed
+curl -fsSL https://raw.githubusercontent.com/slee1996/court-jester-mcp/main/install.sh | sh
+```
+
+This downloads the release binary and puts it on your PATH. No Rust toolchain needed.
+
+<details>
+<summary>Build from source instead</summary>
+
+```bash
 cargo install --git https://github.com/slee1996/court-jester-mcp.git
 ```
 
-This builds the binary and puts it on your PATH. Pre-built binaries are also available on [GitHub Releases](https://github.com/slee1996/court-jester-mcp/releases).
+Requires Rust 1.85+. Install via [rustup](https://rustup.rs) if needed.
+</details>
 
 Optional tools (Court Jester works without them — lint becomes advisory):
 - [ruff](https://docs.astral.sh/ruff/installation/) (Python lint)
