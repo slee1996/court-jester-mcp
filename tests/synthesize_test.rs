@@ -126,6 +126,23 @@ fn python_no_idempotency_for_non_clean_names() {
 }
 
 #[test]
+fn python_average_order_value_is_not_treated_as_comparator() {
+    let a = make_analysis(
+        vec![func(
+            "average_order_value",
+            vec![("total_cents", Some("int")), ("order_count", Some("int"))],
+            Some("float"),
+        )],
+        vec![],
+    );
+    let code = synthesize_calls(&a, &Language::Python);
+    assert!(
+        !code.contains("Comparator self-compare should be zero"),
+        "average_order_value should not get comparator checks, got: {code}"
+    );
+}
+
+#[test]
 fn python_no_idempotency_for_different_types() {
     let a = make_analysis(
         vec![func(

@@ -1,0 +1,10 @@
+{
+  "id": "codex-spark-cli",
+  "title": "Codex CLI GPT-5.3 Codex Spark",
+  "provider": "codex_cli",
+  "model": "gpt-5.3-codex-spark",
+  "enabled_by_default": false,
+  "metadata": {
+    "timeout_seconds": 420
+  }
+}

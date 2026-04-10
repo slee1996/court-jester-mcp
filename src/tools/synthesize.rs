@@ -516,8 +516,10 @@ fn likely_nullish_string_leak(name: &str) -> bool {
 /// Names that suggest symmetric behavior (f(a,b) == f(b,a)).
 const SYMMETRIC_NAME_CUES: &[&str] = &["distance", "similarity", "hamming", "gcd"];
 
-/// Names that suggest ordering/comparison (antisymmetric, NOT symmetric).
-const ANTISYMMETRIC_NAME_CUES: &[&str] = &["compare", "cmp", "sort", "asc", "desc", "order"];
+/// Names that suggest comparator-style ordering (antisymmetric, NOT symmetric).
+/// Keep this list narrow: generic words like "order" create false positives for
+/// ordinary business functions such as average_order_value(total, count).
+const ANTISYMMETRIC_NAME_CUES: &[&str] = &["compare", "cmp", "sort", "asc", "desc"];
 
 fn likely_symmetric(name: &str) -> bool {
     let lower = name.to_lowercase();
