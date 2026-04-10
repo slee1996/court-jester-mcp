@@ -122,21 +122,32 @@ pub async fn verify(
         )
     });
 
-    let lint_ok = true;
+    let lint_runner_failed = lint_result.error.is_some() && !lint_result.unavailable;
+    let lint_ok = !lint_runner_failed;
+    if lint_runner_failed {
+        overall_ok = false;
+    }
 
     stages.push(VerificationStage {
         name: "lint".into(),
         ok: lint_ok,
         duration_ms: lint_ms,
         detail: Some(serde_json::to_value(&lint_result).unwrap()),
-        error: lint_result.error.clone(),
+        error: if lint_runner_failed {
+            lint_result.error.clone()
+        } else {
+            None
+        },
     });
 
     // Stage 4: Synthesize + Execute
     if !analysis.functions.is_empty() {
         // Determine which functions to fuzz
         let functions_to_fuzz: Vec<FunctionInfo> = if let Some(diff_str) = opts.diff {
-            let changed_ranges = diff::parse_changed_lines(diff_str);
+            let changed_ranges = opts
+                .source_file
+                .map(|path| diff::parse_changed_lines_for_file(diff_str, path))
+                .unwrap_or_else(|| diff::parse_changed_lines(diff_str));
             analyze::filter_changed_functions(&analysis, &changed_ranges)
         } else {
             analysis.functions.clone()
@@ -207,7 +218,7 @@ pub async fn verify(
     if let Some(tests) = opts.test_code {
         let has_import_statements = test_code_has_imports(tests, language);
         let mut test_file_for_execution = opts.test_source_file.or(opts.source_file);
-        if opts.test_source_file.is_some() && !has_import_statements {
+        if !has_import_statements {
             if let Some(source_file) = opts.source_file {
                 test_file_for_execution = Some(source_file);
             }
@@ -216,10 +227,7 @@ pub async fn verify(
         // Test files in this benchmark can include direct symbol assertions against the
         // module under test (e.g., `displayInitials(...)`). In those cases, include the
         // candidate source so the assertions execute in a valid lexical scope.
-        let test_input = if opts.test_source_file.is_some()
-            && !has_import_statements
-            && opts.source_file.is_some()
-        {
+        let test_input = if !has_import_statements {
             format!("{code}\n\n{tests}")
         } else {
             tests.to_string()
@@ -315,6 +323,8 @@ fn write_report(
                                 summary.functions_fuzzed += 1;
                                 if line.contains("CRASHED") {
                                     summary.fuzz_crash += 1;
+                                } else if line.contains("nothing tested") {
+                                    // Rejected-only runs are verifier failures, not passes.
                                 } else {
                                     summary.fuzz_pass += 1;
                                 }

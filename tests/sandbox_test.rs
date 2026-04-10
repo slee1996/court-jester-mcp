@@ -158,3 +158,24 @@ async fn source_file_cleanup() {
         remaining
     );
 }
+
+#[tokio::test]
+async fn typescript_memory_limit_counts_child_processes() {
+    let code = r#"
+import { spawn } from "node:child_process";
+
+spawn(
+  process.execPath,
+  ["-e", "const buf = new Uint8Array(200_000_000); buf.fill(1); setInterval(() => {}, 1000);"],
+  { stdio: "ignore" }
+);
+
+setInterval(() => {}, 1000);
+"#;
+    let r = execute(code, &Language::TypeScript, 5.0, 64, None, None).await;
+    assert!(
+        r.memory_error,
+        "expected child-process RSS to trip memory limit, got: {:?}",
+        r
+    );
+}

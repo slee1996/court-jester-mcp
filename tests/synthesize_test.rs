@@ -358,6 +358,26 @@ fn typescript_non_exported_string_helper_skips_name_cued_properties() {
 }
 
 #[test]
+fn typescript_non_exported_structured_identifier_helper_gets_nonempty_string() {
+    let mut helper = func(
+        "primaryCity",
+        vec![("user", Some("{ city?: string | null } | null"))],
+        Some("string"),
+    );
+    helper.is_exported = false;
+    let a = make_analysis(vec![helper], vec![]);
+    let code = synthesize_calls(&a, &Language::TypeScript);
+    let fuzz_call = code
+        .lines()
+        .find(|line| line.contains("_fuzzOne(\"primaryCity\""))
+        .unwrap_or("");
+    assert!(
+        fuzz_call.contains("\"nonempty_string\""),
+        "structured identifier helper should get nonempty_string, got: {fuzz_call}"
+    );
+}
+
+#[test]
 fn typescript_exported_compare_gets_comparator_property() {
     let a = make_analysis(
         vec![func(

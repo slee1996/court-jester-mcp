@@ -175,7 +175,11 @@ impl CourtJester {
 
                 // Diff-aware filtering
                 if let Some(diff_str) = &p.diff {
-                    let changed_ranges = tools::diff::parse_changed_lines(diff_str);
+                    let changed_ranges = p
+                        .file_path
+                        .as_deref()
+                        .map(|path| tools::diff::parse_changed_lines_for_file(diff_str, path))
+                        .unwrap_or_else(|| tools::diff::parse_changed_lines(diff_str));
                     let changed_fns =
                         tools::analyze::filter_changed_functions(&analysis, &changed_ranges);
                     value["changed_functions"] = serde_json::to_value(&changed_fns).unwrap();

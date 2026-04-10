@@ -296,6 +296,74 @@ fn resolve_imported_non_object_alias_from_sibling() {
     );
 }
 
+#[test]
+fn resolve_imported_types_from_deep_typescript_relative_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let types_dir = dir.path().join("src").join("types");
+    let main_dir = dir.path().join("src").join("deep").join("nested");
+    std::fs::create_dir_all(&types_dir).unwrap();
+    std::fs::create_dir_all(&main_dir).unwrap();
+
+    std::fs::write(
+        types_dir.join("profile.ts"),
+        "export type Profile = { id: number; timezone: string; };",
+    )
+    .unwrap();
+
+    let main_path = main_dir.join("main.ts");
+    std::fs::write(
+        &main_path,
+        "import type { Profile } from \"../../types/profile\";\nexport function tz(profile: Profile): string { return profile.timezone; }",
+    )
+    .unwrap();
+
+    let code = std::fs::read_to_string(&main_path).unwrap();
+    let analysis = analyze(&code, &Language::TypeScript);
+    let imported = analyze::resolve_imported_types(
+        &analysis,
+        main_path.to_str().unwrap(),
+        &Language::TypeScript,
+    );
+
+    assert_eq!(
+        imported.classes.len(),
+        1,
+        "should resolve ../../types/profile"
+    );
+    assert_eq!(imported.classes[0].name, "Profile");
+}
+
+#[test]
+fn resolve_imported_types_from_parent_python_relative_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let pkg_dir = dir.path().join("pkg");
+    let sub_dir = pkg_dir.join("sub");
+    std::fs::create_dir_all(&sub_dir).unwrap();
+    std::fs::write(pkg_dir.join("__init__.py"), "").unwrap();
+    std::fs::write(sub_dir.join("__init__.py"), "").unwrap();
+    std::fs::write(
+        pkg_dir.join("models.py"),
+        "class Profile:\n    timezone: str\n    locale: str\n",
+    )
+    .unwrap();
+
+    let main_path = sub_dir.join("main.py");
+    std::fs::write(
+        &main_path,
+        "from ..models import Profile\n\ndef preferred_timezone(profile: Profile) -> str:\n    return profile.timezone\n",
+    )
+    .unwrap();
+
+    let code = std::fs::read_to_string(&main_path).unwrap();
+    let analysis = analyze(&code, &Language::Python);
+    let imported =
+        analyze::resolve_imported_types(&analysis, main_path.to_str().unwrap(), &Language::Python);
+
+    assert_eq!(imported.classes.len(), 1, "should resolve ..models");
+    assert_eq!(imported.classes[0].name, "Profile");
+    assert_eq!(imported.classes[0].fields.len(), 2);
+}
+
 // ── Per-function complexity (Change 2) ──────────────────────────────────────
 
 #[test]

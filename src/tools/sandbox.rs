@@ -3,13 +3,11 @@ use tokio::process::Command;
 
 use crate::types::*;
 
-/// Poll a process's RSS (resident set size) on macOS using `proc_pidinfo`.
-/// Returns the RSS in bytes, or 0 on failure.
 #[cfg(target_os = "macos")]
 fn get_rss_bytes(pid: u32) -> u64 {
     use std::mem;
-    // PROC_PIDTASKINFO = 4, struct size = 232 on arm64/x86_64
     const PROC_PIDTASKINFO: i32 = 4;
+
     #[repr(C)]
     struct ProcTaskInfo {
         pti_virtual_size: u64,
@@ -31,10 +29,11 @@ fn get_rss_bytes(pid: u32) -> u64 {
         pti_numrunning: i32,
         pti_priority: i32,
     }
+
     unsafe {
         let mut info: ProcTaskInfo = mem::zeroed();
         let size = mem::size_of::<ProcTaskInfo>() as i32;
-        extern "C" {
+        unsafe extern "C" {
             fn proc_pidinfo(
                 pid: i32,
                 flavor: i32,
@@ -58,8 +57,90 @@ fn get_rss_bytes(pid: u32) -> u64 {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-fn get_rss_bytes(_pid: u32) -> u64 {
+#[cfg(target_os = "macos")]
+fn get_process_group_rss_bytes(pgid: u32) -> u64 {
+    unsafe {
+        unsafe extern "C" {
+            fn proc_listpgrppids(
+                pgrpid: libc::pid_t,
+                buffer: *mut libc::c_void,
+                buffersize: i32,
+            ) -> i32;
+        }
+
+        let mut pids = vec![0i32; 256];
+        let bytes = (pids.len() * std::mem::size_of::<i32>()) as i32;
+        let filled = proc_listpgrppids(pgid as i32, pids.as_mut_ptr() as *mut libc::c_void, bytes);
+        if filled <= 0 {
+            return 0;
+        }
+
+        let pid_count = (filled as usize).min(pids.len());
+        pids[..pid_count]
+            .iter()
+            .filter_map(|pid| (*pid > 0).then_some(*pid as u32))
+            .map(get_rss_bytes)
+            .sum()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn get_rss_bytes(pid: u32) -> u64 {
+    let status = match std::fs::read_to_string(format!("/proc/{pid}/status")) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let kb = rest
+                .split_whitespace()
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+            return kb * 1024;
+        }
+    }
+    0
+}
+
+#[cfg(target_os = "linux")]
+fn get_process_group_rss_bytes(pgid: u32) -> u64 {
+    let mut total = 0;
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(entries) => entries,
+        Err(_) => return 0,
+    };
+
+    for entry in entries.flatten() {
+        let pid = match entry.file_name().to_string_lossy().parse::<u32>() {
+            Ok(pid) => pid,
+            Err(_) => continue,
+        };
+        let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat,
+            Err(_) => continue,
+        };
+        let (_, rest) = match stat.split_once(") ") {
+            Some(parts) => parts,
+            None => continue,
+        };
+        let mut fields = rest.split_whitespace();
+        let _state = fields.next();
+        let _ppid = fields.next();
+        let row_pgid = match fields.next().and_then(|value| value.parse::<u32>().ok()) {
+            Some(row_pgid) => row_pgid,
+            None => continue,
+        };
+        if row_pgid == pgid {
+            total += get_rss_bytes(pid);
+        }
+    }
+
+    total
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn get_process_group_rss_bytes(_pgid: u32) -> u64 {
     0
 }
 
@@ -364,7 +445,7 @@ pub async fn execute(
 
     let start = Instant::now();
 
-    // Spawn the child so we can poll its RSS for memory enforcement on macOS.
+    // Spawn the child so we can poll process-group RSS for memory enforcement.
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -382,15 +463,16 @@ pub async fn execute(
     let child_pid = child.id().unwrap_or(0);
     let mem_limit_bytes = mem_bytes;
 
-    // RSS monitor: poll every 50ms on macOS, kill process group if RSS exceeds limit.
+    // RSS monitor: poll the whole process group so wrapper commands and spawned
+    // children count against the same memory budget.
     let memory_killed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let memory_killed_clone = memory_killed.clone();
 
-    let monitor_handle = if cfg!(target_os = "macos") && child_pid > 0 {
+    let monitor_handle = if child_pid > 0 {
         Some(tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                let rss = get_rss_bytes(child_pid);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let rss = get_process_group_rss_bytes(child_pid);
                 if rss > mem_limit_bytes {
                     memory_killed_clone.store(true, std::sync::atomic::Ordering::SeqCst);
                     // Kill entire process group (negative PID) to catch child processes

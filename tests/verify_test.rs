@@ -1,5 +1,48 @@
 use court_jester_mcp::tools::verify::{parse_fuzz_failures, verify, VerifyOptions};
 use court_jester_mcp::types::Language;
+use std::fs;
+use std::sync::{Mutex, OnceLock};
+
+fn path_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+struct PathGuard {
+    old_path: String,
+}
+
+impl PathGuard {
+    fn install(prefix: &std::path::Path) -> Self {
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{}", prefix.display(), old_path));
+        Self { old_path }
+    }
+}
+
+impl Drop for PathGuard {
+    fn drop(&mut self) {
+        std::env::set_var("PATH", &self.old_path);
+    }
+}
+
+#[cfg(unix)]
+fn make_executable(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut perms = fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).unwrap();
+}
+
+fn install_fake_tool(name: &str, body: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let script_path = dir.path().join(name);
+    fs::write(&script_path, body).unwrap();
+    #[cfg(unix)]
+    make_executable(&script_path);
+    dir
+}
 
 fn default_opts(test_code: Option<&str>) -> VerifyOptions<'_> {
     VerifyOptions {
@@ -61,6 +104,13 @@ async fn with_failing_tests() {
 
 #[tokio::test]
 async fn lint_warnings_are_informational() {
+    let _guard = path_lock().lock().unwrap();
+    let tool_dir = install_fake_tool(
+        "biome",
+        "#!/bin/sh\ncat <<'EOF'\n{\"diagnostics\":[{\"category\":\"lint/style/noNonNullAssertion\",\"description\":\"Avoid non-null assertions.\",\"severity\":\"warning\",\"location\":{\"start\":{\"line\":3,\"column\":12}}}]}\nEOF\nexit 1\n",
+    );
+    let _path = PathGuard::install(tool_dir.path());
+
     let code = r#"
 function normalizeName(name: string): string {
     return name!.trim();
@@ -362,6 +412,34 @@ async fn no_report_without_output_dir() {
 }
 
 #[tokio::test]
+async fn rejected_only_fuzz_run_is_not_counted_as_pass_in_report_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    let code = "def always_reject(x: int) -> int:\n    raise ValueError('nope')";
+    let opts = VerifyOptions {
+        test_code: None,
+        test_source_file: None,
+        complexity_threshold: None,
+        project_dir: None,
+        diff: None,
+        source_file: None,
+        output_dir: Some(dir.path().to_str().unwrap()),
+    };
+    let report = verify(code, &Language::Python, opts).await;
+
+    assert!(
+        !report.overall_ok,
+        "rejected-only fuzz run should fail verify"
+    );
+    let path = report.report_path.unwrap();
+    let content = std::fs::read_to_string(&path).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+    let summary = parsed.get("summary").unwrap();
+    assert_eq!(summary.get("functions_fuzzed").unwrap().as_u64(), Some(1));
+    assert_eq!(summary.get("fuzz_pass").unwrap().as_u64(), Some(0));
+    assert_eq!(summary.get("fuzz_crash").unwrap().as_u64(), Some(0));
+}
+
+#[tokio::test]
 async fn typescript_test_stage_can_import_source_module_from_test_file() {
     let dir = tempfile::tempdir().unwrap();
     let src_dir = dir.path().join("src");
@@ -480,12 +558,9 @@ async fn typescript_test_file_without_imports_uses_source_file_scope() {
 
     let code = r#"
 export function displayInitials(name: string | null): string {
-  return name
-    ?.trim()
-    .split(/\s+/)
-    .map((part) => part[0]!.toUpperCase())
-    .join("")
-    .slice(0, 2);
+  const parts = name?.trim().split(/\s+/).filter(Boolean) ?? [];
+  const initials = parts.map((part) => part[0]?.toUpperCase() ?? "").join("");
+  return initials || "NA";
 }
 "#;
     let tests = r#"

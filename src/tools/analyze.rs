@@ -797,15 +797,12 @@ fn resolve_import_file(
 ) -> Option<std::path::PathBuf> {
     match language {
         Language::TypeScript => {
-            // "./types" → try types.ts, types/index.ts
-            let rel = import_path
-                .trim_start_matches("./")
-                .trim_start_matches("../");
-            let base = if import_path.starts_with("../") {
-                source_dir.parent()?.join(rel)
-            } else {
-                source_dir.join(rel)
-            };
+            // "./types" or "../../types/foo" → try .ts/.tsx and index files.
+            let base = source_dir.join(import_path);
+
+            if base.exists() {
+                return Some(base);
+            }
             for ext in &[".ts", ".tsx", "/index.ts", "/index.tsx"] {
                 let candidate = std::path::PathBuf::from(format!("{}{}", base.display(), ext));
                 if candidate.exists() {
@@ -815,15 +812,32 @@ fn resolve_import_file(
             None
         }
         Language::Python => {
-            // ".module" → module.py, ".pkg.module" → pkg/module.py
-            let rel = import_path.trim_start_matches('.');
-            let file_path = rel.replace('.', "/");
-            let candidate = source_dir.join(format!("{file_path}.py"));
+            // ".module" → module.py, "..pkg.module" → ../pkg/module.py
+            let leading_dots = import_path.chars().take_while(|c| *c == '.').count();
+            if leading_dots == 0 {
+                return None;
+            }
+
+            let mut base_dir = source_dir.to_path_buf();
+            for _ in 1..leading_dots {
+                base_dir = base_dir.parent()?.to_path_buf();
+            }
+
+            let rel = import_path[leading_dots..].replace('.', "/");
+            let candidate = if rel.is_empty() {
+                base_dir.join("__init__.py")
+            } else {
+                base_dir.join(format!("{rel}.py"))
+            };
             if candidate.exists() {
                 return Some(candidate);
             }
             // Try as package: module/__init__.py
-            let candidate = source_dir.join(&file_path).join("__init__.py");
+            let candidate = if rel.is_empty() {
+                base_dir.join("__init__.py")
+            } else {
+                base_dir.join(&rel).join("__init__.py")
+            };
             if candidate.exists() {
                 return Some(candidate);
             }

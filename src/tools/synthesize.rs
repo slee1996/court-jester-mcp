@@ -536,6 +536,56 @@ fn is_api_surface(func: &FunctionInfo) -> bool {
     !func.is_method && !func.is_nested && func.is_exported
 }
 
+fn ts_has_structured_input_type(type_name: &str, type_defs: &TsNamedTypes<'_>) -> bool {
+    let trimmed = type_name.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let union_branches = split_ts_top_level(trimmed, '|');
+    if union_branches.len() > 1 {
+        return union_branches.iter().any(|branch| {
+            let branch = branch.trim();
+            !matches!(branch, "null" | "undefined")
+                && ts_has_structured_input_type(branch, type_defs)
+        });
+    }
+
+    let intersection_branches = split_ts_top_level(trimmed, '&');
+    if intersection_branches.len() > 1 {
+        return intersection_branches
+            .iter()
+            .any(|branch| ts_has_structured_input_type(branch.trim(), type_defs));
+    }
+
+    let effective = ts_effective_type(trimmed, type_defs);
+    let effective = effective.trim();
+
+    is_ts_mapping_type(effective, type_defs)
+        || effective.ends_with("[]")
+        || effective.starts_with("Array<")
+        || effective.starts_with("ReadonlyArray<")
+        || effective.starts_with('[')
+        || ts_class_def(effective, type_defs).is_some()
+}
+
+fn should_require_ts_nonempty_string(
+    func: &FunctionInfo,
+    param_types: &[String],
+    type_defs: &TsNamedTypes<'_>,
+) -> bool {
+    if !likely_nonempty_string(&func.name) {
+        return false;
+    }
+
+    is_api_surface(func)
+        || (!func.is_method
+            && !func.is_nested
+            && param_types
+                .iter()
+                .any(|param_type| ts_has_structured_input_type(param_type, type_defs)))
+}
+
 fn is_python_mapping_type(type_name: &str) -> bool {
     matches!(type_name.trim(), "dict" | "Dict")
         || starts_with_any(type_name.trim(), &["dict[", "Dict["])
@@ -614,11 +664,18 @@ fn should_inject_python_edge_cases(func: &FunctionInfo, params: &[&ParamInfo]) -
 
 fn should_inject_ts_edge_cases(
     func: &FunctionInfo,
+    params: &[&ParamInfo],
     param_types: &[String],
     ret_type: &str,
     type_defs: &TsNamedTypes<'_>,
 ) -> bool {
-    is_api_surface(func) || infer_ts_contract(func, param_types, ret_type, type_defs).is_some()
+    let contract = infer_ts_contract(func, param_types, ret_type, type_defs);
+    is_api_surface(func)
+        || contract.is_some()
+        || params.iter().any(|param| {
+            !ts_edge_type_name_for_param(contract, param.type_annotation.as_deref(), type_defs)
+                .is_empty()
+        })
 }
 
 fn python_idempotency_check(
@@ -972,7 +1029,8 @@ fn synthesize_typescript(analysis: &AnalysisResult, type_defs: &TsNamedTypes<'_>
         }
         // Non-empty strings: string-returning identifier/display helpers should
         // not silently return blank output.
-        if ret_type == "string" && is_api_surface(func) && likely_nonempty_string(&func.name) {
+        if ret_type == "string" && should_require_ts_nonempty_string(func, &param_types, type_defs)
+        {
             properties.push("nonempty_string");
         }
         // Serialized/canonical string helpers should not leak nullish sentinel
@@ -1008,25 +1066,30 @@ fn synthesize_typescript(analysis: &AnalysisResult, type_defs: &TsNamedTypes<'_>
             .collect::<Vec<_>>()
             .join(", ");
 
-        let param_type_list: String =
-            if should_inject_ts_edge_cases(func, &param_types, ret_type, type_defs) {
-                callable_params
-                    .iter()
-                    .map(|p| {
-                        format!(
-                            "\"{}\"",
-                            ts_edge_type_name_for_param(
-                                contract,
-                                p.type_annotation.as_deref(),
-                                type_defs
-                            )
+        let param_type_list: String = if should_inject_ts_edge_cases(
+            func,
+            &callable_params,
+            &param_types,
+            ret_type,
+            type_defs,
+        ) {
+            callable_params
+                .iter()
+                .map(|p| {
+                    format!(
+                        "\"{}\"",
+                        ts_edge_type_name_for_param(
+                            contract,
+                            p.type_annotation.as_deref(),
+                            type_defs
                         )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            } else {
-                String::new()
-            };
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            String::new()
+        };
 
         code.push_str(&format!(
             r#"

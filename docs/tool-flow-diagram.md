@@ -30,7 +30,7 @@ flowchart TD
 
         J --> J1[src/tools/lint.rs]
         J1 --> J2[Python: ruff JSON]
-        J1 --> J3[TypeScript: biome JSON via npx]
+        J1 --> J3[TypeScript: biome JSON via sibling binary or PATH]
         J2 --> J4[LintResult JSON]
         J3 --> J4
 

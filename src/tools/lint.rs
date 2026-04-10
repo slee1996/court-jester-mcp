@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
 
@@ -12,6 +13,36 @@ fn extended_path() -> String {
     )
 }
 
+fn find_binary_on_path(path_env: &str, binary: &str) -> Option<String> {
+    for dir in path_env.split(':') {
+        let candidate = std::path::Path::new(dir).join(binary);
+        if candidate.is_file() {
+            return Some(candidate.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
+fn current_exe_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+}
+
+fn find_binary_near_exe_dir(exe_dir: Option<&Path>, binary: &str) -> Option<String> {
+    let dir = exe_dir?;
+    let candidate = dir.join(binary);
+    if candidate.is_file() {
+        Some(candidate.to_string_lossy().to_string())
+    } else {
+        None
+    }
+}
+
+fn resolve_binary(path_env: &str, binary: &str, exe_dir: Option<&Path>) -> Option<String> {
+    find_binary_near_exe_dir(exe_dir, binary).or_else(|| find_binary_on_path(path_env, binary))
+}
+
 pub async fn lint(code: &str, language: &Language) -> LintResult {
     let tmpdir = match tempfile::tempdir() {
         Ok(d) => d,
@@ -19,6 +50,7 @@ pub async fn lint(code: &str, language: &Language) -> LintResult {
             return LintResult {
                 diagnostics: vec![],
                 error: Some(format!("Failed to create temp dir: {e}")),
+                unavailable: false,
             }
         }
     };
@@ -29,12 +61,33 @@ pub async fn lint(code: &str, language: &Language) -> LintResult {
     }
 }
 
+fn tool_failure_message(
+    tool: &str,
+    status: std::process::ExitStatus,
+    stdout: &str,
+    stderr: &str,
+) -> String {
+    let exit = status
+        .code()
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "terminated by signal".to_string());
+    let detail = if !stderr.trim().is_empty() {
+        stderr.trim()
+    } else if !stdout.trim().is_empty() {
+        stdout.trim()
+    } else {
+        "no output"
+    };
+    format!("{tool} failed with exit status {exit}: {detail}")
+}
+
 async fn lint_python(code: &str, tmpdir: &tempfile::TempDir) -> LintResult {
     let file_path = tmpdir.path().join("snippet.py");
     if let Err(e) = std::fs::write(&file_path, code) {
         return LintResult {
             diagnostics: vec![],
             error: Some(format!("Failed to write temp file: {e}")),
+            unavailable: false,
         };
     }
 
@@ -48,11 +101,17 @@ async fn lint_python(code: &str, tmpdir: &tempfile::TempDir) -> LintResult {
     match output {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
-            parse_ruff_output(&stdout)
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let mut result = parse_ruff_output(&stdout);
+            if result.error.is_some() || (!out.status.success() && result.diagnostics.is_empty()) {
+                result.error = Some(tool_failure_message("ruff", out.status, &stdout, &stderr));
+            }
+            result
         }
         Err(e) => LintResult {
             diagnostics: vec![],
             error: Some(format!("ruff not available: {e}")),
+            unavailable: true,
         },
     }
 }
@@ -62,6 +121,7 @@ fn parse_ruff_output(output: &str) -> LintResult {
         return LintResult {
             diagnostics: vec![],
             error: None,
+            unavailable: false,
         };
     }
 
@@ -88,11 +148,13 @@ fn parse_ruff_output(output: &str) -> LintResult {
             LintResult {
                 diagnostics,
                 error: None,
+                unavailable: false,
             }
         }
         Err(e) => LintResult {
             diagnostics: vec![],
             error: Some(format!("Failed to parse ruff output: {e}")),
+            unavailable: false,
         },
     }
 }
@@ -103,17 +165,23 @@ async fn lint_typescript(code: &str, tmpdir: &tempfile::TempDir) -> LintResult {
         return LintResult {
             diagnostics: vec![],
             error: Some(format!("Failed to write temp file: {e}")),
+            unavailable: false,
         };
     }
 
-    let output = Command::new("npx")
-        .args([
-            "@biomejs/biome",
-            "lint",
-            "--reporter=json",
-            file_path.to_str().unwrap(),
-        ])
-        .env("PATH", extended_path())
+    let path = extended_path();
+    let exe_dir = current_exe_dir();
+    let Some(biome) = resolve_binary(&path, "biome", exe_dir.as_deref()) else {
+        return LintResult {
+            diagnostics: vec![],
+            error: Some("biome not available on PATH or next to court-jester-mcp".to_string()),
+            unavailable: true,
+        };
+    };
+
+    let output = Command::new(&biome)
+        .args(["lint", "--reporter=json", file_path.to_str().unwrap()])
+        .env("PATH", &path)
         .stdin(Stdio::null())
         .output()
         .await;
@@ -128,12 +196,63 @@ async fn lint_typescript(code: &str, tmpdir: &tempfile::TempDir) -> LintResult {
             } else {
                 stderr.to_string()
             };
-            parse_biome_output(&text)
+            let mut result = parse_biome_output(&text);
+            if result.error.is_some() || (!out.status.success() && result.diagnostics.is_empty()) {
+                result.error = Some(tool_failure_message("biome", out.status, &stdout, &stderr));
+            }
+            result
         }
         Err(e) => LintResult {
             diagnostics: vec![],
             error: Some(format!("biome not available: {e}")),
+            unavailable: true,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{find_binary_near_exe_dir, resolve_binary};
+    use std::fs;
+
+    #[cfg(unix)]
+    fn make_executable(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut perms = fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).unwrap();
+    }
+
+    #[test]
+    fn resolve_binary_prefers_sibling_executable() {
+        let sibling_dir = tempfile::tempdir().unwrap();
+        let path_dir = tempfile::tempdir().unwrap();
+        let sibling = sibling_dir.path().join("biome");
+        let on_path = path_dir.path().join("biome");
+        fs::write(&sibling, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::write(&on_path, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            make_executable(&sibling);
+            make_executable(&on_path);
+        }
+
+        let resolved = resolve_binary(
+            path_dir.path().to_str().unwrap(),
+            "biome",
+            Some(sibling_dir.path()),
+        )
+        .expect("biome should resolve");
+
+        assert_eq!(resolved, sibling.to_string_lossy());
+    }
+
+    #[test]
+    fn find_binary_near_exe_dir_returns_none_when_missing() {
+        let sibling_dir = tempfile::tempdir().unwrap();
+        let resolved = find_binary_near_exe_dir(Some(sibling_dir.path()), "biome");
+        assert!(resolved.is_none());
     }
 }
 
@@ -165,6 +284,7 @@ fn parse_biome_output(output: &str) -> LintResult {
         return LintResult {
             diagnostics: vec![],
             error: None,
+            unavailable: false,
         };
     }
 
@@ -216,11 +336,13 @@ fn parse_biome_output(output: &str) -> LintResult {
             LintResult {
                 diagnostics,
                 error: None,
+                unavailable: false,
             }
         }
         Err(_) => LintResult {
             diagnostics: vec![],
             error: Some(format!("Failed to parse biome output")),
+            unavailable: false,
         },
     }
 }
