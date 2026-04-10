@@ -44,10 +44,18 @@ cargo install --git https://github.com/slee1996/court-jester-mcp.git
 Requires Rust 1.85+. Install via [rustup](https://rustup.rs) if needed. You'll need to manually connect to your agent (see below).
 </details>
 
-Optional tools (Court Jester works without them — lint becomes advisory):
-- [ruff](https://docs.astral.sh/ruff/installation/) (Python lint)
-- [biome](https://biomejs.dev/guides/getting-started/) (TypeScript lint)
-- [bun](https://bun.sh) (required for TypeScript fuzz execution)
+Recommended companion tools:
+- [ruff](https://docs.astral.sh/ruff/installation/) for Python lint
+- [Biome](https://biomejs.dev/guides/getting-started/) for TypeScript lint
+- [bun](https://bun.sh) for TypeScript fuzz execution
+
+Install Ruff and Biome separately rather than relying on bundled copies. Court Jester will use:
+
+1. A project-local linter (`.venv/bin/ruff`, `venv/bin/ruff`, `node_modules/.bin/biome`)
+2. A sibling binary next to `court-jester-mcp` if you deliberately bundle one
+3. `PATH`
+
+This avoids macOS quarantine/signing issues on downloaded helper binaries.
 
 ### 2. Connect to your agent (if not auto-configured)
 
@@ -201,11 +209,13 @@ Agent: [calls court-jester verify again]
 |-------|-------------|----------------|
 | **parse** | Tree-sitter AST extraction | Yes — syntax errors stop the pipeline |
 | **complexity** | Cyclomatic complexity check | Only when threshold is set |
-| **lint** | `ruff` (Python) / `biome` (TypeScript) | No — advisory only |
+| **lint** | `ruff` (Python) / `biome` (TypeScript) | No — advisory only, even if the linter itself errors |
 | **execute** | Synthesize fuzz inputs from function signatures, run in sandbox | Yes |
 | **test** | Run caller-supplied test file | Yes |
 
 The **execute** stage is the differentiator. Court Jester walks tree-sitter output for every function, resolves parameter types (across imports, class fields, type aliases), generates diverse inputs, and calls each function in a sandboxed subprocess with time and memory limits. When a call crashes, the harness returns a structured failure with the exact input that triggered it.
+
+For Python, common built-in runtime and validation exceptions such as `TypeError`, `AttributeError`, `KeyError`, `IndexError`, `ValueError`, `ZeroDivisionError`, and `UnicodeError` are treated as crashes, not ignored validation rejects. Repo-specific custom exceptions still count as rejected inputs unless they surface as one of those built-ins or violate a synthesized property check.
 
 This is not "ruff + biome in a trench coat." It finds runtime bugs that linters cannot.
 
@@ -407,14 +417,25 @@ court-jester-mcp verify --file src/profile.py --language python \
     --output-dir .court-jester/reports
 ```
 
-### Release bundle (self-contained)
+### Optional Local Bundle
 
-For environments without `ruff`/`biome` on `PATH`:
+For public releases, prefer a binary-only staging directory:
 
 ```bash
-python scripts/prepare_release.py --release --require-ruff --require-biome
+python scripts/prepare_release.py --release
+# produces dist/court-jester-release/ with only court-jester-mcp
+```
+
+If you explicitly need a controlled local bundle with sibling linters:
+
+```bash
+python scripts/prepare_release.py --release \
+  --include-ruff --include-biome \
+  --require-ruff --require-biome
 # produces dist/court-jester-release/ with court-jester-mcp + ruff + biome
 ```
+
+Bundled linters are for controlled/local use only. Public macOS releases should ship `court-jester-mcp` alone and ask users to install Ruff and Biome separately.
 
 ---
 
@@ -426,6 +447,8 @@ python scripts/prepare_release.py --release --require-ruff --require-biome
 | Execute stage times out | Raise `COURT_JESTER_VERIFY_PYTHON_TIMEOUT_SECONDS` or the TS equivalent |
 | `memory_error: true` | Code exceeded 512 MB sandbox cap. For `execute` tool, raise `memory_mb` |
 | `lint` shows `unavailable: true` | `ruff`/`biome` not found in the project, next to the binary, or on `PATH` — advisory, does not fail verify |
+| `lint.ok: false` but `overall_ok: true` | The linter itself crashed or was blocked. Court Jester still reports the lint-stage error, but it no longer blocks verify |
+| Bundled `ruff`/`biome` dies with `signal 9 (SIGKILL)` on macOS | Prefer separate linter installs. If you intentionally bundled them, clear quarantine on the extracted bundle with `xattr -dr com.apple.quarantine <bundle-dir>` |
 | `cargo build` fails on `edition2024` | Homebrew cargo is 1.83. Use `rustup` or `just build` |
 | `cargo run` hangs | Expected — it's a stdio server waiting for MCP client. Use `just smoke` to test |
 | Agent only verifies some functions | Diff-aware mode. Clear `diff` parameter to fuzz all functions |

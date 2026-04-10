@@ -566,7 +566,7 @@ async fn no_report_without_output_dir() {
 #[tokio::test]
 async fn rejected_only_fuzz_run_is_not_counted_as_pass_in_report_summary() {
     let dir = tempfile::tempdir().unwrap();
-    let code = "def always_reject(x: int) -> int:\n    raise ValueError('nope')";
+    let code = "class ValidationError(Exception):\n    pass\n\ndef always_reject(x: int) -> int:\n    raise ValidationError('nope')";
     let opts = VerifyOptions {
         test_code: None,
         test_source_file: None,
@@ -591,6 +591,75 @@ async fn rejected_only_fuzz_run_is_not_counted_as_pass_in_report_summary() {
     assert_eq!(summary.get("functions_fuzzed").unwrap().as_u64(), Some(1));
     assert_eq!(summary.get("fuzz_pass").unwrap().as_u64(), Some(0));
     assert_eq!(summary.get("fuzz_crash").unwrap().as_u64(), Some(0));
+}
+
+#[tokio::test]
+async fn value_error_is_treated_as_a_crash() {
+    let code = "def normalize_timezone(value: str) -> str:\n    raise ValueError('invalid timezone offset')";
+    let report = verify(code, &Language::Python, default_opts(None)).await;
+
+    assert!(!report.overall_ok, "value errors should fail verify");
+
+    let exec_stage = report
+        .stages
+        .iter()
+        .find(|s| s.name == "execute")
+        .expect("execute stage should be present");
+    assert!(!exec_stage.ok, "value error should be treated as a crash");
+
+    let failures = exec_stage
+        .detail
+        .as_ref()
+        .and_then(|detail| detail.get("fuzz_failures"))
+        .and_then(|value| value.as_array())
+        .expect("fuzz failures should be present");
+    assert!(
+        failures.iter().any(
+            |failure| failure.get("error_type").and_then(|value| value.as_str())
+                == Some("ValueError")
+        ),
+        "expected ValueError fuzz failure, got: {failures:?}"
+    );
+}
+
+#[tokio::test]
+async fn fuzz_failures_truncate_large_inputs_and_messages() {
+    let code =
+        "def explode(name: str) -> str:\n    if len(name) < 1000:\n        return name\n    raise TypeError('x' * 500)";
+    let report = verify(code, &Language::Python, default_opts(None)).await;
+
+    let exec_stage = report
+        .stages
+        .iter()
+        .find(|s| s.name == "execute")
+        .expect("execute stage should be present");
+    let failures = exec_stage
+        .detail
+        .as_ref()
+        .and_then(|detail| detail.get("fuzz_failures"))
+        .and_then(|value| value.as_array())
+        .expect("fuzz failures should be present");
+    let first = failures
+        .first()
+        .expect("expected at least one fuzz failure");
+
+    let input = first
+        .get("input")
+        .and_then(|value| value.as_str())
+        .expect("failure input should be present");
+    let message = first
+        .get("message")
+        .and_then(|value| value.as_str())
+        .expect("failure message should be present");
+
+    assert!(
+        input.len() <= 270 && input.contains("[truncated "),
+        "expected truncated input, got: {input}"
+    );
+    assert!(
+        message.len() <= 270 && message.contains("[truncated "),
+        "expected truncated message, got: {message}"
+    );
 }
 
 #[tokio::test]

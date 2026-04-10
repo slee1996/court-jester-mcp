@@ -61,7 +61,7 @@ def copy_executable(src: Path, dst: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Stage a Court Jester release bundle with optional sibling Ruff and Biome binaries."
+        description="Stage a Court Jester release directory. By default this includes only court-jester-mcp."
     )
     profile = parser.add_mutually_exclusive_group()
     profile.add_argument(
@@ -80,21 +80,31 @@ def main() -> int:
     )
     parser.add_argument(
         "--biome",
-        help="Use an explicit biome binary path instead of resolving biome from PATH.",
+        help="Explicit biome binary path to include when bundling Biome.",
     )
     parser.add_argument(
         "--ruff",
-        help="Use an explicit ruff binary path instead of resolving ruff from PATH.",
+        help="Explicit ruff binary path to include when bundling Ruff.",
+    )
+    parser.add_argument(
+        "--include-biome",
+        action="store_true",
+        help="Include a sibling biome binary. Not recommended for public macOS releases.",
+    )
+    parser.add_argument(
+        "--include-ruff",
+        action="store_true",
+        help="Include a sibling ruff binary. Not recommended for public macOS releases.",
     )
     parser.add_argument(
         "--require-biome",
         action="store_true",
-        help="Fail if a biome binary cannot be bundled.",
+        help="When bundling Biome, fail if a biome binary cannot be found.",
     )
     parser.add_argument(
         "--require-ruff",
         action="store_true",
-        help="Fail if a ruff binary cannot be bundled.",
+        help="When bundling Ruff, fail if a ruff binary cannot be found.",
     )
     parser.add_argument(
         "--bundle-dir",
@@ -105,8 +115,18 @@ def main() -> int:
     try:
         binary = resolve_binary(args)
         bundle_dir = resolve_bundle_dir(args)
-        biome = resolve_tool("biome", args.biome, args.require_biome)
-        ruff = resolve_tool("ruff", args.ruff, args.require_ruff)
+        include_biome = args.include_biome or args.biome is not None or args.require_biome
+        include_ruff = args.include_ruff or args.ruff is not None or args.require_ruff
+        biome = (
+            resolve_tool("biome", args.biome, args.require_biome)
+            if include_biome
+            else None
+        )
+        ruff = (
+            resolve_tool("ruff", args.ruff, args.require_ruff)
+            if include_ruff
+            else None
+        )
 
         bundle_dir.mkdir(parents=True, exist_ok=True)
 
@@ -115,24 +135,34 @@ def main() -> int:
 
         print(f"Bundled binary: {bundled_binary}")
 
-        if ruff is not None:
+        if include_ruff and ruff is not None:
             bundled_ruff = bundle_dir / "ruff"
             copy_executable(ruff, bundled_ruff)
             print(f"Bundled ruff:   {bundled_ruff}")
+        elif include_ruff:
+            print("Bundled ruff:   requested but unavailable")
         else:
-            print("Bundled ruff:   skipped (Python lint will require ruff on PATH)")
+            print("Bundled ruff:   skipped by default (install Ruff separately)")
 
-        if biome is not None:
+        if include_biome and biome is not None:
             bundled_biome = bundle_dir / "biome"
             copy_executable(biome, bundled_biome)
             print(f"Bundled biome:  {bundled_biome}")
+        elif include_biome:
+            print("Bundled biome:  requested but unavailable")
         else:
-            print("Bundled biome:  skipped (TypeScript lint will require biome on PATH)")
+            print("Bundled biome:  skipped by default (install Biome separately)")
 
         print()
         print("Runtime behavior:")
         print("1. court-jester-mcp looks for ./ruff and ./biome next to itself first")
         print("2. if a sibling linter is missing, it falls back to PATH for that tool")
+        print("3. public release assets should normally ship only court-jester-mcp")
+        if sys.platform == "darwin" and (include_ruff or include_biome):
+            print()
+            print("macOS note:")
+            print("Bundling third-party linters is best for controlled/local use.")
+            print("For public releases, prefer shipping court-jester-mcp alone and installing Ruff/Biome separately.")
         return 0
     except Exception as exc:
         print(f"Release bundling failed: {exc}", file=sys.stderr)

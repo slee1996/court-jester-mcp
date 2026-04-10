@@ -193,11 +193,11 @@ for _args in _all_inputs:
     except Exception as _e:
         if _is_crash(_e):
             _crash += 1
-            _FUZZ_RESULTS.append({{"function": "{name}", "input": repr(_args),
-                "error_type": type(_e).__name__, "message": str(_e),
+            _FUZZ_RESULTS.append({{"function": "{name}", "input": _short_repr(_args),
+                "error_type": type(_e).__name__, "message": _clip_text(str(_e)),
                 "severity": "crash" if isinstance(_e, _CRASH_TYPES) else "property_violation"}})
             if _crash == 1:
-                print(f"  CRASH {name}({{_args}}): {{type(_e).__name__}}: {{_e}}")
+                print(f"  CRASH {name}({{_short_repr(_args)}}): {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
         else:
             _reject += 1
 _total = _pass + _reject + _crash
@@ -283,10 +283,10 @@ for _fi in range({iters}):
         if _is_crash(_e):
             _factory_crash += 1
             _FUZZ_RESULTS.append({{"function": "{name} (factory)", "input": "factory call",
-                "error_type": type(_e).__name__, "message": str(_e),
+                "error_type": type(_e).__name__, "message": _clip_text(str(_e)),
                 "severity": "crash"}})
             if _factory_crash == 1:
-                print(f"  CRASH {name}(factory): {{type(_e).__name__}}: {{_e}}")
+                print(f"  CRASH {name}(factory): {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
 _factory_total = _factory_pass + _factory_crash
 if _factory_crash > 0:
     print(f"FUZZ {name} (factory->nested): {{_factory_pass}} passed, {{_factory_crash}} CRASHED (of {{_factory_total}}) [exercises: {nested}]")
@@ -798,9 +798,19 @@ import json as _json
 _rng.seed(42)
 _fuzz_failures = 0
 _FUZZ_RESULTS = []
+_FUZZ_TEXT_LIMIT = 240
 
 # Crash detection: these exception types indicate real bugs, not validation.
-_CRASH_TYPES = (TypeError, AttributeError, KeyError, IndexError, RecursionError, MemoryError, ZeroDivisionError, UnicodeError)
+_CRASH_TYPES = (TypeError, AttributeError, KeyError, IndexError, RecursionError, MemoryError, ValueError, ZeroDivisionError, UnicodeError)
+
+def _clip_text(value, limit=_FUZZ_TEXT_LIMIT):
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}... [truncated {len(text) - limit} chars]"
+
+def _short_repr(value, limit=_FUZZ_TEXT_LIMIT):
+    return _clip_text(repr(value), limit)
 
 def _is_crash(e):
     """Distinguish intentional validation errors from real bugs."""
@@ -1194,9 +1204,9 @@ fn synthesize_typescript_factory_exercise(
         _factoryCrash++;
         _fuzzResults.push({{function: "{name} (factory)", input: "factory call",
           error_type: _e instanceof Error ? _e.constructor.name : "unknown",
-          message: _e instanceof Error ? _e.message : String(_e),
+          message: _clipText(_e instanceof Error ? _e.message : String(_e)),
           severity: "crash"}});
-        if (_factoryCrash === 1) console.log(`  CRASH {name}(factory): ${{_e}}`);
+        if (_factoryCrash === 1) console.log(`  CRASH {name}(factory): ${{_clipText(_e)}}`);
       }}
     }}
   }}
@@ -1765,6 +1775,21 @@ function _cmpSign(value: unknown): number {
   return 0;
 }
 
+const _FUZZ_TEXT_LIMIT = 240;
+function _clipText(value: unknown, limit = _FUZZ_TEXT_LIMIT): string {
+  const text = typeof value === "string" ? value : String(value);
+  if (text.length <= limit) return text;
+  return `${text.slice(0, limit)}... [truncated ${text.length - limit} chars]`;
+}
+
+function _shortJson(value: unknown, limit = _FUZZ_TEXT_LIMIT): string {
+  try {
+    return _clipText(JSON.stringify(value), limit);
+  } catch {
+    return _clipText(value, limit);
+  }
+}
+
 // Crash detection: real bugs vs intentional validation errors
 function _isCrash(e: unknown): boolean {
   if (e instanceof TypeError) return true;
@@ -1876,11 +1901,11 @@ function _fuzzOne(
     } catch (e: unknown) {
       if (_isCrash(e)) {
         crash++;
-        _fuzzResults.push({function: name, input: JSON.stringify(args),
+        _fuzzResults.push({function: name, input: _shortJson(args),
           error_type: e instanceof Error ? e.constructor.name : "unknown",
-          message: e instanceof Error ? e.message : String(e),
+          message: _clipText(e instanceof Error ? e.message : String(e)),
           severity: (e instanceof TypeError || e instanceof RangeError || e instanceof ReferenceError || e instanceof URIError) ? "crash" : "property_violation"});
-        if (crash === 1) firstCrash = `  CRASH ${name}(${JSON.stringify(args)}): ${e}`;
+        if (crash === 1) firstCrash = `  CRASH ${name}(${_shortJson(args)}): ${_clipText(e)}`;
       } else {
         reject++;
       }
@@ -2133,12 +2158,12 @@ for _i in range(30):
         _inv_decoded = {dec_name}(_inv_encoded)
         assert _nan_eq(_inv_input, _inv_decoded), f"Roundtrip failed: {{repr(_inv_input)}} -> {{repr(_inv_encoded)}} -> {{repr(_inv_decoded)}}"
     except AssertionError:
-        print(f"  ROUNDTRIP FAIL {enc_name} <-> {dec_name}: {{repr(_inv_input)}} -> {{repr(_inv_encoded)}} -> {{repr(_inv_decoded)}}")
+        print(f"  ROUNDTRIP FAIL {enc_name} <-> {dec_name}: {{_short_repr(_inv_input)}} -> {{_short_repr(_inv_encoded)}} -> {{_short_repr(_inv_decoded)}}")
         _fuzz_failures += 1
         break
     except Exception as _e:
         if _is_crash(_e):
-            print(f"  ROUNDTRIP CRASH {enc_name} <-> {dec_name}: {{type(_e).__name__}}: {{_e}}")
+            print(f"  ROUNDTRIP CRASH {enc_name} <-> {dec_name}: {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
             _fuzz_failures += 1
             break
 "#,
@@ -2187,7 +2212,9 @@ fn synthesize_typescript_involution_checks(
         code.push_str(&enc.name);
         code.push_str(" <-> ");
         code.push_str(&dec.name);
-        code.push_str(": ${JSON.stringify(input)} -> ${JSON.stringify(encoded)} -> ${JSON.stringify(decoded)}`);\n");
+        code.push_str(
+            ": ${_shortJson(input)} -> ${_shortJson(encoded)} -> ${_shortJson(decoded)}`);\n",
+        );
         code.push_str(
             "        _fuzzTotalFailures++;\n        _invFail = true;\n        break;\n      }\n",
         );
@@ -2197,7 +2224,7 @@ fn synthesize_typescript_involution_checks(
         code.push_str(&enc.name);
         code.push_str(" <-> ");
         code.push_str(&dec.name);
-        code.push_str(": ${e}`);\n");
+        code.push_str(": ${_clipText(e)}`);\n");
         code.push_str("        _fuzzTotalFailures++;\n        _invFail = true;\n        break;\n      }\n    }\n  }\n");
         code.push_str("  if (!_invFail) console.log(\"FUZZ ");
         code.push_str(&enc.name);

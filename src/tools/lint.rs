@@ -119,18 +119,62 @@ fn tool_failure_message(
     stdout: &str,
     stderr: &str,
 ) -> String {
-    let exit = status
-        .code()
-        .map(|code| code.to_string())
-        .unwrap_or_else(|| "terminated by signal".to_string());
+    let exit = exit_status_label(status);
     let detail = if !stderr.trim().is_empty() {
-        stderr.trim()
+        stderr.trim().to_string()
     } else if !stdout.trim().is_empty() {
-        stdout.trim()
+        stdout.trim().to_string()
     } else {
-        "no output"
+        signal_only_failure_hint(tool, status).unwrap_or_else(|| "no output".to_string())
     };
-    format!("{tool} failed with exit status {exit}: {detail}")
+    format!("{tool} failed with {exit}: {detail}")
+}
+
+fn exit_status_label(status: std::process::ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        return format!("exit status {code}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+
+        if let Some(signal) = status.signal() {
+            return format!("signal {signal}{}", signal_name(signal));
+        }
+    }
+    "terminated by signal".to_string()
+}
+
+#[cfg(unix)]
+fn signal_name(signal: i32) -> String {
+    match signal {
+        libc::SIGKILL => " (SIGKILL)",
+        libc::SIGTERM => " (SIGTERM)",
+        libc::SIGABRT => " (SIGABRT)",
+        libc::SIGSEGV => " (SIGSEGV)",
+        libc::SIGBUS => " (SIGBUS)",
+        _ => "",
+    }
+    .to_string()
+}
+
+#[cfg(not(unix))]
+fn signal_name(_signal: i32) -> String {
+    String::new()
+}
+
+fn signal_only_failure_hint(tool: &str, status: std::process::ExitStatus) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+
+        if cfg!(target_os = "macos") && status.signal() == Some(libc::SIGKILL) {
+            return Some(format!(
+                "no output. macOS may have blocked the bundled {tool} binary (Gatekeeper/quarantine); try `xattr -dr com.apple.quarantine <bundle-dir>` or install {tool} in the project"
+            ));
+        }
+    }
+    None
 }
 
 fn tool_unavailable_message(tool: &str) -> String {

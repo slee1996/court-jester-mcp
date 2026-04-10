@@ -133,7 +133,7 @@ fn lint_reports_python_unavailable_when_ruff_missing() {
 }
 
 #[test]
-fn verify_fails_when_python_lint_runner_errors() {
+fn verify_keeps_python_lint_runner_errors_advisory() {
     let _guard = path_lock().lock().unwrap_or_else(|e| e.into_inner());
     let tool_dir = install_fake_tool("ruff", "#!/bin/sh\necho 'bad ruff config' 1>&2\nexit 2\n");
     let _path = EnvVarGuard::prepend_path(tool_dir.path());
@@ -161,7 +161,10 @@ fn verify_fails_when_python_lint_runner_errors() {
         .find(|stage| stage.name == "lint")
         .expect("lint stage should exist");
     assert!(!lint_stage.ok, "lint stage should fail on runner error");
-    assert!(!report.overall_ok, "runner error should fail verify");
+    assert!(
+        report.overall_ok,
+        "lint runner errors should stay advisory for verify"
+    );
 }
 
 #[test]
@@ -180,6 +183,33 @@ fn lint_reports_typescript_runner_failure() {
     assert!(
         result.diagnostics.is_empty(),
         "runner failure is not a lint finding"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn lint_reports_signal_kill_with_actionable_hint() {
+    let _guard = path_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tool_dir = install_fake_tool("ruff", "#!/bin/sh\nkill -9 $$\n");
+    let _path = EnvVarGuard::prepend_path(tool_dir.path());
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let result = runtime.block_on(lint(
+        "def add(a: int, b: int) -> int:\n    return a + b",
+        &Language::Python,
+    ));
+
+    let error = result
+        .error
+        .expect("signal kill should surface as runner error");
+    assert!(
+        error.contains("signal 9"),
+        "expected signal number in error, got: {error}"
+    );
+    #[cfg(target_os = "macos")]
+    assert!(
+        error.contains("Gatekeeper/quarantine"),
+        "expected macOS hint in error, got: {error}"
     );
 }
 

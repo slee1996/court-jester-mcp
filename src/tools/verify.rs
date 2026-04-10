@@ -179,9 +179,6 @@ pub async fn verify(
 
     let lint_runner_failed = lint_result.error.is_some() && !lint_result.unavailable;
     let lint_ok = !lint_runner_failed;
-    if lint_runner_failed {
-        overall_ok = false;
-    }
 
     stages.push(VerificationStage {
         name: "lint".into(),

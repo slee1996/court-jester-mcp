@@ -59,7 +59,7 @@ if [ -z "${EXTRACTED}" ]; then
 fi
 EXTRACTED_DIR="$(dirname "${EXTRACTED}")"
 
-# Install binary + any bundled tools (ruff, biome)
+# Install the binary and any optional sibling tools present in the archive
 mkdir -p "${INSTALL_DIR}"
 for f in "${EXTRACTED_DIR}"/*; do
   mv "${f}" "${INSTALL_DIR}/$(basename "${f}")"
