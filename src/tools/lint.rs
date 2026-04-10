@@ -1,8 +1,27 @@
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Output, Stdio};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::types::*;
+
+pub struct LintOptions<'a> {
+    pub source_file: Option<&'a str>,
+    pub project_dir: Option<&'a str>,
+    pub config_path: Option<&'a str>,
+    pub virtual_file_path: Option<&'a str>,
+}
+
+impl Default for LintOptions<'_> {
+    fn default() -> Self {
+        Self {
+            source_file: None,
+            project_dir: None,
+            config_path: None,
+            virtual_file_path: None,
+        }
+    }
+}
 
 /// Build a PATH that includes common tool install locations (uv, pip, homebrew, cargo).
 fn extended_path() -> String {
@@ -15,7 +34,25 @@ fn extended_path() -> String {
 
 fn find_binary_on_path(path_env: &str, binary: &str) -> Option<String> {
     for dir in path_env.split(':') {
-        let candidate = std::path::Path::new(dir).join(binary);
+        if let Some(candidate) = find_binary_in_dir(Path::new(dir), binary) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn candidate_binary_names(binary: &str) -> Vec<String> {
+    let mut names = vec![binary.to_string()];
+    if cfg!(windows) {
+        names.push(format!("{binary}.exe"));
+        names.push(format!("{binary}.cmd"));
+    }
+    names
+}
+
+fn find_binary_in_dir(dir: &Path, binary: &str) -> Option<String> {
+    for name in candidate_binary_names(binary) {
+        let candidate = dir.join(name);
         if candidate.is_file() {
             return Some(candidate.to_string_lossy().to_string());
         }
@@ -31,33 +68,48 @@ fn current_exe_dir() -> Option<PathBuf> {
 
 fn find_binary_near_exe_dir(exe_dir: Option<&Path>, binary: &str) -> Option<String> {
     let dir = exe_dir?;
-    let candidate = dir.join(binary);
-    if candidate.is_file() {
-        Some(candidate.to_string_lossy().to_string())
-    } else {
-        None
-    }
+    find_binary_in_dir(dir, binary)
 }
 
-fn resolve_binary(path_env: &str, binary: &str, exe_dir: Option<&Path>) -> Option<String> {
-    find_binary_near_exe_dir(exe_dir, binary).or_else(|| find_binary_on_path(path_env, binary))
+fn find_project_local_binary(project_dir: Option<&str>, binary: &str) -> Option<String> {
+    let project_dir = project_dir.map(Path::new)?;
+    let candidates: &[&str] = match binary {
+        "ruff" => &[".venv/bin", "venv/bin", ".venv/Scripts", "venv/Scripts"],
+        "biome" => &["node_modules/.bin"],
+        _ => &[],
+    };
+
+    for relative_dir in candidates {
+        if let Some(path) = find_binary_in_dir(&project_dir.join(relative_dir), binary) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn resolve_binary(
+    path_env: &str,
+    binary: &str,
+    exe_dir: Option<&Path>,
+    project_dir: Option<&str>,
+) -> Option<String> {
+    find_project_local_binary(project_dir, binary)
+        .or_else(|| find_binary_near_exe_dir(exe_dir, binary))
+        .or_else(|| find_binary_on_path(path_env, binary))
 }
 
 pub async fn lint(code: &str, language: &Language) -> LintResult {
-    let tmpdir = match tempfile::tempdir() {
-        Ok(d) => d,
-        Err(e) => {
-            return LintResult {
-                diagnostics: vec![],
-                error: Some(format!("Failed to create temp dir: {e}")),
-                unavailable: false,
-            }
-        }
-    };
+    lint_with_options(code, language, LintOptions::default()).await
+}
 
+pub async fn lint_with_options(
+    code: &str,
+    language: &Language,
+    opts: LintOptions<'_>,
+) -> LintResult {
     match language {
-        Language::Python => lint_python(code, &tmpdir).await,
-        Language::TypeScript => lint_typescript(code, &tmpdir).await,
+        Language::Python => lint_python(code, &opts).await,
+        Language::TypeScript => lint_typescript(code, &opts).await,
     }
 }
 
@@ -81,32 +133,181 @@ fn tool_failure_message(
     format!("{tool} failed with exit status {exit}: {detail}")
 }
 
-async fn lint_python(code: &str, tmpdir: &tempfile::TempDir) -> LintResult {
-    let file_path = tmpdir.path().join("snippet.py");
-    if let Err(e) = std::fs::write(&file_path, code) {
-        return LintResult {
-            diagnostics: vec![],
-            error: Some(format!("Failed to write temp file: {e}")),
-            unavailable: false,
+fn tool_unavailable_message(tool: &str) -> String {
+    format!("{tool} not available in project, on PATH, or next to court-jester-mcp")
+}
+
+fn working_dir(opts: &LintOptions<'_>) -> Option<PathBuf> {
+    opts.project_dir.map(PathBuf::from).or_else(|| {
+        opts.source_file
+            .and_then(|path| Path::new(path).parent().map(Path::to_path_buf))
+    })
+}
+
+fn lint_target_path(language: &Language, opts: &LintOptions<'_>) -> String {
+    opts.source_file
+        .or(opts.virtual_file_path)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| match language {
+            Language::Python => "snippet.py".to_string(),
+            Language::TypeScript => "snippet.ts".to_string(),
+        })
+}
+
+async fn run_command(command: &mut Command, stdin_input: Option<&str>) -> std::io::Result<Output> {
+    match stdin_input {
+        Some(input) => {
+            command.stdin(Stdio::piped());
+            command.stdout(Stdio::piped());
+            command.stderr(Stdio::piped());
+
+            let mut child = command.spawn()?;
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(input.as_bytes()).await?;
+            }
+            child.wait_with_output().await
+        }
+        None => {
+            command.stdin(Stdio::null());
+            command.output().await
+        }
+    }
+}
+
+struct PreparedLintFile {
+    path: PathBuf,
+    cleanup_dirs: Vec<PathBuf>,
+    _tempdir: Option<tempfile::TempDir>,
+    remove_on_drop: bool,
+}
+
+impl PreparedLintFile {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for PreparedLintFile {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            let _ = std::fs::remove_file(&self.path);
+        }
+
+        for dir in self.cleanup_dirs.iter().rev() {
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
+}
+
+fn missing_dirs_to_create(path: &Path) -> Vec<PathBuf> {
+    let mut missing = Vec::new();
+    let mut current = path;
+    while !current.exists() {
+        missing.push(current.to_path_buf());
+        let Some(parent) = current.parent() else {
+            break;
         };
+        current = parent;
+    }
+    missing.reverse();
+    missing
+}
+
+fn prepare_typescript_inline_file(
+    code: &str,
+    opts: &LintOptions<'_>,
+) -> Result<PreparedLintFile, String> {
+    let relative_target = opts.virtual_file_path.unwrap_or("snippet.ts");
+
+    if let Some(project_dir) = opts.project_dir {
+        let project_root = Path::new(project_dir);
+        let relative_path = Path::new(relative_target);
+        let full_path = if relative_path.is_absolute() {
+            relative_path.to_path_buf()
+        } else {
+            project_root.join(relative_path)
+        };
+
+        if full_path.exists() {
+            return Err(format!(
+                "Cannot materialize inline TypeScript lint file at existing path '{}'",
+                full_path.display()
+            ));
+        }
+
+        let parent = full_path.parent().ok_or_else(|| {
+            format!(
+                "Inline TypeScript lint path '{}' has no parent",
+                full_path.display()
+            )
+        })?;
+        let cleanup_dirs = missing_dirs_to_create(parent);
+        for dir in &cleanup_dirs {
+            std::fs::create_dir(dir).map_err(|e| {
+                format!(
+                    "Failed to create inline TypeScript lint directory '{}': {e}",
+                    dir.display()
+                )
+            })?;
+        }
+        std::fs::write(&full_path, code)
+            .map_err(|e| format!("Failed to write inline TypeScript lint file: {e}"))?;
+
+        return Ok(PreparedLintFile {
+            path: full_path,
+            cleanup_dirs,
+            _tempdir: None,
+            remove_on_drop: true,
+        });
     }
 
+    let tempdir =
+        tempfile::tempdir().map_err(|e| format!("Failed to create temp dir for lint: {e}"))?;
+    let file_path = tempdir.path().join(relative_target);
+    if let Some(parent) = file_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create temp lint directory: {e}"))?;
+    }
+    std::fs::write(&file_path, code).map_err(|e| format!("Failed to write temp lint file: {e}"))?;
+
+    Ok(PreparedLintFile {
+        path: file_path,
+        cleanup_dirs: Vec::new(),
+        _tempdir: Some(tempdir),
+        remove_on_drop: false,
+    })
+}
+
+async fn lint_python(code: &str, opts: &LintOptions<'_>) -> LintResult {
     let path = extended_path();
     let exe_dir = current_exe_dir();
-    let Some(ruff) = resolve_binary(&path, "ruff", exe_dir.as_deref()) else {
+    let Some(ruff) = resolve_binary(&path, "ruff", exe_dir.as_deref(), opts.project_dir) else {
         return LintResult {
             diagnostics: vec![],
-            error: Some("ruff not available on PATH or next to court-jester-mcp".to_string()),
+            error: Some(tool_unavailable_message("ruff")),
             unavailable: true,
         };
     };
 
-    let output = Command::new(&ruff)
-        .args(["check", "--output-format=json", file_path.to_str().unwrap()])
-        .env("PATH", &path)
-        .stdin(Stdio::null())
-        .output()
-        .await;
+    let mut command = Command::new(&ruff);
+    command.args(["check", "--output-format=json"]);
+    if let Some(config_path) = opts.config_path {
+        command.args(["--config", config_path]);
+    }
+    let stdin_input = if let Some(source_file) = opts.source_file {
+        command.arg(source_file);
+        None
+    } else {
+        let target_path = lint_target_path(&Language::Python, opts);
+        command.args(["--stdin-filename", &target_path, "-"]);
+        Some(code)
+    };
+    command.env("PATH", &path);
+    if let Some(dir) = working_dir(opts) {
+        command.current_dir(dir);
+    }
+
+    let output = run_command(&mut command, stdin_input).await;
 
     match output {
         Ok(out) => {
@@ -169,32 +370,48 @@ fn parse_ruff_output(output: &str) -> LintResult {
     }
 }
 
-async fn lint_typescript(code: &str, tmpdir: &tempfile::TempDir) -> LintResult {
-    let file_path = tmpdir.path().join("snippet.ts");
-    if let Err(e) = std::fs::write(&file_path, code) {
-        return LintResult {
-            diagnostics: vec![],
-            error: Some(format!("Failed to write temp file: {e}")),
-            unavailable: false,
-        };
-    }
-
+async fn lint_typescript(code: &str, opts: &LintOptions<'_>) -> LintResult {
     let path = extended_path();
     let exe_dir = current_exe_dir();
-    let Some(biome) = resolve_binary(&path, "biome", exe_dir.as_deref()) else {
+    let Some(biome) = resolve_binary(&path, "biome", exe_dir.as_deref(), opts.project_dir) else {
         return LintResult {
             diagnostics: vec![],
-            error: Some("biome not available on PATH or next to court-jester-mcp".to_string()),
+            error: Some(tool_unavailable_message("biome")),
             unavailable: true,
         };
     };
 
-    let output = Command::new(&biome)
-        .args(["lint", "--reporter=json", file_path.to_str().unwrap()])
-        .env("PATH", &path)
-        .stdin(Stdio::null())
-        .output()
-        .await;
+    let input_file = match opts.source_file {
+        Some(path) => PreparedLintFile {
+            path: PathBuf::from(path),
+            cleanup_dirs: Vec::new(),
+            _tempdir: None,
+            remove_on_drop: false,
+        },
+        None => match prepare_typescript_inline_file(code, opts) {
+            Ok(file) => file,
+            Err(e) => {
+                return LintResult {
+                    diagnostics: vec![],
+                    error: Some(e),
+                    unavailable: false,
+                }
+            }
+        },
+    };
+
+    let mut command = Command::new(&biome);
+    command.args(["lint", "--reporter=json"]);
+    if let Some(config_path) = opts.config_path {
+        command.args(["--config-path", config_path]);
+    }
+    command.arg(input_file.path());
+    command.env("PATH", &path);
+    if let Some(dir) = working_dir(opts) {
+        command.current_dir(dir);
+    }
+
+    let output = run_command(&mut command, None).await;
 
     match output {
         Ok(out) => {
@@ -222,7 +439,10 @@ async fn lint_typescript(code: &str, tmpdir: &tempfile::TempDir) -> LintResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{find_binary_near_exe_dir, resolve_binary};
+    use super::{
+        find_binary_near_exe_dir, find_project_local_binary, resolve_binary,
+        tool_unavailable_message,
+    };
     use std::fs;
 
     #[cfg(unix)]
@@ -252,6 +472,7 @@ mod tests {
             path_dir.path().to_str().unwrap(),
             "biome",
             Some(sibling_dir.path()),
+            None,
         )
         .expect("biome should resolve");
 
@@ -276,6 +497,7 @@ mod tests {
             path_dir.path().to_str().unwrap(),
             "ruff",
             Some(sibling_dir.path()),
+            None,
         )
         .expect("ruff should resolve");
 
@@ -283,10 +505,59 @@ mod tests {
     }
 
     #[test]
+    fn resolve_binary_prefers_project_local_executable() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let sibling_dir = tempfile::tempdir().unwrap();
+        let path_dir = tempfile::tempdir().unwrap();
+        let project_bin_dir = project_dir.path().join(".venv").join("bin");
+        fs::create_dir_all(&project_bin_dir).unwrap();
+
+        let project = project_bin_dir.join("ruff");
+        let sibling = sibling_dir.path().join("ruff");
+        let on_path = path_dir.path().join("ruff");
+        fs::write(&project, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::write(&sibling, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::write(&on_path, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            make_executable(&project);
+            make_executable(&sibling);
+            make_executable(&on_path);
+        }
+
+        let resolved = resolve_binary(
+            path_dir.path().to_str().unwrap(),
+            "ruff",
+            Some(sibling_dir.path()),
+            Some(project_dir.path().to_str().unwrap()),
+        )
+        .expect("ruff should resolve");
+
+        assert_eq!(resolved, project.to_string_lossy());
+    }
+
+    #[test]
     fn find_binary_near_exe_dir_returns_none_when_missing() {
         let sibling_dir = tempfile::tempdir().unwrap();
         let resolved = find_binary_near_exe_dir(Some(sibling_dir.path()), "biome");
         assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn find_project_local_binary_returns_none_when_missing() {
+        let project_dir = tempfile::tempdir().unwrap();
+        assert!(
+            find_project_local_binary(Some(project_dir.path().to_str().unwrap()), "biome")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unavailable_message_mentions_project_context() {
+        assert_eq!(
+            tool_unavailable_message("ruff"),
+            "ruff not available in project, on PATH, or next to court-jester-mcp"
+        );
     }
 }
 

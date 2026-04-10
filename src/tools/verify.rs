@@ -9,6 +9,8 @@ pub struct VerifyOptions<'a> {
     pub test_source_file: Option<&'a str>,
     pub complexity_threshold: Option<usize>,
     pub project_dir: Option<&'a str>,
+    pub lint_config_path: Option<&'a str>,
+    pub lint_virtual_file_path: Option<&'a str>,
     pub diff: Option<&'a str>,
     /// Original source file path — when set, fuzz code is written as a sibling
     /// so relative imports resolve correctly.
@@ -152,16 +154,28 @@ pub async fn verify(
 
     // Stage 3: Lint — informational unless the lint runner itself errors.
     let start = Instant::now();
-    let mut lint_result = lint::lint(code, language).await;
+    let mut lint_result = lint::lint_with_options(
+        code,
+        language,
+        lint::LintOptions {
+            source_file: opts.source_file,
+            project_dir: opts.project_dir,
+            config_path: opts.lint_config_path,
+            virtual_file_path: opts.lint_virtual_file_path,
+        },
+    )
+    .await;
     let lint_ms = start.elapsed().as_millis() as u64;
 
-    // Filter out false positives from snippet mode
-    lint_result.diagnostics.retain(|d| {
-        !matches!(
-            d.rule.as_str(),
-            "lint/correctness/noUnusedVariables" | "F401" | "F841"
-        )
-    });
+    // Filter out false positives only when linting anonymous inline snippets.
+    if opts.source_file.is_none() && opts.lint_virtual_file_path.is_none() {
+        lint_result.diagnostics.retain(|d| {
+            !matches!(
+                d.rule.as_str(),
+                "lint/correctness/noUnusedVariables" | "F401" | "F841"
+            )
+        });
+    }
 
     let lint_runner_failed = lint_result.error.is_some() && !lint_result.unavailable;
     let lint_ok = !lint_runner_failed;

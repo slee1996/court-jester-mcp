@@ -10,6 +10,8 @@ fn opts() -> VerifyOptions<'static> {
         test_source_file: None,
         complexity_threshold: None,
         project_dir: None,
+        lint_config_path: None,
+        lint_virtual_file_path: None,
         diff: None,
         source_file: None,
         output_dir: None,

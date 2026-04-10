@@ -65,6 +65,15 @@ pub struct LintParams {
     pub file_path: Option<String>,
     /// Programming language: "python" or "typescript"
     pub language: String,
+    /// Project directory for config discovery and local binary resolution
+    #[serde(default)]
+    pub project_dir: Option<String>,
+    /// Explicit Ruff/Biome config file path
+    #[serde(default)]
+    pub config_path: Option<String>,
+    /// Virtual file path for inline code so path-based lint rules still apply
+    #[serde(default)]
+    pub virtual_file_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -89,6 +98,12 @@ pub struct VerifyParams {
     /// Project directory for venv/node_modules resolution
     #[serde(default)]
     pub project_dir: Option<String>,
+    /// Explicit Ruff/Biome config file path for the lint stage
+    #[serde(default)]
+    pub config_path: Option<String>,
+    /// Virtual file path for inline linting so path-based rules still apply
+    #[serde(default)]
+    pub virtual_file_path: Option<String>,
     /// Unified diff string — only fuzz functions overlapping changed lines
     #[serde(default)]
     pub diff: Option<String>,
@@ -270,10 +285,23 @@ impl CourtJester {
             Ok(c) => c,
             Err(e) => return e,
         };
+        let project_dir = p
+            .project_dir
+            .or_else(|| p.file_path.as_deref().and_then(detect_project_dir));
         match parse_lang(&p.language) {
             Ok(lang) => {
                 let _permit = self.exec_semaphore.acquire().await.unwrap();
-                let result = tools::lint::lint(&code, &lang).await;
+                let result = tools::lint::lint_with_options(
+                    &code,
+                    &lang,
+                    tools::lint::LintOptions {
+                        source_file: p.file_path.as_deref(),
+                        project_dir: project_dir.as_deref(),
+                        config_path: p.config_path.as_deref(),
+                        virtual_file_path: p.virtual_file_path.as_deref(),
+                    },
+                )
+                .await;
                 serde_json::to_string_pretty(&result).unwrap()
             }
             Err(e) => e,
@@ -308,6 +336,8 @@ impl CourtJester {
                     test_source_file: p.test_file_path.as_deref(),
                     complexity_threshold: p.complexity_threshold,
                     project_dir: project_dir.as_deref(),
+                    lint_config_path: p.config_path.as_deref(),
+                    lint_virtual_file_path: p.virtual_file_path.as_deref(),
                     diff: p.diff.as_deref(),
                     source_file: p.file_path.as_deref(),
                     output_dir: p.output_dir.as_deref(),

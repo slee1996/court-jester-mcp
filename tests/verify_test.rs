@@ -1,6 +1,7 @@
 use court_jester_mcp::tools::verify::{parse_fuzz_failures, verify, VerifyOptions};
 use court_jester_mcp::types::Language;
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 fn path_lock() -> &'static Mutex<()> {
@@ -37,11 +38,39 @@ fn make_executable(path: &std::path::Path) {
 
 fn install_fake_tool(name: &str, body: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    let script_path = dir.path().join(name);
+    install_fake_tool_at(dir.path(), name, body);
+    dir
+}
+
+fn install_fake_tool_at(dir: &Path, name: &str, body: &str) -> PathBuf {
+    let script_path = dir.join(name);
+    if let Some(parent) = script_path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
     fs::write(&script_path, body).unwrap();
     #[cfg(unix)]
     make_executable(&script_path);
-    dir
+    script_path
+}
+
+fn normalize_logged_path(path: &str) -> String {
+    path.trim()
+        .strip_prefix("/private")
+        .unwrap_or(path.trim())
+        .to_string()
+}
+
+fn assert_log_contains_path(log: &str, prefix: &str, expected: &Path) {
+    let expected = normalize_logged_path(&expected.to_string_lossy());
+    assert!(
+        log.lines().any(|line| {
+            line.strip_prefix(prefix)
+                .map(normalize_logged_path)
+                .as_deref()
+                == Some(expected.as_str())
+        }),
+        "expected log to contain {prefix}{expected}, got:\n{log}"
+    );
 }
 
 fn default_opts(test_code: Option<&str>) -> VerifyOptions<'_> {
@@ -50,6 +79,8 @@ fn default_opts(test_code: Option<&str>) -> VerifyOptions<'_> {
         test_source_file: None,
         complexity_threshold: None,
         project_dir: None,
+        lint_config_path: None,
+        lint_virtual_file_path: None,
         diff: None,
         source_file: None,
         output_dir: None,
@@ -136,6 +167,119 @@ function normalizeName(name: string): string {
     assert!(
         !diagnostics.is_empty(),
         "expected lint diagnostics to remain in the report"
+    );
+}
+
+#[tokio::test]
+async fn verify_passes_project_local_lint_context_to_ruff() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let tool_dir = project_dir.path().join(".venv").join("bin");
+    let log_path = project_dir.path().join("ruff-verify.log");
+    let config_path = project_dir.path().join("ruff.toml");
+    let source_path = project_dir.path().join("src").join("account.py");
+    std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+
+    let code = "def add(a: int, b: int) -> int:\n    return a + b\n";
+    std::fs::write(&source_path, code).unwrap();
+    std::fs::write(&config_path, "[lint]\n").unwrap();
+
+    install_fake_tool_at(
+        &tool_dir,
+        "ruff",
+        &format!(
+            r#"#!/bin/sh
+printf 'cwd=%s\n' "$PWD" > "{log}"
+for arg in "$@"; do
+  printf 'arg=%s\n' "$arg" >> "{log}"
+done
+cat <<'EOF'
+[{{"code":"F841","message":"local variable is assigned to but never used","location":{{"row":1,"column":1}}}}]
+EOF
+exit 1
+"#,
+            log = log_path.display(),
+        ),
+    );
+
+    let report = verify(
+        code,
+        &Language::Python,
+        VerifyOptions {
+            test_code: None,
+            test_source_file: None,
+            complexity_threshold: None,
+            project_dir: Some(project_dir.path().to_str().unwrap()),
+            lint_config_path: Some(config_path.to_str().unwrap()),
+            lint_virtual_file_path: None,
+            diff: None,
+            source_file: Some(source_path.to_str().unwrap()),
+            output_dir: None,
+        },
+    )
+    .await;
+
+    assert!(
+        report.overall_ok,
+        "lint diagnostics should stay informational"
+    );
+
+    let lint_stage = report
+        .stages
+        .iter()
+        .find(|s| s.name == "lint")
+        .expect("lint stage should be present");
+    let diagnostics = lint_stage
+        .detail
+        .as_ref()
+        .and_then(|detail| detail.get("diagnostics"))
+        .and_then(|value| value.as_array())
+        .expect("lint diagnostics should be present");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diag| diag.get("rule").and_then(|value| value.as_str()) == Some("F841")),
+        "real-file verify runs should keep file-aware unused-variable diagnostics"
+    );
+
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert_log_contains_path(&log, "cwd=", project_dir.path());
+    assert!(log.contains("arg=check"));
+    assert!(log.contains("arg=--config"));
+    assert_log_contains_path(&log, "arg=", &config_path);
+    assert_log_contains_path(&log, "arg=", &source_path);
+}
+
+#[tokio::test]
+async fn verify_filters_unused_variable_diagnostics_for_anonymous_inline_snippets() {
+    let _guard = path_lock().lock().unwrap();
+    let tool_dir = install_fake_tool(
+        "ruff",
+        "#!/bin/sh\ncat <<'EOF'\n[{\"code\":\"F841\",\"message\":\"assigned but unused\",\"location\":{\"row\":1,\"column\":1}}]\nEOF\nexit 1\n",
+    );
+    let _path = PathGuard::install(tool_dir.path());
+
+    let code = "def add(a: int, b: int) -> int:\n    return a + b\n";
+    let report = verify(code, &Language::Python, default_opts(None)).await;
+
+    assert!(
+        report.overall_ok,
+        "snippet-only unused diagnostics should not fail verify"
+    );
+
+    let lint_stage = report
+        .stages
+        .iter()
+        .find(|s| s.name == "lint")
+        .expect("lint stage should be present");
+    let diagnostics = lint_stage
+        .detail
+        .as_ref()
+        .and_then(|detail| detail.get("diagnostics"))
+        .and_then(|value| value.as_array())
+        .expect("lint diagnostics should be present");
+    assert!(
+        diagnostics.is_empty(),
+        "anonymous inline snippets should continue filtering unused-variable false positives"
     );
 }
 
@@ -276,6 +420,8 @@ async fn python_test_stage_can_import_source_module_from_sibling_path() {
         test_source_file: None,
         complexity_threshold: None,
         project_dir: None,
+        lint_config_path: None,
+        lint_virtual_file_path: None,
         diff: None,
         source_file: Some(source_path.to_str().unwrap()),
         output_dir: None,
@@ -294,6 +440,8 @@ async fn verify_with_threshold_adds_stage() {
         test_source_file: None,
         complexity_threshold: Some(3),
         project_dir: None,
+        lint_config_path: None,
+        lint_virtual_file_path: None,
         diff: None,
         source_file: None,
         output_dir: None,
@@ -352,6 +500,8 @@ def changed(x: int) -> int:
         test_source_file: None,
         complexity_threshold: None,
         project_dir: None,
+        lint_config_path: None,
+        lint_virtual_file_path: None,
         diff: Some(diff),
         source_file: None,
         output_dir: None,
@@ -379,6 +529,8 @@ async fn writes_report_to_output_dir() {
         test_source_file: None,
         complexity_threshold: None,
         project_dir: None,
+        lint_config_path: None,
+        lint_virtual_file_path: None,
         diff: None,
         source_file: None,
         output_dir: Some(dir.path().to_str().unwrap()),
@@ -420,6 +572,8 @@ async fn rejected_only_fuzz_run_is_not_counted_as_pass_in_report_summary() {
         test_source_file: None,
         complexity_threshold: None,
         project_dir: None,
+        lint_config_path: None,
+        lint_virtual_file_path: None,
         diff: None,
         source_file: None,
         output_dir: Some(dir.path().to_str().unwrap()),
@@ -472,6 +626,8 @@ assert.equal(displayHandle({ profile: { handle: " Admin " }, username: "root" })
         test_source_file: Some(test_path.to_str().unwrap()),
         complexity_threshold: None,
         project_dir: None,
+        lint_config_path: None,
+        lint_virtual_file_path: None,
         diff: None,
         source_file: Some(source_path.to_str().unwrap()),
         output_dir: None,
@@ -535,6 +691,8 @@ assert.equal(primaryPlanCode({ plans: [null, ""] }), "FREE");
         test_source_file: Some(test_path.to_str().unwrap()),
         complexity_threshold: None,
         project_dir: None,
+        lint_config_path: None,
+        lint_virtual_file_path: None,
         diff: None,
         source_file: Some(normalizers_path.to_str().unwrap()),
         output_dir: None,
@@ -576,6 +734,8 @@ if (displayInitials("Spencer Lee") !== "SL") {
         test_source_file: Some(tests_path.to_str().unwrap()),
         complexity_threshold: None,
         project_dir: None,
+        lint_config_path: None,
+        lint_virtual_file_path: None,
         diff: None,
         source_file: Some(src_path.to_str().unwrap()),
         output_dir: None,

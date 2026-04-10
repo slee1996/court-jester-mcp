@@ -21,6 +21,7 @@ COMMON OPTIONS:
   --file <PATH>              Source file (required for all subcommands)
   --language <LANG>          python | typescript (required)
   --project-dir <PATH>       venv / node_modules root (auto-detected if omitted)
+  --config-path <PATH>       Explicit Ruff/Biome config path for lint + verify
 
 VERIFY OPTIONS:
   --test-file <PATH>         Test file to include as an authoritative stage
@@ -101,6 +102,7 @@ struct CliArgs {
     file: Option<String>,
     language: Option<String>,
     project_dir: Option<String>,
+    config_path: Option<String>,
     test_file: Option<String>,
     output_dir: Option<String>,
     diff_file: Option<String>,
@@ -125,6 +127,7 @@ fn parse_flags(rest: &[String]) -> Result<CliArgs, String> {
             "--file" => out.file = Some(take_value(&mut i)?),
             "--language" => out.language = Some(take_value(&mut i)?),
             "--project-dir" => out.project_dir = Some(take_value(&mut i)?),
+            "--config-path" => out.config_path = Some(take_value(&mut i)?),
             "--test-file" => out.test_file = Some(take_value(&mut i)?),
             "--output-dir" => out.output_dir = Some(take_value(&mut i)?),
             "--diff-file" => out.diff_file = Some(take_value(&mut i)?),
@@ -209,6 +212,8 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
                 test_source_file: args.test_file.as_deref(),
                 complexity_threshold: args.complexity_threshold,
                 project_dir: project_dir.as_deref(),
+                lint_config_path: args.config_path.as_deref(),
+                lint_virtual_file_path: None,
                 diff: diff.as_deref(),
                 source_file: Some(file.as_str()),
                 output_dir: args.output_dir.as_deref(),
@@ -239,7 +244,17 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
             Ok(())
         }
         "lint" => {
-            let result = tools::lint::lint(&code, &language).await;
+            let result = tools::lint::lint_with_options(
+                &code,
+                &language,
+                tools::lint::LintOptions {
+                    source_file: Some(file.as_str()),
+                    project_dir: project_dir.as_deref(),
+                    config_path: args.config_path.as_deref(),
+                    virtual_file_path: None,
+                },
+            )
+            .await;
             let json = serde_json::to_string_pretty(&result)
                 .map_err(|e| format!("failed to serialize lint result: {}", e))?;
             println!("{}", json);
