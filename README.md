@@ -46,23 +46,25 @@ Optional tools (Court Jester works without them — lint becomes advisory):
 
 ### 2. Connect to your agent
 
+Point your agent at the binary. If you built from source, use `$(pwd)/target/release/court-jester-mcp`. If you downloaded the release, use the full path to wherever you extracted it.
+
 **Claude Code:**
 
 ```bash
-claude mcp add court-jester -- /absolute/path/to/court-jester-mcp
+claude mcp add court-jester -- $(pwd)/target/release/court-jester-mcp
 ```
 
 **Codex CLI:**
 
 ```bash
-codex mcp add court-jester -- /absolute/path/to/court-jester-mcp
+codex mcp add court-jester -- $(pwd)/target/release/court-jester-mcp
 ```
 
 **Any MCP host** (generic JSON config):
 
 ```json
 {
-  "command": "/absolute/path/to/court-jester-mcp"
+  "command": "/full/path/to/court-jester-mcp"
 }
 ```
 
@@ -136,6 +138,8 @@ All tools accept **either** `code` (inline source) **or** `file_path` (absolute 
 | `test_file_path` | string | no | Test file for authoritative test stage |
 | `test_code` | string | no | Inline test code |
 | `project_dir` | string | no | Root for `.venv` / `node_modules` resolution |
+| `config_path` | string | no | Explicit Ruff/Biome config path for the lint stage |
+| `virtual_file_path` | string | no | Virtual lint path for inline code so path-based rules still apply |
 | `diff` | string | no | Unified diff — only fuzz functions touching changed lines |
 | `complexity_threshold` | integer | no | Fail if any function exceeds this complexity |
 | `output_dir` | string | no | Write timestamped JSON report to this directory |
@@ -155,6 +159,17 @@ All tools accept **either** `code` (inline source) **or** `file_path` (absolute 
 |-----------|------|----------|-------------|
 | `file_path` / `code` | string | one of | Source to lint |
 | `language` | `"python"` / `"typescript"` | yes | Picks `ruff` vs `biome` |
+| `project_dir` | string | no | Root for config discovery and project-local linter binaries |
+| `config_path` | string | no | Explicit Ruff/Biome config path |
+| `virtual_file_path` | string | no | Virtual lint path for inline code so path-based rules still apply |
+
+Lint runs in the user project context. Binary resolution order is:
+
+1. Project-local binary (`.venv/bin/ruff`, `venv/bin/ruff`, or `node_modules/.bin/biome`)
+2. Bundled sibling binary next to `court-jester-mcp`
+3. `PATH`
+
+When you pass inline `code`, set `virtual_file_path` if your lint config depends on filename or path overrides. Python uses Ruff's stdin filename hint. TypeScript materializes a temporary file at that path inside `project_dir`, runs Biome, then removes it.
 
 ### `execute`
 
@@ -275,7 +290,7 @@ python scripts/prepare_release.py --release --require-ruff --require-biome
 | `parse_error: true` on valid code | Wrong `language` field — check `.py` vs `.ts` |
 | Execute stage times out | Raise `COURT_JESTER_VERIFY_PYTHON_TIMEOUT_SECONDS` or the TS equivalent |
 | `memory_error: true` | Code exceeded 512 MB sandbox cap. For `execute` tool, raise `memory_mb` |
-| `lint` shows `unavailable: true` | `ruff`/`biome` not on `PATH` — advisory, does not fail verify |
+| `lint` shows `unavailable: true` | `ruff`/`biome` not found in the project, next to the binary, or on `PATH` — advisory, does not fail verify |
 | `cargo build` fails on `edition2024` | Homebrew cargo is 1.83. Use `rustup` or `just build` |
 | `cargo run` hangs | Expected — it's a stdio server waiting for MCP client. Use `just smoke` to test |
 | Agent only verifies some functions | Diff-aware mode. Clear `diff` parameter to fuzz all functions |
