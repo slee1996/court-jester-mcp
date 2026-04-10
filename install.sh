@@ -70,7 +70,24 @@ case ":${PATH}:" in
     ;;
 esac
 
+# Auto-configure agent MCP servers
+BINARY_PATH="${INSTALL_DIR}/${BINARY_NAME}"
+
+if command -v claude >/dev/null 2>&1; then
+  echo ""
+  claude mcp add court-jester -- "${BINARY_PATH}" 2>/dev/null \
+    && echo "Configured Claude Code" \
+    || echo "Claude Code: could not auto-configure. Run: claude mcp add court-jester -- ${BINARY_PATH}"
+fi
+
+if command -v codex >/dev/null 2>&1; then
+  codex mcp add court-jester -- "${BINARY_PATH}" 2>/dev/null \
+    && echo "Configured Codex CLI" \
+    || echo "Codex CLI: could not auto-configure. Run: codex mcp add court-jester -- ${BINARY_PATH}"
+fi
+
 echo ""
-echo "Next: connect to your agent"
-echo "  claude mcp add court-jester -- court-jester-mcp"
-echo "  codex mcp add court-jester -- court-jester-mcp"
+echo "Done. Add this to your agent prompt:"
+echo ""
+echo "  After every code change, call court-jester verify on each changed file."
+echo "  If verify returns overall_ok: false, fix the failing repro and verify again."

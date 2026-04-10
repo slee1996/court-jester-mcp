@@ -32,7 +32,7 @@ The false-positive control (known-good code, 20 runs) passes 20/20.
 curl -fsSL https://raw.githubusercontent.com/slee1996/court-jester-mcp/main/install.sh | sh
 ```
 
-This downloads the release binary and puts it on your PATH. No Rust toolchain needed.
+Downloads the binary, puts it on your PATH, and auto-configures Claude Code and Codex CLI if installed. No Rust toolchain needed.
 
 <details>
 <summary>Build from source instead</summary>
@@ -41,7 +41,7 @@ This downloads the release binary and puts it on your PATH. No Rust toolchain ne
 cargo install --git https://github.com/slee1996/court-jester-mcp.git
 ```
 
-Requires Rust 1.85+. Install via [rustup](https://rustup.rs) if needed.
+Requires Rust 1.85+. Install via [rustup](https://rustup.rs) if needed. You'll need to manually connect to your agent (see below).
 </details>
 
 Optional tools (Court Jester works without them — lint becomes advisory):
@@ -49,25 +49,9 @@ Optional tools (Court Jester works without them — lint becomes advisory):
 - [biome](https://biomejs.dev/guides/getting-started/) (TypeScript lint)
 - [bun](https://bun.sh) (required for TypeScript fuzz execution)
 
-### 2. Connect to your agent
+### 2. Connect to your agent (if not auto-configured)
 
-<details>
-<summary><strong>Claude Code</strong></summary>
-
-```bash
-claude mcp add court-jester -- court-jester-mcp
-```
-
-Use `-s project` instead of the default to commit the config into your repo for your team.
-</details>
-
-<details>
-<summary><strong>Codex CLI</strong></summary>
-
-```bash
-codex mcp add court-jester -- court-jester-mcp
-```
-</details>
+The install script auto-configures Claude Code and Codex CLI. For other editors, or if you built from source:
 
 <details>
 <summary><strong>Cursor</strong></summary>
@@ -145,7 +129,7 @@ Court Jester is a stdio MCP server. The standard config shape works everywhere:
 ```
 </details>
 
-### 3. Add one line to your agent prompt
+### 3. Add to your agent prompt
 
 ```text
 After every code change, call court-jester `verify` on each changed file.
