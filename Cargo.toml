@@ -2,6 +2,7 @@
 name = "court-jester-mcp"
 version = "0.1.2"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
 rmcp = { version = "1.2", features = ["server", "transport-io"] }
