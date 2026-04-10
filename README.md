@@ -28,8 +28,19 @@ The false-positive control (known-good code, 20 runs) passes 20/20.
 
 ### 1. Install
 
+**Download the release binary** (macOS Apple Silicon):
+
 ```bash
-# Requires Rust 1.85+ — install via https://rustup.rs if needed
+curl -L https://github.com/slee1996/court-jester-mcp/releases/latest/download/court-jester-v0.1.2-darwin-arm64.tar.gz | tar xz
+# move the binary somewhere on PATH
+mv court-jester-mcp /usr/local/bin/
+```
+
+Or **build from source** (any platform, requires Rust 1.85+):
+
+```bash
+git clone https://github.com/slee1996/court-jester-mcp.git
+cd court-jester-mcp
 cargo install --path .
 ```
 
