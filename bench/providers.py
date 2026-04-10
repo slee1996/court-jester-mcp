@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import selectors
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -290,6 +291,112 @@ class CliAgentProvider(Provider):
             changed_files=list(parsed.get("files_changed", [])) if isinstance(parsed, dict) else [],
         )
 
+    def _run_cli_command(
+        self,
+        *,
+        command: list[str],
+        workspace: Path,
+        early_abort_markers: dict[str, str] | None = None,
+    ) -> ProviderResult:
+        if not early_abort_markers:
+            try:
+                completed = subprocess.run(
+                    command,
+                    cwd=workspace,
+                    capture_output=True,
+                    text=True,
+                    timeout=self._timeout_seconds(),
+                    env=self._agent_env(),
+                )
+            except subprocess.TimeoutExpired as exc:
+                return ProviderResult(
+                    transcript=[exc.stdout or "", exc.stderr or ""],
+                    failed=True,
+                    failure_reason=f"{self.model.provider} timed out after {self._timeout_seconds()} seconds",
+                )
+            return self._finalize_cli_result(completed=completed, raw_output=completed.stdout)
+
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+        lowered_markers = {
+            marker.lower(): reason for marker, reason in early_abort_markers.items()
+        }
+        timeout_seconds = self._timeout_seconds()
+        proc = subprocess.Popen(
+            command,
+            cwd=workspace,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=self._agent_env(),
+            bufsize=1,
+        )
+        selector = selectors.DefaultSelector()
+        if proc.stdout is not None:
+            selector.register(proc.stdout, selectors.EVENT_READ, data=("stdout", proc.stdout))
+        if proc.stderr is not None:
+            selector.register(proc.stderr, selectors.EVENT_READ, data=("stderr", proc.stderr))
+        deadline = time.time() + timeout_seconds
+        early_abort_reason: str | None = None
+        try:
+            while selector.get_map():
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    proc.kill()
+                    stdout_tail, stderr_tail = proc.communicate()
+                    stdout_chunks.append(stdout_tail or "")
+                    stderr_chunks.append(stderr_tail or "")
+                    return ProviderResult(
+                        transcript=["".join(stdout_chunks), "".join(stderr_chunks)],
+                        failed=True,
+                        failure_reason=f"{self.model.provider} timed out after {timeout_seconds} seconds",
+                    )
+                events = selector.select(timeout=min(0.25, remaining))
+                if not events and proc.poll() is not None:
+                    break
+                for key, _ in events:
+                    stream_name, stream = key.data
+                    line = stream.readline()
+                    if line == "":
+                        selector.unregister(stream)
+                        continue
+                    if stream_name == "stdout":
+                        stdout_chunks.append(line)
+                    else:
+                        stderr_chunks.append(line)
+                    lowered_line = line.lower()
+                    matched_reason = next(
+                        (reason for marker, reason in lowered_markers.items() if marker in lowered_line),
+                        None,
+                    )
+                    if matched_reason:
+                        early_abort_reason = matched_reason
+                        break
+                if early_abort_reason:
+                    break
+            if early_abort_reason and proc.poll() is None:
+                proc.kill()
+            stdout_tail, stderr_tail = proc.communicate()
+            stdout_chunks.append(stdout_tail or "")
+            stderr_chunks.append(stderr_tail or "")
+        finally:
+            selector.close()
+
+        completed = subprocess.CompletedProcess(
+            args=command,
+            returncode=proc.returncode or 0,
+            stdout="".join(stdout_chunks),
+            stderr="".join(stderr_chunks),
+        )
+        if early_abort_reason:
+            return ProviderResult(
+                transcript=[completed.stdout, completed.stderr],
+                exit_code=completed.returncode,
+                failed=True,
+                failure_reason=early_abort_reason,
+            )
+        return self._finalize_cli_result(completed=completed, raw_output=completed.stdout)
+
 
 class CodexCliProvider(CliAgentProvider):
     def apply(
@@ -319,23 +426,18 @@ class CodexCliProvider(CliAgentProvider):
         ]
         if self.model.model:
             command.extend(["--model", self.model.model])
-        try:
-            completed = subprocess.run(
-                command + [prompt],
-                cwd=workspace,
-                capture_output=True,
-                text=True,
-                timeout=self._timeout_seconds(),
-                env=self._agent_env(),
-            )
-        except subprocess.TimeoutExpired as exc:
-            return ProviderResult(
-                transcript=[exc.stdout or "", exc.stderr or ""],
-                failed=True,
-                failure_reason=f"codex_cli timed out after {self._timeout_seconds()} seconds",
-            )
-        raw = completed.stdout
-        return self._finalize_cli_result(completed=completed, raw_output=raw)
+        return self._run_cli_command(
+            command=command + [prompt],
+            workspace=workspace,
+            early_abort_markers={
+                "body: Internal server error": "codex_cli aborted after provider internal server error",
+                "Transport channel closed": "codex_cli aborted after provider transport failure",
+                "all inference nodes that can serve this model are currently busy": (
+                    "codex_cli aborted after provider capacity busy error"
+                ),
+                "You've hit your usage limit": "codex_cli aborted after provider usage limit error",
+            },
+        )
 
 
 class ClaudeCliProvider(CliAgentProvider):
@@ -367,22 +469,7 @@ class ClaudeCliProvider(CliAgentProvider):
         ]
         if self.model.model:
             command.extend(["--model", self.model.model])
-        try:
-            completed = subprocess.run(
-                command + [prompt],
-                cwd=workspace,
-                capture_output=True,
-                text=True,
-                timeout=self._timeout_seconds(),
-                env=self._agent_env(),
-            )
-        except subprocess.TimeoutExpired as exc:
-            return ProviderResult(
-                transcript=[exc.stdout or "", exc.stderr or ""],
-                failed=True,
-                failure_reason=f"claude_cli timed out after {self._timeout_seconds()} seconds",
-            )
-        return self._finalize_cli_result(completed=completed, raw_output=completed.stdout)
+        return self._run_cli_command(command=command + [prompt], workspace=workspace)
 
 
 class OpenAICompatProvider(Provider):

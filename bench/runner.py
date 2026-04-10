@@ -17,6 +17,9 @@ from .mcp_client import CourtJesterClient
 from .providers import ProviderResult, provider_from_manifest
 
 
+PROVIDER_RETRYABLE_KINDS = {"capacity_busy", "internal_server_error", "transport_error"}
+
+
 @dataclass(slots=True)
 class CommandResult:
     argv: list[str]
@@ -124,19 +127,55 @@ def run_single(
     critic_feedbacks: list[str] = []
     max_attempts = 1 + max(policy.max_repair_rounds, 0)
     for attempt in range(max_attempts):
-        provider_started = time.time()
-        provider_result = provider.apply(
-            workspace,
-            task,
-            feedback=feedback,
-            attempt=attempt,
-            history=attempt_history if policy.replay_attempt_history else None,
-        )
-        provider_apply_ms = int((time.time() - provider_started) * 1000)
+        provider_retry_records: list[dict[str, Any]] = []
+        provider_apply_ms = 0
+        provider_result = None
+        provider_call_count = 0
+        max_provider_retries = provider_retry_limit() if supports_provider_retry(model) else 0
+        backup_dir = run_dir / f".provider_backup_attempt_{attempt}"
+        while True:
+            if max_provider_retries > 0 and provider_call_count <= max_provider_retries:
+                snapshot_workspace_for_retry(workspace, backup_dir)
+            provider_started = time.time()
+            provider_candidate = provider.apply(
+                workspace,
+                task,
+                feedback=feedback,
+                attempt=attempt,
+                history=attempt_history if policy.replay_attempt_history else None,
+            )
+            provider_apply_ms += int((time.time() - provider_started) * 1000)
+            provider_call_count += 1
+            provider_error_kind = (
+                classify_provider_failure(provider_candidate) if provider_candidate.failed else None
+            )
+            if (
+                provider_candidate.failed
+                and provider_error_kind is not None
+                and should_retry_provider_failure(provider_error_kind)
+                and len(provider_retry_records) < max_provider_retries
+            ):
+                restore_workspace_from_retry_snapshot(backup_dir, workspace)
+                delay_seconds = provider_retry_delay_seconds(provider_error_kind, len(provider_retry_records))
+                provider_retry_records.append(
+                    {
+                        "retry_index": len(provider_retry_records),
+                        "provider_error_kind": provider_error_kind,
+                        "failure_reason": provider_candidate.failure_reason,
+                        "delay_seconds": delay_seconds,
+                    }
+                )
+                if delay_seconds > 0:
+                    time.sleep(delay_seconds)
+                continue
+            provider_result = provider_candidate
+            break
         result["timings"]["provider_apply_ms"] += provider_apply_ms
         attempt_record: dict[str, Any] = {
             "attempt": attempt,
             "provider_apply_ms": provider_apply_ms,
+            "provider_call_count": provider_call_count,
+            "provider_retries": provider_retry_records,
             "provider_result": {
                 "changed_files": provider_result.changed_files,
                 "transcript": provider_result.transcript,
@@ -369,7 +408,13 @@ def run_single(
         result["failure_category"] = (
             "provider_auth_error"
             if provider_error_kind == "auth_required"
-            else "provider_infra_busy" if provider_error_kind == "capacity_busy" else "provider_error"
+            else "provider_usage_limited"
+            if provider_error_kind == "usage_limited"
+            else "provider_infra_busy"
+            if provider_error_kind == "capacity_busy"
+            else "provider_infra_error"
+            if provider_error_kind in {"internal_server_error", "transport_error"}
+            else "provider_error"
         )
         result["failure_details"] = {
             "provider_error_kind": provider_error_kind,
@@ -562,6 +607,18 @@ def snapshot_tree(root: Path) -> dict[str, str]:
     return snapshot
 
 
+def snapshot_workspace_for_retry(workspace: Path, backup_dir: Path) -> None:
+    if backup_dir.exists():
+        shutil.rmtree(backup_dir)
+    shutil.copytree(workspace, backup_dir)
+
+
+def restore_workspace_from_retry_snapshot(backup_dir: Path, workspace: Path) -> None:
+    if workspace.exists():
+        shutil.rmtree(workspace)
+    shutil.copytree(backup_dir, workspace)
+
+
 def stringify_output(value: Any) -> str:
     if value is None:
         return ""
@@ -583,6 +640,9 @@ def classify_provider_failure(provider_result: ProviderResult) -> str:
     auth_markers = ("not logged in", "please run /login", "login required", "authentication")
     if any(marker in haystack for marker in auth_markers):
         return "auth_required"
+    usage_limit_markers = ("usage limit", "quota", "try again at")
+    if any(marker in haystack for marker in usage_limit_markers):
+        return "usage_limited"
     capacity_markers = (
         "all inference nodes that can serve this model are currently busy",
         "retry shortly",
@@ -590,7 +650,52 @@ def classify_provider_failure(provider_result: ProviderResult) -> str:
     )
     if any(marker in haystack for marker in capacity_markers):
         return "capacity_busy"
+    internal_server_markers = (
+        "internal server error",
+        "http 500",
+        "http 502",
+        "http 504",
+        "unexpectedcontenttype",
+    )
+    if any(marker in haystack for marker in internal_server_markers):
+        return "internal_server_error"
+    transport_markers = (
+        "transport channel closed",
+        "connection reset",
+        "broken pipe",
+        "curl: (6)",
+        "could not resolve host",
+        "curl: (56)",
+    )
+    if any(marker in haystack for marker in transport_markers):
+        return "transport_error"
     return "generic"
+
+
+def supports_provider_retry(model: ModelManifest) -> bool:
+    return model.provider in {"codex_cli", "claude_cli", "openai_compat_chat"}
+
+
+def provider_retry_limit() -> int:
+    raw = os.getenv("CJ_PROVIDER_INFRA_RETRIES", "2")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 2
+
+
+def should_retry_provider_failure(provider_error_kind: str) -> bool:
+    return provider_error_kind in PROVIDER_RETRYABLE_KINDS
+
+
+def provider_retry_delay_seconds(provider_error_kind: str, retry_index: int) -> float:
+    if provider_error_kind == "capacity_busy":
+        return [5.0, 15.0][min(retry_index, 1)]
+    if provider_error_kind == "internal_server_error":
+        return [2.0, 5.0][min(retry_index, 1)]
+    if provider_error_kind == "transport_error":
+        return [1.0, 3.0][min(retry_index, 1)]
+    return 0.0
 
 
 def classify_outcome(
