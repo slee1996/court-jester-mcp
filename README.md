@@ -28,17 +28,12 @@ The false-positive control (known-good code, 20 runs) passes 20/20.
 
 ### 1. Install
 
-**Build from source** (any platform):
-
 ```bash
 # Requires Rust 1.85+ — install via https://rustup.rs if needed
-git clone https://github.com/slee1996/court-jester-mcp.git && cd court-jester-mcp
-cargo install --path .
+cargo install --git https://github.com/slee1996/court-jester-mcp.git
 ```
 
-This puts `court-jester-mcp` in `~/.cargo/bin/`, which is already on your PATH.
-
-Pre-built binaries are also available on [GitHub Releases](https://github.com/slee1996/court-jester-mcp/releases) (macOS Apple Silicon).
+This builds the binary and puts it on your PATH. Pre-built binaries are also available on [GitHub Releases](https://github.com/slee1996/court-jester-mcp/releases).
 
 Optional tools (Court Jester works without them — lint becomes advisory):
 - [ruff](https://docs.astral.sh/ruff/installation/) (Python lint)
