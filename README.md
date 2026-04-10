@@ -77,6 +77,49 @@ If verify returns overall_ok: false, fix the failing repro and verify again.
 
 That's it. The agent now self-corrects.
 
+### What this looks like in practice
+
+**Claude Code** — you ask it to fix a bug. It writes the fix, calls `verify`, gets a fuzz failure, and repairs before responding:
+
+```
+You: Fix the timezone handling in profile.py
+
+Agent: [edits profile.py]
+Agent: [calls court-jester verify on profile.py]
+
+  verify returned overall_ok: false
+  execute stage: CRASH normalize_timezone(["  ", "UTC+99"])
+    → ValueError: invalid timezone offset
+
+Agent: [fixes normalize_timezone to validate offset range]
+Agent: [calls court-jester verify again]
+
+  verify returned overall_ok: true
+
+Agent: Fixed. The original code crashed on invalid timezone strings
+       like "UTC+99" — added offset validation.
+```
+
+**Codex CLI** — same loop, autonomous. Add the verify instruction to your AGENTS.md or system prompt and Codex calls it after every edit:
+
+```
+Task: Implement parse_csv_row() that handles quoted fields
+
+Agent: [writes parse_csv_row in parser.py]
+Agent: [calls court-jester verify on parser.py]
+
+  verify returned overall_ok: false
+  execute stage: CRASH parse_csv_row(['field,"has,comma",end'])
+    → IndexError: list index out of range
+
+Agent: [fixes quoted-field splitting logic]
+Agent: [calls court-jester verify again]
+
+  verify returned overall_ok: true
+```
+
+**Key point:** the agent never saw a test for `"has,comma"` — Court Jester synthesized that input from the function signature. Without it, the bug ships silently.
+
 ---
 
 ## How it works
