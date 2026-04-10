@@ -46,27 +46,101 @@ Optional tools (Court Jester works without them — lint becomes advisory):
 
 ### 2. Connect to your agent
 
-Point your agent at the binary. If you built from source, use `$(pwd)/target/release/court-jester-mcp`. If you downloaded the release, use the full path to wherever you extracted it.
+Point your agent at the binary. If you built from source, the path is `$(pwd)/target/release/court-jester-mcp`. If you downloaded the release, use the full path to wherever you extracted it.
 
-**Claude Code:**
+<details>
+<summary><strong>Claude Code</strong></summary>
 
 ```bash
 claude mcp add court-jester -- $(pwd)/target/release/court-jester-mcp
 ```
 
-**Codex CLI:**
+Use `-s project` instead of the default to commit the config into your repo for your team.
+</details>
+
+<details>
+<summary><strong>Codex CLI</strong></summary>
 
 ```bash
 codex mcp add court-jester -- $(pwd)/target/release/court-jester-mcp
 ```
+</details>
 
-**Any MCP host** (generic JSON config):
+<details>
+<summary><strong>Cursor</strong></summary>
+
+Add to `.cursor/mcp.json` in your project root (or `~/.cursor/mcp.json` for global):
+
+```json
+{
+  "mcpServers": {
+    "court-jester": {
+      "command": "/full/path/to/court-jester-mcp"
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><strong>VS Code / Copilot</strong></summary>
+
+Add to `.vscode/mcp.json` in your workspace:
+
+```json
+{
+  "servers": {
+    "court-jester": {
+      "command": "/full/path/to/court-jester-mcp"
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><strong>Windsurf</strong></summary>
+
+Add to `~/.codeium/windsurf/mcp_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "court-jester": {
+      "command": "/full/path/to/court-jester-mcp"
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><strong>Cline</strong></summary>
+
+Open Cline settings in VS Code, go to MCP Servers, and add:
+
+```json
+{
+  "mcpServers": {
+    "court-jester": {
+      "command": "/full/path/to/court-jester-mcp"
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><strong>Any other MCP host</strong></summary>
+
+Court Jester is a stdio MCP server. The standard config shape works everywhere:
 
 ```json
 {
   "command": "/full/path/to/court-jester-mcp"
 }
 ```
+</details>
 
 ### 3. Add one line to your agent prompt
 
@@ -76,6 +150,16 @@ If verify returns overall_ok: false, fix the failing repro and verify again.
 ```
 
 That's it. The agent now self-corrects.
+
+### Example prompts to try
+
+Once connected, try asking your agent:
+
+- "Implement a URL parser and verify it handles edge cases before you're done."
+- "Fix the bug in auth.py. Run court-jester verify after your fix to make sure it holds."
+- "Refactor the payment module. Only verify the functions you changed — pass the diff."
+- "Write a TypeScript date formatter. Use court-jester to fuzz it before committing."
+- "Check if src/utils.py has any functions that crash on unexpected inputs."
 
 ### What this looks like in practice
 
@@ -173,6 +257,12 @@ All tools accept **either** `code` (inline source) **or** `file_path` (absolute 
 
 ### `verify`
 
+The primary tool. Parses, lints, fuzzes, and optionally runs tests in one call.
+
+> "Verify src/parser.py after my changes."
+> "Verify only the functions I touched — here's the diff."
+> "Verify this file and fail if any function has cyclomatic complexity above 10."
+
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `file_path` | string | one of | Absolute path to source file |
@@ -189,6 +279,11 @@ All tools accept **either** `code` (inline source) **or** `file_path` (absolute 
 
 ### `analyze`
 
+Extract functions, classes, imports, and complexity from a file without running anything.
+
+> "Analyze utils.ts and show me all the exported functions and their complexity."
+> "Which functions in this file overlap with my diff?"
+
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `file_path` / `code` | string | one of | Source to analyze |
@@ -197,6 +292,11 @@ All tools accept **either** `code` (inline source) **or** `file_path` (absolute 
 | `diff` | string | no | Adds `changed_functions` to result |
 
 ### `lint`
+
+Run ruff (Python) or biome (TypeScript) and return diagnostics.
+
+> "Lint src/handlers.py before I commit."
+> "Run biome on this TypeScript file and show me what to fix."
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -215,6 +315,11 @@ Lint runs in the user project context. Binary resolution order is:
 When you pass inline `code`, set `virtual_file_path` if your lint config depends on filename or path overrides. Python uses Ruff's stdin filename hint. TypeScript materializes a temporary file at that path inside `project_dir`, runs Biome, then removes it.
 
 ### `execute`
+
+Run a file in a sandboxed subprocess with time and memory limits. Use this to test a specific script directly rather than fuzzing function signatures.
+
+> "Run this script in the sandbox with a 5-second timeout."
+> "Execute my test harness and check if it passes."
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
