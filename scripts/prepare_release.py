@@ -32,20 +32,22 @@ def resolve_bundle_dir(args: argparse.Namespace) -> Path:
     return (REPO_ROOT / "dist" / f"court-jester-{profile}").resolve()
 
 
-def resolve_biome(args: argparse.Namespace) -> Path | None:
-    if args.biome:
-        biome = Path(args.biome).expanduser().resolve()
-        if not biome.exists():
-            raise FileNotFoundError(f"Could not find biome binary at {biome}")
-        return biome
+def resolve_tool(
+    tool_name: str, explicit_path: str | None, require_tool: bool
+) -> Path | None:
+    if explicit_path:
+        tool = Path(explicit_path).expanduser().resolve()
+        if not tool.exists():
+            raise FileNotFoundError(f"Could not find {tool_name} binary at {tool}")
+        return tool
 
-    found = shutil.which("biome")
+    found = shutil.which(tool_name)
     if found:
         return Path(found).resolve()
 
-    if args.require_biome:
+    if require_tool:
         raise FileNotFoundError(
-            "Could not find `biome` on PATH. Install it or pass --biome /absolute/path/to/biome."
+            f"Could not find `{tool_name}` on PATH. Install it or pass --{tool_name} /absolute/path/to/{tool_name}."
         )
 
     return None
@@ -59,7 +61,7 @@ def copy_executable(src: Path, dst: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Stage a Court Jester release bundle with an optional sibling biome binary."
+        description="Stage a Court Jester release bundle with optional sibling Ruff and Biome binaries."
     )
     profile = parser.add_mutually_exclusive_group()
     profile.add_argument(
@@ -81,9 +83,18 @@ def main() -> int:
         help="Use an explicit biome binary path instead of resolving biome from PATH.",
     )
     parser.add_argument(
+        "--ruff",
+        help="Use an explicit ruff binary path instead of resolving ruff from PATH.",
+    )
+    parser.add_argument(
         "--require-biome",
         action="store_true",
         help="Fail if a biome binary cannot be bundled.",
+    )
+    parser.add_argument(
+        "--require-ruff",
+        action="store_true",
+        help="Fail if a ruff binary cannot be bundled.",
     )
     parser.add_argument(
         "--bundle-dir",
@@ -94,7 +105,8 @@ def main() -> int:
     try:
         binary = resolve_binary(args)
         bundle_dir = resolve_bundle_dir(args)
-        biome = resolve_biome(args)
+        biome = resolve_tool("biome", args.biome, args.require_biome)
+        ruff = resolve_tool("ruff", args.ruff, args.require_ruff)
 
         bundle_dir.mkdir(parents=True, exist_ok=True)
 
@@ -102,6 +114,13 @@ def main() -> int:
         copy_executable(binary, bundled_binary)
 
         print(f"Bundled binary: {bundled_binary}")
+
+        if ruff is not None:
+            bundled_ruff = bundle_dir / "ruff"
+            copy_executable(ruff, bundled_ruff)
+            print(f"Bundled ruff:   {bundled_ruff}")
+        else:
+            print("Bundled ruff:   skipped (Python lint will require ruff on PATH)")
 
         if biome is not None:
             bundled_biome = bundle_dir / "biome"
@@ -112,8 +131,8 @@ def main() -> int:
 
         print()
         print("Runtime behavior:")
-        print("1. court-jester-mcp looks for ./biome next to itself first")
-        print("2. if no sibling biome exists, it falls back to biome on PATH")
+        print("1. court-jester-mcp looks for ./ruff and ./biome next to itself first")
+        print("2. if a sibling linter is missing, it falls back to PATH for that tool")
         return 0
     except Exception as exc:
         print(f"Release bundling failed: {exc}", file=sys.stderr)

@@ -99,8 +99,18 @@ pub struct VerifyParams {
 
 // ── MCP Server ──────────────────────────────────────────────────────────────
 
-/// Maximum concurrent subprocess executions (lint, execute, verify all spawn processes).
-const MAX_CONCURRENT_EXEC: usize = 1;
+/// Default cap on concurrent subprocess executions (lint, execute, verify all spawn
+/// processes). Set to 1 historically to avoid interleaved sandboxes fighting over
+/// the same on-disk artifacts. Overridable via `COURT_JESTER_MAX_CONCURRENT_EXEC`.
+const DEFAULT_MAX_CONCURRENT_EXEC: usize = 1;
+
+fn max_concurrent_exec() -> usize {
+    std::env::var("COURT_JESTER_MAX_CONCURRENT_EXEC")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(DEFAULT_MAX_CONCURRENT_EXEC)
+}
 
 #[derive(Debug, Clone)]
 pub struct CourtJester {
@@ -108,23 +118,41 @@ pub struct CourtJester {
     exec_semaphore: Arc<Semaphore>,
 }
 
+/// Build a uniform JSON error response for pre-tool validation failures.
+/// Every tool surfaces the same shape so agents can rely on a single contract:
+/// `{"error": "...", "error_kind": "..."}`.
+pub fn tool_error(kind: &str, message: impl AsRef<str>) -> String {
+    let value = serde_json::json!({
+        "error": message.as_ref(),
+        "error_kind": kind,
+    });
+    serde_json::to_string_pretty(&value).expect("serde_json::to_string_pretty on json! never fails")
+}
+
 pub fn resolve_code(code: &str, file_path: Option<&str>) -> Result<String, String> {
     match (code.is_empty(), file_path) {
         (false, None) => Ok(code.to_string()),
         (true, Some(path)) => std::fs::read_to_string(path)
-            .map_err(|e| format!("{{\"error\": \"Cannot read '{}': {}\"}}", path, e)),
-        (false, Some(_)) => {
-            Err("{\"error\": \"Provide either 'code' or 'file_path', not both\"}".into())
-        }
-        (true, None) => Err("{\"error\": \"Must provide 'code' or 'file_path'\"}".into()),
+            .map_err(|e| tool_error("read_failed", format!("Cannot read '{}': {}", path, e))),
+        (false, Some(_)) => Err(tool_error(
+            "ambiguous_input",
+            "Provide either 'code' or 'file_path', not both",
+        )),
+        (true, None) => Err(tool_error(
+            "missing_input",
+            "Must provide 'code' or 'file_path'",
+        )),
     }
 }
 
 fn parse_lang(s: &str) -> Result<Language, String> {
     Language::parse(s).ok_or_else(|| {
-        format!(
-            "{{\"error\": \"Unsupported language '{}'. Use 'python' or 'typescript'.\"}}",
-            s
+        tool_error(
+            "unsupported_language",
+            format!(
+                "Unsupported language '{}'. Use 'python' or 'typescript'.",
+                s
+            ),
         )
     })
 }
@@ -310,7 +338,7 @@ impl CourtJester {
     pub fn new() -> Self {
         Self {
             tool_router: Self::tool_router(),
-            exec_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_EXEC)),
+            exec_semaphore: Arc::new(Semaphore::new(max_concurrent_exec())),
         }
     }
 }

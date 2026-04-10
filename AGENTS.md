@@ -1,21 +1,21 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-`src/` contains the Rust MCP server. `src/main.rs` wires the stdio transport, `src/lib.rs` defines tool parameters and server routing, and `src/tools/` holds the implementation for `analyze`, `lint`, `execute`, `verify`, `diff`, and `synthesize`. `tests/` contains Rust integration tests, usually grouped by tool (`verify_test.rs`, `diff_test.rs`, `synthesize_test.rs`). `bench/` is a separate Python benchmark harness with task manifests, evaluators, fixture repos, and runner scripts. `docs/` stores design notes and benchmark writeups.
+`src/` contains the Rust MCP server. `src/main.rs` wires stdio transport plus one-shot CLI subcommands (`verify`, `analyze`, `lint`, `execute`). `src/lib.rs` defines tool parameters and server routing. `src/tools/` holds the implementation for the four exposed MCP tools — `analyze`, `lint`, `execute`, `verify` — plus the internal `diff` and `synthesize` modules that `verify` composes. `tests/` contains Rust integration tests, usually grouped by tool (`verify_test.rs`, `diff_test.rs`, `synthesize_test.rs`). `scripts/smoke_mcp.py` is a tiny stdio MCP client used by `just smoke`. `bench/` is a separate Python benchmark harness with task manifests, evaluators, fixture repos, and runner scripts. `docs/` stores design notes and benchmark writeups.
 
 ## Build, Test, and Development Commands
-Use Cargo for the Rust server:
+The canonical commands live in the `justfile` — prefer those so the README, CI, and contributor docs stay in sync.
 
-- `cargo run`: start the MCP server over stdio.
-- `cargo fmt`: format Rust sources before review.
-- `cargo test`: run the Rust test suite in `tests/`.
+- `just build` (or `cargo build --release`): build the release binary.
+- `just serve` (or `cargo run`): start the MCP server over stdio.
+- `just smoke` / `just smoke-sample`: run the Python smoke client against the binary.
+- `just verify-sample`: one-shot verify of the bundled fixture via the new CLI subcommand.
+- `just test` (or `cargo test`): run the Rust integration test suite.
+- `just fmt`: format Rust sources before review.
+- `just bench-dry-run`: validate the Python benchmark matrix without running agents.
+- `just bench-summarize <output-dir>`: summarize benchmark results.
 
-Use Python for the benchmark harness:
-
-- `python -m bench.run_matrix --dry-run`: validate the benchmark matrix without running agents.
-- `python -m bench.summarize_runs <output-dir>`: summarize benchmark results.
-
-Note: in this environment, `cargo test` currently fails with Cargo `1.83.0` because `rmcp-macros` requires `edition2024`; use a newer Rust toolchain before relying on test results.
+Rust toolchain: **MSRV is 1.85** (`rmcp-macros` requires edition2024). Homebrew's stock `cargo` is 1.83 and will fail to build — install via `rustup` (`rustup default stable`) and make sure `~/.cargo/bin` comes before `/opt/homebrew/bin` on `PATH`. The `justfile` prepends `~/.cargo/bin` for you.
 
 ## Coding Style & Naming Conventions
 Follow default Rust formatting via `cargo fmt`; use 4-space indentation and keep functions/modules in `snake_case`, types/traits in `PascalCase`, and constants in `SCREAMING_SNAKE_CASE`. Match the existing test style: concise helper builders plus descriptive test names such as `missing_preferred_timezone_fails_verify`. Python in `bench/` should stay simple and script-like, also using `snake_case`.

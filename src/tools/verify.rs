@@ -16,6 +16,47 @@ pub struct VerifyOptions<'a> {
     pub output_dir: Option<&'a str>,
 }
 
+/// Default execute-stage timeout for synthesized Python fuzz harnesses (seconds).
+/// Overridable via `COURT_JESTER_VERIFY_PYTHON_TIMEOUT_SECONDS`.
+const DEFAULT_PYTHON_EXEC_TIMEOUT: f64 = 10.0;
+
+/// Default execute-stage timeout for synthesized TypeScript fuzz harnesses (seconds).
+/// TypeScript is slower to boot (bun/tsx startup + transpile), so it gets a longer
+/// default. Overridable via `COURT_JESTER_VERIFY_TYPESCRIPT_TIMEOUT_SECONDS`.
+const DEFAULT_TYPESCRIPT_EXEC_TIMEOUT: f64 = 25.0;
+
+/// Default test-stage timeout (seconds). Overridable via
+/// `COURT_JESTER_VERIFY_TEST_TIMEOUT_SECONDS`.
+const DEFAULT_TEST_TIMEOUT: f64 = 30.0;
+
+fn env_timeout(key: &str, default: f64) -> f64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(default)
+}
+
+fn execute_timeout_for(language: &Language) -> f64 {
+    match language {
+        Language::Python => env_timeout(
+            "COURT_JESTER_VERIFY_PYTHON_TIMEOUT_SECONDS",
+            DEFAULT_PYTHON_EXEC_TIMEOUT,
+        ),
+        Language::TypeScript => env_timeout(
+            "COURT_JESTER_VERIFY_TYPESCRIPT_TIMEOUT_SECONDS",
+            DEFAULT_TYPESCRIPT_EXEC_TIMEOUT,
+        ),
+    }
+}
+
+fn test_timeout() -> f64 {
+    env_timeout(
+        "COURT_JESTER_VERIFY_TEST_TIMEOUT_SECONDS",
+        DEFAULT_TEST_TIMEOUT,
+    )
+}
+
 fn test_code_has_imports(code: &str, language: &Language) -> bool {
     code.lines().any(|line| {
         let trimmed = line.trim_start();
@@ -171,10 +212,7 @@ pub async fn verify(
 
         if !synth_code.is_empty() {
             let full_code = format!("{code}\n{synth_code}");
-            let execute_timeout = match language {
-                Language::Python => 10.0,
-                Language::TypeScript => 25.0,
-            };
+            let execute_timeout = execute_timeout_for(language);
 
             let start = Instant::now();
             let exec_result = sandbox::execute(
@@ -237,7 +275,7 @@ pub async fn verify(
         let test_result = sandbox::execute(
             &test_input,
             language,
-            30.0,
+            test_timeout(),
             512,
             opts.project_dir,
             test_file_for_execution,

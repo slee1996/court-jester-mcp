@@ -91,9 +91,19 @@ async fn lint_python(code: &str, tmpdir: &tempfile::TempDir) -> LintResult {
         };
     }
 
-    let output = Command::new("ruff")
+    let path = extended_path();
+    let exe_dir = current_exe_dir();
+    let Some(ruff) = resolve_binary(&path, "ruff", exe_dir.as_deref()) else {
+        return LintResult {
+            diagnostics: vec![],
+            error: Some("ruff not available on PATH or next to court-jester-mcp".to_string()),
+            unavailable: true,
+        };
+    };
+
+    let output = Command::new(&ruff)
         .args(["check", "--output-format=json", file_path.to_str().unwrap()])
-        .env("PATH", extended_path())
+        .env("PATH", &path)
         .stdin(Stdio::null())
         .output()
         .await;
@@ -244,6 +254,30 @@ mod tests {
             Some(sibling_dir.path()),
         )
         .expect("biome should resolve");
+
+        assert_eq!(resolved, sibling.to_string_lossy());
+    }
+
+    #[test]
+    fn resolve_ruff_prefers_sibling_executable() {
+        let sibling_dir = tempfile::tempdir().unwrap();
+        let path_dir = tempfile::tempdir().unwrap();
+        let sibling = sibling_dir.path().join("ruff");
+        let on_path = path_dir.path().join("ruff");
+        fs::write(&sibling, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::write(&on_path, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            make_executable(&sibling);
+            make_executable(&on_path);
+        }
+
+        let resolved = resolve_binary(
+            path_dir.path().to_str().unwrap(),
+            "ruff",
+            Some(sibling_dir.path()),
+        )
+        .expect("ruff should resolve");
 
         assert_eq!(resolved, sibling.to_string_lossy());
     }

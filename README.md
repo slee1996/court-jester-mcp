@@ -1,120 +1,152 @@
 # Court Jester MCP
 
-Court Jester is an experimental MCP server for verifying AI-written code inside an agent loop.
+Court Jester is an experimental MCP server for disproving AI-written code inside an agent loop.
 
-It is built for a narrow job:
+The job is narrow on purpose:
 
 1. an agent writes code
-2. Court Jester tries to disprove that code quickly
-3. the agent gets a concrete repro and another repair attempt
+2. Court Jester tries to disprove it quickly with a synthesized fuzz harness
+3. the agent gets a concrete failing repro and another repair attempt
 
-If you want the shortest possible description of how to use it:
+Court Jester works on **Python** and **TypeScript**. It is not a general CI replacement, and it is not a secure hidden-judge system. See [Status](#status) for an honest read of what it is and is not proven to do.
 
-1. build the `court-jester-mcp` binary
-2. register that binary as a stdio MCP server in your agent/client
-3. have the agent call `verify` on changed files before it declares success
-4. if `verify` fails, feed the failing repro back into the next repair attempt
+## Contents
+- [How it works](#how-it-works)
+- [Install](#install)
+- [Quickstart](#quickstart)
+- [Connect it to your agent](#connect-it-to-your-agent)
+- [Tool reference](#tool-reference)
+- [Verify response shape](#verify-response-shape)
+- [Diff-aware verify](#diff-aware-verify)
+- [Persistent reports](#persistent-reports)
+- [Repair loop](#repair-loop)
+- [Environment variables](#environment-variables)
+- [Troubleshooting](#troubleshooting)
+- [Development commands](#development-commands)
+- [Repo layout](#repo-layout)
+- [Status](#status)
+- [Further reading](#further-reading)
+- [License](#license)
 
-Court Jester is strongest today on Python and TypeScript. It is not a general CI replacement, and it is not a secure hidden-judge system.
+## How it works
 
-## What The Server Exposes
+`verify` is the main entry point. It runs up to five stages in order and returns a single `VerificationReport`:
 
-- `analyze`: tree-sitter-based function, class, import, and complexity extraction
-- `lint`: Python via `ruff`, TypeScript via `biome`
-- `execute`: sandboxed subprocess execution with memory and timeout limits
-- `verify`: parse, lint, synthesize, execute, and optional test execution in one verdict
+| # | Stage        | What it does                                                                          | Fails overall? |
+|---|--------------|---------------------------------------------------------------------------------------|---------------|
+| 1 | `parse`      | Tree-sitter AST: functions, classes, imports, cyclomatic complexity                    | Yes (syntax errors short-circuit the rest of the pipeline) |
+| 2 | `complexity` | Flags any function whose complexity exceeds the caller-supplied threshold              | Yes (only when `complexity_threshold` is set) |
+| 3 | `lint`       | `ruff` for Python, `biome` for TypeScript                                              | No — diagnostics are advisory. A missing runner sets `unavailable: true` and does not fail. Only a *running* linter that crashes fails the stage. |
+| 4 | `execute`    | **Synthesize** argument-level fuzz calls from the extracted signatures and types, then run them in a sandboxed subprocess. This is the step that actually disproves code. | Yes |
+| 5 | `test`       | Optional. Runs a caller-supplied test file as an authoritative stage.                   | Yes |
 
-The MCP server entrypoint is in [main.rs](src/main.rs), and the tool parameter definitions live in [lib.rs](src/lib.rs).
+The **synthesize** step is the differentiator vs. "ruff + biome in a trench coat." Court Jester walks the tree-sitter output for every function in scope, resolves parameter types (including across imports, class fields, and Python type aliases), generates a diverse set of inputs per parameter, and calls the functions under a harness that captures crashes, assertion failures, and time/memory limits. When a call raises, the harness emits a structured failure record with the input that triggered it, and `verify` echoes that record back in `stages[execute].detail.fuzz_failures`.
 
-## Repo Layout
+For a deeper architectural walkthrough see [docs/system-flow.md](docs/system-flow.md) and [docs/tool-flow-diagram.md](docs/tool-flow-diagram.md).
 
-- [src/](src): Rust MCP server and tool implementations
-- [tests/](tests): Rust integration tests
-- [bench/](bench): benchmark harness, fixtures, evaluators, and model/provider adapters
-- [docs/](docs): design notes, benchmark writeups, and release planning
+## Install
 
-## Requirements
+### Prerequisites
 
-- Rust toolchain: use a current stable toolchain
-- Python 3 for the benchmark harness
-- `ruff` if you want Python lint stages to run locally
-- `biome` if you want TypeScript lint stages to run locally, unless you stage a sibling `biome` binary next to `court-jester-mcp`
-- `bun` for the TypeScript benchmark fixtures that use Bun test commands
+- **Rust 1.85+** (MSRV). `rmcp-macros` requires `edition2024`. Homebrew's stock `cargo` is 1.83 and **will fail to build** — install via [rustup](https://rustup.rs/) and make sure `~/.cargo/bin` comes before `/opt/homebrew/bin` on `PATH`. The `justfile` at the repo root does this for you.
+- **Python 3.10+** for the benchmark harness and the `scripts/smoke_mcp.py` smoke client.
+- **[ruff](https://docs.astral.sh/ruff/installation/)** for the Python lint stage: `pip install ruff` or `brew install ruff`. Alternatively, stage a sibling `ruff` next to the binary via `scripts/prepare_release.py`.
+- **[biome](https://biomejs.dev/guides/getting-started/)** for the TypeScript lint stage: `npm i -g @biomejs/biome` or `brew install biome`. Alternatively, stage a sibling `biome` next to the binary via `scripts/prepare_release.py` — see [Release bundle with sibling Ruff and Biome binaries](#release-bundle-with-sibling-ruff-and-biome-binaries).
+- **[bun](https://bun.sh)** for TypeScript fuzz execution and benchmark fixtures that use Bun test commands: `curl -fsSL https://bun.sh/install | bash`.
 
-Toolchain note:
+When `ruff` or `biome` is missing, the `lint` stage sets `unavailable: true` and the pipeline treats lint as advisory (the missing runner does not fail `verify`). Only a *running* linter that crashes is counted as a lint stage failure. Fuzz execution for TypeScript still requires `bun` on `PATH`.
 
-- In this environment, `cargo test` under Cargo `1.83.0` is not reliable because `rmcp-macros` requires `edition2024`.
-- Use a newer stable toolchain before treating test results as authoritative.
-
-## 5-Minute Setup
-
-Court Jester is a stdio MCP server. You normally do not "open" it in a browser or call it over HTTP.
-
-Your MCP client or agent runner starts the process, talks JSON-RPC over stdin/stdout, and exposes the tools to an agent.
-
-If you run `cargo run` manually in a terminal, it will appear to hang. That is expected: it is waiting for an MCP client to connect and send requests.
-
-Build a release binary:
+### Build
 
 ```bash
 cargo build --release
+# binary at ./target/release/court-jester-mcp
 ```
 
-If you want the release artifact to carry its own TypeScript linter, stage a sibling `biome`
-binary next to `court-jester-mcp`:
+Or via `just`:
 
 ```bash
-python scripts/prepare_release.py --release --require-biome
+just build
 ```
 
-That creates `dist/court-jester-release/` with:
+Install the binary somewhere on `PATH`:
+
+```bash
+cargo install --path .
+```
+
+### Release bundle with sibling Ruff and Biome binaries
+
+For deployments where `ruff` or `biome` may not be on the target's `PATH`, you can stage a release
+directory that carries its own Python and TypeScript linters next to the binary:
+
+```bash
+python scripts/prepare_release.py --release --require-ruff --require-biome
+```
+
+That produces `dist/court-jester-release/` with:
 
 - `court-jester-mcp`
+- `ruff`
 - `biome`
 
-At runtime, Court Jester checks for `./biome` next to its own executable before falling back to
-`biome` on `PATH`.
+At runtime the lint stage prefers sibling `./ruff` and `./biome` binaries next to its own
+executable before falling back to `PATH`. Point your MCP host's `command` at the bundled binary.
 
-Smoke-test the MCP handshake and tool discovery:
+## Quickstart
 
-```bash
-python scripts/smoke_mcp.py --release
-```
-
-Expected output:
-
-```text
-Connected to court-jester 0.1.1
-Tools:
-- analyze
-- execute
-- lint
-- verify
-```
-
-Run one real `verify` call against a fixture file:
+The fastest way to try Court Jester without wiring anything up is the new **one-shot CLI**:
 
 ```bash
-python scripts/smoke_mcp.py \
-  --release \
-  --verify-file bench/repos/mini_py_service/profile.py \
-  --language python \
-  --project-dir bench/repos/mini_py_service \
-  --test-file bench/repos/mini_py_service/tests/court_jester_public_verify.py
+./target/release/court-jester-mcp verify \
+    --file bench/repos/mini_py_service/profile.py \
+    --language python \
+    --project-dir bench/repos/mini_py_service
 ```
 
-If that works, your MCP server is usable from an agent.
+Or simply:
 
-## Connect It To Your Agent
+```bash
+just verify-sample
+```
 
-Most MCP clients need the same core fields:
+That prints a full `VerificationReport` as JSON. On the bundled fixture it will deliberately **fail** because the sample code has a latent `IndexError` that the fuzz stage finds.
+
+### Subcommands
+
+| Subcommand | Purpose                                                             |
+|------------|---------------------------------------------------------------------|
+| *(no args)*| Run as a stdio MCP server — default behavior used by agent hosts    |
+| `verify`   | Full pipeline, prints a `VerificationReport` JSON to stdout         |
+| `analyze`  | Tree-sitter analysis of a single file                               |
+| `lint`     | Ruff or Biome against a single file                                 |
+| `execute`  | Run a file in the sandbox with resource limits                      |
+| `--help`   | Usage                                                               |
+| `--version`| `court-jester-mcp <version>`                                        |
+
+Exit code is `0` on pass and `1` on a failing verify/lint/execute result, so the CLI composes cleanly with shells and CI.
+
+### Smoke-test the MCP server
+
+```bash
+just smoke           # handshake + tools/list
+just smoke-sample    # handshake + real verify call against the bundled fixture
+```
+
+Both are thin wrappers around `python scripts/smoke_mcp.py`. The `--verify-sample` flag makes the smoke script hands-off — no paths to remember.
+
+## Connect it to your agent
+
+Court Jester is a stdio MCP server. Your agent host starts the process, talks JSON-RPC over stdin/stdout, and exposes the four tools to the model. Running `cargo run` by hand will appear to hang — that is expected: it is waiting for an MCP client to connect.
+
+Most MCP hosts need the same core fields:
 
 - `command`: path to `target/release/court-jester-mcp`
-- `args`: usually empty when launching the binary directly
-- `cwd`: optional, typically this repo or the repo the agent is working in
-- `env`: optional, only if you need to control tool discovery
+- `args`: usually empty
+- `cwd`: optional, typically the repo the agent is working in
+- `env`: optional, see [Environment variables](#environment-variables)
 
-A minimal shape looks like:
+Minimal shape:
 
 ```json
 {
@@ -124,10 +156,7 @@ A minimal shape looks like:
 }
 ```
 
-If you staged a release bundle with `scripts/prepare_release.py`, point `command` at the bundled
-`court-jester-mcp` inside that directory. The sibling `biome` will be discovered automatically.
-
-For local development, launching through Cargo is also fine:
+For local development, launching through Cargo also works:
 
 ```json
 {
@@ -137,214 +166,320 @@ For local development, launching through Cargo is also fine:
 }
 ```
 
-The exact config file location depends on the MCP host. The important part is that the host starts this process as a stdio server and exposes the four tools to the model.
+Prefer the compiled binary in real agent setups — faster startup, less toolchain variability.
 
-For most agent setups, the built binary is better than `cargo run` because startup is faster and there is less toolchain variability.
+The MCP protocol version used by the smoke client is `2025-06-18`.
 
 ### Codex CLI
 
-Add Court Jester to Codex as a stdio MCP server:
-
 ```bash
 codex mcp add court-jester -- /absolute/path/to/court-jester-mcp
-```
-
-Confirm that Codex sees it:
-
-```bash
 codex mcp list
 codex mcp get court-jester --json
-```
-
-Then start Codex in the repo you want to work on and tell it to use Court Jester as a verify gate:
-
-```bash
 codex -C /absolute/path/to/your/repo
-```
-
-Example prompt:
-
-```text
-Fix the bug. After every patch, call court-jester verify on each changed Python or TypeScript file before you finish. If verify fails, treat the failing repro as authoritative, repair the code, and run verify again.
 ```
 
 ### Claude Code
 
-Add Court Jester to Claude Code as a stdio MCP server:
-
 ```bash
 claude mcp add -s local court-jester -- /absolute/path/to/court-jester-mcp
-```
-
-If you want the server config to live with the repo instead of only in your local Claude settings, use `-s project` instead of `-s local`.
-
-Confirm that Claude Code sees it:
-
-```bash
+# use `-s project` instead of `-s local` to commit the config into your repo
 claude mcp list
 claude mcp get court-jester
-```
-
-Then start Claude Code in the repo you want to work on:
-
-```bash
 cd /absolute/path/to/your/repo
 claude
 ```
 
-Example prompt:
+### Agent prompt
+
+Whatever host you use, the prompt is the same shape:
 
 ```text
-Fix the bug. Use the court-jester verify tool on every file you change before you finish. If verify reports a failing stage or repro, change the code to satisfy that repro and rerun verify.
+Fix the bug. After every patch, call the court-jester `verify` tool on each
+changed Python or TypeScript file before you finish. If `verify` returns
+overall_ok: false, treat the failing stage and repro as authoritative: repair
+the code so the repro no longer fails, and call `verify` again.
 ```
 
-In both Codex and Claude Code, the important behavior is the same:
+## Tool reference
 
-- the agent edits files in the target repo
-- the host exposes the `court-jester` MCP tools to the model
-- the model calls `verify` before it declares success
-- failing repros become the next repair input
+All four tools accept **either** `code` (inline source) **or** `file_path` (absolute path on disk), never both. Prefer `file_path` for anything touching local imports, `node_modules`, or a `.venv`.
 
-## First Useful Call
+### `verify`
 
-Once your agent can see the server, it should see four tools:
+| Parameter              | Type               | Required | Description |
+|------------------------|--------------------|----------|-------------|
+| `file_path`            | string             | one of   | Absolute path to the source file |
+| `code`                 | string             | one of   | Inline source (use for in-memory content not yet on disk) |
+| `language`             | `"python"` / `"typescript"` | yes | Target language |
+| `test_file_path`       | string             | no       | Test file to run as an authoritative stage |
+| `test_code`            | string             | no       | Inline test code; ignored if `test_file_path` is set |
+| `project_dir`          | string             | no       | Root for `.venv` / `node_modules` resolution. Auto-detected from `file_path` if omitted |
+| `diff`                 | string (unified diff) | no    | Only fuzz functions touching changed lines — see [Diff-aware verify](#diff-aware-verify) |
+| `complexity_threshold` | integer            | no       | Fails the run if any function exceeds this cyclomatic complexity |
+| `output_dir`           | string             | no       | Write a timestamped JSON report to this directory — see [Persistent reports](#persistent-reports) |
 
-- `analyze`
-- `lint`
-- `execute`
-- `verify`
+### `analyze`
 
-`verify` is the main entry point for an agent loop.
+| Parameter              | Type               | Required | Description |
+|------------------------|--------------------|----------|-------------|
+| `file_path` / `code`   | string             | one of   | Source to analyze |
+| `language`             | `"python"` / `"typescript"` | yes | Target language |
+| `complexity_threshold` | integer            | no       | Adds `complexity_violations` and `complexity_ok` to the result |
+| `diff`                 | string             | no       | Adds `changed_functions` to the result (functions overlapping changed lines) |
 
-Use `file_path` for normal repo work. Use `code` only when you are verifying in-memory content that has not been written to disk yet.
+### `lint`
 
-Pass `project_dir` when the file relies on local imports, `node_modules`, or `.venv` resolution.
+| Parameter            | Type               | Required | Description |
+|----------------------|--------------------|----------|-------------|
+| `file_path` / `code` | string             | one of   | Source to lint |
+| `language`           | `"python"` / `"typescript"` | yes | Picks `ruff` vs `biome` |
 
-Pass `test_file_path` when you already have a focused regression test or public verify test you want included in the verdict.
+### `execute`
 
-Typical `verify` call for a Python file:
+| Parameter          | Type               | Required | Description |
+|--------------------|--------------------|----------|-------------|
+| `file_path` / `code` | string           | one of   | Source to run |
+| `language`         | `"python"` / `"typescript"` | yes | Target runtime |
+| `timeout_seconds`  | number             | no       | Default `10.0` |
+| `memory_mb`        | integer            | no       | Default `128` |
+| `project_dir`      | string             | no       | Root for `.venv` / `node_modules` resolution. Auto-detected from `file_path` if omitted |
+
+### Pre-tool validation errors
+
+When a tool rejects its input before running (missing file, ambiguous `code` + `file_path`, unsupported language, unreadable source), it returns a uniform JSON string:
+
+```json
+{
+  "error": "Cannot read '/missing.py': No such file or directory (os error 2)",
+  "error_kind": "read_failed"
+}
+```
+
+`error_kind` is one of `read_failed`, `ambiguous_input`, `missing_input`, `unsupported_language`. Stage-level failures inside a successful tool call live on `stages[i].error`, not at the top level.
+
+## Verify response shape
+
+Every successful `verify` call returns a `VerificationReport`:
+
+```jsonc
+{
+  "stages": [
+    {
+      "name": "parse" | "complexity" | "lint" | "execute" | "test",
+      "ok": true,
+      "duration_ms": 12,
+      "detail": { /* stage-specific JSON */ },
+      "error": null
+    }
+  ],
+  "overall_ok": true,
+  "report_path": null  // string when output_dir is set, see Persistent reports
+}
+```
+
+- `overall_ok` is `true` only if every non-advisory stage passed.
+- `stages[].detail` is stage-specific: the `parse` stage embeds the full `AnalysisResult`, `lint` embeds the `LintResult`, `execute` embeds the sandbox `ExecutionResult` plus an optional `fuzz_failures` array, and `test` embeds another `ExecutionResult`.
+- `stages[].error` is populated on failure with human-readable text (stderr for execute/test, a short explanation otherwise).
+
+### Example: passing verify
+
+```console
+$ court-jester-mcp verify --file good_profile.py --language python
+```
+
+```json
+{
+  "stages": [
+    { "name": "parse", "ok": true, "duration_ms": 1, "detail": { "functions": [ /* ... */ ], "parse_error": false } },
+    { "name": "lint",  "ok": true, "duration_ms": 8, "detail": { "diagnostics": [] } },
+    {
+      "name": "execute",
+      "ok": true,
+      "duration_ms": 24,
+      "detail": {
+        "exit_code": 0,
+        "timed_out": false,
+        "memory_error": false,
+        "stdout": "FUZZ normalize_display_name: 30 passed, 0 rejected (of 30)\nAll fuzz tests passed\n",
+        "stderr": ""
+      }
+    }
+  ],
+  "overall_ok": true
+}
+```
+
+### Example: failing verify (fuzz found a crash)
+
+```console
+$ court-jester-mcp verify --file bench/repos/mini_py_service/profile.py --language python \
+    --project-dir bench/repos/mini_py_service
+```
+
+```jsonc
+{
+  "stages": [
+    { "name": "parse", "ok": true, "duration_ms": 1, "detail": { "functions": [/* ... */] } },
+    { "name": "lint",  "ok": true, "duration_ms": 14, "detail": { "diagnostics": [] } },
+    {
+      "name": "execute",
+      "ok": false,
+      "duration_ms": 22,
+      "detail": {
+        "exit_code": 1,
+        "timed_out": false,
+        "memory_error": false,
+        "stdout": "  CRASH normalize_display_name(['\\xa0...']): IndexError: string index out of range\nFUZZ normalize_display_name: 28 passed, 0 rejected, 2 CRASHED (of 30)\n",
+        "stderr": "AssertionError: Fuzz testing failed: 1 function(s) had failures",
+        "fuzz_failures": [
+          {
+            "function": "normalize_display_name",
+            "input": "['\\xa0\\xa0\\xa0\\xa0...']",
+            "error_type": "IndexError",
+            "message": "string index out of range",
+            "severity": "crash"
+          }
+        ]
+      },
+      "error": "AssertionError: Fuzz testing failed: 1 function(s) had failures"
+    }
+  ],
+  "overall_ok": false
+}
+```
+
+**How an agent should read this:** on `overall_ok: false`, find the first stage with `ok: false`. Its `detail.fuzz_failures[]` (for the execute stage) or `error` string is the authoritative repro. The repair attempt's job is to make that specific input stop failing.
+
+## Diff-aware verify
+
+Passing a unified diff string as the `diff` parameter restricts fuzzing to functions that overlap with changed lines. This is the right mode for a repair loop: the agent only changed a few functions, and rerunning the fuzzer on the entire file wastes time and can surface pre-existing failures that the agent did not cause.
 
 ```json
 {
   "name": "verify",
   "arguments": {
-    "file_path": "/absolute/path/to/profile.py",
+    "file_path": "/repo/src/profile.py",
     "language": "python",
-    "project_dir": "/absolute/path/to/repo",
-    "test_file_path": "/absolute/path/to/tests/test_profile.py"
+    "project_dir": "/repo",
+    "diff": "diff --git a/src/profile.py b/src/profile.py\n@@ -12,6 +12,8 @@\n..."
   }
 }
 ```
 
-Typical `verify` call for a TypeScript file:
+From the CLI you pass a diff via a file: `--diff-file changes.patch`.
 
-```json
-{
-  "name": "verify",
-  "arguments": {
-    "file_path": "/absolute/path/to/src/semver.ts",
-    "language": "typescript",
-    "project_dir": "/absolute/path/to/repo",
-    "test_file_path": "/absolute/path/to/tests/semver.test.ts"
-  }
-}
+## Persistent reports
+
+Set `output_dir` (MCP) or `--output-dir` (CLI) to make `verify` write a timestamped JSON report alongside the in-memory response:
+
+```bash
+court-jester-mcp verify --file src/profile.py --language python \
+    --output-dir .court-jester/reports
 ```
 
-If you are building your own agent instead of using an MCP host, [scripts/smoke_mcp.py](scripts/smoke_mcp.py) is the smallest end-to-end example in the repo, and [bench/mcp_client.py](bench/mcp_client.py) is the fuller benchmark-side client.
+Each report file is named `<timestamp>-<basename>.json` and includes a `meta`, `stages`, `overall_ok`, and `summary` block. The written path is echoed back on `VerificationReport.report_path`.
 
-## Use It In A Repair Loop
+## Repair loop
 
 The intended loop is:
 
-1. the agent edits one or more files
-2. the agent calls `verify` on the changed file(s)
-3. if `verify` passes, the agent can continue to broader checks or finish
-4. if `verify` fails, the agent reads the failing stage and repro
-5. the agent makes another repair attempt
-6. the agent calls `verify` again
-
-In pseudocode:
-
 ```text
 edit files
-call verify(changed files)
-if verify passes:
+call verify(changed files, diff)
+if overall_ok:
     continue or finalize
 else:
-    use the failing repro as authoritative feedback
-    repair code
+    take the first failing stage and its repro as authoritative
+    require the next patch to change behavior on that repro
     call verify again
 ```
 
 A concrete pattern that works well in practice:
 
 1. run `verify` immediately after the patch, before the agent writes its final answer
-2. treat the failing stage and repro as authoritative
-3. require the next attempt to change behavior on that repro
+2. treat the first failing stage and its repro as authoritative feedback
+3. require the next attempt to change behavior on that specific repro
 4. stop only after `verify` passes or the repair budget is exhausted
 
-That is also how the benchmark harness uses Court Jester:
+That is also how the benchmark harness uses Court Jester. The fuller benchmark-side client implementation lives in [bench/mcp_client.py](bench/mcp_client.py).
 
-```text
-model writes code -> verify -> repair attempt -> verify -> hidden evaluation
+## Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `COURT_JESTER_MAX_CONCURRENT_EXEC`           | `1`  | Cap on concurrent sandbox subprocesses. Kept at 1 by default so parallel fuzz harnesses don't fight over on-disk artifacts. Increase for agent setups that can tolerate interleaving. |
+| `COURT_JESTER_VERIFY_PYTHON_TIMEOUT_SECONDS`   | `10` | Execute-stage timeout for Python fuzz harnesses. |
+| `COURT_JESTER_VERIFY_TYPESCRIPT_TIMEOUT_SECONDS` | `25` | Execute-stage timeout for TypeScript fuzz harnesses (bun/tsx cold start is slower). |
+| `COURT_JESTER_VERIFY_TEST_TIMEOUT_SECONDS`     | `30` | Timeout for the optional test stage. |
+
+All four are read at invocation time, so you can set them per-agent or per-call via `env` in your MCP host config.
+
+## Troubleshooting
+
+**`parse_error: true` on code that looks valid.** Usually the `language` field is wrong. `.ts` with `language: "python"` or `.py` with `language: "typescript"` will produce a parse error.
+
+**`verify` hangs or the execute stage times out.** Your fuzz targets are slower than the defaults. Raise `COURT_JESTER_VERIFY_PYTHON_TIMEOUT_SECONDS` or `COURT_JESTER_VERIFY_TYPESCRIPT_TIMEOUT_SECONDS`. TypeScript in particular pays a bun/tsx startup cost per call.
+
+**`memory_error: true` in the execute stage.** Your code allocated past the 512 MB sandbox cap. For the standalone `execute` tool, raise `memory_mb`. The verify pipeline's cap is not currently user-tunable.
+
+**`lint` stage reports `unavailable: true`.** `ruff` / `biome` isn't on `PATH` (or alongside the binary). The lint stage treats this as advisory and does not fail `verify`. Install the missing tool (see [Prerequisites](#install)) or stage a sibling via `scripts/prepare_release.py`.
+
+**`cargo build` complains about `edition2024`.** You are building with Homebrew's cargo 1.83. Install rustup and put `~/.cargo/bin` before `/opt/homebrew/bin` on `PATH`, or use `just build` which does that for you.
+
+**The MCP server appears to hang when I run `cargo run`.** That is expected. It is a stdio server and is waiting for JSON-RPC on stdin. Use `just smoke` or `python scripts/smoke_mcp.py --release` to drive it from the outside.
+
+**Agent only verifies some functions after a diff.** That is diff-aware mode doing its job — see [Diff-aware verify](#diff-aware-verify). Clear the `diff` parameter to fuzz every function in the file.
+
+## Development commands
+
+The canonical commands live in the `justfile`:
+
+```bash
+just build            # cargo build --release
+just test             # cargo test
+just fmt              # cargo fmt
+just smoke            # handshake + tools/list
+just smoke-sample     # handshake + real verify call against bundled fixture
+just verify-sample    # one-shot verify via CLI
+just bench-dry-run    # validate the benchmark matrix without running agents
+just bench-summarize <dir>
 ```
 
-The benchmark-side client implementation lives in [bench/mcp_client.py](bench/mcp_client.py).
+Every recipe is a short shell one-liner — you can copy them straight out if you don't have `just` installed.
 
-## Current Status
+More benchmark detail is in [bench/README.md](bench/README.md). Repository conventions (code style, commit/PR guidelines) are in [AGENTS.md](AGENTS.md).
 
-This repo is publishable as an experimental verifier and benchmark harness.
+## Repo layout
 
-It is not yet proven ready for broad end-user release.
+- [src/](src) — Rust MCP server, CLI subcommands, and tool implementations
+- [tests/](tests) — Rust integration tests, one file per tool surface
+- [scripts/](scripts) — `smoke_mcp.py`, the minimal stdio MCP client
+- [bench/](bench) — Python benchmark harness: fixtures, evaluators, runner, model/provider adapters
+- [docs/](docs) — design notes, benchmark writeups, release planning
+- [AGENTS.md](AGENTS.md) — repository guidelines for contributors and agents
+- [justfile](justfile) — canonical build/test/run recipes
 
-The current evidence supports:
+## Status
+
+Court Jester is **experimental / research-driven / private-beta-prep**. It is not a production-ready verifier, a broadly proven tool for all users, or a complete CI replacement.
+
+What the current evidence supports:
 
 - a working MCP verifier with `analyze`, `lint`, `execute`, and `verify`
 - a benchmark harness for `baseline`, `required-final`, and `repair-loop` comparisons
 - a small known-good control corpus that currently passes after a TypeScript alias-resolution fix
 - benchmark evidence that Court Jester can improve outcomes for weaker models on the established suite
 
-The current evidence does not yet support:
+What the current evidence does **not** yet support:
 
 - a broad claim that Court Jester improves frontier-model outcomes in general
 - a claim that false positives are already well-characterized across a large known-good corpus
 - a production-readiness claim for arbitrary repos or agent workflows
 
-The release bar and current read are documented in [release-readiness-private-beta.md](docs/release-readiness-private-beta.md).
+The release bar and honest read are documented in [docs/release-readiness-private-beta.md](docs/release-readiness-private-beta.md).
 
-## Sanity Check
-
-If you want to confirm the binary starts successfully before wiring it into an agent, run:
-
-```bash
-cargo run
-```
-
-You should not expect human-readable output. A successful startup means the process stays running and waits for MCP traffic over stdio.
-
-## Development Commands
-
-Run the Rust test suite with a current stable toolchain:
-
-```bash
-rustup run stable cargo test
-```
-
-Validate the benchmark matrix:
-
-```bash
-python -m bench.run_matrix --dry-run
-```
-
-Summarize benchmark output:
-
-```bash
-python -m bench.summarize_runs <output-dir>
-```
-
-More benchmark detail is in [bench/README.md](bench/README.md).
-
-## Benchmark Positioning
+### Benchmark positioning
 
 The benchmark harness exists to answer a product question, not just a unit-test question:
 
@@ -353,37 +488,19 @@ The benchmark harness exists to answer a product question, not just a unit-test 
 That means the important comparisons in this repo are:
 
 - `baseline` vs `repair-loop`
-- hidden-eval success, not only verify failures
+- hidden-eval success, not just verify failure counts
 - known-good false-positive control under `required-final`
 
-Recent benchmark and design docs:
+## Further reading
 
-- [docs/README.md](docs/README.md)
-- [court-jester-overview.md](docs/court-jester-overview.md)
-- [benchmark-2026-03-26.md](docs/benchmark-2026-03-26.md)
-- [release-readiness-private-beta.md](docs/release-readiness-private-beta.md)
+- [docs/README.md](docs/README.md) — docs index
+- [docs/court-jester-overview.md](docs/court-jester-overview.md) — why Court Jester exists and what the benchmark is meant to answer
+- [docs/system-flow.md](docs/system-flow.md) — detailed architecture and runner flow
+- [docs/tool-flow-diagram.md](docs/tool-flow-diagram.md) — compact flow diagram companion
+- [docs/benchmark-2026-03-26.md](docs/benchmark-2026-03-26.md) — strongest current benchmark summary
+- [docs/big-benchmark-runbook.md](docs/big-benchmark-runbook.md) — commands and pass/fail criteria for the large release-evidence run
+- [docs/release-readiness-private-beta.md](docs/release-readiness-private-beta.md) — release bar and current read
 
-## Model Providers In The Harness
+## License
 
-The benchmark harness currently supports:
-
-- local `codex exec`
-- local `claude -p`
-- deterministic replay and noop providers
-- OpenAI-compatible chat endpoints via `openai_compat_chat`
-
-The repo already includes Actual-backed manifests in [actual-api-qwen3-14b.json](bench/models/actual-api-qwen3-14b.json) and [actual-api-qwen3-vl-30b.json](bench/models/actual-api-qwen3-vl-30b.json).
-
-## Publishing Guidance
-
-If you publish this repo now, the honest framing is:
-
-- experimental
-- research / benchmark-driven
-- private-beta-prep
-
-The dishonest framing would be:
-
-- production-ready verifier
-- broadly proven for all users
-- complete CI replacement
+Not yet set. Do not redistribute without permission from the author.

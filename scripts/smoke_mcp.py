@@ -15,6 +15,17 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# Bundled fixture used by --verify-sample. Kept in one place so
+# `scripts/smoke_mcp.py --verify-sample` stays a hands-off end-to-end check
+# that doesn't require the caller to remember any paths.
+SAMPLE_FIXTURE = {
+    "verify_file": REPO_ROOT / "bench/repos/mini_py_service/profile.py",
+    "language": "python",
+    "project_dir": REPO_ROOT / "bench/repos/mini_py_service",
+    "test_file": REPO_ROOT
+    / "bench/repos/mini_py_service/tests/court_jester_public_verify.py",
+}
+
 
 class McpSmokeClient:
     def __init__(self, command: list[str]) -> None:
@@ -192,7 +203,21 @@ def main() -> int:
         "--test-file",
         help="Optional explicit test file to include in the verify call.",
     )
+    parser.add_argument(
+        "--verify-sample",
+        action="store_true",
+        help=(
+            "Run a full verify call against the bundled mini_py_service fixture. "
+            "Overrides --verify-file/--language/--project-dir/--test-file."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.verify_sample:
+        args.verify_file = str(SAMPLE_FIXTURE["verify_file"])
+        args.language = SAMPLE_FIXTURE["language"]
+        args.project_dir = str(SAMPLE_FIXTURE["project_dir"])
+        args.test_file = str(SAMPLE_FIXTURE["test_file"])
 
     try:
         command = resolve_command(args)
