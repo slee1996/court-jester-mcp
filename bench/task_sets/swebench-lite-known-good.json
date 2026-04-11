@@ -1,0 +1,8 @@
+{
+  "id": "swebench-lite-known-good",
+  "title": "SWE-bench-lite known-good control",
+  "goal": "Replay task-level gold patches for SWE-bench-lite pilot tasks and verify they are not blocked.",
+  "task_ids": [
+    "py-swebench-lite-cookiejar-quoted"
+  ]
+}

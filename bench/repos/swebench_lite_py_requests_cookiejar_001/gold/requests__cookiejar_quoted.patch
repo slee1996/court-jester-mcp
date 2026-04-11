@@ -1,0 +1,42 @@
+diff --git a/mini_requests/_quote.py b/mini_requests/_quote.py
+--- a/mini_requests/_quote.py
++++ b/mini_requests/_quote.py
+@@ -9,5 +9,9 @@ def needs_cookie_quote(value: str) -> bool:
+ def format_cookie_value(value: str) -> str:
+     normalized = value.strip()
+     if is_quoted(normalized):
+-        return normalized[1:-1]
++        return normalized
+     return normalized
++
++
++def quote_cookie_value(value: str) -> str:
++    return f'"{value}"'
+diff --git a/mini_requests/cookies.py b/mini_requests/cookies.py
+--- a/mini_requests/cookies.py
++++ b/mini_requests/cookies.py
+@@ -1,16 +1,20 @@
+ from collections.abc import Mapping
+ 
+-from ._quote import format_cookie_value, needs_cookie_quote
++from ._quote import format_cookie_value, is_quoted, needs_cookie_quote, quote_cookie_value
+ 
+ 
+-def build_cookie_header(cookies: Mapping[str, str | None]) -> str:
++def build_cookie_header(cookies: Mapping[str, str | None] | None) -> str:
++    if not cookies:
++        return ""
+     parts: list[str] = []
+     for name, value in cookies.items():
+         if value is None:
+             continue
+         rendered = format_cookie_value(value)
+-        if needs_cookie_quote(rendered):
+-            parts.append(f"{name}={rendered}")
++        if is_quoted(rendered):
++            parts.append(f"{name}={rendered}")
++        elif needs_cookie_quote(rendered):
++            parts.append(f"{name}={quote_cookie_value(rendered)}")
+         else:
+             parts.append(f"{name}={rendered}")
+     return "; ".join(parts)

@@ -100,9 +100,19 @@ Current implementation status:
   - `upstream_instance_id`
   - `instance_notes`
   - `python -m bench.run_matrix --use-task-gold-patches`
+  - first checked-in pilot task:
+    - `py-swebench-lite-cookiejar-quoted`
+    - task set: `swebench-lite-pilot`
+    - known-good control set: `swebench-lite-known-good`
 - still future work:
-  - first real checked-in SWE-bench-lite task set
   - broader summarizer slices for setup-specific failures
+
+Current pilot validation:
+
+- `python -m bench.run_matrix --tasks py-swebench-lite-cookiejar-quoted --models noop --policies baseline --output-dir /tmp/court-jester-swebench-lite-baseline-smoke-v3`
+  - result: `0/1` success, failing as intended on the visible upstream-style cookie-header regression
+- `python -m bench.run_matrix --task-set swebench-lite-known-good --models noop --policies required-final --use-task-gold-patches --output-dir /tmp/court-jester-swebench-lite-known-good-smoke-v5`
+  - result: `1/1` success, with public checks, hidden checks, and `verify` all passing on the task gold patch
 
 ### Current fields we can keep
 

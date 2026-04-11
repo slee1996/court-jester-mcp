@@ -181,21 +181,102 @@ class WorkspacePreparationTest(unittest.TestCase):
                 self.assertFalse(first.cache_hit)
                 self.assertTrue((workspace1 / "prepared.txt").exists())
 
-                cached_task = TaskManifest(
-                    id="setup-cache-task",
-                    title="",
-                    repo_fixture="unused",
-                    prompt="",
-                    language="python",
-                    bucket="test",
-                    verify_paths=["base.txt"],
-                    setup_commands=[["python", "-c", "import sys; sys.exit(17)"]],
-                    setup_cache_key="setup-cache-key",
-                )
-                second = prepare_workspace_for_run(cached_task, workspace2, run_dir2)
+                second = prepare_workspace_for_run(task, workspace2, run_dir2)
                 self.assertTrue(second.success)
                 self.assertTrue(second.cache_hit)
                 self.assertTrue((workspace2 / "prepared.txt").exists())
+
+    def test_prepare_workspace_invalidates_cache_when_fixture_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            workspace1 = tmp_path / "workspace1"
+            workspace2 = tmp_path / "workspace2"
+            run_dir1 = tmp_path / "run1"
+            run_dir2 = tmp_path / "run2"
+            cache_root = tmp_path / "cache"
+            for path in (workspace1, workspace2, run_dir1, run_dir2):
+                path.mkdir(parents=True, exist_ok=True)
+            (workspace1 / "base.txt").write_text("base\n")
+            (workspace2 / "base.txt").write_text("changed\n")
+
+            task = TaskManifest(
+                id="setup-cache-task",
+                title="",
+                repo_fixture="unused",
+                prompt="",
+                language="python",
+                bucket="test",
+                verify_paths=["base.txt"],
+                setup_commands=[
+                    [
+                        "python",
+                        "-c",
+                        (
+                            "from pathlib import Path; "
+                            "Path('prepared.txt').write_text(Path('base.txt').read_text())"
+                        ),
+                    ]
+                ],
+                setup_cache_key="setup-cache-key",
+            )
+
+            with mock.patch.dict(os.environ, {"CJ_SETUP_CACHE_ROOT": str(cache_root)}, clear=False):
+                first = prepare_workspace_for_run(task, workspace1, run_dir1)
+                self.assertTrue(first.success)
+                self.assertFalse(first.cache_hit)
+                self.assertEqual((workspace1 / "prepared.txt").read_text(), "base\n")
+
+                second = prepare_workspace_for_run(task, workspace2, run_dir2)
+                self.assertTrue(second.success)
+                self.assertFalse(second.cache_hit)
+                self.assertEqual((workspace2 / "prepared.txt").read_text(), "changed\n")
+
+    def test_prepare_workspace_invalidates_cache_when_setup_commands_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            workspace1 = tmp_path / "workspace1"
+            workspace2 = tmp_path / "workspace2"
+            run_dir1 = tmp_path / "run1"
+            run_dir2 = tmp_path / "run2"
+            cache_root = tmp_path / "cache"
+            for path in (workspace1, workspace2, run_dir1, run_dir2):
+                path.mkdir(parents=True, exist_ok=True)
+            (workspace1 / "base.txt").write_text("base\n")
+            (workspace2 / "base.txt").write_text("base\n")
+
+            first_task = TaskManifest(
+                id="setup-cache-task",
+                title="",
+                repo_fixture="unused",
+                prompt="",
+                language="python",
+                bucket="test",
+                verify_paths=["base.txt"],
+                setup_commands=[["python", "-c", "from pathlib import Path; Path('prepared.txt').write_text('one\\n')"]],
+                setup_cache_key="setup-cache-key",
+            )
+            second_task = TaskManifest(
+                id="setup-cache-task",
+                title="",
+                repo_fixture="unused",
+                prompt="",
+                language="python",
+                bucket="test",
+                verify_paths=["base.txt"],
+                setup_commands=[["python", "-c", "from pathlib import Path; Path('prepared.txt').write_text('two\\n')"]],
+                setup_cache_key="setup-cache-key",
+            )
+
+            with mock.patch.dict(os.environ, {"CJ_SETUP_CACHE_ROOT": str(cache_root)}, clear=False):
+                first = prepare_workspace_for_run(first_task, workspace1, run_dir1)
+                self.assertTrue(first.success)
+                self.assertFalse(first.cache_hit)
+                self.assertEqual((workspace1 / "prepared.txt").read_text(), "one\n")
+
+                second = prepare_workspace_for_run(second_task, workspace2, run_dir2)
+                self.assertTrue(second.success)
+                self.assertFalse(second.cache_hit)
+                self.assertEqual((workspace2 / "prepared.txt").read_text(), "two\n")
 
 
 class GoldPatchReplayTest(unittest.TestCase):

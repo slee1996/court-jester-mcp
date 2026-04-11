@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import difflib
+import errno
 import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -708,10 +710,50 @@ def setup_cache_dir(cache_key: str) -> Path:
     return setup_cache_root() / f"{slug}-{digest}"
 
 
+def snapshot_digest(snapshot: dict[str, str]) -> str:
+    hasher = hashlib.sha256()
+    for rel_path, content in sorted(snapshot.items()):
+        hasher.update(rel_path.encode("utf-8"))
+        hasher.update(b"\0")
+        hasher.update(content.encode("utf-8"))
+        hasher.update(b"\0")
+    return hasher.hexdigest()
+
+
+def effective_setup_cache_dir(task: TaskManifest, workspace: Path) -> Path | None:
+    if not (task.setup_cache_key and task.setup_commands):
+        return None
+    fixture_digest = snapshot_digest(snapshot_tree(workspace))
+    commands_digest = hashlib.sha256(
+        json.dumps(task.setup_commands, separators=(",", ":"), sort_keys=False).encode("utf-8")
+    ).hexdigest()
+    return setup_cache_dir(f"{task.setup_cache_key}:{commands_digest}:{fixture_digest}")
+
+
+def replace_directory_tree(src: Path, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    temp_root = Path(tempfile.mkdtemp(prefix=f".{dest.name}.tmp-", dir=dest.parent))
+    staged = temp_root / dest.name
+    try:
+        shutil.copytree(src, staged)
+        if dest.exists():
+            shutil.rmtree(dest)
+        try:
+            os.replace(staged, dest)
+        except OSError as exc:
+            # Another runner may have published the same cache between our delete
+            # check and rename. If the final cache directory exists, keep it.
+            if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY} or not dest.exists():
+                raise
+    finally:
+        if temp_root.exists():
+            shutil.rmtree(temp_root, ignore_errors=True)
+
+
 def prepare_workspace_for_run(task: TaskManifest, workspace: Path, run_dir: Path) -> WorkspaceSetupResult:
     start = time.time()
     commands = task.setup_commands
-    cache_dir = setup_cache_dir(task.setup_cache_key) if task.setup_cache_key and commands else None
+    cache_dir = effective_setup_cache_dir(task, workspace)
     if cache_dir is not None and cache_dir.exists():
         if workspace.exists():
             shutil.rmtree(workspace)
@@ -734,10 +776,7 @@ def prepare_workspace_for_run(task: TaskManifest, workspace: Path, run_dir: Path
     results = run_commands(commands, workspace, run_dir, "setup")
     success = all(item.exit_code == 0 for item in results)
     if success and cache_dir is not None:
-        cache_dir.parent.mkdir(parents=True, exist_ok=True)
-        if cache_dir.exists():
-            shutil.rmtree(cache_dir)
-        shutil.copytree(workspace, cache_dir)
+        replace_directory_tree(workspace, cache_dir)
     failure_reason = None
     if not success:
         for item in results:

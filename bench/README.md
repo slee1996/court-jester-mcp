@@ -201,5 +201,6 @@ python -m bench.summarize_runs bench/results/dev
 
 ## What To Add Next
 
-1. Add the first real `swebench-lite-pilot` task set on top of the new setup-cache and gold-patch replay plumbing.
+1. Expand `swebench-lite-pilot` beyond the first Python cookie-header instance.
 2. Add broader known-good coverage beyond the current small corpus.
+3. Add summarizer cuts for `setup_error` and `gold_patch_apply_error`.

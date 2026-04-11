@@ -1,0 +1,72 @@
+{
+  "id": "py-swebench-lite-cookiejar-quoted",
+  "title": "Requests-style cookie header preserves quoted values",
+  "repo_fixture": "swebench_lite_py_requests_cookiejar_001",
+  "prompt": "Fix cookie-header rendering so already-quoted cookie values round-trip correctly, values containing cookie separators like semicolons or commas are quoted, None values are skipped, and cookie order is preserved.",
+  "language": "python",
+  "bucket": "swebench_lite",
+  "verify_paths": [
+    "mini_requests/cookies.py",
+    "mini_requests/_quote.py"
+  ],
+  "setup_commands": [
+    [
+      "python",
+      "-m",
+      "compileall",
+      "mini_requests",
+      "tests"
+    ]
+  ],
+  "setup_cache_key": "swebench-lite-cookiejar-quoted-v1",
+  "verify_test_path": "tests/court_jester_public_verify.py",
+  "public_check_commands": [
+    [
+      "python",
+      "-m",
+      "unittest",
+      "tests.test_cookiejar_visible"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "-m",
+    "unittest",
+    "tests.test_cookiejar_hidden"
+  ],
+  "gold_patch_path": "gold/requests__cookiejar_quoted.patch",
+  "gold_changed_files": [
+    "mini_requests/_quote.py",
+    "mini_requests/cookies.py"
+  ],
+  "expected_files": [
+    "mini_requests/_quote.py",
+    "mini_requests/cookies.py"
+  ],
+  "family": "swebench_lite",
+  "bug_class": "contract_drift",
+  "bug_surface": "cross_file",
+  "difficulty": "medium",
+  "golden_patch_description": "Preserve already-quoted cookie values and quote separator-bearing values while preserving order and skipping None values.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": true,
+  "cross_file": true,
+  "upstream_benchmark": "swebench-lite-pilot",
+  "upstream_instance_id": "requests-cookiejar-quoted-001",
+  "instance_notes": "First repo-shaped Python pilot task using workspace setup caching and task-level gold patch replay.",
+  "tags": [
+    "python",
+    "swebench_lite",
+    "requests_style",
+    "cookies",
+    "cross_file",
+    "setup_cache",
+    "gold_patch"
+  ]
+}
