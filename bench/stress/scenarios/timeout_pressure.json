@@ -1,7 +1,7 @@
 {
   "id": "timeout_pressure",
   "title": "Timeout pressure workload",
-  "mode": "per_agent_server",
+  "mode": "per_worker_cli",
   "concurrency": 2,
   "requests_per_worker": 6,
   "request_timeout_seconds": 120.0,

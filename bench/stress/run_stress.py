@@ -10,8 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..cli_client import CourtJesterClient
 from ..common import BENCH_ROOT
-from ..mcp_client import CourtJesterClient
 
 
 @dataclass(slots=True)
@@ -124,10 +124,10 @@ def worker_run(
     results: list[StressRequestResult],
     lock: threading.Lock,
 ) -> None:
-    mode = scenario.get("mode", "per_agent_server")
-    if mode != "per_agent_server":
+    mode = scenario.get("mode", "per_worker_cli")
+    if mode != "per_worker_cli":
         raise RuntimeError(
-            f"Scenario mode '{mode}' is not implemented yet. Use 'per_agent_server' for now."
+            f"Scenario mode '{mode}' is not implemented yet. Use 'per_worker_cli' for now."
         )
 
     payloads = scenario["payloads"]

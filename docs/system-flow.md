@@ -12,7 +12,7 @@ Describe the full Court Jester system as it exists today:
 - hidden evaluator path
 - future external-judge direction
 
-See also: [tool-flow-diagram.md](./tool-flow-diagram.md) for a single Mermaid view of the MCP tools and benchmark loop.
+See also: [tool-flow-diagram.md](./tool-flow-diagram.md) for a single Mermaid view of the CLI commands and benchmark loop.
 
 ## High-Level Flow
 
@@ -35,7 +35,7 @@ Patch candidate in temp workspace
     |
     v
 Court Jester verify
-bench/mcp_client.py -> src/lib.rs
+bench/cli_client.py -> src/main.rs
     |
     +-------------------------------+
     |                               |
@@ -132,11 +132,11 @@ The benchmark does not assume providers are stable. Provider errors are explicit
 
 ## Court Jester Verify Flow
 
-The benchmark talks to the Rust MCP server through `bench/mcp_client.py`.
+The benchmark shells out to the Rust CLI through `bench/cli_client.py`.
 
-The `verify` tool entrypoint is exposed from:
+The `verify` command entrypoint is exposed from:
 
-- `src/lib.rs`
+- `src/main.rs`
 - `src/tools/verify.rs`
 
 For each verified file, Court Jester runs a staged pipeline:

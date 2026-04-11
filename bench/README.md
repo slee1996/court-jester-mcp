@@ -6,7 +6,7 @@ This benchmark scaffold measures whether `court-jester` improves agentic coding 
 - model tiers
 - tool-gating policies
 
-The harness is intentionally separate from the Rust server. `court-jester` stays focused on verification, while the benchmark layer orchestrates:
+The harness is intentionally separate from the Rust CLI. `court-jester` stays focused on verification, while the benchmark layer orchestrates:
 
 - task fixtures
 - model/provider adapters
@@ -18,6 +18,7 @@ The harness is intentionally separate from the Rust server. `court-jester` stays
 
 Benchmark writeups:
 
+- `docs/benchmark-2026-04-10.md`
 - `docs/benchmark-2026-03-26.md`
 - `docs/archive/benchmark-2026-03-18.md`
 - `docs/archive/benchmark-and-fuzzing-2026-03-20.md`
@@ -27,6 +28,15 @@ Benchmark writeups:
 Release-positioning and current release bar:
 
 - `docs/release-readiness-private-beta.md`
+
+Current headline run:
+
+- `core-current` task set
+- `39` tasks
+- models: `codex-default`, `claude-default`
+- policies: `baseline`, `repair-loop-verify-only`
+- result: `71 / 78` baseline -> `76 / 78` verify-only repair loop
+- repair triggers: verify-only, with `0` public-trigger and `0` hidden-trigger repairs
 
 ## Layout
 
@@ -53,6 +63,8 @@ Task manifest:
   "language": "python",
   "bucket": "semantic_bug",
   "verify_paths": ["profile.py"],
+  "setup_commands": [],
+  "setup_cache_key": null,
   "verify_test_path": "tests/court_jester_public_verify.py",
   "public_check_commands": [["python", "tests/public_checks.py"]],
   "hidden_check_command": [
@@ -60,10 +72,25 @@ Task manifest:
     "{bench_root}/evaluators/profile_hidden.py",
     "{workspace}"
   ],
+  "gold_patch_path": null,
+  "gold_changed_files": [],
   "expected_files": ["profile.py"],
+  "upstream_benchmark": null,
+  "upstream_instance_id": null,
+  "instance_notes": null,
   "tags": ["null_handling", "hidden_edge_case"]
 }
 ```
+
+Additional task fields now supported for external-repo style benchmarks:
+
+- `setup_commands`: prepare the copied fixture before provider or judge steps
+- `setup_cache_key`: reuse prepared workspaces across repeats
+- `gold_patch_path`: task-local patch file for known-good replay mode
+- `gold_changed_files`: optional changed-file hint for gold patch mode
+- `upstream_benchmark`, `upstream_instance_id`, `instance_notes`: provenance metadata
+
+`setup_cache_key` caches the prepared workspace tree, so setup commands should materialize anything important inside the copied workspace itself. Do not rely on mutable global virtualenv or system state if you want cache hits to be meaningful.
 
 Policy manifest:
 
@@ -78,6 +105,12 @@ Policy manifest:
   "max_repair_rounds": 0
 }
 ```
+
+Additional policy fields now supported:
+
+- `verify_only_repair`: allow repair only after a failed Court Jester verify
+- `promote_verify_repros`: materialize verify repros into a temporary test file when the task supports it
+- `replay_attempt_history`: include earlier attempt summaries in the next provider prompt
 
 Model manifest:
 
@@ -107,7 +140,7 @@ Present in manifests but not implemented in `provider_from_manifest` yet:
 
 - `openai_responses`
 
-The harness can now validate policy flow, result logging, `court-jester` MCP integration, hidden/public evaluator wiring, local agent CLI execution, and OpenAI-compatible HTTP adapters such as Actual.
+The harness can now validate policy flow, result logging, `court-jester` CLI integration, hidden/public evaluator wiring, local agent CLI execution, and OpenAI-compatible HTTP adapters such as Actual.
 
 ## Local Smoke Test
 
@@ -116,6 +149,19 @@ Dry-run the matrix:
 ```bash
 python -m bench.run_matrix --dry-run
 ```
+
+Replay task-level gold patches instead of asking a provider to edit the workspace:
+
+```bash
+python -m bench.run_matrix \
+  --task-set known-good-corpus \
+  --models noop \
+  --policies required-final \
+  --use-task-gold-patches \
+  --output-dir bench/results/dev
+```
+
+This is intended for known-good control runs on upstream-derived tasks. The runner will apply `gold_patch_path`, then run `verify`, public checks, and hidden checks normally.
 
 Run the sample task with the local replay model:
 
@@ -137,6 +183,16 @@ python -m bench.run_matrix \
   --output-dir bench/results/dev
 ```
 
+Run the current strict utility benchmark:
+
+```bash
+python -m bench.run_matrix \
+  --task-set core-current \
+  --models codex-default,claude-default \
+  --policies baseline,repair-loop-verify-only \
+  --output-dir /tmp/court-jester-core-cli-verify-only-rerun
+```
+
 Summarize results:
 
 ```bash
@@ -145,7 +201,5 @@ python -m bench.summarize_runs bench/results/dev
 
 ## What To Add Next
 
-1. Expand the task suite from 9 to 20-50 tasks.
-2. Add slower TypeScript fixture repos to keep pressure on execute-stage stability.
-3. Track transcript-level deltas: when `court-jester` changed the patch, and whether that improved hidden-check pass rate.
-4. Add named Codex/Claude manifests for more model-tier comparisons beyond the current defaults.
+1. Add the first real `swebench-lite-pilot` task set on top of the new setup-cache and gold-patch replay plumbing.
+2. Add broader known-good coverage beyond the current small corpus.

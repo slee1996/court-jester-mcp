@@ -2,31 +2,30 @@ use std::env;
 use std::process::ExitCode;
 
 use court_jester_mcp::types::Language;
-use court_jester_mcp::{detect_project_dir, tools, CourtJester};
-use rmcp::ServiceExt;
+use court_jester_mcp::{detect_project_dir, parse_language, tools};
 
 const USAGE: &str = "\
-court-jester-mcp — code verification gate for Python and TypeScript
+court-jester — code verification CLI for Python and TypeScript
 
 USAGE:
-  court-jester-mcp                      Run as a stdio MCP server (default)
-  court-jester-mcp verify   [OPTIONS]   One-shot verify, prints JSON report to stdout
-  court-jester-mcp analyze  [OPTIONS]   One-shot tree-sitter analysis
-  court-jester-mcp lint     [OPTIONS]   One-shot lint (ruff or biome)
-  court-jester-mcp execute  [OPTIONS]   One-shot sandboxed execution
-  court-jester-mcp --help                Print this help
-  court-jester-mcp --version             Print server version
+  court-jester verify   [OPTIONS]   Verify a file and print a JSON report
+  court-jester analyze  [OPTIONS]   Run tree-sitter analysis
+  court-jester lint     [OPTIONS]   Run Ruff or Biome
+  court-jester execute  [OPTIONS]   Run code in the sandbox
+  court-jester --help               Print this help
+  court-jester --version            Print the version
 
 COMMON OPTIONS:
   --file <PATH>              Source file (required for all subcommands)
   --language <LANG>          python | typescript (required)
   --project-dir <PATH>       venv / node_modules root (auto-detected if omitted)
   --config-path <PATH>       Explicit Ruff/Biome config path for lint + verify
+  --virtual-file-path <PATH> Virtual lint path for temp or generated source files
 
 VERIFY OPTIONS:
   --test-file <PATH>         Test file to include as an authoritative stage
   --output-dir <PATH>        Directory to write persistent JSON reports
-  --diff-file <PATH>         Unified-diff file — only fuzz functions touching changed lines
+  --diff-file <PATH>         Unified-diff file — only inspect changed functions
   --complexity-threshold <N> Fail if any function exceeds this complexity
 
 EXECUTE OPTIONS:
@@ -34,15 +33,15 @@ EXECUTE OPTIONS:
   --memory-mb <N>            Sandbox memory cap MB (default 128)
 
 ENVIRONMENT:
-  COURT_JESTER_MAX_CONCURRENT_EXEC             Cap on concurrent subprocesses (default 1)
-  COURT_JESTER_VERIFY_PYTHON_TIMEOUT_SECONDS   Python fuzz-exec timeout (default 10)
+  COURT_JESTER_VERIFY_PYTHON_TIMEOUT_SECONDS      Python fuzz-exec timeout (default 10)
   COURT_JESTER_VERIFY_TYPESCRIPT_TIMEOUT_SECONDS  TS fuzz-exec timeout (default 25)
-  COURT_JESTER_VERIFY_TEST_TIMEOUT_SECONDS     Test stage timeout (default 30)
+  COURT_JESTER_VERIFY_TEST_TIMEOUT_SECONDS        Test stage timeout (default 30)
 
 EXAMPLES:
-  court-jester-mcp verify --file src/profile.py --language python
-  court-jester-mcp verify --file src/semver.ts --language typescript \\
+  court-jester verify --file src/profile.py --language python
+  court-jester verify --file src/semver.ts --language typescript \\
       --test-file tests/semver.test.ts --output-dir .court-jester/reports
+  court-jester lint --file src/parser.py --language python --config-path pyproject.toml
 ";
 
 #[tokio::main]
@@ -50,7 +49,8 @@ async fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
 
     if args.is_empty() {
-        return run_stdio_server().await;
+        eprint!("{}", USAGE);
+        return ExitCode::from(2);
     }
 
     match args[0].as_str() {
@@ -59,7 +59,7 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         "-V" | "--version" => {
-            println!("court-jester-mcp {}", env!("CARGO_PKG_VERSION"));
+            println!("court-jester {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
         "verify" | "analyze" | "lint" | "execute" => {
@@ -79,30 +79,13 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run_stdio_server() -> ExitCode {
-    let server = CourtJester::new();
-    let (stdin, stdout) = rmcp::transport::stdio();
-    match server.serve((stdin, stdout)).await {
-        Ok(running) => {
-            if let Err(e) = running.waiting().await {
-                eprintln!("court-jester-mcp: server loop ended with error: {}", e);
-                return ExitCode::from(1);
-            }
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("court-jester-mcp: failed to start MCP server: {}", e);
-            ExitCode::from(1)
-        }
-    }
-}
-
 #[derive(Default)]
 struct CliArgs {
     file: Option<String>,
     language: Option<String>,
     project_dir: Option<String>,
     config_path: Option<String>,
+    virtual_file_path: Option<String>,
     test_file: Option<String>,
     output_dir: Option<String>,
     diff_file: Option<String>,
@@ -128,6 +111,7 @@ fn parse_flags(rest: &[String]) -> Result<CliArgs, String> {
             "--language" => out.language = Some(take_value(&mut i)?),
             "--project-dir" => out.project_dir = Some(take_value(&mut i)?),
             "--config-path" => out.config_path = Some(take_value(&mut i)?),
+            "--virtual-file-path" => out.virtual_file_path = Some(take_value(&mut i)?),
             "--test-file" => out.test_file = Some(take_value(&mut i)?),
             "--output-dir" => out.output_dir = Some(take_value(&mut i)?),
             "--diff-file" => out.diff_file = Some(take_value(&mut i)?),
@@ -175,16 +159,23 @@ fn require_language(args: &CliArgs) -> Result<Language, String> {
         .language
         .as_deref()
         .ok_or_else(|| "--language is required".to_string())?;
-    Language::parse(raw).ok_or_else(|| {
-        format!(
-            "unsupported language '{}'. Use 'python' or 'typescript'.",
-            raw
-        )
+    parse_language(raw).map_err(|json_error| {
+        serde_json::from_str::<serde_json::Value>(&json_error)
+            .ok()
+            .and_then(|value| value["error"].as_str().map(ToOwned::to_owned))
+            .unwrap_or(json_error)
     })
 }
 
 fn read_file(path: &str) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|e| format!("cannot read '{}': {}", path, e))
+}
+
+fn read_optional_file(path: Option<&str>) -> Result<Option<String>, String> {
+    match path {
+        Some(path) => Ok(Some(read_file(path)?)),
+        None => Ok(None),
+    }
 }
 
 async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
@@ -199,21 +190,15 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
 
     match cmd {
         "verify" => {
-            let test_code = match args.test_file.as_deref() {
-                Some(path) => Some(read_file(path)?),
-                None => None,
-            };
-            let diff = match args.diff_file.as_deref() {
-                Some(path) => Some(read_file(path)?),
-                None => None,
-            };
+            let test_code = read_optional_file(args.test_file.as_deref())?;
+            let diff = read_optional_file(args.diff_file.as_deref())?;
             let opts = tools::verify::VerifyOptions {
                 test_code: test_code.as_deref(),
                 test_source_file: args.test_file.as_deref(),
                 complexity_threshold: args.complexity_threshold,
                 project_dir: project_dir.as_deref(),
                 lint_config_path: args.config_path.as_deref(),
-                lint_virtual_file_path: None,
+                lint_virtual_file_path: args.virtual_file_path.as_deref(),
                 diff: diff.as_deref(),
                 source_file: Some(file.as_str()),
                 output_dir: args.output_dir.as_deref(),
@@ -231,6 +216,12 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
             let analysis = tools::analyze::analyze(&code, &language);
             let mut value = serde_json::to_value(&analysis)
                 .map_err(|e| format!("failed to serialize analysis: {}", e))?;
+            if let Some(diff) = read_optional_file(args.diff_file.as_deref())? {
+                let changed_ranges = tools::diff::parse_changed_lines_for_file(&diff, &file);
+                let changed_fns =
+                    tools::analyze::filter_changed_functions(&analysis, &changed_ranges);
+                value["changed_functions"] = serde_json::to_value(&changed_fns).unwrap();
+            }
             if let Some(threshold) = args.complexity_threshold {
                 let violations = tools::analyze::check_complexity_threshold(&analysis, threshold);
                 value["complexity_violations"] = serde_json::to_value(&violations).unwrap();
@@ -251,7 +242,7 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
                     source_file: Some(file.as_str()),
                     project_dir: project_dir.as_deref(),
                     config_path: args.config_path.as_deref(),
-                    virtual_file_path: None,
+                    virtual_file_path: args.virtual_file_path.as_deref(),
                 },
             )
             .await;

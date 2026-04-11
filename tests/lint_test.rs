@@ -128,7 +128,7 @@ fn lint_reports_python_unavailable_when_ruff_missing() {
     );
     assert_eq!(
         result.error.as_deref(),
-        Some("ruff not available in project, on PATH, or next to court-jester-mcp")
+        Some("ruff not available in project, on PATH, or next to court-jester")
     );
 }
 
@@ -199,12 +199,20 @@ fn lint_reports_signal_kill_with_actionable_hint() {
         &Language::Python,
     ));
 
+    assert!(
+        result.unavailable,
+        "signal-killed ruff should be treated as unavailable"
+    );
     let error = result
         .error
-        .expect("signal kill should surface as runner error");
+        .expect("signal kill should surface an unavailable message");
     assert!(
         error.contains("signal 9"),
         "expected signal number in error, got: {error}"
+    );
+    assert!(
+        error.contains(tool_dir.path().join("ruff").to_string_lossy().as_ref()),
+        "expected executable path in error, got: {error}"
     );
     #[cfg(target_os = "macos")]
     assert!(

@@ -20,8 +20,13 @@ class TaskManifest:
     bucket: str
     verify_paths: list[str]
     verify_test_path: str | None = None
+    setup_commands: list[list[str]] = field(default_factory=list)
+    setup_cache_key: str | None = None
     public_check_commands: list[list[str]] = field(default_factory=list)
+    judge_check_commands: list[list[str]] = field(default_factory=list)
     hidden_check_command: list[str] | None = None
+    gold_patch_path: str | None = None
+    gold_changed_files: list[str] = field(default_factory=list)
     expected_files: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
     family: str | None = None
@@ -37,6 +42,9 @@ class TaskManifest:
     uses_project_dir: bool | None = None
     uses_relative_imports: bool | None = None
     cross_file: bool | None = None
+    upstream_benchmark: str | None = None
+    upstream_instance_id: str | None = None
+    instance_notes: str | None = None
 
 
 @dataclass(slots=True)
@@ -48,6 +56,7 @@ class PolicyManifest:
     required_tools: list[str] = field(default_factory=list)
     block_on_failed_verify: bool = False
     max_repair_rounds: int = 0
+    verify_only_repair: bool = False
     promote_verify_repros: bool = False
     replay_attempt_history: bool = False
     critic_model_id: str | None = None

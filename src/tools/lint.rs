@@ -115,6 +115,7 @@ pub async fn lint_with_options(
 
 fn tool_failure_message(
     tool: &str,
+    binary_path: &str,
     status: std::process::ExitStatus,
     stdout: &str,
     stderr: &str,
@@ -125,7 +126,8 @@ fn tool_failure_message(
     } else if !stdout.trim().is_empty() {
         stdout.trim().to_string()
     } else {
-        signal_only_failure_hint(tool, status).unwrap_or_else(|| "no output".to_string())
+        signal_only_failure_hint(tool, binary_path, status)
+            .unwrap_or_else(|| "no output".to_string())
     };
     format!("{tool} failed with {exit}: {detail}")
 }
@@ -163,22 +165,53 @@ fn signal_name(_signal: i32) -> String {
     String::new()
 }
 
-fn signal_only_failure_hint(tool: &str, status: std::process::ExitStatus) -> Option<String> {
+fn signal_only_failure_hint(
+    tool: &str,
+    binary_path: &str,
+    status: std::process::ExitStatus,
+) -> Option<String> {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
 
         if cfg!(target_os = "macos") && status.signal() == Some(libc::SIGKILL) {
             return Some(format!(
-                "no output. macOS may have blocked the bundled {tool} binary (Gatekeeper/quarantine); try `xattr -dr com.apple.quarantine <bundle-dir>` or install {tool} in the project"
+                "no output from '{}'. macOS may have blocked this {tool} executable (Gatekeeper/quarantine); try `xattr -dr com.apple.quarantine {binary_path}` or install {tool} in the project",
+                binary_path
             ));
         }
     }
     None
 }
 
+fn signal_only_unavailable_message(
+    tool: &str,
+    binary_path: &str,
+    status: std::process::ExitStatus,
+    stdout: &str,
+    stderr: &str,
+) -> Option<String> {
+    if !stdout.trim().is_empty() || !stderr.trim().is_empty() {
+        return None;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+
+        if cfg!(target_os = "macos") && status.signal() == Some(libc::SIGKILL) {
+            let exit = exit_status_label(status);
+            return Some(format!(
+                "{tool} unavailable: '{binary_path}' was terminated with {exit}. macOS may have blocked this executable (Gatekeeper/quarantine); try `xattr -dr com.apple.quarantine {binary_path}` or install {tool} in the project"
+            ));
+        }
+    }
+
+    None
+}
+
 fn tool_unavailable_message(tool: &str) -> String {
-    format!("{tool} not available in project, on PATH, or next to court-jester-mcp")
+    format!("{tool} not available in project, on PATH, or next to court-jester")
 }
 
 fn working_dir(opts: &LintOptions<'_>) -> Option<PathBuf> {
@@ -359,7 +392,16 @@ async fn lint_python(code: &str, opts: &LintOptions<'_>) -> LintResult {
             let stderr = String::from_utf8_lossy(&out.stderr);
             let mut result = parse_ruff_output(&stdout);
             if result.error.is_some() || (!out.status.success() && result.diagnostics.is_empty()) {
-                result.error = Some(tool_failure_message("ruff", out.status, &stdout, &stderr));
+                if let Some(message) =
+                    signal_only_unavailable_message("ruff", &ruff, out.status, &stdout, &stderr)
+                {
+                    result.error = Some(message);
+                    result.unavailable = true;
+                } else {
+                    result.error = Some(tool_failure_message(
+                        "ruff", &ruff, out.status, &stdout, &stderr,
+                    ));
+                }
             }
             result
         }
@@ -469,7 +511,16 @@ async fn lint_typescript(code: &str, opts: &LintOptions<'_>) -> LintResult {
             };
             let mut result = parse_biome_output(&text);
             if result.error.is_some() || (!out.status.success() && result.diagnostics.is_empty()) {
-                result.error = Some(tool_failure_message("biome", out.status, &stdout, &stderr));
+                if let Some(message) =
+                    signal_only_unavailable_message("biome", &biome, out.status, &stdout, &stderr)
+                {
+                    result.error = Some(message);
+                    result.unavailable = true;
+                } else {
+                    result.error = Some(tool_failure_message(
+                        "biome", &biome, out.status, &stdout, &stderr,
+                    ));
+                }
             }
             result
         }
@@ -485,7 +536,7 @@ async fn lint_typescript(code: &str, opts: &LintOptions<'_>) -> LintResult {
 mod tests {
     use super::{
         find_binary_near_exe_dir, find_project_local_binary, resolve_binary,
-        tool_unavailable_message,
+        signal_only_unavailable_message, tool_unavailable_message,
     };
     use std::fs;
 
@@ -521,6 +572,27 @@ mod tests {
         .expect("biome should resolve");
 
         assert_eq!(resolved, sibling.to_string_lossy());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_kill_without_output_is_treated_as_unavailable_on_macos() {
+        let status = std::process::Command::new("sh")
+            .args(["-c", "kill -9 $$"])
+            .status()
+            .unwrap();
+        let message = signal_only_unavailable_message("ruff", "/tmp/ruff", status, "", "");
+
+        #[cfg(target_os = "macos")]
+        {
+            let message = message.expect("expected unavailable message on macOS");
+            assert!(message.contains("ruff unavailable"));
+            assert!(message.contains("/tmp/ruff"));
+            assert!(message.contains("Gatekeeper/quarantine"));
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        assert!(message.is_none());
     }
 
     #[test]
@@ -600,7 +672,7 @@ mod tests {
     fn unavailable_message_mentions_project_context() {
         assert_eq!(
             tool_unavailable_message("ruff"),
-            "ruff not available in project, on PATH, or next to court-jester-mcp"
+            "ruff not available in project, on PATH, or next to court-jester"
         );
     }
 }

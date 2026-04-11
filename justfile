@@ -1,19 +1,18 @@
-# Court Jester MCP — canonical commands.
+# Court Jester CLI — canonical commands.
 #
 # `just` is optional: every recipe is a short one-liner you can copy into a shell.
 # This file just exists so the README, CI, and new contributors all read the same
 # commands instead of drifting.
 
-# The rmcp-macros dependency requires edition2024, so cargo must be >= 1.85.
-# If your system cargo is Homebrew 1.83, rustup usually has a newer one —
-# export this to force rustup's shims to take priority.
+# Prefer rustup's cargo when it differs from an older system installation.
+# This keeps contributor commands aligned with CI and the README.
 export PATH := env_var_or_default("HOME", "") + "/.cargo/bin:" + env_var_or_default("PATH", "")
 
 # List all recipes.
 default:
     @just --list
 
-# Build the release binary at target/release/court-jester-mcp.
+# Build the release binary at target/release/court-jester.
 build:
     cargo build --release
 
@@ -25,22 +24,17 @@ build-debug:
 test:
     cargo test
 
-# Start the MCP server over stdio. Will appear to hang — that is normal; it is
-# waiting for an MCP client to connect on stdin.
-serve:
-    cargo run --quiet
-
-# End-to-end smoke test: initialize + tools/list over stdio.
+# End-to-end smoke test: help/version plus optional verify call.
 smoke: build
-    python3 scripts/smoke_mcp.py --release
+    python3 scripts/smoke_cli.py --release
 
 # End-to-end smoke test including a real verify call against the bundled fixture.
 smoke-sample: build
-    python3 scripts/smoke_mcp.py --release --verify-sample
+    python3 scripts/smoke_cli.py --release --verify-sample
 
 # One-shot verify of the bundled sample fixture via the new CLI subcommand.
 verify-sample: build
-    ./target/release/court-jester-mcp verify \
+    ./target/release/court-jester verify \
         --file bench/repos/mini_py_service/profile.py \
         --language python \
         --project-dir bench/repos/mini_py_service

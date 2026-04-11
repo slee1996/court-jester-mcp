@@ -1,7 +1,7 @@
 {
   "id": "mixed_verify",
   "title": "Mixed verify workload",
-  "mode": "per_agent_server",
+  "mode": "per_worker_cli",
   "concurrency": 4,
   "requests_per_worker": 10,
   "request_timeout_seconds": 120.0,

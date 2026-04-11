@@ -1,21 +1,21 @@
 # Court Jester Tool And Flow Diagram
 
-Date: 2026-03-19
+Date: 2026-04-10
 
 ```mermaid
 flowchart TD
-    A[Task manifest or MCP client request] --> B{Entry path}
+    A[Task manifest or direct CLI call] --> B{Entry path}
 
     B -->|Benchmark harness| C[bench/run_matrix.py / bench/runner.py]
-    B -->|Direct MCP call| D[src/main.rs -> src/lib.rs]
+    B -->|Direct command| D[src/main.rs]
 
     C --> E[Model provider edits temp workspace]
-    E --> F[bench/mcp_client.py calls verify]
+    E --> F[bench/cli_client.py shells out to court-jester]
     F --> D
 
-    subgraph S1[Court Jester MCP server]
-        D --> G[resolve_code + parse_lang]
-        G --> H{Tool}
+    subgraph S1[Court Jester CLI]
+        D --> G[resolve_code + parse_language]
+        G --> H{Command}
 
         H --> I[analyze]
         H --> J[lint]
@@ -30,7 +30,7 @@ flowchart TD
 
         J --> J1[src/tools/lint.rs]
         J1 --> J2[Python: ruff JSON]
-        J1 --> J3[TypeScript: biome JSON via sibling binary or PATH]
+        J1 --> J3[TypeScript: biome JSON via project local, sibling binary, or PATH]
         J2 --> J4[LintResult JSON]
         J3 --> J4
 
@@ -65,7 +65,7 @@ flowchart TD
 
 ## Reading Notes
 
-- `analyze`, `lint`, and `execute` are directly callable MCP tools.
+- `analyze`, `lint`, `execute`, and `verify` are CLI commands.
 - `verify` is the main product loop: `analyze -> lint -> synthesize -> execute -> optional tests`.
 - `diff` and `synthesize` are internal modules that support `analyze` and `verify`.
 - The benchmark harness uses `verify` as either a gate or a repair-loop trigger before hidden evaluation.

@@ -12,8 +12,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from .cli_client import CourtJesterClient
 from .common import BENCH_ROOT, REPO_ROOT, ModelManifest, PolicyManifest, TaskManifest, load_model, slugify
-from .mcp_client import CourtJesterClient
 from .providers import ProviderResult, provider_from_manifest
 
 
@@ -29,6 +29,35 @@ class CommandResult:
     stderr_path: str
 
 
+@dataclass(slots=True)
+class WorkspaceSetupResult:
+    success: bool
+    cache_hit: bool
+    duration_ms: int
+    commands: list[CommandResult]
+    cache_dir: str | None = None
+    failure_reason: str | None = None
+
+
+def select_repair_trigger_source(
+    *,
+    policy: PolicyManifest,
+    verify_failed: bool,
+    public_ok: bool,
+    hidden_checks_ran: bool,
+    hidden_ok: bool,
+) -> str | None:
+    if verify_failed:
+        return "verify"
+    if policy.verify_only_repair:
+        return None
+    if not public_ok:
+        return "public"
+    if hidden_checks_ran and not hidden_ok:
+        return "hidden"
+    return None
+
+
 def run_single(
     task: TaskManifest,
     model: ModelManifest,
@@ -38,6 +67,7 @@ def run_single(
     repeat_index: int = 0,
     repeat_count: int = 1,
     hidden_seed: str | None = None,
+    use_task_gold_patches: bool = False,
 ) -> dict[str, Any]:
     started_at_ms = int(time.time() * 1000)
     run_id = (
@@ -51,7 +81,6 @@ def run_single(
     if not fixture.exists():
         raise FileNotFoundError(f"Task fixture not found: {fixture}")
     shutil.copytree(fixture, workspace)
-    before = snapshot_tree(workspace)
 
     result: dict[str, Any] = {
         "run_id": run_id,
@@ -74,11 +103,15 @@ def run_single(
             "uses_relative_imports": task.uses_relative_imports,
             "cross_file": task.cross_file,
             "tags": task.tags,
+            "upstream_benchmark": task.upstream_benchmark,
+            "upstream_instance_id": task.upstream_instance_id,
+            "instance_notes": task.instance_notes,
         },
         "repeat_index": repeat_index,
         "repeat_ordinal": repeat_index + 1,
         "repeat_count": repeat_count,
         "dry_run": dry_run,
+        "task_gold_patch_mode": use_task_gold_patches,
         "timestamps": {"started_at_epoch_ms": int(time.time() * 1000)},
         "provider": {
             "id": model.provider,
@@ -92,6 +125,7 @@ def run_single(
             "verify_calls": 0,
         },
         "timings": {
+            "setup_ms": 0,
             "provider_apply_ms": 0,
             "court_jester_total_ms": 0,
             "public_checks_ms": 0,
@@ -110,6 +144,23 @@ def run_single(
     ).hexdigest()
     (run_dir / "hidden_seed.txt").write_text(hidden_seed + "\n")
 
+    setup_result = prepare_workspace_for_run(task, workspace, run_dir)
+    result["setup"] = serialize_setup_result(setup_result)
+    result["timings"]["setup_ms"] = setup_result.duration_ms
+    if not setup_result.success:
+        result["status"] = "setup_error"
+        result["success"] = False
+        result["failure_category"] = "setup_error"
+        result["failure_details"] = {
+            "failure_reason": setup_result.failure_reason,
+            "cache_hit": setup_result.cache_hit,
+            "cache_dir": setup_result.cache_dir,
+        }
+        finalize_result(result)
+        write_json(run_dir / "result.json", result)
+        return result
+
+    before = snapshot_tree(workspace)
     provider = provider_from_manifest(model)
     attempts: list[dict[str, Any]] = []
     provider_result = None
@@ -125,51 +176,58 @@ def run_single(
     promoted_verify_test_path: Path | None = None
     attempt_history: list[dict[str, object]] = []
     critic_feedbacks: list[str] = []
-    max_attempts = 1 + max(policy.max_repair_rounds, 0)
+    max_attempts = 1 if use_task_gold_patches else 1 + max(policy.max_repair_rounds, 0)
     for attempt in range(max_attempts):
         provider_retry_records: list[dict[str, Any]] = []
         provider_apply_ms = 0
         provider_result = None
         provider_call_count = 0
-        max_provider_retries = provider_retry_limit() if supports_provider_retry(model) else 0
-        backup_dir = run_dir / f".provider_backup_attempt_{attempt}"
-        while True:
-            if max_provider_retries > 0 and provider_call_count <= max_provider_retries:
-                snapshot_workspace_for_retry(workspace, backup_dir)
+        gold_patch_command: CommandResult | None = None
+        if use_task_gold_patches:
             provider_started = time.time()
-            provider_candidate = provider.apply(
-                workspace,
-                task,
-                feedback=feedback,
-                attempt=attempt,
-                history=attempt_history if policy.replay_attempt_history else None,
-            )
-            provider_apply_ms += int((time.time() - provider_started) * 1000)
-            provider_call_count += 1
-            provider_error_kind = (
-                classify_provider_failure(provider_candidate) if provider_candidate.failed else None
-            )
-            if (
-                provider_candidate.failed
-                and provider_error_kind is not None
-                and should_retry_provider_failure(provider_error_kind)
-                and len(provider_retry_records) < max_provider_retries
-            ):
-                restore_workspace_from_retry_snapshot(backup_dir, workspace)
-                delay_seconds = provider_retry_delay_seconds(provider_error_kind, len(provider_retry_records))
-                provider_retry_records.append(
-                    {
-                        "retry_index": len(provider_retry_records),
-                        "provider_error_kind": provider_error_kind,
-                        "failure_reason": provider_candidate.failure_reason,
-                        "delay_seconds": delay_seconds,
-                    }
+            provider_result, gold_patch_command = apply_task_gold_patch(task, workspace, run_dir, attempt)
+            provider_apply_ms = int((time.time() - provider_started) * 1000)
+            provider_call_count = 1
+        else:
+            max_provider_retries = provider_retry_limit() if supports_provider_retry(model) else 0
+            backup_dir = run_dir / f".provider_backup_attempt_{attempt}"
+            while True:
+                if max_provider_retries > 0 and provider_call_count <= max_provider_retries:
+                    snapshot_workspace_for_retry(workspace, backup_dir)
+                provider_started = time.time()
+                provider_candidate = provider.apply(
+                    workspace,
+                    task,
+                    feedback=feedback,
+                    attempt=attempt,
+                    history=attempt_history if policy.replay_attempt_history else None,
                 )
-                if delay_seconds > 0:
-                    time.sleep(delay_seconds)
-                continue
-            provider_result = provider_candidate
-            break
+                provider_apply_ms += int((time.time() - provider_started) * 1000)
+                provider_call_count += 1
+                provider_error_kind = (
+                    classify_provider_failure(provider_candidate) if provider_candidate.failed else None
+                )
+                if (
+                    provider_candidate.failed
+                    and provider_error_kind is not None
+                    and should_retry_provider_failure(provider_error_kind)
+                    and len(provider_retry_records) < max_provider_retries
+                ):
+                    restore_workspace_from_retry_snapshot(backup_dir, workspace)
+                    delay_seconds = provider_retry_delay_seconds(provider_error_kind, len(provider_retry_records))
+                    provider_retry_records.append(
+                        {
+                            "retry_index": len(provider_retry_records),
+                            "provider_error_kind": provider_error_kind,
+                            "failure_reason": provider_candidate.failure_reason,
+                            "delay_seconds": delay_seconds,
+                        }
+                    )
+                    if delay_seconds > 0:
+                        time.sleep(delay_seconds)
+                    continue
+                provider_result = provider_candidate
+                break
         result["timings"]["provider_apply_ms"] += provider_apply_ms
         attempt_record: dict[str, Any] = {
             "attempt": attempt,
@@ -187,6 +245,8 @@ def run_single(
                 "parsed_summary": provider_result.parsed_summary,
             },
         }
+        if gold_patch_command is not None:
+            attempt_record["gold_patch_apply"] = asdict(gold_patch_command)
         attempts.append(attempt_record)
         if provider_result.unsupported:
             break
@@ -308,10 +368,15 @@ def run_single(
         attempt_record["hidden_checks_ran"] = attempt_hidden_checks_ran
         attempt_record["hidden_checks_sampled_on_public_failure"] = attempt_hidden_checks_sampled
 
-        repair_trigger_source: str | None = None
+        repair_trigger_source = select_repair_trigger_source(
+            policy=policy,
+            verify_failed=verify_failed,
+            public_ok=final_public_ok,
+            hidden_checks_ran=attempt_hidden_checks_ran,
+            hidden_ok=attempt_hidden_ok,
+        )
         promoted_repros: list[str] = []
-        if verify_failed:
-            repair_trigger_source = "verify"
+        if repair_trigger_source == "verify":
             promoted_repros = collect_promoted_verify_repros(task.language, attempt_cj_results)
             feedback = format_verify_feedback(
                 attempt_cj_results,
@@ -339,12 +404,10 @@ def run_single(
                 )
             else:
                 promoted_verify_test_path = None
-        elif not final_public_ok:
-            repair_trigger_source = "public"
+        elif repair_trigger_source == "public":
             feedback = format_public_failure_feedback(final_public_results)
             promoted_verify_test_path = None
-        elif attempt_hidden_checks_ran and not attempt_hidden_ok:
-            repair_trigger_source = "hidden"
+        elif repair_trigger_source == "hidden":
             feedback = format_hidden_failure_feedback(attempt_hidden_results)
             promoted_verify_test_path = None
         else:
@@ -397,10 +460,27 @@ def run_single(
         result["repair_trigger_source"] = prior_repair_trigger_source
         result["repair_trigger_sources"] = prior_repair_trigger_sources
         result["failure_provenance"] = prior_repair_trigger_sources
-        result["timestamps"]["finished_at_epoch_ms"] = int(time.time() * 1000)
+        finalize_result(result)
         write_json(run_dir / "result.json", result)
         return result
     if provider_result.failed:
+        if use_task_gold_patches:
+            result["status"] = "gold_patch_apply_error"
+            result["success"] = False
+            result["failure_category"] = "gold_patch_apply_error"
+            result["failure_details"] = {
+                "failure_reason": provider_result.failure_reason,
+                "prior_repair_trigger_source": prior_repair_trigger_source,
+                "prior_repair_trigger_sources": prior_repair_trigger_sources,
+            }
+            result["attempt_count"] = len(attempts)
+            result["repair_attempted"] = False
+            result["repair_trigger_source"] = prior_repair_trigger_source
+            result["repair_trigger_sources"] = prior_repair_trigger_sources
+            result["failure_provenance"] = prior_repair_trigger_sources + ["gold_patch"]
+            finalize_result(result)
+            write_json(run_dir / "result.json", result)
+            return result
         provider_error_kind = classify_provider_failure(provider_result)
         result["status"] = "provider_auth_error" if provider_error_kind == "auth_required" else "provider_error"
         result["provider_error_kind"] = provider_error_kind
@@ -426,7 +506,7 @@ def run_single(
         result["repair_trigger_source"] = prior_repair_trigger_source
         result["repair_trigger_sources"] = prior_repair_trigger_sources
         result["failure_provenance"] = prior_repair_trigger_sources + ["provider"]
-        result["timestamps"]["finished_at_epoch_ms"] = int(time.time() * 1000)
+        finalize_result(result)
         write_json(run_dir / "result.json", result)
         return result
 
@@ -534,8 +614,7 @@ def run_single(
     result["failure_category"] = failure_category
     result["failure_details"] = failure_details
     result["status"] = "completed"
-    result["timestamps"]["finished_at_epoch_ms"] = int(time.time() * 1000)
-    result["timings"]["end_to_end_ms"] = result["timestamps"]["finished_at_epoch_ms"] - started_at_ms
+    finalize_result(result)
     write_json(run_dir / "result.json", result)
     return result
 
@@ -617,6 +696,162 @@ def restore_workspace_from_retry_snapshot(backup_dir: Path, workspace: Path) -> 
     if workspace.exists():
         shutil.rmtree(workspace)
     shutil.copytree(backup_dir, workspace)
+
+
+def setup_cache_root() -> Path:
+    return Path(os.getenv("CJ_SETUP_CACHE_ROOT", "/tmp/court-jester-setup-cache"))
+
+
+def setup_cache_dir(cache_key: str) -> Path:
+    slug = slugify(cache_key)[:64] or "setup-cache"
+    digest = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()[:12]
+    return setup_cache_root() / f"{slug}-{digest}"
+
+
+def prepare_workspace_for_run(task: TaskManifest, workspace: Path, run_dir: Path) -> WorkspaceSetupResult:
+    start = time.time()
+    commands = task.setup_commands
+    cache_dir = setup_cache_dir(task.setup_cache_key) if task.setup_cache_key and commands else None
+    if cache_dir is not None and cache_dir.exists():
+        if workspace.exists():
+            shutil.rmtree(workspace)
+        shutil.copytree(cache_dir, workspace)
+        return WorkspaceSetupResult(
+            success=True,
+            cache_hit=True,
+            duration_ms=int((time.time() - start) * 1000),
+            commands=[],
+            cache_dir=str(cache_dir),
+        )
+    if not commands:
+        return WorkspaceSetupResult(
+            success=True,
+            cache_hit=False,
+            duration_ms=int((time.time() - start) * 1000),
+            commands=[],
+            cache_dir=str(cache_dir) if cache_dir is not None else None,
+        )
+    results = run_commands(commands, workspace, run_dir, "setup")
+    success = all(item.exit_code == 0 for item in results)
+    if success and cache_dir is not None:
+        cache_dir.parent.mkdir(parents=True, exist_ok=True)
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir)
+        shutil.copytree(workspace, cache_dir)
+    failure_reason = None
+    if not success:
+        for item in results:
+            if item.exit_code == 0:
+                continue
+            stderr = Path(item.stderr_path).read_text() if Path(item.stderr_path).exists() else ""
+            stdout = Path(item.stdout_path).read_text() if Path(item.stdout_path).exists() else ""
+            failure_reason = first_nonempty_text(stderr, stdout) or f"setup command failed: {' '.join(item.argv)}"
+            break
+    return WorkspaceSetupResult(
+        success=success,
+        cache_hit=False,
+        duration_ms=int((time.time() - start) * 1000),
+        commands=results,
+        cache_dir=str(cache_dir) if cache_dir is not None else None,
+        failure_reason=failure_reason,
+    )
+
+
+def serialize_setup_result(result: WorkspaceSetupResult) -> dict[str, Any]:
+    return {
+        "success": result.success,
+        "cache_hit": result.cache_hit,
+        "duration_ms": result.duration_ms,
+        "cache_dir": result.cache_dir,
+        "failure_reason": result.failure_reason,
+        "commands": [asdict(item) for item in result.commands],
+    }
+
+
+def apply_task_gold_patch(
+    task: TaskManifest,
+    workspace: Path,
+    run_dir: Path,
+    attempt: int,
+) -> tuple[ProviderResult, CommandResult | None]:
+    if not task.gold_patch_path:
+        return (
+            ProviderResult(
+                failed=True,
+                failure_reason="Task gold patch mode requested but task.gold_patch_path is not set",
+            ),
+            None,
+        )
+    patch_path = workspace / task.gold_patch_path
+    if not patch_path.exists():
+        return (
+            ProviderResult(
+                failed=True,
+                failure_reason=f"Task gold patch not found: {patch_path}",
+            ),
+            None,
+        )
+    argv = ["git", "apply", "--reject", "--whitespace=nowarn", str(patch_path.resolve())]
+    start = time.time()
+    completed = subprocess.run(argv, cwd=workspace, capture_output=True, text=True)
+    duration_ms = int((time.time() - start) * 1000)
+    stdout_path = run_dir / f"gold_patch_attempt_{attempt}_0.stdout.txt"
+    stderr_path = run_dir / f"gold_patch_attempt_{attempt}_0.stderr.txt"
+    stdout_path.write_text(completed.stdout)
+    stderr_path.write_text(completed.stderr)
+    command_result = CommandResult(
+        argv=argv,
+        exit_code=completed.returncode,
+        duration_ms=duration_ms,
+        stdout_path=str(stdout_path),
+        stderr_path=str(stderr_path),
+    )
+    if completed.returncode != 0:
+        return (
+            ProviderResult(
+                transcript=[completed.stdout, completed.stderr],
+                exit_code=completed.returncode,
+                failed=True,
+                failure_reason=completed.stderr.strip()
+                or completed.stdout.strip()
+                or "task gold patch apply failed",
+            ),
+            command_result,
+        )
+    changed_files = task.gold_changed_files or infer_changed_files_from_patch(patch_path.read_text())
+    return (
+        ProviderResult(
+            changed_files=changed_files,
+            transcript=[completed.stdout, completed.stderr],
+            parsed_summary={
+                "status": "completed",
+                "summary": "Applied task gold patch.",
+                "files_changed": changed_files,
+            },
+        ),
+        command_result,
+    )
+
+
+def infer_changed_files_from_patch(patch_text: str) -> list[str]:
+    changed: list[str] = []
+    seen: set[str] = set()
+    for line in patch_text.splitlines():
+        if not line.startswith("+++ b/"):
+            continue
+        path = line[len("+++ b/") :].strip()
+        if not path or path == "/dev/null" or path in seen:
+            continue
+        seen.add(path)
+        changed.append(path)
+    return changed
+
+
+def finalize_result(result: dict[str, Any]) -> None:
+    finished_at_ms = int(time.time() * 1000)
+    result["timestamps"]["finished_at_epoch_ms"] = finished_at_ms
+    started_at_ms = int(result["timestamps"].get("started_at_epoch_ms", finished_at_ms))
+    result["timings"]["end_to_end_ms"] = finished_at_ms - started_at_ms
 
 
 def stringify_output(value: Any) -> str:

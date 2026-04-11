@@ -17,7 +17,7 @@ def resolve_binary(args: argparse.Namespace) -> Path:
         binary = Path(args.binary).expanduser().resolve()
     else:
         profile = "debug" if args.debug else "release"
-        binary = REPO_ROOT / "target" / profile / "court-jester-mcp"
+        binary = REPO_ROOT / "target" / profile / "court-jester"
     if not binary.exists():
         raise FileNotFoundError(
             f"Could not find {binary}. Build it first with `cargo build --release`."
@@ -61,22 +61,22 @@ def copy_executable(src: Path, dst: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Stage a Court Jester release directory. By default this includes only court-jester-mcp."
+        description="Stage a Court Jester release directory. By default this includes only court-jester."
     )
     profile = parser.add_mutually_exclusive_group()
     profile.add_argument(
         "--release",
         action="store_true",
-        help="Use target/release/court-jester-mcp (default).",
+        help="Use target/release/court-jester (default).",
     )
     profile.add_argument(
         "--debug",
         action="store_true",
-        help="Use target/debug/court-jester-mcp.",
+        help="Use target/debug/court-jester.",
     )
     parser.add_argument(
         "--binary",
-        help="Use an explicit court-jester-mcp binary instead of target/{release,debug}/court-jester-mcp.",
+        help="Use an explicit court-jester binary instead of target/{release,debug}/court-jester.",
     )
     parser.add_argument(
         "--biome",
@@ -130,7 +130,7 @@ def main() -> int:
 
         bundle_dir.mkdir(parents=True, exist_ok=True)
 
-        bundled_binary = bundle_dir / "court-jester-mcp"
+        bundled_binary = bundle_dir / "court-jester"
         copy_executable(binary, bundled_binary)
 
         print(f"Bundled binary: {bundled_binary}")
@@ -155,14 +155,14 @@ def main() -> int:
 
         print()
         print("Runtime behavior:")
-        print("1. court-jester-mcp looks for ./ruff and ./biome next to itself first")
+        print("1. court-jester looks for ./ruff and ./biome next to itself first")
         print("2. if a sibling linter is missing, it falls back to PATH for that tool")
-        print("3. public release assets should normally ship only court-jester-mcp")
+        print("3. public release assets should normally ship only court-jester")
         if sys.platform == "darwin" and (include_ruff or include_biome):
             print()
             print("macOS note:")
             print("Bundling third-party linters is best for controlled/local use.")
-            print("For public releases, prefer shipping court-jester-mcp alone and installing Ruff/Biome separately.")
+            print("For public releases, prefer shipping court-jester alone and installing Ruff/Biome separately.")
         return 0
     except Exception as exc:
         print(f"Release bundling failed: {exc}", file=sys.stderr)

@@ -3,7 +3,7 @@ set -e
 
 REPO="slee1996/court-jester-mcp"
 INSTALL_DIR="${HOME}/.local/bin"
-BINARY_NAME="court-jester-mcp"
+BINARY_NAME="court-jester"
 
 # Detect platform
 OS="$(uname -s)"
@@ -80,24 +80,17 @@ case ":${PATH}:" in
     ;;
 esac
 
-# Auto-configure agent MCP servers
+# Agent setup note
 BINARY_PATH="${INSTALL_DIR}/${BINARY_NAME}"
 
-if command -v claude >/dev/null 2>&1; then
-  echo ""
-  claude mcp add court-jester -- "${BINARY_PATH}" 2>/dev/null \
-    && echo "Configured Claude Code" \
-    || echo "Claude Code: could not auto-configure. Run: claude mcp add court-jester -- ${BINARY_PATH}"
-fi
-
-if command -v codex >/dev/null 2>&1; then
-  codex mcp add court-jester -- "${BINARY_PATH}" 2>/dev/null \
-    && echo "Configured Codex CLI" \
-    || echo "Codex CLI: could not auto-configure. Run: codex mcp add court-jester -- ${BINARY_PATH}"
-fi
-
 echo ""
-echo "Done. Add this to your agent prompt:"
+echo "Done. No agent transport setup is required."
+echo ""
+echo "Tell your agent to run:"
+echo ""
+echo "  ${BINARY_PATH} verify --file <changed-file> --language <python|typescript>"
+echo ""
+echo "And add this to your agent prompt:"
 echo ""
 echo "  After every code change, call court-jester verify on each changed file."
 echo "  If verify returns overall_ok: false, fix the failing repro and verify again."

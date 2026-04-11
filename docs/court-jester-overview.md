@@ -12,7 +12,7 @@ The idea is simple:
 
 It is not a general-purpose CI replacement, and it is not trying to be a human code reviewer. It is a fast, structured verifier that fits inside an agent loop.
 
-In this repo, Court Jester is exposed as an MCP server over stdio. It provides four main tools:
+In this repo, Court Jester is exposed as a local CLI. It provides four main commands:
 
 1. `analyze`
 2. `lint`
@@ -82,7 +82,7 @@ The execution path is built around:
 3. timeout enforcement
 4. temp-file management
 
-This was not just a theoretical concern. During stress testing we found real transport and subprocess-isolation bugs, including child processes inheriting MCP stdio and interfering with the server connection. Fixing those issues was necessary before benchmark results could be trusted.
+This was not just a theoretical concern. During stress testing we found real subprocess-isolation bugs, including child processes inheriting the wrong stdio handles and interfering with benchmark execution. Fixing those issues was necessary before benchmark results could be trusted.
 
 ### 4. Prefer concrete counterexamples over vague advice
 
@@ -112,7 +112,7 @@ That means we ask three different questions.
 
 Before you can trust any model comparison, the verifier itself has to be stable.
 
-So we built a stress harness around the MCP server and exercised:
+So we built a stress harness around the CLI and exercised:
 
 1. mixed tool traffic
 2. concurrent clients
@@ -122,7 +122,7 @@ So we built a stress harness around the MCP server and exercised:
 
 This found real bugs:
 
-1. subprocess stdin inheritance that could collapse MCP sessions
+1. subprocess stdin inheritance that could collapse verifier runs
 2. temp/sibling path resolution issues in verification
 3. lifecycle problems in the client harness
 

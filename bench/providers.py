@@ -414,6 +414,8 @@ class CodexCliProvider(CliAgentProvider):
         command = [
             "codex",
             "exec",
+            "-c",
+            "mcp_servers={}",
             "--skip-git-repo-check",
             "--ephemeral",
             "--full-auto",
@@ -430,8 +432,6 @@ class CodexCliProvider(CliAgentProvider):
             command=command + [prompt],
             workspace=workspace,
             early_abort_markers={
-                "body: Internal server error": "codex_cli aborted after provider internal server error",
-                "Transport channel closed": "codex_cli aborted after provider transport failure",
                 "all inference nodes that can serve this model are currently busy": (
                     "codex_cli aborted after provider capacity busy error"
                 ),
@@ -441,6 +441,12 @@ class CodexCliProvider(CliAgentProvider):
 
 
 class ClaudeCliProvider(CliAgentProvider):
+    def _agent_env(self) -> dict[str, str]:
+        env = dict(os.environ)
+        for key in ("OTEL_SDK_DISABLED", "OTEL_TRACES_EXPORTER", "OTEL_METRICS_EXPORTER"):
+            env.pop(key, None)
+        return env
+
     def apply(
         self,
         workspace: Path,

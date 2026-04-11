@@ -1,6 +1,6 @@
 # Court Jester Private Beta Release Checklist
 
-Date: 2026-04-09
+Date: 2026-04-10
 
 ## Goal
 
@@ -80,7 +80,7 @@ Suggested minimum bar:
 
 Required evidence:
 
-- no MCP stdio collapse under stress
+- no CLI process collapse under stress
 - no meaningful temp-file or sibling-file leakage
 - acceptable p50 and p95 verify latency
 - timeout rate low enough for normal agent-loop use
@@ -138,7 +138,7 @@ Utility benchmark:
 python -m bench.run_matrix \
   --task-set core-current \
   --models codex-default,claude-default \
-  --policies baseline,repair-loop \
+  --policies baseline,repair-loop-verify-only \
   --output-dir /tmp/court-jester-core-release
 ```
 
@@ -178,18 +178,26 @@ Current evidence does not yet justify a broad public claim that Court Jester is 
 
 Updated utility and reliability read on 2026-04-10:
 
-- clean `core-current` utility run:
-  - `claude-default`: `106 / 117` baseline -> `116 / 117` repair-loop
-  - `codex-default`: `108 / 117` baseline -> `117 / 117` repair-loop
+- clean strict `core-current` utility run:
+  - `claude-default`: `35 / 39` baseline -> `37 / 39` verify-only repair loop
+  - `codex-default`: `36 / 39` baseline -> `39 / 39` verify-only repair loop
+- aggregate:
+  - `71 / 78` baseline -> `76 / 78` verify-only repair loop
+- repair attribution:
+  - `11` repair rounds were triggered by Court Jester `verify`
+  - `0` repair rounds were triggered by public or hidden evaluator feedback
+  - `10` verify-triggered repair rounds ended in success
 - known-good control:
   - `20 / 20` success under `noop + required-final`
 - provider caveat:
-  - fresh Codex and Spark reruns on 2026-04-10 are currently provider-outage-contaminated and fail as `provider_infra_error`
-  - after runner fixes, those failures now abort quickly and classify correctly instead of consuming the full timeout budget
+  - one Claude run in the strict benchmark still failed as `provider_error`
+  - provider failures are now classified separately enough that they do not contaminate the utility read
 
 Interpretation:
 
 - the clean utility evidence is stronger than it was in March
+- the strictest current benchmark still shows real lift
+- the strongest current evidence is now specifically about verify-triggered repair, not evaluator-feedback-triggered retry
 - the immediate known-good false-positive blocker remains cleared on the current small control corpus
 - current external provider health is still a separate release risk because it can contaminate fresh reruns even when the benchmark logic is sound
 

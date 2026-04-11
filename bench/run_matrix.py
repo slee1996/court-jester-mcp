@@ -32,6 +32,11 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of repeated runs for each task/model/policy combination.",
     )
+    parser.add_argument(
+        "--use-task-gold-patches",
+        action="store_true",
+        help="Apply task-level gold patches instead of asking a provider to edit the fixture.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Expand the matrix without executing it.")
     return parser.parse_args()
 
@@ -87,6 +92,7 @@ def main() -> int:
                         repeat_index=repeat_index,
                         repeat_count=repeats,
                         hidden_seed=paired_hidden_seeds[repeat_index],
+                        use_task_gold_patches=args.use_task_gold_patches,
                     )
                     status = result["status"]
                     success = result.get("success", False)
