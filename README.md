@@ -1,13 +1,15 @@
 # Court Jester
 
-**An agent-focused CLI that catches real Python and TypeScript bugs before the agent declares success.**
+> **Experimental** — this project is under active development and not yet stable. APIs, CLI flags, and output formats may change without notice.
 
-AI coding agents are good at writing plausible code and bad at knowing when they are actually done. Court Jester sits inside that loop: the agent edits a file, Court Jester fuzzes it, and if it finds a concrete failure the agent gets a repro to fix before it stops.
+**A CLI for making AI-written Python and TypeScript code fail as fast as possible in a meaningful, useful way.**
+
+AI coding agents are good at producing plausible code and bad at knowing when they are actually done. Court Jester is built to break that code quickly, with concrete failures the agent can use immediately. It sits inside the agent loop, fuzzes the edited file, and turns false confidence into a specific repro before the agent ships the patch.
 
 ```text
-Agent edits code -> court-jester verify -> bug found?
+Agent edits code -> court-jester verify -> fast concrete failure?
                                          |
-                              yes: agent repairs with repro
+                              yes: agent repairs from repro
                               no:  agent can ship
 ```
 
@@ -32,6 +34,16 @@ Within the repair-loop arm itself:
 - `10` of those verify-triggered repairs ended in final success
 
 The known-good false-positive control still passes `20 / 20`.
+
+We also now have a first external-style `swebench-lite-pilot` result on a vendored Python task:
+
+| Model | Baseline | Repair Loop | Verify-Only Repair | Required Final |
+|-------|----------|-------------|--------------------|----------------|
+| Claude | 5 / 5 | 5 / 5 | 4 / 5 | 0 / 5 |
+| Codex | 5 / 5 | 5 / 5 | 5 / 5 | 4 / 5 |
+| Codex Spark | 5 / 5 | 5 / 5 | 5 / 5 | 2 / 5 |
+
+That pilot is useful in a different way than `core-current`: it shows Court Jester working as a repair aid on an external-style repo fixture, but it also exposes that the strict `required-final` gate is still too aggressive on this task. See [docs/swebench-lite-plan.md](docs/swebench-lite-plan.md) for the full matrix and failure pattern.
 
 ## Get Started
 
@@ -99,12 +111,21 @@ This sample is expected to fail. The point is to show the execute stage finding 
 | Stage | What it does | Fails the run? |
 |-------|--------------|----------------|
 | `parse` | Tree-sitter AST extraction | Yes |
-| `complexity` | Optional cyclomatic complexity gate | Only if you set a threshold |
+| `complexity` | Optional cyclomatic gate with cognitive/max-depth breakdown | Only if you set a threshold |
 | `lint` | Ruff or Biome in the project context | No, advisory only |
 | `execute` | Synthesized fuzz/property checks in a sandbox | Yes |
 | `test` | Optional caller-supplied test file | Yes |
 
 The important stage is `execute`. Court Jester walks the AST, resolves types across local imports, generates adversarial inputs, and runs those calls in a sandbox with time and memory limits. When something breaks, it returns the concrete repro.
+
+`analyze` and the `complexity` stage now report:
+
+- `complexity`: cyclomatic complexity
+- `cognitive_complexity`
+- `max_nesting_depth`
+- `complexity_breakdown` by decision type
+
+When `--diff-file` is set, the complexity gate applies only to changed functions.
 
 For Python, common built-in runtime and validation exceptions such as `TypeError`, `AttributeError`, `KeyError`, `IndexError`, `ValueError`, `ZeroDivisionError`, and `UnicodeError` are treated as crashes, not harmless validation rejects.
 

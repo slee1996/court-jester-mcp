@@ -114,6 +114,63 @@ Current pilot validation:
 - `python -m bench.run_matrix --task-set swebench-lite-known-good --models noop --policies required-final --use-task-gold-patches --output-dir /tmp/court-jester-swebench-lite-known-good-smoke-v5`
   - result: `1/1` success, with public checks, hidden checks, and `verify` all passing on the task gold patch
 
+## Pilot Matrix Results
+
+Full pilot matrix:
+
+- task set: `swebench-lite-pilot`
+- models: `claude-default`, `codex-default`, `codex-spark-cli`
+- policies: `baseline`, `repair-loop`, `repair-loop-verify-only`, `required-final`
+- repeats: `5`
+- total: `60` runs
+
+Command shape:
+
+```bash
+python -m bench.run_matrix \
+  --task-set swebench-lite-pilot \
+  --models claude-default,codex-default,codex-spark-cli \
+  --policies baseline,required-final,repair-loop,repair-loop-verify-only \
+  --repeats 5 \
+  --output-dir /tmp/court-jester-swebench-lite-agent-matrix-v2
+```
+
+Headline result on the first external-style pilot task:
+
+| Model | Baseline | Repair Loop | Verify-Only Repair | Required Final |
+|-------|----------|-------------|--------------------|----------------|
+| Claude | 5 / 5 | 5 / 5 | 4 / 5 | 0 / 5 |
+| Codex | 5 / 5 | 5 / 5 | 5 / 5 | 4 / 5 |
+| Codex Spark | 5 / 5 | 5 / 5 | 5 / 5 | 2 / 5 |
+
+What this means:
+
+- the pilot does not show success-rate lift over baseline yet, because all three models already solve this task reliably without Court Jester
+- the pilot does show that `repair-loop` can absorb real verify failures without reducing final pass rate
+- the strict `required-final` gate is still too aggressive on this task, especially for Claude and Spark
+
+Observed verify-triggered repairs:
+
+- Claude `repair-loop`: `5` verify-triggered repairs, `5` recovered
+- Claude `repair-loop-verify-only`: `5` verify-triggered repairs, `4` recovered
+- Codex `repair-loop`: `1` verify-triggered repair, `1` recovered
+- Codex `repair-loop-verify-only`: `2` verify-triggered repairs, `2` recovered
+- Codex Spark `repair-loop`: `3` verify-triggered repairs, `3` recovered
+- Codex Spark `repair-loop-verify-only`: `3` verify-triggered repairs, `3` recovered
+
+Strict-gate failure pattern:
+
+- every `required-final` failure on this pilot was `verify_stronger_than_eval`
+- the representative failure path was always `mini_requests/cookies.py`
+- the representative failing stage was always `execute`
+- the verify reports showed `20-30` fuzz failures on the repaired implementation even when public and hidden checks passed
+
+So the current external-style evidence is narrower but honest:
+
+- Court Jester looks good as a repair aid on this pilot
+- Court Jester is not yet clean enough as a universal final gate on this pilot
+- to turn this into stronger release evidence, the next step is expanding `swebench-lite-pilot` to more tasks and reducing these strict-gate false positives
+
 ### Current fields we can keep
 
 - `id`
