@@ -1,59 +1,49 @@
 # Court Jester
 
-> **Experimental** — this project is under active development and not yet stable. APIs, CLI flags, and output formats may change without notice.
+> **Experimental**: Court Jester is under active development. CLI flags, output fields, and behavior may still change.
 
-**A CLI for making AI-written Python and TypeScript code fail as fast as possible in a meaningful, useful way.**
+**Court Jester is a CLI that catches real Python and TypeScript failures in AI-written code before the agent says the task is done.**
 
-AI coding agents are good at producing plausible code and bad at knowing when they are actually done. Court Jester is built to break that code quickly, with concrete failures the agent can use immediately. It sits inside the agent loop, fuzzes the edited file, and turns false confidence into a specific repro before the agent ships the patch.
+AI agents are good at writing plausible code and bad at knowing when they are actually finished. Court Jester sits in that gap: it runs after the edit, tries to break the changed file, and returns concrete failures the agent can repair immediately.
 
 ```text
-Agent edits code -> court-jester verify -> fast concrete failure?
-                                         |
-                              yes: agent repairs from repro
-                              no:  agent can ship
+agent edits code -> court-jester verify -> concrete failure?
+                                        |
+                             yes: repair from repro
+                             no:  ship with more confidence
 ```
 
-## Benchmarked Results
+It is just a CLI. No MCP transport, editor plugin, or custom agent integration layer is required.
 
-The current strongest benchmark is a strict verify-only repair policy on the 39-task `core-current` suite.
+## Why Use It
 
-One repair round was allowed only after a failed `court-jester verify`. Public and hidden evaluator failures did not trigger repair feedback.
+- Finds runtime and semantic failures, not just style issues
+- Produces concrete repros instead of vague "something seems wrong" feedback
+- Fits into any agent loop or CI job because it shells out like any other CLI
+- Uses the target project's Ruff and Biome config instead of detached temp-dir defaults
+- Returns structured JSON so automation can make decisions on pass/fail
 
-| Model | Baseline | Verify-Only Repair Loop | Tasks saved |
-|-------|----------|-------------------------|-------------|
-| Claude | 35 / 39 (90%) | 37 / 39 (95%) | +2 |
-| Codex | 36 / 39 (92%) | 39 / 39 (100%) | +3 |
+## Install
 
-Across both models, that is `71 / 78` baseline vs `76 / 78` with Court Jester.
-
-Within the repair-loop arm itself:
-
-- `11` runs triggered a repair round because `verify` failed
-- all `11` trigger sources were `verify`
-- `0` repair rounds were triggered by public or hidden evaluator feedback
-- `10` of those verify-triggered repairs ended in final success
-
-The known-good false-positive control still passes `20 / 20`.
-
-We also now have a first external-style `swebench-lite-pilot` result on a vendored Python task:
-
-| Model | Baseline | Repair Loop | Verify-Only Repair | Required Final |
-|-------|----------|-------------|--------------------|----------------|
-| Claude | 5 / 5 | 5 / 5 | 4 / 5 | 0 / 5 |
-| Codex | 5 / 5 | 5 / 5 | 5 / 5 | 4 / 5 |
-| Codex Spark | 5 / 5 | 5 / 5 | 5 / 5 | 2 / 5 |
-
-That pilot is useful in a different way than `core-current`: it shows Court Jester working as a repair aid on an external-style repo fixture, but it also exposes that the strict `required-final` gate is still too aggressive on this task. See [docs/swebench-lite-plan.md](docs/swebench-lite-plan.md) for the full matrix and failure pattern.
-
-## Get Started
-
-### 1. Install
+Fastest path:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/slee1996/court-jester-mcp/main/install.sh | sh
 ```
 
-This downloads `court-jester` into `~/.local/bin`. No Rust toolchain and no agent transport configuration are required.
+That installs `court-jester` into `~/.local/bin`.
+
+The install script:
+
+- downloads the latest release binary for your platform
+- does not require a Rust toolchain
+- does not require agent transport setup
+
+If `~/.local/bin` is not on `PATH`, add:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
 
 <details>
 <summary>Build from source instead</summary>
@@ -65,25 +55,31 @@ cargo install --git https://github.com/slee1996/court-jester-mcp.git
 Use a current stable Rust toolchain.
 </details>
 
-### 2. Install the companion tools you actually want
+## Install Optional Tooling
 
-Recommended:
+Court Jester itself is one binary, but some stages rely on tools from the project you are checking:
 
-- [ruff](https://docs.astral.sh/ruff/installation/) for Python lint
-- [Biome](https://biomejs.dev/guides/getting-started/) for TypeScript lint
-- [bun](https://bun.sh) for TypeScript fuzz execution
+- Python lint: [Ruff](https://docs.astral.sh/ruff/installation/)
+- TypeScript lint: [Biome](https://biomejs.dev/guides/getting-started/)
+- TypeScript execute/verify: [bun](https://bun.sh)
 
-Court Jester resolves linters in this order:
+Tool resolution order:
 
 1. Project-local binaries such as `.venv/bin/ruff`, `venv/bin/ruff`, and `node_modules/.bin/biome`
 2. Optional sibling binaries next to `court-jester`
 3. `PATH`
 
-Public release assets should normally ship `court-jester` alone. Bundled linters are for controlled/local use only.
+## Use It With An Agent
 
-### 3. Tell your agent how to use it
+The simplest integration is to run `verify` after every edit to a changed file.
 
-Add this to your prompt or `AGENTS.md`:
+Agent command:
+
+```bash
+court-jester verify --file <changed-file> --language <python|typescript>
+```
+
+Prompt snippet:
 
 ```text
 After every code change, run `court-jester verify --file <changed-file> --language <python|typescript>`.
@@ -91,169 +87,137 @@ If verify returns overall_ok: false, fix the failing repro and verify again.
 Treat verify repros as authoritative.
 ```
 
-That is the whole integration. The agent just shells out to the CLI.
-
-## Quick Start Without An Agent
+If the repo has a local virtualenv, `node_modules`, or lint config, pass `--project-dir` so lint and execution resolve in the right project context:
 
 ```bash
 court-jester verify \
-  --file bench/repos/mini_py_service/profile.py \
+  --file apps/api/profile.py \
   --language python \
-  --project-dir bench/repos/mini_py_service
+  --project-dir .
 ```
 
-This sample is expected to fail. The point is to show the execute stage finding a real runtime bug automatically.
+## Use It Directly
 
-## What `verify` Does
+Python:
 
-`verify` runs a staged pipeline and returns one JSON report:
+```bash
+court-jester verify \
+  --file src/profile.py \
+  --language python \
+  --project-dir .
+```
 
-| Stage | What it does | Fails the run? |
-|-------|--------------|----------------|
-| `parse` | Tree-sitter AST extraction | Yes |
-| `complexity` | Optional cyclomatic gate with cognitive/max-depth breakdown | Only if you set a threshold |
-| `lint` | Ruff or Biome in the project context | No, advisory only |
-| `execute` | Synthesized fuzz/property checks in a sandbox | Yes |
-| `test` | Optional caller-supplied test file | Yes |
+TypeScript with an authoritative test file:
 
-The important stage is `execute`. Court Jester walks the AST, resolves types across local imports, generates adversarial inputs, and runs those calls in a sandbox with time and memory limits. When something breaks, it returns the concrete repro.
+```bash
+court-jester verify \
+  --file src/semver.ts \
+  --language typescript \
+  --project-dir . \
+  --test-file tests/semver.test.ts
+```
 
-`analyze` and the `complexity` stage now report:
+Write JSON reports to disk:
 
-- `complexity`: cyclomatic complexity
-- `cognitive_complexity`
-- `max_nesting_depth`
-- `complexity_breakdown` by decision type
+```bash
+court-jester verify \
+  --file src/profile.py \
+  --language python \
+  --output-dir .court-jester/reports
+```
 
-When `--diff-file` is set, the complexity gate applies only to changed functions.
-
-For Python, common built-in runtime and validation exceptions such as `TypeError`, `AttributeError`, `KeyError`, `IndexError`, `ValueError`, `ZeroDivisionError`, and `UnicodeError` are treated as crashes, not harmless validation rejects.
-
-## CLI Usage
+Other commands:
 
 ```text
-court-jester verify   [OPTIONS]
 court-jester analyze  [OPTIONS]
 court-jester lint     [OPTIONS]
 court-jester execute  [OPTIONS]
 court-jester --help
-court-jester --version
 ```
+
+## What `verify` Does
+
+`verify` runs a staged pipeline and returns one JSON report.
+
+| Stage | What it does | Fails the run? |
+|-------|--------------|----------------|
+| `parse` | Tree-sitter AST extraction | Yes |
+| `complexity` | Optional complexity gate | Only if you set a threshold |
+| `lint` | Ruff or Biome in the target project context | No, advisory only |
+| `execute` | Synthesized fuzz/property checks in a sandbox | Yes |
+| `test` | Optional caller-supplied test file | Yes |
+
+The important stage is `execute`: Court Jester walks the AST, generates adversarial inputs, runs them in a sandbox, and reports the concrete repro when something breaks.
+
+For Python, common runtime and validation exceptions like `TypeError`, `AttributeError`, `KeyError`, `IndexError`, `ValueError`, `ZeroDivisionError`, and `UnicodeError` are treated as failures.
+
+## Common Flags
 
 Core flags:
 
 - `--file <PATH>`: source file to inspect
 - `--language python|typescript`
 - `--project-dir <PATH>`: root for `.venv`, `node_modules`, and config discovery
-- `--config-path <PATH>`: explicit Ruff/Biome config
-- `--virtual-file-path <PATH>`: preserve lint path semantics for temp or generated files
+- `--config-path <PATH>`: explicit Ruff or Biome config path
+- `--virtual-file-path <PATH>`: preserve lint path semantics for temp/generated code
 
-Verify-specific flags:
+Useful `verify` flags:
 
-- `--test-file <PATH>`
-- `--output-dir <PATH>`
-- `--diff-file <PATH>`
-- `--complexity-threshold <N>`
+- `--test-file <PATH>`: add an authoritative test stage
+- `--tests-only`: skip fuzz execute and run only the authoritative test stage
+- `--output-dir <PATH>`: persist JSON reports
+- `--diff-file <PATH>`: only inspect changed functions from a unified diff
+- `--complexity-threshold <N>`: fail when a function exceeds the threshold
 
-Execute-specific flags:
+Sandbox flags for `execute`:
 
 - `--timeout-seconds <F>`
 - `--memory-mb <N>`
 
-Examples:
+Use `court-jester --help` for the full CLI help text.
 
-```bash
-court-jester verify --file src/profile.py --language python
-court-jester verify --file src/semver.ts --language typescript --test-file tests/semver.test.ts
-court-jester lint --file src/parser.py --language python --config-path pyproject.toml
-court-jester analyze --file src/router.ts --language typescript --diff-file changes.diff
-court-jester execute --file src/demo.py --language python --timeout-seconds 5
-```
-
-Exit codes:
+## Exit Codes And Output
 
 - `0`: command succeeded and the code passed
-- `1`: the code failed verification or execution, but the CLI still returned structured JSON
+- `1`: the code failed verification or execution, but Court Jester still returned structured JSON
 - `2`: CLI usage or setup error
 
-## Bring Your Own Lint Rules
+That makes it easy to use in:
 
-Court Jester now runs linters in the user project context rather than a detached temp directory.
+- agent loops
+- pre-merge checks
+- local shell workflows
+- benchmark harnesses
 
-Use these patterns:
+## Evidence
 
-```bash
-court-jester lint --file src/app.py --language python --project-dir .
-court-jester verify --file src/app.ts --language typescript --project-dir apps/web
-court-jester lint --file src/app.py --language python --config-path pyproject.toml
-```
+Court Jester's current headline benchmark is a 39-task verify-only repair policy on `core-current`.
 
-That means repo-local `pyproject.toml`, `ruff.toml`, `biome.json`, path-based overrides, include/exclude rules, and project-local linter binaries all work the way users expect.
+- Claude: `35 / 39` baseline -> `37 / 39` with verify-guided repair
+- Codex: `36 / 39` baseline -> `39 / 39` with verify-guided repair
+- Known-good false-positive control: `20 / 20` passes
 
-## Release And Dev
+More detail:
 
-Build and test:
-
-```bash
-cargo fmt
-cargo test
-cargo build --release
-```
-
-CLI smoke tests:
-
-```bash
-python scripts/smoke_cli.py --release
-python scripts/smoke_cli.py --release --verify-sample
-```
-
-Stage a release directory:
-
-```bash
-python scripts/prepare_release.py --release
-```
-
-Optional local-only bundling:
-
-```bash
-python scripts/prepare_release.py --release --include-ruff --include-biome
-```
-
-Benchmark harness:
-
-```bash
-python -m bench.run_matrix --dry-run
-python -m bench.run_matrix \
-  --task-set core-current \
-  --models codex-default,claude-default \
-  --policies baseline,repair-loop-verify-only \
-  --output-dir /tmp/court-jester-core-verify-only
-python -m bench.summarize_runs bench/results/dev
-```
-
-## Repo Layout
-
-```text
-src/        Rust CLI and verification pipeline
-tests/      Rust integration tests
-bench/      Benchmark harness, task fixtures, evaluators, stress runs
-docs/       Product notes, architecture docs, benchmark writeups
-scripts/    smoke_cli.py, prepare_release.py
-```
-
-## Troubleshooting
-
-| Problem | What it means |
-|---------|---------------|
-| `ruff not available in project, on PATH, or next to court-jester` | Install Ruff or point the CLI at the right project root |
-| `biome not available...` | Install Biome or make sure `node_modules/.bin/biome` exists |
-| TypeScript verify fails before fuzzing starts | Install `bun` or make sure the local TS runtime is available |
-| Lint crashes but verify still reports code failures separately | Expected; lint is advisory and no longer blocks the full verify verdict by itself |
-
-## More Detail
-
-- [docs/court-jester-overview.md](docs/court-jester-overview.md)
 - [docs/benchmark-2026-04-10.md](docs/benchmark-2026-04-10.md)
-- [docs/system-flow.md](docs/system-flow.md)
-- [docs/tool-flow-diagram.md](docs/tool-flow-diagram.md)
+- [docs/swebench-lite-plan.md](docs/swebench-lite-plan.md)
+- [docs/court-jester-overview.md](docs/court-jester-overview.md)
+
+## Development
+
+Contributor commands are intentionally kept in [`justfile`](justfile):
+
+```bash
+just build
+just test
+just smoke
+just smoke-sample
+just fmt
+just bench-dry-run
+```
+
+More repo and benchmark detail:
+
+- [AGENTS.md](AGENTS.md)
+- [docs/README.md](docs/README.md)
 - [bench/README.md](bench/README.md)
