@@ -147,9 +147,10 @@ court-jester --help
 | `execute` | Synthesized fuzz/property checks in a sandbox | Yes |
 | `test` | Optional caller-supplied test file | Yes |
 
-The important stage is `execute`: Court Jester walks the AST, generates adversarial inputs, runs them in a sandbox, and reports the concrete repro when something breaks.
+The important stage is `execute`: Court Jester synthesizes a language-specific harness from the AST, runs it in a sandbox, and reports the concrete repro when something breaks.
 
-For Python, common runtime and validation exceptions like `TypeError`, `AttributeError`, `KeyError`, `IndexError`, `ValueError`, `ZeroDivisionError`, and `UnicodeError` are treated as failures.
+- Python: generates direct calls and adversarial edge cases, and treats common runtime and validation exceptions like `TypeError`, `AttributeError`, `KeyError`, `IndexError`, `ValueError`, `ZeroDivisionError`, and `UnicodeError` as real failures.
+- TypeScript: resolves local aliases, interfaces, classes, and imported types where it can, generates structured values for unions, arrays, records, nullable branches, and inline object shapes, then treats both runtime crashes and contract violations as execute-stage failures. Return-type mismatches, inconsistency, failed idempotency or boundedness checks, blank string outputs, nullish-string leaks, symmetry violations, and comparator violations all count.
 
 ## Common Flags
 
