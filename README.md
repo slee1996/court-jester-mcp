@@ -149,8 +149,8 @@ court-jester --help
 
 The important stage is `execute`: Court Jester synthesizes a language-specific harness from the AST, runs it in a sandbox, and reports the concrete repro when something breaks.
 
-- Python: generates direct calls and adversarial edge cases, and treats common runtime and validation exceptions like `TypeError`, `AttributeError`, `KeyError`, `IndexError`, `ValueError`, `ZeroDivisionError`, and `UnicodeError` as real failures.
-- TypeScript: resolves local aliases, interfaces, classes, and imported types where it can, generates structured values for unions, arrays, records, nullable branches, and inline object shapes, then treats both runtime crashes and contract violations as execute-stage failures. Return-type mismatches, inconsistency, failed idempotency or boundedness checks, blank string outputs, nullish-string leaks, symmetry violations, and comparator violations all count.
+- Python: generates direct calls and adversarial edge cases from the function surface, then treats both runtime exceptions and contract violations as execute-stage failures. That includes crashes like `TypeError`, `AttributeError`, `KeyError`, `IndexError`, `RecursionError`, `MemoryError`, `ValueError`, `ZeroDivisionError`, and `UnicodeError`, plus return-type mismatches, inconsistency, failed idempotency or boundedness checks, non-negative violations, nullish-string leaks, symmetry violations, comparator violations, and roundtrip failures for inferred encode/decode pairs.
+- TypeScript: resolves local aliases, interfaces, classes, and imported types where it can, generates structured values for unions, arrays, records, nullable branches, and inline object shapes, then treats both runtime crashes and contract violations as execute-stage failures. That includes crashes like `TypeError`, `RangeError`, `ReferenceError`, `URIError`, and stack overflows, plus return-type mismatches, inconsistency, failed idempotency or boundedness checks, blank string outputs, nullish-string leaks, symmetry violations, comparator violations, and roundtrip failures for inferred encode/decode pairs.
 
 ## Common Flags
 
