@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -30,12 +29,57 @@ def load_results(results_dir: Path) -> list[dict]:
     rows = []
     if not results_dir.exists():
         return rows
-    for path in sorted(results_dir.glob("*/result.json")):
+    for run_dir in sorted(path for path in results_dir.iterdir() if path.is_dir()):
+        result_path = run_dir / "result.json"
+        run_path = run_dir / "run.json"
+        target_path = result_path if result_path.exists() else run_path if run_path.exists() else None
+        if target_path is None:
+            continue
         try:
-            rows.append(json.loads(path.read_text()))
+            row = json.loads(target_path.read_text())
         except (json.JSONDecodeError, OSError):
             continue
+        if target_path == run_path and "status" not in row:
+            row["status"] = "running"
+        rows.append(row)
     return rows
+
+
+def load_matrix_metadata(results_dir: Path) -> dict:
+    matrix_path = results_dir / "matrix.json"
+    if not matrix_path.exists():
+        return {}
+    try:
+        data = json.loads(matrix_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def load_status(results_dir: Path) -> dict:
+    rows = load_results(results_dir)
+    run_dirs = [path for path in results_dir.iterdir() if path.is_dir()] if results_dir.exists() else []
+    completed = sum(1 for row in rows if row.get("status") != "running")
+    running = sum(1 for row in rows if row.get("status") == "running")
+    bare_running = 0
+    for run_dir in run_dirs:
+        if (run_dir / "result.json").exists():
+            continue
+        if not (run_dir / "run.json").exists():
+            bare_running += 1
+    running += bare_running
+    metadata = load_matrix_metadata(results_dir)
+    expected_total = metadata.get("expected_total")
+    if not isinstance(expected_total, int):
+        expected_total = None
+    return {
+        "results_dir": str(results_dir),
+        "completed_runs": completed,
+        "running_runs": running,
+        "observed_runs": max(len(rows), completed + running),
+        "expected_total": expected_total,
+        "metadata": metadata,
+    }
 
 
 def load_tasks(bench_root: Path) -> list[dict]:
@@ -84,6 +128,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/runs":
             self._json_response(load_results(self.results_dir))
+        elif parsed.path == "/api/status":
+            self._json_response(load_status(self.results_dir))
         elif parsed.path == "/api/manifests":
             data = {
                 "tasks": load_tasks(BENCH_ROOT),

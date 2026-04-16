@@ -394,6 +394,18 @@ def complex_fn(x: int) -> int:
         "complex_fn should have complexity >= 4, got {}",
         complex.complexity
     );
+    assert_eq!(complex.complexity_breakdown.get("if"), Some(&2));
+    assert_eq!(complex.complexity_breakdown.get("for"), Some(&1));
+    assert!(
+        complex.cognitive_complexity >= 4,
+        "complex_fn should have cognitive complexity >= 4, got {}",
+        complex.cognitive_complexity
+    );
+    assert!(
+        complex.max_nesting_depth >= 2,
+        "complex_fn should report nesting depth >= 2, got {}",
+        complex.max_nesting_depth
+    );
 }
 
 #[test]
@@ -438,6 +450,104 @@ function complex(x: number): number {
         "complex should have complexity >= 4, got {}",
         complex.complexity
     );
+    assert_eq!(complex.complexity_breakdown.get("if"), Some(&2));
+    assert_eq!(complex.complexity_breakdown.get("for"), Some(&1));
+}
+
+#[test]
+fn python_nested_function_complexity_does_not_include_child() {
+    let code = "\
+def outer(x: int) -> int:
+    def inner(y: int) -> int:
+        if y > 0:
+            return y
+        return 0
+    return x
+";
+    let r = analyze(code, &Language::Python);
+    let outer = r.functions.iter().find(|f| f.name == "outer").unwrap();
+    let inner = r.functions.iter().find(|f| f.name == "inner").unwrap();
+
+    assert_eq!(
+        outer.complexity, 1,
+        "outer should not inherit nested inner complexity"
+    );
+    assert_eq!(outer.cognitive_complexity, 0);
+    assert!(inner.is_nested, "inner should be marked nested");
+    assert!(
+        inner.complexity >= 2,
+        "inner should still report its own branch complexity, got {}",
+        inner.complexity
+    );
+}
+
+#[test]
+fn python_match_case_counts_complexity() {
+    let code = "\
+def classify(x: int) -> str:
+    match x:
+        case 0:
+            return \"zero\"
+        case 1 | 2:
+            return \"small\"
+        case _:
+            return \"other\"
+";
+    let r = analyze(code, &Language::Python);
+    let classify = r.functions.iter().find(|f| f.name == "classify").unwrap();
+
+    assert_eq!(
+        classify.complexity, 4,
+        "base + three case clauses should produce complexity 4"
+    );
+    assert_eq!(classify.complexity_breakdown.get("case"), Some(&3));
+    assert!(
+        classify.cognitive_complexity >= 6,
+        "match/case should accumulate cognitive complexity, got {}",
+        classify.cognitive_complexity
+    );
+    assert!(
+        classify.max_nesting_depth >= 1,
+        "match/case should report nesting depth, got {}",
+        classify.max_nesting_depth
+    );
+}
+
+#[test]
+fn typescript_switch_for_of_and_logical_operators_count_complexity() {
+    let code = "\
+function score(items: number[] | null, fallback: number): number {
+  let total = 0;
+  for (const item of items ?? []) {
+    switch (item) {
+      case 0:
+        total += fallback || 1;
+        break;
+      default:
+        total += item && fallback ? item : fallback;
+    }
+  }
+  return total;
+}
+";
+    let r = analyze(code, &Language::TypeScript);
+    let score = r.functions.iter().find(|f| f.name == "score").unwrap();
+
+    assert!(
+        score.complexity >= 8,
+        "for-of, switch branches, logical ops, ternary, and ?? should all count; got {}",
+        score.complexity
+    );
+    assert_eq!(score.complexity_breakdown.get("for_of"), Some(&1));
+    assert_eq!(score.complexity_breakdown.get("switch_case"), Some(&1));
+    assert_eq!(score.complexity_breakdown.get("switch_default"), Some(&1));
+    assert_eq!(score.complexity_breakdown.get("logical_or"), Some(&1));
+    assert_eq!(score.complexity_breakdown.get("logical_and"), Some(&1));
+    assert_eq!(
+        score.complexity_breakdown.get("nullish_coalescing"),
+        Some(&1)
+    );
+    assert_eq!(score.complexity_breakdown.get("ternary"), Some(&1));
 }
 
 // ── Method detection (Change 3) ─────────────────────────────────────────────

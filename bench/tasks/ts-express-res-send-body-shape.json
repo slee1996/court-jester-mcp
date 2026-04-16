@@ -1,0 +1,60 @@
+{
+  "id": "ts-express-res-send-body-shape",
+  "title": "Express clone res.send handles numbers, heads, and binary bodies",
+  "repo_fixture": "express_clone_alpha",
+  "prompt": "Fix the Express clone so res.send matches Express for this benchmark slice. Numeric bodies should behave like JSON, while HEAD, binary, and no-content responses should still preserve the correct semantics.",
+  "language": "typescript",
+  "bucket": "framework_clone_alpha",
+  "verify_paths": [
+    "index.ts"
+  ],
+  "verify_test_path": "tests/verify_res_send.ts",
+  "setup_commands": [
+    [
+      "python",
+      "{bench_root}/seed_express_clone_bug.py",
+      "{workspace}",
+      "res_send_numbers_as_text"
+    ]
+  ],
+  "setup_cache_key": "express-clone-alpha:res-send-numbers-v1",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_res_send.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_workspace_test.py",
+    "{workspace}",
+    "tests/hidden_res_send.ts"
+  ],
+  "expected_files": [
+    "index.ts"
+  ],
+  "family": "express_clone_alpha",
+  "bug_class": "framework_semantics",
+  "bug_surface": "response_send",
+  "difficulty": "hard",
+  "golden_patch_description": "Restore Express res.send handling for numbers while preserving HEAD, binary, and 204 response semantics.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": true,
+  "cross_file": false,
+  "upstream_benchmark": "express",
+  "upstream_instance_id": "res-send-v1",
+  "instance_notes": "Derived from res.send.js primitive, HEAD, binary, and no-content semantics.",
+  "tags": [
+    "typescript",
+    "express",
+    "response",
+    "send",
+    "upstream_derived"
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "id": "ts-query-string-canonicalization-public-repair",
+  "title": "TypeScript query-string canonicalization public-repair probe",
+  "repo_fixture": "mini_ts_query_string_service",
+  "prompt": "Fix canonicalQuery so it produces a normalized query string and drops empty values correctly.",
+  "language": "typescript",
+  "bucket": "public_repair_probe",
+  "verify_paths": [
+    "query.ts"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.ts",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_repair_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_query_string_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "query.ts"
+  ],
+  "tags": [
+    "typescript",
+    "public-repair-probe",
+    "serialization",
+    "query_string",
+    "normalization"
+  ],
+  "bug_class": "semantic_normalization",
+  "expected_public_failure_without_fix": true
+}

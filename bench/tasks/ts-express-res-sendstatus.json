@@ -1,0 +1,60 @@
+{
+  "id": "ts-express-res-sendstatus",
+  "title": "Express clone sends standard status bodies through res.sendStatus",
+  "repo_fixture": "express_clone_alpha",
+  "prompt": "Fix the Express clone so res.sendStatus behaves like Express for this benchmark slice. It should set the status code, send the standard status text for non-empty responses, and preserve no-body semantics for 204 responses.",
+  "language": "typescript",
+  "bucket": "framework_clone_alpha",
+  "verify_paths": [
+    "index.ts"
+  ],
+  "verify_test_path": "tests/verify_res_sendstatus.ts",
+  "setup_commands": [
+    [
+      "python",
+      "{bench_root}/seed_express_clone_bug.py",
+      "{workspace}",
+      "res_sendstatus_numeric_body"
+    ]
+  ],
+  "setup_cache_key": "express-clone-alpha:res-sendstatus-v1",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_res_sendstatus.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_workspace_test.py",
+    "{workspace}",
+    "tests/hidden_res_sendstatus.ts"
+  ],
+  "expected_files": [
+    "index.ts"
+  ],
+  "family": "express_clone_alpha",
+  "bug_class": "framework_semantics",
+  "bug_surface": "response_sendstatus",
+  "difficulty": "medium",
+  "golden_patch_description": "Restore res.sendStatus text-body behavior while keeping 204 responses empty.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": true,
+  "cross_file": false,
+  "upstream_benchmark": "express",
+  "upstream_instance_id": "res-sendstatus-v1",
+  "instance_notes": "Derived from res.sendStatus.js semantics.",
+  "tags": [
+    "typescript",
+    "express",
+    "response",
+    "status",
+    "upstream_derived"
+  ]
+}

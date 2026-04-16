@@ -1,0 +1,52 @@
+{
+  "id": "ts-qs-parse-nested-brackets",
+  "title": "QS parse handles bracket notation and repeated keys",
+  "repo_fixture": "mini_ts_qs_parse_service",
+  "prompt": "Fix parseQuery so it matches qs-style parsing for this benchmark slice: repeated flat keys should become arrays, bracket notation should build nested objects, and scalar URL decoding should still work.",
+  "language": "typescript",
+  "bucket": "library_semantic_core",
+  "verify_paths": [
+    "parse.ts"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.ts",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_qs_parse_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "parse.ts"
+  ],
+  "family": "library_slice",
+  "bug_class": "spec_conformance",
+  "bug_surface": "parsing",
+  "difficulty": "hard",
+  "golden_patch_description": "Match a narrow qs.parse slice for repeated keys, array shorthand, nested bracket notation, and scalar URL decoding.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": false,
+  "cross_file": false,
+  "upstream_benchmark": "qs",
+  "upstream_instance_id": "parse-nested-brackets-v1",
+  "instance_notes": "Compact qs parse slice derived from repeated-key and bracket-notation semantics in the qs README and upstream parse tests.",
+  "tags": [
+    "typescript",
+    "library",
+    "qs",
+    "query_string",
+    "parse",
+    "spec_conformance",
+    "upstream_derived"
+  ]
+}

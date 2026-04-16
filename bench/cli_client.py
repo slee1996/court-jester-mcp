@@ -140,6 +140,8 @@ class CourtJesterClient:
             )
             if test_path is not None:
                 command.extend(["--test-file", str(test_path)])
+            if arguments.get("tests_only"):
+                command.append("--tests-only")
             output_dir = arguments.get("output_dir")
             if output_dir:
                 command.extend(["--output-dir", str(output_dir)])

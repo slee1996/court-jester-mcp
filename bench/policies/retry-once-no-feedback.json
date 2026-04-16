@@ -1,0 +1,13 @@
+{
+  "id": "retry-once-no-feedback",
+  "title": "Retry once (no feedback)",
+  "description": "Reserve one blind retry after a failed Court Jester verify. The second attempt gets no verify, public, or hidden failure details.",
+  "court_jester_mode": "required",
+  "required_tools": [
+    "verify"
+  ],
+  "block_on_failed_verify": true,
+  "max_repair_rounds": 1,
+  "verify_only_repair": true,
+  "repair_feedback_style": "none"
+}

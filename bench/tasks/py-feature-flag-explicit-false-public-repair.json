@@ -1,0 +1,37 @@
+{
+  "id": "py-feature-flag-explicit-false-public-repair",
+  "title": "Feature flag explicit false public-repair probe",
+  "repo_fixture": "mini_py_feature_flag_service",
+  "prompt": "Fix the feature flag helper so it falls back safely when config data is missing, but still respects an explicit false override.",
+  "language": "python",
+  "bucket": "public_repair_probe",
+  "verify_paths": [
+    "flags.py",
+    "defaults.py"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.py",
+  "public_check_commands": [
+    [
+      "python",
+      "tests/public_repair_checks.py"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/py_feature_flag_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "flags.py",
+    "defaults.py"
+  ],
+  "tags": [
+    "python",
+    "public-repair-probe",
+    "falsey_override",
+    "cross_file",
+    "feature_flag"
+  ],
+  "bug_class": "falsey_override",
+  "expected_public_failure_without_fix": true
+}

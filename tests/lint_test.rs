@@ -145,6 +145,7 @@ fn verify_keeps_python_lint_runner_errors_advisory() {
         VerifyOptions {
             test_code: None,
             test_source_file: None,
+            tests_only: false,
             complexity_threshold: None,
             project_dir: None,
             lint_config_path: None,

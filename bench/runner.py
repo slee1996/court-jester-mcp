@@ -14,12 +14,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from .agent_trace import prepare_agent_trace, summarize_agent_trace
 from .cli_client import CourtJesterClient
 from .common import BENCH_ROOT, REPO_ROOT, ModelManifest, PolicyManifest, TaskManifest, load_model, slugify
 from .providers import ProviderResult, provider_from_manifest
 
 
 PROVIDER_RETRYABLE_KINDS = {"capacity_busy", "internal_server_error", "transport_error"}
+DEFAULT_AGENT_TRACE_EVENT_OVERHEAD_MS = 20.0
 
 
 @dataclass(slots=True)
@@ -55,9 +57,50 @@ def select_repair_trigger_source(
         return None
     if not public_ok:
         return "public"
+    if policy.public_only_repair:
+        return None
     if hidden_checks_ran and not hidden_ok:
         return "hidden"
     return None
+
+
+def normalize_repair_feedback_style(policy: PolicyManifest) -> str:
+    style = (policy.repair_feedback_style or "detailed").strip().lower()
+    if style in {"detailed", "generic", "none"}:
+        return style
+    return "detailed"
+
+
+def uses_blind_retry_without_verify(policy: PolicyManifest) -> bool:
+    return bool(policy.blind_retry_without_verify)
+
+
+def uses_public_only_repair(policy: PolicyManifest) -> bool:
+    return bool(policy.public_only_repair)
+
+
+def supports_agent_path_trace(model: ModelManifest) -> bool:
+    enabled = os.getenv("CJ_AGENT_TRACE", "").strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return False
+    return model.provider in {"codex_cli", "claude_cli"}
+
+
+def agent_trace_event_overhead_ms() -> float:
+    value = os.getenv("CJ_AGENT_TRACE_EVENT_OVERHEAD_MS")
+    if value is None:
+        return DEFAULT_AGENT_TRACE_EVENT_OVERHEAD_MS
+    try:
+        return float(value)
+    except ValueError:
+        return DEFAULT_AGENT_TRACE_EVENT_OVERHEAD_MS
+
+
+def generic_repair_feedback(repair_trigger_source: str) -> str:
+    return (
+        "The previous attempt failed benchmark evaluation. "
+        f"Try again and focus on the behavior that caused the {repair_trigger_source} failure."
+    )
 
 
 def run_single(
@@ -129,12 +172,38 @@ def run_single(
         "timings": {
             "setup_ms": 0,
             "provider_apply_ms": 0,
+            "provider_retry_backoff_ms": 0,
             "court_jester_total_ms": 0,
             "public_checks_ms": 0,
             "hidden_checks_ms": 0,
+            "agent_trace_setup_ms": 0,
+            "agent_trace_summary_ms": 0,
+            "agent_trace_event_count": 0,
+            "agent_trace_event_overhead_estimate_ms": 0,
+            "agent_trace_overhead_estimate_ms": 0,
+            "product_loop_ms": 0,
+            "benchmark_scoring_ms": 0,
+            "harness_overhead_ms": 0,
             "end_to_end_ms": 0,
         },
     }
+    write_json(
+        run_dir / "run.json",
+        {
+            "run_id": run_id,
+            "task_id": task.id,
+            "model_id": model.id,
+            "policy_id": policy.id,
+            "bucket": task.bucket,
+            "repeat_index": repeat_index,
+            "repeat_ordinal": repeat_index + 1,
+            "repeat_count": repeat_count,
+            "dry_run": dry_run,
+            "status": "running",
+            "task_gold_patch_mode": use_task_gold_patches,
+            "timestamps": {"started_at_epoch_ms": started_at_ms},
+        },
+    )
 
     if dry_run:
         result["status"] = "dry_run"
@@ -179,12 +248,36 @@ def run_single(
     attempt_history: list[dict[str, object]] = []
     critic_feedbacks: list[str] = []
     max_attempts = 1 if use_task_gold_patches else 1 + max(policy.max_repair_rounds, 0)
+    blind_retry_without_verify = uses_blind_retry_without_verify(policy) and not use_task_gold_patches
+    public_only_repair = uses_public_only_repair(policy) and not use_task_gold_patches
+    result["blind_retry_without_verify"] = blind_retry_without_verify
+    result["public_only_repair"] = public_only_repair
     for attempt in range(max_attempts):
+        attempt_before = snapshot_tree(workspace)
         provider_retry_records: list[dict[str, Any]] = []
         provider_apply_ms = 0
         provider_result = None
         provider_call_count = 0
         gold_patch_command: CommandResult | None = None
+        attempt_trace_setup: dict[str, Any] | None = None
+        attempt_trace_summary: dict[str, Any] | None = None
+        attempt_trace_setup_ms = 0.0
+        attempt_trace_summary_ms = 0.0
+        attempt_trace_event_count = 0
+        attempt_trace_event_overhead_estimate_ms = 0.0
+        attempt_trace_overhead_estimate_ms = 0.0
+        trace_environment = None
+        if supports_agent_path_trace(model):
+            trace_setup_started = time.time()
+            trace_environment = prepare_agent_trace(run_dir / "agent_trace" / f"attempt_{attempt}")
+            attempt_trace_setup_ms = int((time.time() - trace_setup_started) * 1000)
+            attempt_trace_setup = {
+                "trace_dir": trace_environment.trace_dir,
+                "events_path": trace_environment.events_path,
+                "summary_path": trace_environment.summary_path,
+                "shim_dir": trace_environment.shim_dir,
+                "wrapped_commands": trace_environment.wrapped_commands,
+            }
         if use_task_gold_patches:
             provider_started = time.time()
             provider_result, gold_patch_command = apply_task_gold_patch(task, workspace, run_dir, attempt)
@@ -203,6 +296,7 @@ def run_single(
                     feedback=feedback,
                     attempt=attempt,
                     history=attempt_history if policy.replay_attempt_history else None,
+                    env_overrides=trace_environment.env_updates if trace_environment is not None else None,
                 )
                 provider_apply_ms += int((time.time() - provider_started) * 1000)
                 provider_call_count += 1
@@ -226,16 +320,50 @@ def run_single(
                         }
                     )
                     if delay_seconds > 0:
+                        result["timings"]["provider_retry_backoff_ms"] += int(delay_seconds * 1000)
                         time.sleep(delay_seconds)
                     continue
                 provider_result = provider_candidate
                 break
+        if trace_environment is not None:
+            trace_summary_started = time.time()
+            attempt_trace_summary = summarize_agent_trace(Path(trace_environment.trace_dir))
+            attempt_trace_summary_ms = int((time.time() - trace_summary_started) * 1000)
+            attempt_trace_event_count = int(attempt_trace_summary.get("event_count", 0) or 0)
+            attempt_trace_event_overhead_estimate_ms = (
+                float(attempt_trace_event_count) * agent_trace_event_overhead_ms()
+            )
+            attempt_trace_overhead_estimate_ms = (
+                attempt_trace_setup_ms
+                + attempt_trace_summary_ms
+                + attempt_trace_event_overhead_estimate_ms
+            )
+            result["timings"]["agent_trace_setup_ms"] += attempt_trace_setup_ms
+            result["timings"]["agent_trace_summary_ms"] += attempt_trace_summary_ms
+            result["timings"]["agent_trace_event_count"] += attempt_trace_event_count
+            result["timings"]["agent_trace_event_overhead_estimate_ms"] += (
+                attempt_trace_event_overhead_estimate_ms
+            )
+            result["timings"]["agent_trace_overhead_estimate_ms"] += attempt_trace_overhead_estimate_ms
         result["timings"]["provider_apply_ms"] += provider_apply_ms
+        attempt_after = snapshot_tree(workspace)
+        attempt_changed_files = sorted(compute_changed_files(attempt_before, attempt_after))
+        attempt_diff_path = run_dir / f"attempt_{attempt}.diff"
+        attempt_diff_path.write_text(unified_diff(attempt_before, attempt_after))
         attempt_record: dict[str, Any] = {
             "attempt": attempt,
             "provider_apply_ms": provider_apply_ms,
             "provider_call_count": provider_call_count,
             "provider_retries": provider_retry_records,
+            "attempt_changed_files": attempt_changed_files,
+            "attempt_patch_diff_path": str(attempt_diff_path),
+            "agent_trace": attempt_trace_summary,
+            "agent_trace_setup": attempt_trace_setup,
+            "agent_trace_setup_ms": attempt_trace_setup_ms,
+            "agent_trace_summary_ms": attempt_trace_summary_ms,
+            "agent_trace_event_count": attempt_trace_event_count,
+            "agent_trace_event_overhead_estimate_ms": attempt_trace_event_overhead_estimate_ms,
+            "agent_trace_overhead_estimate_ms": attempt_trace_overhead_estimate_ms,
             "provider_result": {
                 "changed_files": provider_result.changed_files,
                 "transcript": provider_result.transcript,
@@ -255,6 +383,45 @@ def run_single(
         if provider_result.failed:
             break
 
+        should_defer_evaluation = (
+            blind_retry_without_verify
+            and attempt < max_attempts - 1
+            and provider.supports_repair
+        )
+        if should_defer_evaluation:
+            attempt_record["court_jester"] = {
+                "results": [],
+                "verify_failed": False,
+                "total_ms": 0,
+                "skipped": True,
+            }
+            attempt_record["public_checks"] = []
+            attempt_record["public_failed"] = False
+            attempt_record["public_checks_ms"] = 0
+            attempt_record["public_checks_deferred"] = True
+            attempt_record["hidden_checks"] = []
+            attempt_record["hidden_failed"] = False
+            attempt_record["hidden_checks_ran"] = False
+            attempt_record["hidden_checks_sampled_on_public_failure"] = False
+            attempt_record["hidden_checks_deferred"] = bool(task.hidden_check_command)
+            attempt_record["repair_trigger_source"] = None
+            attempt_record["repair_feedback_style"] = "none"
+            attempt_record["repair_feedback_present"] = False
+            attempt_record["promoted_verify_test_path"] = None
+            attempt_record["promoted_repros"] = []
+            attempt_record["critic_feedback"] = None
+            if policy.replay_attempt_history:
+                attempt_history.append(
+                    {
+                        "attempt": attempt,
+                        "summary": extract_provider_summary(provider_result),
+                        "changed_files": provider_result.changed_files,
+                        "feedback": None,
+                        "promoted_repros": [],
+                    }
+                )
+            continue
+
         attempt_cj_results: list[dict[str, Any]] = []
         verify_failed = False
         attempt_cj_total_ms = 0
@@ -268,15 +435,33 @@ def run_single(
                         "language": task.language,
                         "output_dir": str(verify_output_dir),
                     }
-                    # Public-file tests generally import the task's main API module, not every
-                    # helper in the dependency closure. Attaching the same test file to helper
-                    # paths creates false positives like NameError on symbols the helper does not
-                    # define. Keep file-based tests on the first/public verify target only.
-                    if verify_index == 0:
+                    if task.verify_tests_only:
+                        arguments["tests_only"] = True
+                    materialized_verify_paths: list[Path] = []
+                    if task.verify_tests_only:
                         if promoted_verify_test_path is not None:
                             arguments["test_file_path"] = str(promoted_verify_test_path)
                         elif task.verify_test_path:
-                            arguments["test_file_path"] = str(workspace / task.verify_test_path)
+                            verify_test_path, materialized_verify_paths = ensure_verify_test_available(
+                                task=task,
+                                workspace=workspace,
+                                relative_test_path=task.verify_test_path,
+                            )
+                            arguments["test_file_path"] = str(verify_test_path)
+                    elif verify_index == 0:
+                        # Non-tests-only verify uses helper fuzz plus an optional file-based test.
+                        # Keep the public test on the first/primary target to avoid helper-path
+                        # false positives when a helper module does not lexically define the API
+                        # symbols asserted by the public test.
+                        if promoted_verify_test_path is not None:
+                            arguments["test_file_path"] = str(promoted_verify_test_path)
+                        elif task.verify_test_path:
+                            verify_test_path, materialized_verify_paths = ensure_verify_test_available(
+                                task=task,
+                                workspace=workspace,
+                                relative_test_path=task.verify_test_path,
+                            )
+                            arguments["test_file_path"] = str(verify_test_path)
                     try:
                         tool_started = time.time()
                         response = client.call_tool("verify", arguments)
@@ -302,7 +487,34 @@ def run_single(
                         result["tool_usage"]["verify_calls"] += 1
                         attempt_cj_total_ms += 120000
                         verify_failed = True
+                        cleanup_materialized_paths(materialized_verify_paths)
                         break
+                    except Exception as exc:
+                        tool_duration_ms = int((time.time() - tool_started) * 1000)
+                        attempt_cj_results.append(
+                            {
+                                "path": rel_path,
+                                "tool_name": "verify",
+                                "duration_ms": tool_duration_ms,
+                                "response": {
+                                    "overall_ok": False,
+                                    "stages": [
+                                        {
+                                            "name": "verify_tool_call",
+                                            "ok": False,
+                                            "error": str(exc),
+                                        }
+                                    ],
+                                },
+                            }
+                        )
+                        result["tool_usage"]["verify_calls"] += 1
+                        attempt_cj_total_ms += tool_duration_ms
+                        verify_failed = True
+                        cleanup_materialized_paths(materialized_verify_paths)
+                        break
+                    finally:
+                        cleanup_materialized_paths(materialized_verify_paths)
                     parsed = response["result"].get("parsed")
                     item = {
                         "path": rel_path,
@@ -336,11 +548,12 @@ def run_single(
         attempt_record["public_checks"] = [asdict(item) for item in final_public_results]
         attempt_record["public_failed"] = not final_public_ok
         attempt_record["public_checks_ms"] = public_checks_ms
+        attempt_record["public_checks_deferred"] = False
         attempt_hidden_results: list[CommandResult] = []
         attempt_hidden_ok = True
         attempt_hidden_checks_ran = False
         attempt_hidden_checks_sampled = False
-        if hidden_checks_requested and policy.max_repair_rounds > 0:
+        if hidden_checks_requested and policy.max_repair_rounds > 0 and not public_only_repair:
             attempt_hidden_checks_ran = final_public_ok or should_sample_hidden_on_public_failure(hidden_seed)
             attempt_hidden_checks_sampled = (not final_public_ok) and attempt_hidden_checks_ran
             attempt_hidden_results = (
@@ -349,7 +562,10 @@ def run_single(
                     workspace,
                     run_dir,
                     f"hidden_attempt_{attempt}",
-                    extra_env={"CJ_HIDDEN_SEED": hidden_seed},
+                    extra_env={
+                        "CJ_HIDDEN_SEED": hidden_seed,
+                        "CJ_REPO_FIXTURE": task.repo_fixture,
+                    },
                 )
                 if attempt_hidden_checks_ran
                 else []
@@ -369,6 +585,7 @@ def run_single(
         attempt_record["hidden_failed"] = attempt_hidden_checks_ran and not attempt_hidden_ok
         attempt_record["hidden_checks_ran"] = attempt_hidden_checks_ran
         attempt_record["hidden_checks_sampled_on_public_failure"] = attempt_hidden_checks_sampled
+        attempt_record["hidden_checks_deferred"] = False
 
         repair_trigger_source = select_repair_trigger_source(
             policy=policy,
@@ -378,15 +595,27 @@ def run_single(
             hidden_ok=attempt_hidden_ok,
         )
         promoted_repros: list[str] = []
-        if repair_trigger_source == "verify":
+        repair_feedback_style = normalize_repair_feedback_style(policy)
+        attempt_critic_feedback: str | None = None
+        if repair_trigger_source is None:
+            feedback = None
+            promoted_verify_test_path = None
+        elif repair_feedback_style == "none":
+            feedback = None
+            promoted_verify_test_path = None
+        elif repair_feedback_style == "generic":
+            feedback = generic_repair_feedback(repair_trigger_source)
+            promoted_verify_test_path = None
+        elif repair_trigger_source == "verify":
             promoted_repros = collect_promoted_verify_repros(task.language, attempt_cj_results)
             feedback = format_verify_feedback(
                 attempt_cj_results,
+                workspace=workspace,
                 promoted_repros=promoted_repros,
                 task=task,
                 include_first_party_checklist=policy.structured_first_party_feedback,
             )
-            critic_feedback = build_critic_feedback(
+            attempt_critic_feedback = build_critic_feedback(
                 policy=policy,
                 workspace=workspace,
                 task=task,
@@ -394,9 +623,9 @@ def run_single(
                 promoted_repros=promoted_repros,
                 history=attempt_history,
             )
-            if critic_feedback:
-                feedback = "\n\n".join([feedback, "External critic advice:", critic_feedback])
-                critic_feedbacks.append(critic_feedback)
+            if attempt_critic_feedback:
+                feedback = "\n\n".join([feedback, "External critic advice:", attempt_critic_feedback])
+                critic_feedbacks.append(attempt_critic_feedback)
             if policy.promote_verify_repros and task.verify_test_path:
                 promoted_verify_test_path = write_promoted_verify_test(
                     workspace=workspace,
@@ -416,11 +645,13 @@ def run_single(
             feedback = None
             promoted_verify_test_path = None
         attempt_record["repair_trigger_source"] = repair_trigger_source
+        attempt_record["repair_feedback_style"] = repair_feedback_style if repair_trigger_source else "none"
+        attempt_record["repair_feedback_present"] = feedback is not None
         attempt_record["promoted_verify_test_path"] = (
             str(promoted_verify_test_path) if promoted_verify_test_path is not None else None
         )
         attempt_record["promoted_repros"] = promoted_repros
-        attempt_record["critic_feedback"] = critic_feedbacks[-1] if critic_feedbacks else None
+        attempt_record["critic_feedback"] = attempt_critic_feedback
 
         if repair_trigger_source is None:
             break
@@ -446,12 +677,23 @@ def run_single(
         for attempt in attempts
         if attempt.get("repair_trigger_source")
     ]
+    prior_repair_feedback_styles = [
+        attempt["repair_feedback_style"]
+        for attempt in attempts
+        if attempt.get("repair_trigger_source")
+    ]
     if not prior_repair_trigger_sources:
         prior_repair_trigger_source = None
     elif len(set(prior_repair_trigger_sources)) == 1:
         prior_repair_trigger_source = prior_repair_trigger_sources[0]
     else:
         prior_repair_trigger_source = "multiple"
+    if not prior_repair_feedback_styles:
+        prior_repair_feedback_style = None
+    elif len(set(prior_repair_feedback_styles)) == 1:
+        prior_repair_feedback_style = prior_repair_feedback_styles[0]
+    else:
+        prior_repair_feedback_style = "multiple"
     if provider_result.unsupported:
         result["status"] = "unsupported_provider"
         result["success"] = False
@@ -461,6 +703,8 @@ def run_single(
         result["repair_attempted"] = len(attempts) > 1
         result["repair_trigger_source"] = prior_repair_trigger_source
         result["repair_trigger_sources"] = prior_repair_trigger_sources
+        result["repair_feedback_style"] = prior_repair_feedback_style
+        result["repair_feedback_styles"] = prior_repair_feedback_styles
         result["failure_provenance"] = prior_repair_trigger_sources
         finalize_result(result)
         write_json(run_dir / "result.json", result)
@@ -479,6 +723,8 @@ def run_single(
             result["repair_attempted"] = False
             result["repair_trigger_source"] = prior_repair_trigger_source
             result["repair_trigger_sources"] = prior_repair_trigger_sources
+            result["repair_feedback_style"] = prior_repair_feedback_style
+            result["repair_feedback_styles"] = prior_repair_feedback_styles
             result["failure_provenance"] = prior_repair_trigger_sources + ["gold_patch"]
             finalize_result(result)
             write_json(run_dir / "result.json", result)
@@ -490,6 +736,8 @@ def run_single(
         result["failure_category"] = (
             "provider_auth_error"
             if provider_error_kind == "auth_required"
+            else "provider_timeout"
+            if provider_error_kind == "timeout"
             else "provider_usage_limited"
             if provider_error_kind == "usage_limited"
             else "provider_infra_busy"
@@ -507,6 +755,8 @@ def run_single(
         result["repair_attempted"] = len(attempts) > 1
         result["repair_trigger_source"] = prior_repair_trigger_source
         result["repair_trigger_sources"] = prior_repair_trigger_sources
+        result["repair_feedback_style"] = prior_repair_feedback_style
+        result["repair_feedback_styles"] = prior_repair_feedback_styles
         result["failure_provenance"] = prior_repair_trigger_sources + ["provider"]
         finalize_result(result)
         write_json(run_dir / "result.json", result)
@@ -542,7 +792,10 @@ def run_single(
                 workspace,
                 run_dir,
                 "hidden",
-                extra_env={"CJ_HIDDEN_SEED": hidden_seed},
+                extra_env={
+                    "CJ_HIDDEN_SEED": hidden_seed,
+                    "CJ_REPO_FIXTURE": task.repo_fixture,
+                },
             )
             if hidden_checks_ran
             else []
@@ -568,12 +821,23 @@ def run_single(
         for attempt in attempts
         if attempt.get("repair_trigger_source")
     ]
+    repair_feedback_styles = [
+        attempt["repair_feedback_style"]
+        for attempt in attempts
+        if attempt.get("repair_trigger_source")
+    ]
     if not repair_trigger_sources:
         repair_trigger_source = None
     elif len(set(repair_trigger_sources)) == 1:
         repair_trigger_source = repair_trigger_sources[0]
     else:
         repair_trigger_source = "multiple"
+    if not repair_feedback_styles:
+        repair_feedback_style = None
+    elif len(set(repair_feedback_styles)) == 1:
+        repair_feedback_style = repair_feedback_styles[0]
+    else:
+        repair_feedback_style = "multiple"
     hidden_failed = hidden_checks_ran and not hidden_ok
 
     result["public_checks"] = [asdict(item) for item in public_results]
@@ -593,6 +857,8 @@ def run_single(
     result["repair_attempted"] = repair_attempted
     result["repair_trigger_source"] = repair_trigger_source
     result["repair_trigger_sources"] = repair_trigger_sources
+    result["repair_feedback_style"] = repair_feedback_style
+    result["repair_feedback_styles"] = repair_feedback_styles
     result["verify_failed_attempts"] = verify_failed_attempts
     result["public_failed_attempts"] = public_failed_attempts
     result["repaired_after_verify_failure"] = repaired_after_verify_failure
@@ -698,6 +964,37 @@ def restore_workspace_from_retry_snapshot(backup_dir: Path, workspace: Path) -> 
     if workspace.exists():
         shutil.rmtree(workspace)
     shutil.copytree(backup_dir, workspace)
+
+
+def verify_asset_source(task: TaskManifest, relative_test_path: str) -> Path | None:
+    candidate = BENCH_ROOT / "verify_assets" / task.repo_fixture / relative_test_path
+    if candidate.exists():
+        return candidate
+    return None
+
+
+def ensure_verify_test_available(
+    *,
+    task: TaskManifest,
+    workspace: Path,
+    relative_test_path: str,
+) -> tuple[Path, list[Path]]:
+    target = workspace / relative_test_path
+    if target.exists():
+        return target, []
+    source = verify_asset_source(task, relative_test_path)
+    if source is None:
+        raise FileNotFoundError(
+            f"Verify test file not found in workspace or verify assets: {relative_test_path}"
+        )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+    return target, [target]
+
+
+def cleanup_materialized_paths(paths: list[Path]) -> None:
+    for path in paths:
+        path.unlink(missing_ok=True)
 
 
 def setup_cache_root() -> Path:
@@ -890,7 +1187,25 @@ def finalize_result(result: dict[str, Any]) -> None:
     finished_at_ms = int(time.time() * 1000)
     result["timestamps"]["finished_at_epoch_ms"] = finished_at_ms
     started_at_ms = int(result["timestamps"].get("started_at_epoch_ms", finished_at_ms))
-    result["timings"]["end_to_end_ms"] = finished_at_ms - started_at_ms
+    timings = result.setdefault("timings", {})
+    timings["end_to_end_ms"] = finished_at_ms - started_at_ms
+    setup_ms = float(timings.get("setup_ms", 0))
+    provider_apply_ms = float(timings.get("provider_apply_ms", 0))
+    provider_retry_backoff_ms = float(timings.get("provider_retry_backoff_ms", 0))
+    court_jester_total_ms = float(timings.get("court_jester_total_ms", 0))
+    public_checks_ms = float(timings.get("public_checks_ms", 0))
+    hidden_checks_ms = float(timings.get("hidden_checks_ms", 0))
+    timings["product_loop_ms"] = provider_apply_ms + court_jester_total_ms + public_checks_ms
+    timings["benchmark_scoring_ms"] = hidden_checks_ms
+    captured_ms = (
+        setup_ms
+        + provider_apply_ms
+        + provider_retry_backoff_ms
+        + court_jester_total_ms
+        + public_checks_ms
+        + hidden_checks_ms
+    )
+    timings["harness_overhead_ms"] = max(0.0, float(timings["end_to_end_ms"]) - captured_ms)
 
 
 def stringify_output(value: Any) -> str:
@@ -902,11 +1217,14 @@ def stringify_output(value: Any) -> str:
 
 
 def classify_provider_failure(provider_result: ProviderResult) -> str:
+    failure_reason = stringify_output(provider_result.failure_reason).lower()
+    if provider_result.timed_out or "timed out after" in failure_reason:
+        return "timeout"
     haystack = "\n".join(
         filter(
             None,
             [
-                stringify_output(provider_result.failure_reason),
+                failure_reason,
                 *(stringify_output(item) for item in provider_result.transcript),
             ],
         )
@@ -914,6 +1232,13 @@ def classify_provider_failure(provider_result: ProviderResult) -> str:
     auth_markers = ("not logged in", "please run /login", "login required", "authentication")
     if any(marker in haystack for marker in auth_markers):
         return "auth_required"
+    model_config_markers = (
+        "invalid_request_error",
+        "model is not supported when using codex with a chatgpt account",
+        "model is not supported",
+    )
+    if any(marker in haystack for marker in model_config_markers):
+        return "model_unsupported"
     usage_limit_markers = ("usage limit", "quota", "try again at")
     if any(marker in haystack for marker in usage_limit_markers):
         return "usage_limited"
@@ -1180,9 +1505,106 @@ def format_public_failure_feedback(items: list[CommandResult]) -> str:
     return "\n".join(lines)
 
 
+def normalize_feedback_path(path: str, workspace: Path | None) -> str:
+    candidate = Path(path)
+    if workspace is not None and candidate.is_absolute():
+        try:
+            return candidate.relative_to(workspace).as_posix()
+        except ValueError:
+            return candidate.as_posix()
+    return candidate.as_posix()
+
+
+def resolve_local_import_path(source_path: Path, import_path: str) -> Path | None:
+    if not import_path.startswith("."):
+        return None
+    target = source_path.parent / import_path
+    candidates: list[Path] = []
+    if target.suffix:
+        candidates.append(target)
+    else:
+        candidates.extend(
+            [
+                target.with_suffix(".ts"),
+                target.with_suffix(".tsx"),
+                target.with_suffix(".js"),
+                target.with_suffix(".jsx"),
+                target / "index.ts",
+                target / "index.tsx",
+                target / "index.js",
+                target / "index.jsx",
+            ]
+        )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def local_import_paths(source_path: Path) -> list[str]:
+    if not source_path.exists():
+        return []
+    text = source_path.read_text()
+    imports: list[str] = []
+    for match in re.finditer(
+        r'^\s*(?:import|export)\s+(?:[^"\']+\s+from\s+)?["\']([^"\']+)["\']',
+        text,
+        re.MULTILINE,
+    ):
+        import_path = match.group(1)
+        if import_path.startswith("."):
+            imports.append(import_path)
+    return imports
+
+
+def infer_tests_only_owner_paths(
+    *,
+    workspace: Path,
+    task: TaskManifest,
+    failed_path: str,
+) -> list[str]:
+    source_path = workspace / failed_path
+    verify_paths = {Path(path).as_posix() for path in task.verify_paths}
+    owners: list[str] = []
+    for import_path in local_import_paths(source_path):
+        resolved = resolve_local_import_path(source_path, import_path)
+        if resolved is None:
+            continue
+        relative = normalize_feedback_path(str(resolved), workspace)
+        if relative != failed_path and relative in verify_paths and relative not in owners:
+            owners.append(relative)
+    return owners
+
+
+def verify_feedback_scope_lines(
+    item: dict[str, Any],
+    *,
+    workspace: Path | None,
+    task: TaskManifest | None,
+) -> list[str]:
+    path = item.get("path")
+    if not isinstance(path, str) or not path:
+        return []
+    normalized_path = normalize_feedback_path(path, workspace)
+    if task is None or not task.verify_tests_only or workspace is None:
+        return [f"File: {normalized_path}"]
+    owner_paths = infer_tests_only_owner_paths(
+        workspace=workspace,
+        task=task,
+        failed_path=normalized_path,
+    )
+    if owner_paths:
+        lines = [f"Likely owner files: {', '.join(owner_paths)}"]
+        if normalized_path not in owner_paths:
+            lines.append(f"Related call site: {normalized_path}")
+        return lines
+    return [f"Related source file: {normalized_path}"]
+
+
 def format_verify_feedback(
     items: list[dict[str, Any]],
     *,
+    workspace: Path | None = None,
     promoted_repros: list[str] | None = None,
     task: TaskManifest | None = None,
     include_first_party_checklist: bool = False,
@@ -1208,9 +1630,13 @@ def format_verify_feedback(
         response = item.get("response")
         if not isinstance(response, dict) or response.get("overall_ok", False):
             continue
-        path = item["path"]
-        lines.append(f"- File: {path}")
-        for summary_line in summarize_verify_failures(response):
+        for scope_line in verify_feedback_scope_lines(
+            item,
+            workspace=workspace,
+            task=task,
+        ):
+            lines.append(f"- {scope_line}")
+        for summary_line in summarize_verify_failures(response, task=task):
             lines.append(f"  {summary_line}")
     return "\n".join(lines)
 
@@ -1329,11 +1755,20 @@ def write_promoted_verify_test(
     if not task.verify_test_path or not promoted_repros:
         return None
     original = workspace / task.verify_test_path
-    if not original.exists():
-        return None
-    suffix = original.suffix
-    generated = original.with_name(f".bench_promoted_verify_attempt_{attempt + 1}{suffix}")
-    lines = [original.read_text().rstrip(), "", promoted_repro_block(task.language, promoted_repros)]
+    if original.exists():
+        source_text = original.read_text()
+        suffix = original.suffix
+        generated = original.with_name(f".bench_promoted_verify_attempt_{attempt + 1}{suffix}")
+    else:
+        source = verify_asset_source(task, task.verify_test_path)
+        if source is None:
+            return None
+        source_text = source.read_text()
+        generated = (workspace / task.verify_test_path).with_name(
+            f".bench_promoted_verify_attempt_{attempt + 1}{source.suffix}"
+        )
+    generated.parent.mkdir(parents=True, exist_ok=True)
+    lines = [source_text.rstrip(), "", promoted_repro_block(task.language, promoted_repros)]
     generated.write_text("\n".join(line for line in lines if line) + "\n")
     return generated
 
@@ -1372,7 +1807,22 @@ def format_hidden_failure_feedback(items: list[CommandResult]) -> str:
     return "\n".join(lines)
 
 
-def summarize_verify_failures(response: dict[str, Any]) -> list[str]:
+def should_suppress_verify_evidence(
+    *,
+    task: TaskManifest | None,
+    stage_name: str,
+    snippet: str,
+) -> bool:
+    if task is None or not task.verify_tests_only:
+        return False
+    return stage_name == "test" and snippet.strip().lower() == "process timed out"
+
+
+def summarize_verify_failures(
+    response: dict[str, Any],
+    *,
+    task: TaskManifest | None = None,
+) -> list[str]:
     lines: list[str] = []
     for stage in response.get("stages", []):
         if stage.get("ok", True):
@@ -1406,7 +1856,11 @@ def summarize_verify_failures(response: dict[str, Any]) -> list[str]:
             str(detail.get("stderr") or ""),
             str(detail.get("stdout") or ""),
         )
-        if snippet:
+        if snippet and not should_suppress_verify_evidence(
+            task=task,
+            stage_name=stage_name,
+            snippet=snippet,
+        ):
             lines.append(f"Evidence: {snippet}")
     if not lines:
         lines.append("No structured verify failure details were available.")

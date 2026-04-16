@@ -1,0 +1,60 @@
+{
+  "id": "ts-express-res-vary",
+  "title": "Express clone merges Vary headers through res.vary",
+  "repo_fixture": "express_clone_alpha",
+  "prompt": "Fix the Express clone so res.vary behaves like Express for this benchmark slice. It should append unique fields, preserve existing Vary values, and avoid duplicate entries.",
+  "language": "typescript",
+  "bucket": "framework_clone_alpha",
+  "verify_paths": [
+    "index.ts"
+  ],
+  "verify_test_path": "tests/verify_res_vary.ts",
+  "setup_commands": [
+    [
+      "python",
+      "{bench_root}/seed_express_clone_bug.py",
+      "{workspace}",
+      "res_vary_reset"
+    ]
+  ],
+  "setup_cache_key": "express-clone-alpha:res-vary-v1",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_res_vary.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_workspace_test.py",
+    "{workspace}",
+    "tests/hidden_res_vary.ts"
+  ],
+  "expected_files": [
+    "index.ts"
+  ],
+  "family": "express_clone_alpha",
+  "bug_class": "framework_semantics",
+  "bug_surface": "response_vary",
+  "difficulty": "medium",
+  "golden_patch_description": "Restore res.vary merge and deduplication semantics.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": true,
+  "cross_file": false,
+  "upstream_benchmark": "express",
+  "upstream_instance_id": "res-vary-v1",
+  "instance_notes": "Derived from res.vary.js semantics.",
+  "tags": [
+    "typescript",
+    "express",
+    "response",
+    "headers",
+    "upstream_derived"
+  ]
+}

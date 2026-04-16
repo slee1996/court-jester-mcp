@@ -1,0 +1,33 @@
+{
+  "id": "ts-secondary-label-missing-public-repair",
+  "title": "Secondary label fallback public-repair probe",
+  "repo_fixture": "mini_ts_label_service",
+  "prompt": "Fix secondaryLabel so it falls back safely when a second label is missing or blank.",
+  "language": "typescript",
+  "bucket": "public_repair_probe",
+  "verify_paths": [
+    "labels.ts"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.ts",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_repair_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_secondary_label_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "labels.ts"
+  ],
+  "tags": [
+    "typescript",
+    "public-repair-probe",
+    "array_bounds"
+  ],
+  "bug_class": "array_bounds",
+  "expected_public_failure_without_fix": true
+}

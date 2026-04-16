@@ -1,0 +1,53 @@
+{
+  "id": "ts-qs-stringify-deep-collections",
+  "title": "qs.stringify handles nested collections and nullish omission",
+  "repo_fixture": "mini_ts_qs_stringify_deep_service",
+  "prompt": "Fix stringifyQuery so it behaves like qs.stringify for the supported subset in this repo.",
+  "language": "typescript",
+  "bucket": "library_semantic_core",
+  "verify_paths": [
+    "stringify.ts"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.ts",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_qs_stringify_deep_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "stringify.ts"
+  ],
+  "family": "library_slice",
+  "bug_class": "spec_conformance",
+  "bug_surface": "serialization",
+  "difficulty": "hard",
+  "golden_patch_description": "Match a narrow qs.stringify contract for nested arrays, nested objects, nullish omission, and empty-string preservation.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": false,
+  "cross_file": false,
+  "upstream_benchmark": "qs",
+  "upstream_instance_id": "stringify-deep-collections-v1",
+  "instance_notes": "Deeper qs.stringify slice focused on nested collections and omission semantics.",
+  "tags": [
+    "typescript",
+    "library",
+    "qs",
+    "query_string",
+    "stringify",
+    "nested",
+    "spec_conformance",
+    "upstream_derived"
+  ]
+}

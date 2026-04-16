@@ -1,0 +1,58 @@
+{
+  "id": "ts-express-fresh-response-headers-v3",
+  "title": "Build Express response header helpers in a fresh repo (v3)",
+  "repo_fixture": "express_clone_alpha_fresh_response_headers",
+  "prompt": "Build the response helper behavior from the visible public spec. This public-repair stress slice includes location and links behavior, while deeper vary semantics remain in follow-up checks.",
+  "language": "typescript",
+  "bucket": "framework_clone_fresh_spec_public_repair_stress",
+  "provider_timeout_seconds": 1000,
+  "provider_idle_timeout_seconds": 600,
+  "verify_paths": [
+    "lib/http.ts"
+  ],
+  "verify_test_path": "tests/verify_spec.ts",
+  "verify_tests_only": true,
+  "setup_commands": [],
+  "setup_cache_key": "express-clone-alpha-fresh-response-headers:v3-public-repair-stress",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_spec.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_workspace_test.py",
+    "{workspace}",
+    "tests/hidden_spec.ts"
+  ],
+  "expected_files": [
+    "lib/http.ts"
+  ],
+  "family": "express_clone_alpha",
+  "bug_class": "framework_semantics",
+  "bug_surface": "fresh_response_headers",
+  "difficulty": "hard",
+  "golden_patch_description": "Implement response location and link semantics for the fresh Express slice, leaving only vary behavior hidden.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": true,
+  "cross_file": false,
+  "upstream_benchmark": "express",
+  "upstream_instance_id": "fresh-response-headers-v3-public-repair-stress",
+  "instance_notes": "Public-repair stress slice: visible location/link behavior, hidden vary dedupe edge, tests-only verify.",
+  "tags": [
+    "typescript",
+    "express",
+    "framework",
+    "fresh_repo",
+    "build_spec",
+    "response",
+    "public_repair_stress"
+  ]
+}

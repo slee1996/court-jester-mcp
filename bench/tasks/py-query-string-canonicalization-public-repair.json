@@ -1,0 +1,35 @@
+{
+  "id": "py-query-string-canonicalization-public-repair",
+  "title": "Query-string canonicalization public-repair probe",
+  "repo_fixture": "mini_py_query_string_service",
+  "prompt": "Fix canonical_query so it produces a stable, filtered query string and ignores empty values correctly.",
+  "language": "python",
+  "bucket": "public_repair_probe",
+  "verify_paths": [
+    "query.py"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.py",
+  "public_check_commands": [
+    [
+      "python",
+      "tests/public_repair_checks.py"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/py_query_string_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "query.py"
+  ],
+  "tags": [
+    "python",
+    "public-repair-probe",
+    "serialization",
+    "query_string",
+    "normalization"
+  ],
+  "bug_class": "semantic_normalization",
+  "expected_public_failure_without_fix": true
+}

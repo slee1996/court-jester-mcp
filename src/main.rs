@@ -24,9 +24,10 @@ COMMON OPTIONS:
 
 VERIFY OPTIONS:
   --test-file <PATH>         Test file to include as an authoritative stage
+  --tests-only               Skip fuzz-execute and run only the authoritative test stage
   --output-dir <PATH>        Directory to write persistent JSON reports
   --diff-file <PATH>         Unified-diff file — only inspect changed functions
-  --complexity-threshold <N> Fail if any function exceeds this complexity
+  --complexity-threshold <N> Fail if any function exceeds this complexity (changed functions only when --diff-file is set)
 
 EXECUTE OPTIONS:
   --timeout-seconds <F>      Sandbox timeout (default 10)
@@ -87,6 +88,7 @@ struct CliArgs {
     config_path: Option<String>,
     virtual_file_path: Option<String>,
     test_file: Option<String>,
+    tests_only: bool,
     output_dir: Option<String>,
     diff_file: Option<String>,
     complexity_threshold: Option<usize>,
@@ -113,6 +115,7 @@ fn parse_flags(rest: &[String]) -> Result<CliArgs, String> {
             "--config-path" => out.config_path = Some(take_value(&mut i)?),
             "--virtual-file-path" => out.virtual_file_path = Some(take_value(&mut i)?),
             "--test-file" => out.test_file = Some(take_value(&mut i)?),
+            "--tests-only" => out.tests_only = true,
             "--output-dir" => out.output_dir = Some(take_value(&mut i)?),
             "--diff-file" => out.diff_file = Some(take_value(&mut i)?),
             "--complexity-threshold" => {
@@ -202,6 +205,7 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
                 diff: diff.as_deref(),
                 source_file: Some(file.as_str()),
                 output_dir: args.output_dir.as_deref(),
+                tests_only: args.tests_only,
             };
             let report = tools::verify::verify(&code, &language, opts).await;
             let json = serde_json::to_string_pretty(&report)

@@ -1,0 +1,51 @@
+{
+  "id": "ts-express-clone-alpha-known-good",
+  "title": "Known-good Express clone alpha should pass without repair",
+  "repo_fixture": "express_clone_alpha",
+  "prompt": "The Express-clone alpha workspace is expected to already satisfy this upstream-derived benchmark slice. Do not change behavior unless you find a real mismatch.",
+  "language": "typescript",
+  "bucket": "known_good_corpus",
+  "verify_paths": [
+    "index.ts",
+    "lib/query.ts"
+  ],
+  "verify_test_path": "tests/verify_known_good.ts",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_known_good.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_workspace_test.py",
+    "{workspace}",
+    "tests/hidden_known_good.ts"
+  ],
+  "expected_files": [
+    "index.ts",
+    "lib/query.ts"
+  ],
+  "family": "known_good",
+  "bug_class": "false_positive_control",
+  "bug_surface": "framework_clone_alpha",
+  "difficulty": "hard",
+  "golden_patch_description": "No semantic change required; this Express clone alpha fixture is already correct for the benchmarked slice.",
+  "expected_verify_outcome": "pass",
+  "expected_verify_failure_kinds": [],
+  "expected_hidden_failure_without_fix": false,
+  "expected_public_failure_without_fix": false,
+  "uses_project_dir": false,
+  "uses_relative_imports": true,
+  "cross_file": true,
+  "upstream_benchmark": "express",
+  "upstream_instance_id": "clone-alpha-known-good-v1",
+  "instance_notes": "Known-good control for the shared Express clone alpha repo.",
+  "tags": [
+    "typescript",
+    "express",
+    "known_good",
+    "framework",
+    "false_positive_control"
+  ]
+}

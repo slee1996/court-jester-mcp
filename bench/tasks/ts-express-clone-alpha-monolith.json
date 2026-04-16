@@ -1,0 +1,126 @@
+{
+  "id": "ts-express-clone-alpha-monolith",
+  "title": "Repair a broken Express clone across router, wrapper, request, and response APIs",
+  "repo_fixture": "express_clone_alpha_monolith",
+  "prompt": "Fix the Express clone so it behaves like Express across this broad alpha slice. The repo has multiple seeded regressions across routing, wrappers, request metadata, header helpers, and response behavior. Make the shared clone broadly correct rather than patching a single narrow case.",
+  "language": "typescript",
+  "bucket": "framework_clone_alpha",
+  "provider_timeout_seconds": 1000,
+  "provider_idle_timeout_seconds": 300,
+  "verify_paths": [
+    "index.ts",
+    "lib/query.ts"
+  ],
+  "verify_test_path": "tests/verify_clone_alpha_monolith.ts",
+  "setup_commands": [
+    [
+      "python",
+      "{bench_root}/seed_express_clone_bug.py",
+      "{workspace}",
+      "app_use_mounting"
+    ],
+    [
+      "python",
+      "{bench_root}/seed_express_clone_bug.py",
+      "{workspace}",
+      "route_all_ignored"
+    ],
+    [
+      "python",
+      "{bench_root}/seed_express_clone_bug.py",
+      "{workspace}",
+      "express_json_passthrough"
+    ],
+    [
+      "python",
+      "{bench_root}/seed_express_clone_bug.py",
+      "{workspace}",
+      "express_urlencoded_simple_only"
+    ],
+    [
+      "python",
+      "{bench_root}/seed_express_clone_bug.py",
+      "{workspace}",
+      "req_get_case_sensitive"
+    ],
+    [
+      "python",
+      "{bench_root}/seed_express_clone_bug.py",
+      "{workspace}",
+      "req_protocol_ignores_proxy"
+    ],
+    [
+      "python",
+      "{bench_root}/seed_express_clone_bug.py",
+      "{workspace}",
+      "res_location_unencoded"
+    ],
+    [
+      "python",
+      "{bench_root}/seed_express_clone_bug.py",
+      "{workspace}",
+      "res_links_overwrite"
+    ],
+    [
+      "python",
+      "{bench_root}/seed_express_clone_bug.py",
+      "{workspace}",
+      "res_vary_reset"
+    ],
+    [
+      "python",
+      "{bench_root}/seed_express_clone_bug.py",
+      "{workspace}",
+      "express_text_uppercase"
+    ],
+    [
+      "python",
+      "{bench_root}/seed_express_clone_bug.py",
+      "{workspace}",
+      "express_raw_string_body"
+    ]
+  ],
+  "setup_cache_key": "express-clone-alpha-monolith:v3",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_clone_alpha_monolith.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_workspace_test.py",
+    "{workspace}",
+    "tests/hidden_clone_alpha_monolith.ts"
+  ],
+  "expected_files": [
+    "index.ts",
+    "lib/http.ts",
+    "lib/router.ts",
+    "lib/query.ts"
+  ],
+  "family": "express_clone_alpha",
+  "bug_class": "framework_semantics",
+  "bug_surface": "clone_monolith",
+  "difficulty": "xhard",
+  "golden_patch_description": "Repair multiple seeded Express-clone regressions across routing, wrappers, request metadata, header helpers, and response APIs.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": true,
+  "cross_file": true,
+  "upstream_benchmark": "express",
+  "upstream_instance_id": "clone-alpha-monolith-v1",
+  "instance_notes": "Large shared-repo Express clone repair task built from the current alpha surface.",
+  "tags": [
+    "typescript",
+    "express",
+    "framework",
+    "monolith",
+    "upstream_derived"
+  ]
+}

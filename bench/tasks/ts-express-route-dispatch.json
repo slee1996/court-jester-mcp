@@ -1,0 +1,60 @@
+{
+  "id": "ts-express-route-dispatch",
+  "title": "Express clone Route dispatch preserves all-handlers and fallthrough",
+  "repo_fixture": "express_clone_alpha",
+  "prompt": "Fix the Express clone so standalone Route dispatch behaves like Express for this benchmark slice. Route-level .all handlers must apply across methods and fallthrough ordering must remain intact.",
+  "language": "typescript",
+  "bucket": "framework_clone_alpha",
+  "verify_paths": [
+    "index.ts"
+  ],
+  "verify_test_path": "tests/verify_route.ts",
+  "setup_commands": [
+    [
+      "python",
+      "{bench_root}/seed_express_clone_bug.py",
+      "{workspace}",
+      "route_all_ignored"
+    ]
+  ],
+  "setup_cache_key": "express-clone-alpha:route-all-ignored",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_route.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_workspace_test.py",
+    "{workspace}",
+    "tests/hidden_route.ts"
+  ],
+  "expected_files": [
+    "index.ts"
+  ],
+  "family": "express_clone_alpha",
+  "bug_class": "framework_semantics",
+  "bug_surface": "route_dispatch",
+  "difficulty": "hard",
+  "golden_patch_description": "Restore Route dispatch behavior so .all handlers participate correctly and error fallthrough still works.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": true,
+  "cross_file": false,
+  "upstream_benchmark": "express",
+  "upstream_instance_id": "route-dispatch-v1",
+  "instance_notes": "Derived from Route.js all-handler, fallthrough, and error behavior.",
+  "tags": [
+    "typescript",
+    "express",
+    "route",
+    "dispatch",
+    "upstream_derived"
+  ]
+}

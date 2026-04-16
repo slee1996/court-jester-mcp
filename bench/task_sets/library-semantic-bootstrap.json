@@ -1,0 +1,14 @@
+{
+  "id": "library-semantic-bootstrap",
+  "title": "Library semantic bootstrap",
+  "goal": "Bootstrap narrow hard-library benchmarking from the strongest existing upstream-backed semantic tasks while packaging/qs tasks are still being built.",
+  "suite_kind": "library_semantic_bootstrap",
+  "task_ids": [
+    "ts-lodash-array-slice-1",
+    "ts-lodash-object-slice-1",
+    "ts-semver-caret-prerelease",
+    "ts-semver-compare-prerelease",
+    "ts-semver-max-stable-cross-file",
+    "py-swebench-lite-cookiejar-quoted"
+  ]
+}

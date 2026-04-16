@@ -1,0 +1,52 @@
+{
+  "id": "ts-qs-stringify-nested-nullish",
+  "title": "QS stringify handles nested objects, repeat arrays, and null skipping",
+  "repo_fixture": "mini_ts_qs_stringify_service",
+  "prompt": "Fix stringifyQuery so it matches qs-style stringify behavior for this benchmark slice: nested objects should use bracket notation, arrays should repeat the same key, null values should be skipped, and scalar values should still be URL encoded.",
+  "language": "typescript",
+  "bucket": "library_semantic_core",
+  "verify_paths": [
+    "stringify.ts"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.ts",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_qs_stringify_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "stringify.ts"
+  ],
+  "family": "library_slice",
+  "bug_class": "spec_conformance",
+  "bug_surface": "serialization",
+  "difficulty": "hard",
+  "golden_patch_description": "Match qs-style nested object bracket encoding, repeated array keys, null skipping, and scalar URL encoding for the supported input shapes.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": false,
+  "uses_project_dir": false,
+  "uses_relative_imports": false,
+  "cross_file": false,
+  "upstream_benchmark": "qs",
+  "upstream_instance_id": "stringify-nested-nullish-v1",
+  "instance_notes": "Compact qs stringify slice derived from upstream stringify semantics with repeat arrays and null skipping.",
+  "tags": [
+    "typescript",
+    "library",
+    "qs",
+    "query_string",
+    "stringify",
+    "spec_conformance",
+    "upstream_derived"
+  ]
+}

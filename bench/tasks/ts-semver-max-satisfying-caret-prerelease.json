@@ -1,0 +1,58 @@
+{
+  "id": "ts-semver-max-satisfying-caret-prerelease",
+  "title": "node-semver maxSatisfying handles caret ranges and prereleases",
+  "repo_fixture": "mini_ts_semver_max_satisfying_service",
+  "prompt": "Fix maxSatisfying so it behaves like node-semver's maxSatisfying for the supported subset in this repo.",
+  "language": "typescript",
+  "bucket": "library_semantic_core",
+  "verify_paths": [
+    "compare.ts",
+    "range.ts",
+    "versions.ts"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.ts",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_semver_max_satisfying_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "compare.ts",
+    "range.ts",
+    "versions.ts"
+  ],
+  "family": "library_slice",
+  "bug_class": "spec_conformance",
+  "bug_surface": "cross_file",
+  "difficulty": "hard",
+  "golden_patch_description": "Match a narrow node-semver maxSatisfying contract for exact versions, caret ranges, prerelease exclusion, zero-major semantics, and build-metadata normalization.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": false,
+  "cross_file": true,
+  "upstream_benchmark": "node-semver",
+  "upstream_instance_id": "max-satisfying-caret-prerelease-v1",
+  "instance_notes": "Cross-file maxSatisfying slice derived from node-semver range and max-satisfying semantics.",
+  "tags": [
+    "typescript",
+    "library",
+    "semver",
+    "node-semver",
+    "range",
+    "max_satisfying",
+    "cross_file",
+    "spec_conformance",
+    "upstream_derived"
+  ]
+}

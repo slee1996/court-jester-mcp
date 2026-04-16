@@ -52,7 +52,7 @@ export PATH="$HOME/.local/bin:$PATH"
 cargo install --git https://github.com/slee1996/court-jester-mcp.git
 ```
 
-Use a current stable Rust toolchain.
+The repo is currently pinned to Rust `1.86.0` via [`rust-toolchain.toml`](rust-toolchain.toml).
 </details>
 
 ## Install Optional Tooling

@@ -1,0 +1,60 @@
+{
+  "id": "ts-express-app-router-params",
+  "title": "Express clone restores req.params after leaving router callbacks",
+  "repo_fixture": "express_clone_alpha",
+  "prompt": "Fix the Express clone so using a router as a route callback behaves like Express. Router-local execution should not leak outer route params, and surrounding handlers must still see the correct params before and after the router runs.",
+  "language": "typescript",
+  "bucket": "framework_clone_alpha",
+  "verify_paths": [
+    "index.ts"
+  ],
+  "verify_test_path": "tests/verify_app_router.ts",
+  "setup_commands": [
+    [
+      "python",
+      "{bench_root}/seed_express_clone_bug.py",
+      "{workspace}",
+      "app_router_params_restore"
+    ]
+  ],
+  "setup_cache_key": "express-clone-alpha:app-router-params-v1",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_app_router.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_workspace_test.py",
+    "{workspace}",
+    "tests/hidden_app_router.ts"
+  ],
+  "expected_files": [
+    "index.ts"
+  ],
+  "family": "express_clone_alpha",
+  "bug_class": "framework_semantics",
+  "bug_surface": "app_router",
+  "difficulty": "hard",
+  "golden_patch_description": "Restore req.params isolation when a router is used as a route callback, while preserving routing behavior around it.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": false,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": true,
+  "cross_file": false,
+  "upstream_benchmark": "express",
+  "upstream_instance_id": "app-router-params-v1",
+  "instance_notes": "Derived from app.router.js req.params restoration semantics.",
+  "tags": [
+    "typescript",
+    "express",
+    "router",
+    "params",
+    "upstream_derived"
+  ]
+}

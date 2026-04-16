@@ -1,0 +1,14 @@
+{
+  "id": "library-semantic-hard-probe-v2",
+  "title": "Library semantic hard probe v2",
+  "goal": "Expanded packaging and qs semantic probe with both public-triggered and hidden-only failures, designed to compare public-test repair against Court Jester verify-guided repair.",
+  "suite_kind": "library_semantic_probe",
+  "task_ids": [
+    "py-packaging-version-ordering",
+    "py-packaging-specifier-prerelease-membership",
+    "py-packaging-filter-prerelease-fallback",
+    "ts-qs-stringify-nested-nullish",
+    "ts-qs-stringify-empty-values",
+    "ts-qs-parse-nested-brackets"
+  ]
+}

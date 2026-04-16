@@ -1,0 +1,60 @@
+{
+  "id": "ts-express-res-redirect-rendering",
+  "title": "Express clone encodes redirect locations and negotiated bodies",
+  "repo_fixture": "express_clone_alpha",
+  "prompt": "Fix the Express clone so res.redirect behaves like Express for this benchmark slice. It must encode redirect URLs correctly, preserve already-encoded sequences, and render the correct body for HEAD, text, html, and binary clients.",
+  "language": "typescript",
+  "bucket": "framework_clone_alpha",
+  "verify_paths": [
+    "index.ts"
+  ],
+  "verify_test_path": "tests/verify_res_redirect.ts",
+  "setup_commands": [
+    [
+      "python",
+      "{bench_root}/seed_express_clone_bug.py",
+      "{workspace}",
+      "res_redirect_encoding"
+    ]
+  ],
+  "setup_cache_key": "express-clone-alpha:res-redirect-encoding",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_res_redirect.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_workspace_test.py",
+    "{workspace}",
+    "tests/hidden_res_redirect.ts"
+  ],
+  "expected_files": [
+    "index.ts"
+  ],
+  "family": "express_clone_alpha",
+  "bug_class": "framework_semantics",
+  "bug_surface": "response_redirect",
+  "difficulty": "hard",
+  "golden_patch_description": "Restore Express-compatible redirect URL encoding and negotiated response-body behavior.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": true,
+  "cross_file": false,
+  "upstream_benchmark": "express",
+  "upstream_instance_id": "res-redirect-v1",
+  "instance_notes": "Derived from res.redirect.js encoding and response negotiation semantics.",
+  "tags": [
+    "typescript",
+    "express",
+    "response",
+    "redirect",
+    "upstream_derived"
+  ]
+}

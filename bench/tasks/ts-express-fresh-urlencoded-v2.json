@@ -1,0 +1,59 @@
+{
+  "id": "ts-express-fresh-urlencoded-v2",
+  "title": "Build the Express urlencoded parser in a fresh repo (v2)",
+  "repo_fixture": "express_clone_alpha_fresh_urlencoded",
+  "prompt": "Build the extended urlencoded parsing behavior from the visible public spec. The supporting app and response scaffolding already exists; focus on parsing nested form bodies into Express-like objects and arrays.",
+  "language": "typescript",
+  "bucket": "framework_clone_fresh_spec_chunk",
+  "provider_timeout_seconds": 1000,
+  "provider_idle_timeout_seconds": 600,
+  "verify_paths": [
+    "index.ts",
+    "lib/query.ts"
+  ],
+  "verify_test_path": "tests/verify_spec.ts",
+  "verify_tests_only": true,
+  "setup_commands": [],
+  "setup_cache_key": "express-clone-alpha-fresh-urlencoded:v2",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_spec.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_workspace_test.py",
+    "{workspace}",
+    "tests/hidden_spec.ts"
+  ],
+  "expected_files": [
+    "index.ts",
+    "lib/query.ts"
+  ],
+  "family": "express_clone_alpha",
+  "bug_class": "framework_semantics",
+  "bug_surface": "fresh_urlencoded",
+  "difficulty": "hard",
+  "golden_patch_description": "Implement extended urlencoded parsing behavior for the fresh Express slice.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": true,
+  "cross_file": true,
+  "upstream_benchmark": "express",
+  "upstream_instance_id": "fresh-urlencoded-v2",
+  "instance_notes": "Fresh-repo Express urlencoded slice with tests-only verify so framework chunks are judged only by authoritative behavioral specs.",
+  "tags": [
+    "typescript",
+    "express",
+    "framework",
+    "fresh_repo",
+    "build_spec",
+    "urlencoded"
+  ]
+}

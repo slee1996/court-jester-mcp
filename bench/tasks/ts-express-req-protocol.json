@@ -1,0 +1,60 @@
+{
+  "id": "ts-express-req-protocol",
+  "title": "Express clone reports protocol, secure, and xhr request metadata",
+  "repo_fixture": "express_clone_alpha",
+  "prompt": "Fix the Express clone so req.protocol, req.secure, and req.xhr behave like Express for this benchmark slice. Trust proxy should affect forwarded protocol handling, and XMLHttpRequest detection should use the request header.",
+  "language": "typescript",
+  "bucket": "framework_clone_alpha",
+  "verify_paths": [
+    "index.ts"
+  ],
+  "verify_test_path": "tests/verify_req_protocol.ts",
+  "setup_commands": [
+    [
+      "python",
+      "{bench_root}/seed_express_clone_bug.py",
+      "{workspace}",
+      "req_protocol_ignores_proxy"
+    ]
+  ],
+  "setup_cache_key": "express-clone-alpha:req-protocol-v1",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_req_protocol.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_workspace_test.py",
+    "{workspace}",
+    "tests/hidden_req_protocol.ts"
+  ],
+  "expected_files": [
+    "index.ts"
+  ],
+  "family": "express_clone_alpha",
+  "bug_class": "framework_semantics",
+  "bug_surface": "request_transport",
+  "difficulty": "medium",
+  "golden_patch_description": "Restore trust-proxy-aware req.protocol / req.secure while keeping req.xhr header detection.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": false,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": true,
+  "cross_file": false,
+  "upstream_benchmark": "express",
+  "upstream_instance_id": "req-protocol-v1",
+  "instance_notes": "Derived from req.protocol.js, req.secure.js, and req.xhr.js semantics.",
+  "tags": [
+    "typescript",
+    "express",
+    "request",
+    "transport",
+    "upstream_derived"
+  ]
+}

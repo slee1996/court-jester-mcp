@@ -139,6 +139,28 @@ body {
 
 .card-sub { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
 
+.status-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.status-chip {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.status-chip strong {
+  color: var(--text-bright);
+  font-family: var(--mono);
+  margin-right: 6px;
+}
+
 /* ─── Tabs ─── */
 .tabs {
   display: flex;
@@ -321,6 +343,7 @@ select {
 .latest-result.pass { border-left: 4px solid var(--green); }
 .latest-result.fail { border-left: 4px solid var(--red); }
 .latest-result.dry { border-left: 4px solid var(--blue); }
+.latest-result.running { border-left: 4px solid var(--yellow); }
 
 .latest-dot {
   width: 14px;
@@ -332,6 +355,7 @@ select {
 .latest-dot.pass { background: var(--green); box-shadow: 0 0 8px rgba(63,185,80,0.4); }
 .latest-dot.fail { background: var(--red); box-shadow: 0 0 8px rgba(248,81,73,0.4); }
 .latest-dot.dry { background: var(--blue); }
+.latest-dot.running { background: var(--yellow); box-shadow: 0 0 8px rgba(210,153,34,0.4); }
 
 .latest-info { flex: 1; min-width: 0; }
 .latest-task { font-family: var(--mono); font-size: 13px; font-weight: 600; }
@@ -339,6 +363,7 @@ select {
 .latest-category { font-family: var(--mono); font-size: 12px; padding: 2px 8px; border-radius: 4px; white-space: nowrap; }
 .latest-category.pass { background: var(--green-dim); color: var(--green); }
 .latest-category.fail { background: var(--red-dim); color: var(--red); }
+.latest-category.running { background: var(--yellow-dim); color: var(--yellow); }
 
 /* feed */
 .feed-header {
@@ -377,6 +402,7 @@ select {
 .feed-dot.pass { background: var(--green); }
 .feed-dot.fail { background: var(--red); }
 .feed-dot.dry { background: var(--blue); }
+.feed-dot.running { background: var(--yellow); }
 
 .feed-task { font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
@@ -390,6 +416,7 @@ select {
 .feed-badge.pass { background: var(--green-dim); color: var(--green); }
 .feed-badge.fail { background: var(--red-dim); color: var(--red); }
 .feed-badge.dry { background: var(--blue-dim); color: var(--blue); }
+.feed-badge.running { background: var(--yellow-dim); color: var(--yellow); }
 
 .feed-time { color: var(--text-dim); font-family: var(--mono); font-size: 11px; }
 
@@ -457,6 +484,7 @@ select {
 .matrix td.success { background: var(--green-dim); color: var(--green); }
 .matrix td.failure { background: var(--red-dim); color: var(--red); }
 .matrix td.partial { background: var(--yellow-dim); color: var(--yellow); }
+.matrix td.running { background: var(--yellow-dim); color: var(--yellow); }
 .matrix td.empty { background: var(--surface); color: var(--text-dim); cursor: default; }
 .matrix td.empty:hover { transform: none; box-shadow: none; }
 .matrix td.dry-run { background: var(--blue-dim); color: var(--blue); }
@@ -513,6 +541,7 @@ select {
 .run-category.public_check_failure { background: var(--red-dim); color: var(--red); }
 .run-category.dry_run { background: var(--blue-dim); color: var(--blue); }
 .run-category.provider_error, .run-category.provider_auth_error { background: rgba(240, 136, 62, 0.15); color: var(--orange); }
+.run-category.running { background: var(--yellow-dim); color: var(--yellow); }
 
 .run-time { color: var(--text-dim); font-size: 11px; font-family: var(--mono); text-align: right; }
 
@@ -594,6 +623,55 @@ select {
 .bar-fill.warning { background: var(--yellow); }
 .bar-count { width: 40px; font-family: var(--mono); font-size: 12px; color: var(--text-dim); }
 
+.comparison-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  margin-bottom: 16px;
+}
+
+.comparison-table th,
+.comparison-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+}
+
+.comparison-table th {
+  color: var(--text-dim);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.comparison-table td.metric {
+  font-family: var(--mono);
+}
+
+.comparison-table tr:hover {
+  background: var(--surface-2);
+}
+
+.comparison-table .success {
+  color: var(--green);
+}
+
+.comparison-table .failure {
+  color: var(--red);
+}
+
+.comparison-table .running {
+  color: var(--yellow);
+}
+
+.task-link {
+  cursor: pointer;
+}
+
+.task-link:hover {
+  color: var(--blue);
+}
+
 /* ─── Empty state ─── */
 .empty-state { text-align: center; padding: 60px 20px; color: var(--text-dim); }
 .empty-state h2 { font-size: 18px; margin-bottom: 8px; color: var(--text); }
@@ -674,6 +752,7 @@ select {
 let allRuns = [];
 let prevRunCount = 0;
 let manifests = { tasks: [], policies: [], models: [] };
+let dashboardStatus = { results_dir: '', completed_runs: 0, running_runs: 0, observed_runs: 0, expected_total: null, metadata: {} };
 let liveMode = true;
 let liveTimer = null;
 let runStartTime = null;
@@ -712,10 +791,17 @@ async function fetchManifests() {
 
 async function fetchAll() {
   try {
-    const resp = await fetch('/api/runs');
-    const newRuns = await resp.json();
+    const [runsResp, statusResp] = await Promise.all([
+      fetch('/api/runs'),
+      fetch('/api/status'),
+    ]);
+    const [newRuns, statusData] = await Promise.all([
+      runsResp.json(),
+      statusResp.json(),
+    ]);
     prevRunCount = allRuns.length;
     allRuns = newRuns;
+    dashboardStatus = statusData || dashboardStatus;
     if (!runStartTime && allRuns.length > 0) {
       const earliest = Math.min(...allRuns.map(r => r.timestamps?.started_at_epoch_ms || Infinity));
       if (earliest < Infinity) runStartTime = earliest;
@@ -783,7 +869,11 @@ function getFiltered() {
 // ─── Render ───
 function render() {
   const runs = getFiltered();
-  document.getElementById('run-count-label').textContent = `${allRuns.length} runs`;
+  const expected = dashboardStatus.expected_total;
+  const completed = dashboardStatus.completed_runs || allRuns.filter(r => r.status !== 'running').length;
+  document.getElementById('run-count-label').textContent = expected
+    ? `${completed}/${expected} complete`
+    : `${allRuns.length} runs`;
   renderTraining(allRuns);
   renderMatrix(runs);
   renderRunList(runs);
@@ -795,61 +885,66 @@ function render() {
 function renderTraining(runs) {
   const container = document.getElementById('tab-training');
 
-  // Compute expected total from manifests
-  const enabledModels = manifests.models.filter(m => m.enabled_by_default);
-  const modelCount = enabledModels.length || unique(runs, 'model_id').length || 1;
-  const taskCount = manifests.tasks.length || unique(runs, 'task_id').length || 1;
-  const policyCount = manifests.policies.length || unique(runs, 'policy_id').length || 1;
-  const expectedTotal = taskCount * modelCount * policyCount;
-
   const completed = runs.filter(r => r.status === 'completed');
-  const total = runs.length;
+  const running = runs.filter(r => r.status === 'running');
+  const observed = runs.length;
+  const completedCount = dashboardStatus.completed_runs || completed.length;
+  const runningCount = dashboardStatus.running_runs || running.length;
+  const expectedTotal = dashboardStatus.expected_total || inferExpectedTotal(runs);
   const successes = completed.filter(r => r.success).length;
   const failures = completed.filter(r => !r.success).length;
-  const completedCount = completed.length;
   const dryCount = runs.filter(r => r.status === 'dry_run').length;
-  const rate = completedCount > 0 ? ((successes / completedCount) * 100) : 0;
   const repaired = completed.filter(r => r.repaired_after_verify_failure || r.repaired_after_public_failure).length;
+  const rate = completed.length > 0 ? ((successes / completed.length) * 100) : 0;
 
-  // Is run active? Check if latest result is recent (within 60s)
   const now = Date.now();
-  const latestTs = Math.max(...runs.map(r => r.timestamps?.finished_at_epoch_ms || r.timestamps?.started_at_epoch_ms || 0));
-  const isActive = total > 0 && (now - latestTs < 60000);
-  const progressPct = expectedTotal > 0 ? Math.min((total / expectedTotal) * 100, 100) : 0;
-  const isDone = total >= expectedTotal && !isActive;
+  const latestCompletedTs = Math.max(0, ...completed.map(r => r.timestamps?.finished_at_epoch_ms || 0));
+  const latestObservedTs = Math.max(0, ...runs.map(r => r.timestamps?.finished_at_epoch_ms || r.timestamps?.started_at_epoch_ms || 0));
+  const isActive = runningCount > 0 || (latestObservedTs > 0 && (now - latestObservedTs < 60000));
+  const progressPct = expectedTotal > 0 ? Math.min((completedCount / expectedTotal) * 100, 100) : 0;
+  const isDone = expectedTotal > 0 && completedCount >= expectedTotal && runningCount === 0;
 
-  // Elapsed time
+  const earliestStarted = Math.min(...runs.map(r => r.timestamps?.started_at_epoch_ms || Infinity));
+  if (!runStartTime && earliestStarted < Infinity) runStartTime = earliestStarted;
   const elapsed = runStartTime ? now - runStartTime : 0;
   const elapsedStr = formatElapsed(elapsed);
-  const etaStr = total > 0 && isActive && progressPct > 0
-    ? formatElapsed((elapsed / progressPct) * (100 - progressPct))
-    : '—';
-
-  // Sort runs newest first
-  const sorted = [...runs].sort((a, b) => {
-    const ta = a.timestamps?.started_at_epoch_ms || 0;
-    const tb = b.timestamps?.started_at_epoch_ms || 0;
+  const completionRatePerHour = latestCompletedTs > 0 && elapsed > 0
+    ? completedCount / (elapsed / 3600000)
+    : null;
+  const remainingRuns = expectedTotal > 0 ? Math.max(expectedTotal - completedCount, 0) : null;
+  const etaMs = completionRatePerHour && remainingRuns
+    ? (remainingRuns / completionRatePerHour) * 3600000
+    : null;
+  const etaStr = etaMs ? formatElapsed(etaMs) : '—';
+  const timeSinceLastCompletion = latestCompletedTs > 0 ? now - latestCompletedTs : null;
+  const latest = [...runs].sort((a, b) => {
+    const ta = a.timestamps?.finished_at_epoch_ms || a.timestamps?.started_at_epoch_ms || 0;
+    const tb = b.timestamps?.finished_at_epoch_ms || b.timestamps?.started_at_epoch_ms || 0;
     return tb - ta;
-  });
-
-  const latest = sorted[0];
-
-  // Rate color
-  const rateColor = completedCount === 0 ? 'var(--text-dim)' : rate >= 70 ? 'var(--green)' : rate >= 40 ? 'var(--yellow)' : 'var(--red)';
+  })[0];
+  const rateColor = completed.length === 0 ? 'var(--text-dim)' : rate >= 70 ? 'var(--green)' : rate >= 40 ? 'var(--yellow)' : 'var(--red)';
+  const runPlan = dashboardStatus.metadata || {};
 
   let html = '';
 
-  // Hero success rate
   html += `<div class="training-hero">
-    <div class="big-rate" style="color:${rateColor}">${completedCount > 0 ? rate.toFixed(1) + '%' : '—'}</div>
-    <div class="big-label">${completedCount > 0 ? 'success rate' : 'waiting for completed runs'}</div>
+    <div class="big-rate" style="color:${rateColor}">${completed.length > 0 ? rate.toFixed(1) + '%' : '—'}</div>
+    <div class="big-label">${completed.length > 0 ? 'completed-run success rate' : 'waiting for completed runs'}</div>
   </div>`;
 
-  // Progress bar
+  html += `<div class="status-row">
+    <span class="status-chip"><strong>Results Dir</strong>${escapeHtml(shortPath(dashboardStatus.results_dir || '—'))}</span>
+    <span class="status-chip"><strong>Tasks</strong>${(runPlan.task_ids || []).length || unique(runs, 'task_id').length || '—'}</span>
+    <span class="status-chip"><strong>Models</strong>${(runPlan.model_ids || []).length || unique(runs, 'model_id').length || '—'}</span>
+    <span class="status-chip"><strong>Policies</strong>${(runPlan.policy_ids || []).length || unique(runs, 'policy_id').length || '—'}</span>
+    <span class="status-chip"><strong>Repeats</strong>${runPlan.repeats || 1}</span>
+    <span class="status-chip"><strong>Last Completion</strong>${timeSinceLastCompletion != null ? formatElapsed(timeSinceLastCompletion) + ' ago' : '—'}</span>
+  </div>`;
+
   html += `<div class="progress-bar-container">
     <div class="progress-meta">
-      <span class="count">${total} / ${expectedTotal} runs</span>
-      <span class="elapsed">${isActive ? 'elapsed ' + elapsedStr + ' &middot; eta ' + etaStr : isDone ? 'finished in ' + elapsedStr : elapsedStr}</span>
+      <span class="count">${completedCount} / ${expectedTotal || observed} completed${runningCount ? ` · ${runningCount} running` : ''}</span>
+      <span class="elapsed">${isDone ? 'finished in ' + elapsedStr : isActive ? 'elapsed ' + elapsedStr + ' · eta ' + etaStr : elapsedStr}</span>
     </div>
     <div class="progress-track">
       <div class="progress-fill ${isDone ? 'done' : 'active'}" style="width:${progressPct.toFixed(1)}%">
@@ -858,12 +953,16 @@ function renderTraining(runs) {
     </div>
   </div>`;
 
-  // Stats row
   html += `<div class="training-stats">
     <div class="card">
       <div class="card-label">Completed</div>
       <div class="card-value blue">${completedCount}</div>
-      <div class="card-sub">of ${total} total</div>
+      <div class="card-sub">${expectedTotal ? `of ${expectedTotal} planned` : `of ${observed} observed`}</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Running</div>
+      <div class="card-value yellow">${runningCount}</div>
+      <div class="card-sub">${remainingRuns != null ? `${remainingRuns} remaining` : 'live scan'}</div>
     </div>
     <div class="card">
       <div class="card-label">Passed</div>
@@ -876,19 +975,21 @@ function renderTraining(runs) {
     <div class="card">
       <div class="card-label">Repaired</div>
       <div class="card-value yellow">${repaired}</div>
+      <div class="card-sub">${completed.length ? `${((repaired / completed.length) * 100).toFixed(0)}% of completed` : '—'}</div>
     </div>
     <div class="card">
-      <div class="card-label">Dry Run</div>
-      <div class="card-value" style="color:var(--text-dim)">${dryCount}</div>
+      <div class="card-label">Throughput</div>
+      <div class="card-value blue">${completionRatePerHour ? completionRatePerHour.toFixed(1) : '—'}</div>
+      <div class="card-sub">completed runs/hour</div>
     </div>
   </div>`;
 
-  // Latest result
   if (latest) {
     const lCat = latest.failure_category || latest.status || 'unknown';
-    const lPass = latest.success;
     const lDry = latest.status === 'dry_run';
-    const lCls = lDry ? 'dry' : lPass ? 'pass' : 'fail';
+    const lRunning = latest.status === 'running';
+    const lPass = latest.success;
+    const lCls = lRunning ? 'running' : lDry ? 'dry' : lPass ? 'pass' : 'fail';
     html += `<div class="latest-result ${lCls}">
       <div class="latest-dot ${lCls}"></div>
       <div class="latest-info">
@@ -899,16 +1000,39 @@ function renderTraining(runs) {
     </div>`;
   }
 
-  // Result feed
+  const runningRows = running.slice().sort((a, b) => {
+    const ta = a.timestamps?.started_at_epoch_ms || 0;
+    const tb = b.timestamps?.started_at_epoch_ms || 0;
+    return tb - ta;
+  }).slice(0, 8);
+  if (runningRows.length) {
+    html += '<div class="card" style="margin-bottom:16px"><h3 style="font-size:13px; margin-bottom:12px">Active Runs</h3><ul class="run-list">';
+    runningRows.forEach(r => {
+      html += `<li class="run-item" onclick='showDetail(${JSON.stringify(r).replace(/'/g, "&#39;")})'>
+        <span class="run-dot running"></span>
+        <span class="run-task">${r.task_id}</span>
+        <span class="run-model">${r.model_id}</span>
+        <span class="run-policy">${r.policy_id}</span>
+        <span class="run-category running">running</span>
+        <span class="run-time">${formatDuration(r.timestamps)}</span>
+      </li>`;
+    });
+    html += '</ul></div>';
+  }
+
+  html += renderPolicyComparisonTable(runs);
+
   html += '<div class="feed-header">Run Feed</div>';
   html += '<ul class="feed">';
-  const feedItems = sorted.slice(0, 100);
+  const feedItems = [...runs].sort((a, b) => {
+    const ta = a.timestamps?.finished_at_epoch_ms || a.timestamps?.started_at_epoch_ms || 0;
+    const tb = b.timestamps?.finished_at_epoch_ms || b.timestamps?.started_at_epoch_ms || 0;
+    return tb - ta;
+  }).slice(0, 100);
   feedItems.forEach((r, i) => {
-    const isNew = i === 0 && total > prevRunCount && prevRunCount > 0;
+    const isNew = i === 0 && observed > prevRunCount && prevRunCount > 0;
     const cat = r.failure_category || r.status || '?';
-    const pass = r.success;
-    const dry = r.status === 'dry_run';
-    const cls = dry ? 'dry' : pass ? 'pass' : 'fail';
+    const cls = statusClassForRun(r);
     const elapsed = formatDuration(r.timestamps);
     html += `<li class="feed-item${isNew ? ' new-entry' : ''}" onclick='showDetail(${JSON.stringify(r).replace(/'/g, "&#39;")})'>
       <span class="feed-dot ${cls}"></span>
@@ -931,29 +1055,38 @@ function renderMatrix(runs) {
   }
 
   const tasks = unique(runs, 'task_id');
-  // Always use ALL policies from manifests for columns, not just filtered ones
+  const selectedModel = document.getElementById('filter-model').value;
+  const selectedPolicy = document.getElementById('filter-policy').value;
+  const allModels = manifests.models.length > 0
+    ? manifests.models.map(m => m.id)
+    : unique(runs, 'model_id');
   const allPolicies = manifests.policies.length > 0
     ? manifests.policies.map(p => p.id)
     : unique(runs, 'policy_id');
-  const policyOrder = ['baseline', 'required-final', 'advisory', 'repair-loop', 'repair-loop-2'];
-  const policies = [...allPolicies].sort((a, b) => {
-    const ai = policyOrder.indexOf(a), bi = policyOrder.indexOf(b);
-    return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+  const policies = sortPolicies(selectedPolicy ? [selectedPolicy] : allPolicies);
+  const models = selectedModel ? [selectedModel] : allModels.filter(modelId => runs.some(r => r.model_id === modelId));
+  const columns = [];
+  models.forEach(modelId => {
+    policies.forEach(policyId => {
+      columns.push({ modelId, policyId });
+    });
   });
 
   const taskBuckets = {};
   runs.forEach(r => { taskBuckets[r.task_id] = r.bucket || 'unknown'; });
 
-  // Group by task+policy
+  // Group by task+model+policy
   const grouped = {};
   runs.forEach(r => {
-    const key = `${r.task_id}::${r.policy_id}`;
+    const key = `${r.task_id}::${r.model_id}::${r.policy_id}`;
     if (!grouped[key]) grouped[key] = [];
     grouped[key].push(r);
   });
 
   let html = '<div class="matrix-container"><table class="matrix"><thead><tr><th class="row-header"></th>';
-  policies.forEach(p => { html += `<th class="col-header">${p}</th>`; });
+  columns.forEach(({ modelId, policyId }) => {
+    html += `<th class="col-header">${escapeHtml(modelId)}<br><span style="font-weight:400">${escapeHtml(policyId)}</span></th>`;
+  });
   html += '</tr></thead><tbody>';
 
   tasks.sort((a, b) => {
@@ -963,23 +1096,29 @@ function renderMatrix(runs) {
 
   tasks.forEach(task => {
     const bucket = taskBuckets[task] || 'unknown';
-    html += `<tr><th class="row-header">${escapeHtml(task)}<span class="bucket-badge">${bucket}</span></th>`;
-    policies.forEach(policy => {
-      const key = `${task}::${policy}`;
+    html += `<tr><th class="row-header task-link" onclick="showTaskDetail('${escapeHtml(task)}')">${escapeHtml(task)}<span class="bucket-badge">${bucket}</span></th>`;
+    columns.forEach(({ modelId, policyId }) => {
+      const key = `${task}::${modelId}::${policyId}`;
       const items = grouped[key] || [];
       if (!items.length) {
         html += '<td class="empty">&mdash;</td>';
         return;
       }
+      const runningItems = items.filter(r => r.status === 'running');
       const completed = items.filter(r => r.status === 'completed');
+      if (runningItems.length && !completed.length) {
+        html += `<td class="running" onclick="showCellRuns('${escapeHtml(task)}','${escapeHtml(modelId)}','${escapeHtml(policyId)}')">run<span class="cell-detail">${runningItems.length} active</span></td>`;
+        return;
+      }
       if (!completed.length) {
-        html += `<td class="dry-run" onclick="showCellRuns('${escapeHtml(task)}','${escapeHtml(policy)}')">dry<span class="cell-detail">${items.length} runs</span></td>`;
+        html += `<td class="dry-run" onclick="showCellRuns('${escapeHtml(task)}','${escapeHtml(modelId)}','${escapeHtml(policyId)}')">dry<span class="cell-detail">${items.length} runs</span></td>`;
         return;
       }
       const successes = completed.filter(r => r.success).length;
       const rate = (successes / completed.length * 100);
       const cls = rate === 100 ? 'success' : rate === 0 ? 'failure' : 'partial';
-      html += `<td class="${cls}" onclick="showCellRuns('${escapeHtml(task)}','${escapeHtml(policy)}')">${rate.toFixed(0)}%<span class="cell-detail">${successes}/${completed.length}</span></td>`;
+      const extra = runningItems.length ? ` · ${runningItems.length} run` : '';
+      html += `<td class="${cls}" onclick="showCellRuns('${escapeHtml(task)}','${escapeHtml(modelId)}','${escapeHtml(policyId)}')">${rate.toFixed(0)}%<span class="cell-detail">${successes}/${completed.length}${extra}</span></td>`;
     });
     html += '</tr>';
   });
@@ -988,12 +1127,17 @@ function renderMatrix(runs) {
   container.innerHTML = html;
 }
 
-function showCellRuns(task, policy) {
-  const runs = getFiltered().filter(r => r.task_id === task && r.policy_id === policy);
+function showCellRuns(task, model, policy) {
+  const runs = getFiltered().filter(r => r.task_id === task && r.model_id === model && r.policy_id === policy);
   if (runs.length === 1) {
     showDetail(runs[0]);
   } else if (runs.length > 1) {
-    showDetail(runs[runs.length - 1]);
+    const sorted = runs.slice().sort((a, b) => {
+      const ta = a.timestamps?.finished_at_epoch_ms || a.timestamps?.started_at_epoch_ms || 0;
+      const tb = b.timestamps?.finished_at_epoch_ms || b.timestamps?.started_at_epoch_ms || 0;
+      return tb - ta;
+    });
+    showDetail(sorted[0]);
   }
 }
 
@@ -1013,7 +1157,8 @@ function renderRunList(runs) {
 
   let html = '<ul class="run-list">';
   sorted.forEach(r => {
-    const dotCls = r.status === 'dry_run' ? 'dry_run' :
+    const dotCls = r.status === 'running' ? 'running' :
+      r.status === 'dry_run' ? 'dry_run' :
       r.status === 'provider_error' || r.status === 'provider_auth_error' ? 'provider_error' :
       r.success ? 'success' : 'failure';
     const category = r.failure_category || r.status || 'unknown';
@@ -1094,12 +1239,7 @@ function renderBuckets(runs) {
   });
   html += '</div>';
 
-  const policies = unique(completed, 'policy_id');
-  const policyOrder = ['baseline', 'required-final', 'advisory', 'repair-loop', 'repair-loop-2'];
-  policies.sort((a, b) => {
-    const ai = policyOrder.indexOf(a), bi = policyOrder.indexOf(b);
-    return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
-  });
+  const policies = sortPolicies(unique(completed, 'policy_id'));
 
   const grouped = {};
   completed.forEach(r => {
@@ -1129,10 +1269,142 @@ function renderBuckets(runs) {
   container.innerHTML = html;
 }
 
+function renderPolicyComparisonTable(runs) {
+  const completed = runs.filter(r => r.status === 'completed');
+  if (!completed.length) {
+    return '';
+  }
+  const grouped = {};
+  completed.forEach(run => {
+    const key = `${run.model_id}::${run.policy_id}`;
+    if (!grouped[key]) {
+      grouped[key] = {
+        model_id: run.model_id,
+        policy_id: run.policy_id,
+        total: 0,
+        successes: 0,
+        repaired: 0,
+        verifyRepairs: 0,
+        totalDurationMs: 0,
+      };
+    }
+    grouped[key].total += 1;
+    grouped[key].totalDurationMs += run.timings?.end_to_end_ms || 0;
+    if (run.success) grouped[key].successes += 1;
+    if (run.repaired_after_verify_failure || run.repaired_after_public_failure) grouped[key].repaired += 1;
+    if ((run.repair_trigger_sources || []).includes('verify') || run.repair_trigger_source === 'verify') {
+      grouped[key].verifyRepairs += 1;
+    }
+  });
+
+  const rows = Object.values(grouped);
+  const orderedPolicies = sortPolicies([...new Set(rows.map(row => row.policy_id))]);
+  const policyRank = Object.fromEntries(orderedPolicies.map((policyId, index) => [policyId, index]));
+  rows.sort((a, b) => {
+    if (a.model_id !== b.model_id) return a.model_id.localeCompare(b.model_id);
+    return (policyRank[a.policy_id] ?? 999) - (policyRank[b.policy_id] ?? 999);
+  });
+
+  let html = '<div class="card" style="margin-bottom:16px"><h3 style="font-size:13px; margin-bottom:12px">Model / Policy Live Comparison</h3><table class="comparison-table"><thead><tr>';
+  html += '<th>Model</th><th>Policy</th><th>Success</th><th>Recovered</th><th>Verify Triggers</th><th>Runs/Hr</th><th>Avg Time</th>';
+  html += '</tr></thead><tbody>';
+  rows.forEach(row => {
+    const successRate = row.total ? (row.successes / row.total) * 100 : 0;
+    const runsPerHour = row.totalDurationMs > 0 ? row.successes / (row.totalDurationMs / 3600000) : null;
+    const avgTime = row.total ? row.totalDurationMs / row.total : null;
+    html += `<tr>
+      <td>${escapeHtml(row.model_id)}</td>
+      <td>${escapeHtml(row.policy_id)}</td>
+      <td class="metric ${successRate >= 80 ? 'success' : successRate === 0 ? 'failure' : 'running'}">${row.successes}/${row.total} · ${successRate.toFixed(0)}%</td>
+      <td class="metric">${row.repaired}</td>
+      <td class="metric">${row.verifyRepairs}</td>
+      <td class="metric">${runsPerHour != null ? runsPerHour.toFixed(1) : '—'}</td>
+      <td class="metric">${avgTime != null ? formatDurationFromMs(avgTime) : '—'}</td>
+    </tr>`;
+  });
+  html += '</tbody></table></div>';
+  return html;
+}
+
+function showTaskDetail(taskId) {
+  const runs = allRuns
+    .filter(r => r.task_id === taskId)
+    .sort((a, b) => {
+      const ta = a.timestamps?.finished_at_epoch_ms || a.timestamps?.started_at_epoch_ms || 0;
+      const tb = b.timestamps?.finished_at_epoch_ms || b.timestamps?.started_at_epoch_ms || 0;
+      return tb - ta;
+    });
+  const taskManifest = manifests.tasks.find(task => task.id === taskId);
+  const models = unique(runs, 'model_id');
+  const policies = sortPolicies(unique(runs, 'policy_id'));
+  let html = '';
+
+  html += '<div class="detail-section"><h3>Task Overview</h3><dl class="detail-grid">';
+  html += kv('Task', taskId);
+  html += kv('Bucket', taskManifest?.bucket || runs[0]?.bucket || '—');
+  if (taskManifest?.family) html += kv('Family', taskManifest.family);
+  if (taskManifest?.bug_class) html += kv('Bug Class', taskManifest.bug_class);
+  if (taskManifest?.bug_surface) html += kv('Bug Surface', taskManifest.bug_surface);
+  if (taskManifest?.difficulty) html += kv('Difficulty', taskManifest.difficulty);
+  if (taskManifest?.verify_paths?.length) html += kv('Verify Paths', taskManifest.verify_paths.join(', '));
+  if (taskManifest?.expected_files?.length) html += kv('Expected Files', taskManifest.expected_files.join(', '));
+  html += '</dl></div>';
+
+  html += '<div class="detail-section"><h3>Model / Policy Cells</h3><div class="matrix-container"><table class="matrix"><thead><tr><th class="row-header">Model</th>';
+  policies.forEach(policyId => {
+    html += `<th class="col-header">${escapeHtml(policyId)}</th>`;
+  });
+  html += '</tr></thead><tbody>';
+  models.forEach(modelId => {
+    html += `<tr><th class="row-header">${escapeHtml(modelId)}</th>`;
+    policies.forEach(policyId => {
+      const cellRuns = runs.filter(r => r.model_id === modelId && r.policy_id === policyId);
+      if (!cellRuns.length) {
+        html += '<td class="empty">&mdash;</td>';
+        return;
+      }
+      const completed = cellRuns.filter(r => r.status === 'completed');
+      const running = cellRuns.filter(r => r.status === 'running');
+      if (running.length && !completed.length) {
+        html += `<td class="running" onclick="showCellRuns('${escapeHtml(taskId)}','${escapeHtml(modelId)}','${escapeHtml(policyId)}')">run<span class="cell-detail">${running.length} active</span></td>`;
+        return;
+      }
+      const successes = completed.filter(r => r.success).length;
+      const rate = completed.length ? (successes / completed.length) * 100 : 0;
+      const cls = !completed.length ? 'dry-run' : rate === 100 ? 'success' : rate === 0 ? 'failure' : 'partial';
+      const label = !completed.length ? 'dry' : `${rate.toFixed(0)}%`;
+      const detail = !completed.length ? `${cellRuns.length} runs` : `${successes}/${completed.length}`;
+      html += `<td class="${cls}" onclick="showCellRuns('${escapeHtml(taskId)}','${escapeHtml(modelId)}','${escapeHtml(policyId)}')">${label}<span class="cell-detail">${detail}</span></td>`;
+    });
+    html += '</tr>';
+  });
+  html += '</tbody></table></div></div>';
+
+  html += '<div class="detail-section"><h3>Runs</h3><ul class="run-list">';
+  runs.slice(0, 24).forEach(run => {
+    const cls = statusClassForRun(run);
+    const category = run.failure_category || run.status || 'unknown';
+    html += `<li class="run-item" onclick='showDetail(${JSON.stringify(run).replace(/'/g, "&#39;")})'>
+      <span class="run-dot ${cls}"></span>
+      <span class="run-task">${run.task_id}</span>
+      <span class="run-model">${run.model_id}</span>
+      <span class="run-policy">${run.policy_id}</span>
+      <span class="run-category ${category.replace(/[^a-z_]/g, '')}">${category}</span>
+      <span class="run-time">${formatDuration(run.timestamps)}</span>
+    </li>`;
+  });
+  html += '</ul></div>';
+
+  document.getElementById('detail-title').textContent = taskId;
+  document.getElementById('detail-body').innerHTML = html;
+  document.getElementById('detail-panel').classList.add('open');
+}
+
 // ─── Detail Panel ───
 function showDetail(run) {
   const panel = document.getElementById('detail-panel');
   document.getElementById('detail-title').textContent = run.run_id || run.task_id;
+  const taskManifest = manifests.tasks.find(task => task.id === run.task_id);
 
   let html = '';
 
@@ -1142,13 +1414,16 @@ function showDetail(run) {
   html += kv('Policy', run.policy_id);
   html += kv('Bucket', run.bucket);
   html += kv('Status', run.status);
-  html += kv('Success', run.success ? 'Yes' : 'No');
+  html += kv('Success', run.status === 'running' ? 'In progress' : run.success ? 'Yes' : 'No');
   html += kv('Category', run.failure_category || '—');
   html += kv('Attempts', run.attempt_count || '—');
   html += kv('Dry Run', run.dry_run ? 'Yes' : 'No');
   html += kv('Duration', formatDuration(run.timestamps));
   if (run.repair_attempted) html += kv('Repair', 'Yes');
   if (run.repair_trigger_source) html += kv('Repair Trigger', run.repair_trigger_source);
+  if (run.repair_feedback_style) html += kv('Repair Feedback', run.repair_feedback_style);
+  if (taskManifest?.bug_class) html += kv('Bug Class', taskManifest.bug_class);
+  if (taskManifest?.bug_surface) html += kv('Bug Surface', taskManifest.bug_surface);
   html += '</dl></div>';
 
   if (run.status === 'completed') {
@@ -1198,10 +1473,12 @@ function showDetail(run) {
       const vjFailed = att.court_jester?.verify_failed;
       const pubFailed = att.public_failed;
       const trigger = att.repair_trigger_source;
+      const feedbackStyle = att.repair_feedback_style;
       html += `<div style="padding:6px 10px; background:var(--surface-2); border-radius:4px; margin-bottom:4px; font-size:12px">
         <strong>Attempt ${i + 1}</strong>
         ${!provOk ? ' — provider failed' : vjFailed ? ' — verify failed' : pubFailed ? ' — public failed' : ' — passed'}
         ${trigger ? ` (trigger: ${trigger})` : ''}
+        ${feedbackStyle ? ` (feedback: ${feedbackStyle})` : ''}
       </div>`;
     });
     html += '</div>';
@@ -1232,6 +1509,48 @@ function closeDetail() {
 }
 
 // ─── Helpers ───
+function sortPolicies(policies) {
+  const policyOrder = [
+    'baseline',
+    'public-repair-1',
+    'retry-once-no-verify',
+    'repair-loop-verify-only',
+    'public-repair-2',
+    'repair-loop-verify-only-2',
+    'retry-twice-no-verify',
+    'repair-loop-2',
+    'retry-once-no-feedback',
+    'retry-twice-no-feedback',
+    'required-final',
+    'advisory',
+    'repair-loop',
+  ];
+  return [...policies].sort((a, b) => {
+    const ai = policyOrder.indexOf(a);
+    const bi = policyOrder.indexOf(b);
+    if (ai !== -1 || bi !== -1) {
+      return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
+    }
+    return a.localeCompare(b);
+  });
+}
+
+function inferExpectedTotal(runs) {
+  const taskCount = unique(runs, 'task_id').length;
+  const modelCount = unique(runs, 'model_id').length;
+  const policyCount = unique(runs, 'policy_id').length;
+  const repeatCount = Math.max(...runs.map(r => r.repeat_count || 1), 1);
+  if (!taskCount || !modelCount || !policyCount) return runs.length;
+  return taskCount * modelCount * policyCount * repeatCount;
+}
+
+function statusClassForRun(run) {
+  if (run.status === 'running') return 'running';
+  if (run.status === 'dry_run') return 'dry';
+  if (run.success) return 'pass';
+  return 'fail';
+}
+
 function unique(arr, key) {
   return [...new Set(arr.map(r => r[key]).filter(Boolean))].sort();
 }
@@ -1240,8 +1559,12 @@ function formatDuration(timestamps) {
   if (!timestamps) return '—';
   const start = timestamps.started_at_epoch_ms;
   const end = timestamps.finished_at_epoch_ms;
-  if (!start || !end) return '—';
-  const ms = end - start;
+  if (!start) return '—';
+  const ms = (end || Date.now()) - start;
+  return formatDurationFromMs(ms);
+}
+
+function formatDurationFromMs(ms) {
   if (ms < 1000) return `${ms}ms`;
   if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
   return `${(ms / 60000).toFixed(1)}m`;
@@ -1271,6 +1594,13 @@ function kvBool(label, value) {
 
 function escapeHtml(str) {
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function shortPath(value) {
+  if (!value) return '—';
+  const text = String(value);
+  if (text.length <= 52) return text;
+  return '…' + text.slice(-51);
 }
 </script>
 </body>

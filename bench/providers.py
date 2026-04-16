@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import re
 import selectors
+import signal
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,9 +22,14 @@ class ProviderResult:
     unsupported: bool = False
     unsupported_reason: str | None = None
     failed: bool = False
+    timed_out: bool = False
     failure_reason: str | None = None
     exit_code: int | None = None
     parsed_summary: dict[str, object] | None = None
+
+
+_ACTIVE_PROVIDER_PROCS: dict[int, subprocess.Popen[str]] = {}
+_ACTIVE_PROVIDER_PROCS_LOCK = threading.Lock()
 
 
 class Provider:
@@ -37,6 +45,7 @@ class Provider:
         feedback: str | None = None,
         attempt: int = 0,
         history: list[dict[str, object]] | None = None,
+        env_overrides: dict[str, str] | None = None,
     ) -> ProviderResult:
         raise NotImplementedError
 
@@ -116,6 +125,98 @@ def stable_subprocess_env(extra: dict[str, str] | None = None) -> dict[str, str]
     return env
 
 
+def _register_active_provider_proc(proc: subprocess.Popen[str]) -> None:
+    with _ACTIVE_PROVIDER_PROCS_LOCK:
+        _ACTIVE_PROVIDER_PROCS[proc.pid] = proc
+
+
+def _unregister_active_provider_proc(proc: subprocess.Popen[str]) -> None:
+    with _ACTIVE_PROVIDER_PROCS_LOCK:
+        _ACTIVE_PROVIDER_PROCS.pop(proc.pid, None)
+
+
+def _session_member_pids(session_id: int) -> list[int]:
+    try:
+        completed = subprocess.run(
+            ["ps", "-axo", "pid=,sid="],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except Exception:
+        return [session_id]
+    members: list[int] = []
+    for raw_line in completed.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            pid = int(parts[0])
+            sid = int(parts[1])
+        except ValueError:
+            continue
+        if sid == session_id:
+            members.append(pid)
+    return members or [session_id]
+
+
+def _signal_session_members(pids: list[int], sig: int) -> None:
+    for pid in sorted(set(pids), reverse=True):
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            continue
+
+
+def _alive_pids(pids: list[int]) -> list[int]:
+    alive: list[int] = []
+    for pid in sorted(set(pids)):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            alive.append(pid)
+        else:
+            alive.append(pid)
+    return alive
+
+
+def terminate_provider_process(proc: subprocess.Popen[str], *, grace_seconds: float = 1.0) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        session_id = os.getsid(proc.pid)
+    except Exception:
+        session_id = proc.pid
+    session_pids = _session_member_pids(session_id)
+    _signal_session_members(session_pids, signal.SIGTERM)
+    deadline = time.time() + max(grace_seconds, 0.0)
+    while time.time() < deadline:
+        alive = _alive_pids(session_pids)
+        if not alive:
+            break
+        time.sleep(0.05)
+    remaining = _alive_pids(session_pids)
+    if remaining:
+        _signal_session_members(remaining, signal.SIGKILL)
+
+
+def terminate_active_provider_processes() -> None:
+    with _ACTIVE_PROVIDER_PROCS_LOCK:
+        procs = list(_ACTIVE_PROVIDER_PROCS.values())
+    for proc in procs:
+        terminate_provider_process(proc)
+
+
+atexit.register(terminate_active_provider_processes)
+
+
 class NoopProvider(Provider):
     def apply(
         self,
@@ -125,6 +226,7 @@ class NoopProvider(Provider):
         feedback: str | None = None,
         attempt: int = 0,
         history: list[dict[str, object]] | None = None,
+        env_overrides: dict[str, str] | None = None,
     ) -> ProviderResult:
         return ProviderResult(
             changed_files=[],
@@ -141,6 +243,7 @@ class ReplayProvider(Provider):
         feedback: str | None = None,
         attempt: int = 0,
         history: list[dict[str, object]] | None = None,
+        env_overrides: dict[str, str] | None = None,
     ) -> ProviderResult:
         changed_files: list[str] = []
         transcript: list[str] = []
@@ -177,6 +280,7 @@ class CliAgentProvider(Provider):
         feedback: str | None = None,
         attempt: int = 0,
         history: list[dict[str, object]] | None = None,
+        env_overrides: dict[str, str] | None = None,
     ) -> ProviderResult:
         raise NotImplementedError
 
@@ -242,15 +346,29 @@ class CliAgentProvider(Provider):
                 return parsed
         return None
 
-    def _timeout_seconds(self) -> int:
-        value = self.model.metadata.get("timeout_seconds", 180)
+    def _timeout_seconds(self, task: TaskManifest | None = None) -> int:
+        if task is not None and task.provider_timeout_seconds is not None:
+            try:
+                return int(task.provider_timeout_seconds)
+            except (TypeError, ValueError):
+                pass
+        value = self.model.metadata.get("timeout_seconds", 1000)
         try:
             return int(value)
         except (TypeError, ValueError):
-            return 180
+            return 1000
 
-    def _agent_env(self) -> dict[str, str]:
-        return stable_subprocess_env()
+    def _idle_timeout_seconds(self, task: TaskManifest | None = None) -> int | None:
+        if task is None or task.provider_idle_timeout_seconds is None:
+            return None
+        try:
+            value = int(task.provider_idle_timeout_seconds)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    def _agent_env(self, extra_env: dict[str, str] | None = None) -> dict[str, str]:
+        return stable_subprocess_env(extra_env)
 
     def _extract_failure_reason(
         self,
@@ -296,60 +414,96 @@ class CliAgentProvider(Provider):
         *,
         command: list[str],
         workspace: Path,
+        task: TaskManifest,
         early_abort_markers: dict[str, str] | None = None,
+        env_overrides: dict[str, str] | None = None,
     ) -> ProviderResult:
-        if not early_abort_markers:
+        idle_timeout_seconds = self._idle_timeout_seconds(task)
+        if not early_abort_markers and idle_timeout_seconds is None:
+            proc = subprocess.Popen(
+                command,
+                cwd=workspace,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=self._agent_env(env_overrides),
+                start_new_session=True,
+            )
+            _register_active_provider_proc(proc)
             try:
-                completed = subprocess.run(
-                    command,
-                    cwd=workspace,
-                    capture_output=True,
-                    text=True,
-                    timeout=self._timeout_seconds(),
-                    env=self._agent_env(),
-                )
-            except subprocess.TimeoutExpired as exc:
+                stdout, stderr = proc.communicate(timeout=self._timeout_seconds(task))
+            except subprocess.TimeoutExpired:
+                terminate_provider_process(proc)
+                stdout, stderr = proc.communicate()
                 return ProviderResult(
-                    transcript=[exc.stdout or "", exc.stderr or ""],
+                    transcript=[stdout or "", stderr or ""],
                     failed=True,
-                    failure_reason=f"{self.model.provider} timed out after {self._timeout_seconds()} seconds",
+                    timed_out=True,
+                    failure_reason=f"{self.model.provider} timed out after {self._timeout_seconds(task)} seconds",
                 )
-            return self._finalize_cli_result(completed=completed, raw_output=completed.stdout)
+            finally:
+                _unregister_active_provider_proc(proc)
+            completed = subprocess.CompletedProcess(
+                args=command,
+                returncode=proc.returncode,
+                stdout=stdout,
+                stderr=stderr,
+            )
+            return self._finalize_cli_result(completed=completed, raw_output=stdout)
 
         stdout_chunks: list[str] = []
         stderr_chunks: list[str] = []
         lowered_markers = {
-            marker.lower(): reason for marker, reason in early_abort_markers.items()
+            marker.lower(): reason for marker, reason in (early_abort_markers or {}).items()
         }
-        timeout_seconds = self._timeout_seconds()
+        timeout_seconds = self._timeout_seconds(task)
         proc = subprocess.Popen(
             command,
             cwd=workspace,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            env=self._agent_env(),
+            env=self._agent_env(env_overrides),
             bufsize=1,
+            start_new_session=True,
         )
+        _register_active_provider_proc(proc)
         selector = selectors.DefaultSelector()
         if proc.stdout is not None:
             selector.register(proc.stdout, selectors.EVENT_READ, data=("stdout", proc.stdout))
         if proc.stderr is not None:
             selector.register(proc.stderr, selectors.EVENT_READ, data=("stderr", proc.stderr))
         deadline = time.time() + timeout_seconds
+        last_activity = time.time()
         early_abort_reason: str | None = None
         try:
             while selector.get_map():
-                remaining = deadline - time.time()
+                now = time.time()
+                remaining = deadline - now
                 if remaining <= 0:
-                    proc.kill()
+                    terminate_provider_process(proc)
                     stdout_tail, stderr_tail = proc.communicate()
                     stdout_chunks.append(stdout_tail or "")
                     stderr_chunks.append(stderr_tail or "")
                     return ProviderResult(
                         transcript=["".join(stdout_chunks), "".join(stderr_chunks)],
                         failed=True,
+                        timed_out=True,
                         failure_reason=f"{self.model.provider} timed out after {timeout_seconds} seconds",
+                    )
+                if idle_timeout_seconds is not None and now - last_activity >= idle_timeout_seconds:
+                    terminate_provider_process(proc)
+                    stdout_tail, stderr_tail = proc.communicate()
+                    stdout_chunks.append(stdout_tail or "")
+                    stderr_chunks.append(stderr_tail or "")
+                    return ProviderResult(
+                        transcript=["".join(stdout_chunks), "".join(stderr_chunks)],
+                        failed=True,
+                        timed_out=True,
+                        failure_reason=(
+                            f"{self.model.provider} idle timed out after "
+                            f"{idle_timeout_seconds} seconds without output"
+                        ),
                     )
                 events = selector.select(timeout=min(0.25, remaining))
                 if not events and proc.poll() is not None:
@@ -364,6 +518,7 @@ class CliAgentProvider(Provider):
                         stdout_chunks.append(line)
                     else:
                         stderr_chunks.append(line)
+                    last_activity = time.time()
                     lowered_line = line.lower()
                     matched_reason = next(
                         (reason for marker, reason in lowered_markers.items() if marker in lowered_line),
@@ -375,11 +530,12 @@ class CliAgentProvider(Provider):
                 if early_abort_reason:
                     break
             if early_abort_reason and proc.poll() is None:
-                proc.kill()
+                terminate_provider_process(proc)
             stdout_tail, stderr_tail = proc.communicate()
             stdout_chunks.append(stdout_tail or "")
             stderr_chunks.append(stderr_tail or "")
         finally:
+            _unregister_active_provider_proc(proc)
             selector.close()
 
         completed = subprocess.CompletedProcess(
@@ -407,6 +563,7 @@ class CodexCliProvider(CliAgentProvider):
         feedback: str | None = None,
         attempt: int = 0,
         history: list[dict[str, object]] | None = None,
+        env_overrides: dict[str, str] | None = None,
     ) -> ProviderResult:
         workspace = workspace.resolve()
         prompt = self._build_prompt(task, feedback, attempt, history)
@@ -416,6 +573,8 @@ class CodexCliProvider(CliAgentProvider):
             "exec",
             "-c",
             "mcp_servers={}",
+            "--disable",
+            "plugins",
             "--skip-git-repo-check",
             "--ephemeral",
             "--full-auto",
@@ -428,24 +587,41 @@ class CodexCliProvider(CliAgentProvider):
         ]
         if self.model.model:
             command.extend(["--model", self.model.model])
+        if self.model.reasoning_effort:
+            command.extend(["-c", f'model_reasoning_effort="{self.model.reasoning_effort}"'])
         return self._run_cli_command(
             command=command + [prompt],
             workspace=workspace,
+            task=task,
             early_abort_markers={
                 "all inference nodes that can serve this model are currently busy": (
                     "codex_cli aborted after provider capacity busy error"
                 ),
                 "You've hit your usage limit": "codex_cli aborted after provider usage limit error",
             },
+            env_overrides=env_overrides,
         )
 
 
 class ClaudeCliProvider(CliAgentProvider):
-    def _agent_env(self) -> dict[str, str]:
+    def _agent_env(self, extra_env: dict[str, str] | None = None) -> dict[str, str]:
         env = dict(os.environ)
+        if extra_env:
+            env.update(extra_env)
         for key in ("OTEL_SDK_DISABLED", "OTEL_TRACES_EXPORTER", "OTEL_METRICS_EXPORTER"):
             env.pop(key, None)
         return env
+
+    def _idle_timeout_seconds(self, task: TaskManifest | None = None) -> int | None:
+        # Claude's `-p --output-format json` path commonly emits only a final JSON blob.
+        # Output silence is therefore not a reliable liveness signal for benchmarks.
+        return None
+
+    def _use_bare_mode(self) -> bool:
+        enabled = os.getenv("CJ_CLAUDE_BARE_MODE", "").strip().lower()
+        if enabled not in {"1", "true", "yes", "on"}:
+            return False
+        return bool(os.getenv("ANTHROPIC_API_KEY"))
 
     def apply(
         self,
@@ -455,6 +631,7 @@ class ClaudeCliProvider(CliAgentProvider):
         feedback: str | None = None,
         attempt: int = 0,
         history: list[dict[str, object]] | None = None,
+        env_overrides: dict[str, str] | None = None,
     ) -> ProviderResult:
         workspace = workspace.resolve()
         schema_obj = json.loads((BENCH_ROOT / "schemas" / "agent_summary.json").read_text())
@@ -465,6 +642,10 @@ class ClaudeCliProvider(CliAgentProvider):
             "-p",
             "--output-format",
             "json",
+            "--setting-sources",
+            "project,local",
+            "--disable-slash-commands",
+            "--no-chrome",
             "--permission-mode",
             "bypassPermissions",
             "--dangerously-skip-permissions",
@@ -473,9 +654,18 @@ class ClaudeCliProvider(CliAgentProvider):
             "--json-schema",
             schema,
         ]
+        if self._use_bare_mode():
+            command.insert(4, "--bare")
         if self.model.model:
             command.extend(["--model", self.model.model])
-        return self._run_cli_command(command=command + [prompt], workspace=workspace)
+        if self.model.reasoning_effort:
+            command.extend(["--effort", self.model.reasoning_effort])
+        return self._run_cli_command(
+            command=command + [prompt],
+            workspace=workspace,
+            task=task,
+            env_overrides=env_overrides,
+        )
 
 
 class OpenAICompatProvider(Provider):
@@ -491,6 +681,7 @@ class OpenAICompatProvider(Provider):
         feedback: str | None = None,
         attempt: int = 0,
         history: list[dict[str, object]] | None = None,
+        env_overrides: dict[str, str] | None = None,
     ) -> ProviderResult:
         api_key_env = str(self.model.metadata.get("api_key_env", "ACTUAL_API_KEY"))
         api_key = os.getenv(api_key_env)
@@ -707,11 +898,11 @@ class OpenAICompatProvider(Provider):
         return "\n".join(lines).strip() or None
 
     def _timeout_seconds(self) -> int:
-        value = self.model.metadata.get("timeout_seconds", 180)
+        value = self.model.metadata.get("timeout_seconds", 1000)
         try:
             return int(value)
         except (TypeError, ValueError):
-            return 180
+            return 1000
 
     def _is_retryable_request_error(self, exc: Exception) -> bool:
         message = str(exc).lower()

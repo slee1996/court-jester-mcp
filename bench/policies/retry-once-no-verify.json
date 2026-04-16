@@ -1,0 +1,11 @@
+{
+  "id": "retry-once-no-verify",
+  "title": "Retry once (no verify)",
+  "description": "Give the model one extra blind attempt with no Court Jester verify calls and no evaluator feedback between attempts. Only the final attempt is judged.",
+  "court_jester_mode": "none",
+  "required_tools": [],
+  "block_on_failed_verify": false,
+  "max_repair_rounds": 1,
+  "blind_retry_without_verify": true,
+  "repair_feedback_style": "none"
+}

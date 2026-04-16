@@ -1,0 +1,62 @@
+{
+  "id": "ts-express-clone-alpha-build-spec",
+  "title": "Build a broad Express clone from the visible public spec",
+  "repo_fixture": "express_clone_alpha_build_spec",
+  "prompt": "Implement the missing Express clone behavior so the visible public monolith spec passes. This repo is a skeletal build scaffold, not a pre-seeded repair task. Use the module structure and visible public test as the spec, and make the shared clone broadly correct across routing, wrappers, request helpers, and response helpers.",
+  "language": "typescript",
+  "bucket": "framework_clone_build_spec",
+  "provider_timeout_seconds": 1000,
+  "provider_idle_timeout_seconds": 300,
+  "verify_paths": [
+    "index.ts",
+    "lib/http.ts",
+    "lib/router.ts",
+    "lib/query.ts"
+  ],
+  "verify_test_path": "tests/verify_clone_alpha_monolith.ts",
+  "setup_commands": [],
+  "setup_cache_key": "express-clone-alpha-build-spec:v1",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_clone_alpha_monolith.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_workspace_test.py",
+    "{workspace}",
+    "tests/hidden_clone_alpha_monolith.ts"
+  ],
+  "expected_files": [
+    "index.ts",
+    "lib/http.ts",
+    "lib/router.ts",
+    "lib/query.ts"
+  ],
+  "family": "express_clone_alpha",
+  "bug_class": "framework_semantics",
+  "bug_surface": "clone_build_spec",
+  "difficulty": "xhard",
+  "golden_patch_description": "Complete the skeletal Express clone implementation so it matches the visible public spec and hidden framework semantics.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": true,
+  "cross_file": true,
+  "upstream_benchmark": "express",
+  "upstream_instance_id": "clone-alpha-build-spec-v1",
+  "instance_notes": "Build-from-spec Express clone task with visible public monolith tests and isolated verify/hidden evaluators.",
+  "tags": [
+    "typescript",
+    "express",
+    "framework",
+    "build_spec",
+    "monolith",
+    "upstream_derived"
+  ]
+}

@@ -1,0 +1,60 @@
+{
+  "id": "ts-express-wrapper-text",
+  "title": "Express clone parses text bodies through express.text",
+  "repo_fixture": "express_clone_alpha",
+  "prompt": "Fix the Express clone so express.text behaves like Express for this benchmark slice. It should parse text request bodies, preserve body bytes as text, and ignore non-text content types.",
+  "language": "typescript",
+  "bucket": "framework_clone_alpha",
+  "verify_paths": [
+    "index.ts"
+  ],
+  "verify_test_path": "tests/verify_express_text.ts",
+  "setup_commands": [
+    [
+      "python",
+      "{bench_root}/seed_express_clone_bug.py",
+      "{workspace}",
+      "express_text_uppercase"
+    ]
+  ],
+  "setup_cache_key": "express-clone-alpha:express-text-v1",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_express_text.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_workspace_test.py",
+    "{workspace}",
+    "tests/hidden_express_text.ts"
+  ],
+  "expected_files": [
+    "index.ts"
+  ],
+  "family": "express_clone_alpha",
+  "bug_class": "framework_semantics",
+  "bug_surface": "wrapper_text",
+  "difficulty": "medium",
+  "golden_patch_description": "Restore express.text body parsing without mutating text payloads.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": true,
+  "cross_file": false,
+  "upstream_benchmark": "express",
+  "upstream_instance_id": "express-text-v1",
+  "instance_notes": "Derived from express.text.js wrapper semantics.",
+  "tags": [
+    "typescript",
+    "express",
+    "wrapper",
+    "text",
+    "upstream_derived"
+  ]
+}

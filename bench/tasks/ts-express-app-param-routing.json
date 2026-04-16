@@ -1,0 +1,60 @@
+{
+  "id": "ts-express-app-param-routing",
+  "title": "Express clone param handlers only run once per request value",
+  "repo_fixture": "express_clone_alpha",
+  "prompt": "Fix the Express clone so app.param behaves like Express for this benchmark slice: param callbacks should not rerun redundantly for the same request value, and route param behavior should remain intact.",
+  "language": "typescript",
+  "bucket": "framework_clone_alpha",
+  "verify_paths": [
+    "index.ts"
+  ],
+  "verify_test_path": "tests/verify_app_param.ts",
+  "setup_commands": [
+    [
+      "python",
+      "{bench_root}/seed_express_clone_bug.py",
+      "{workspace}",
+      "app_param_cache"
+    ]
+  ],
+  "setup_cache_key": "express-clone-alpha:app-param-cache",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_app_param.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_workspace_test.py",
+    "{workspace}",
+    "tests/hidden_app_param.ts"
+  ],
+  "expected_files": [
+    "index.ts"
+  ],
+  "family": "express_clone_alpha",
+  "bug_class": "framework_semantics",
+  "bug_surface": "param_routing",
+  "difficulty": "hard",
+  "golden_patch_description": "Restore once-per-request param callback caching without breaking standard param routing.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": false,
+  "uses_project_dir": false,
+  "uses_relative_imports": true,
+  "cross_file": false,
+  "upstream_benchmark": "express",
+  "upstream_instance_id": "app-param-routing-v1",
+  "instance_notes": "Derived from app.param.js once-per-request semantics.",
+  "tags": [
+    "typescript",
+    "express",
+    "params",
+    "routing",
+    "upstream_derived"
+  ]
+}

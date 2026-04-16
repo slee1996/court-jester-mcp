@@ -1,0 +1,62 @@
+{
+  "id": "ts-express-req-query-parser-modes",
+  "title": "Express clone honors query parser modes",
+  "repo_fixture": "express_clone_alpha",
+  "prompt": "Fix the Express clone so req.query matches Express for this benchmark slice. Keep simple parsing, extended parsing, disabled parsing, and custom parser functions behaving correctly.",
+  "language": "typescript",
+  "bucket": "framework_clone_alpha",
+  "verify_paths": [
+    "index.ts",
+    "lib/query.ts"
+  ],
+  "verify_test_path": "tests/verify_req_query.ts",
+  "setup_commands": [
+    [
+      "python",
+      "{bench_root}/seed_express_clone_bug.py",
+      "{workspace}",
+      "req_query_extended"
+    ]
+  ],
+  "setup_cache_key": "express-clone-alpha:req-query-extended",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_req_query.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_workspace_test.py",
+    "{workspace}",
+    "tests/hidden_req_query.ts"
+  ],
+  "expected_files": [
+    "index.ts",
+    "lib/query.ts"
+  ],
+  "family": "express_clone_alpha",
+  "bug_class": "framework_semantics",
+  "bug_surface": "query_parser",
+  "difficulty": "hard",
+  "golden_patch_description": "Restore Express query parser mode handling, especially extended nested parsing.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": true,
+  "cross_file": true,
+  "upstream_benchmark": "express",
+  "upstream_instance_id": "req-query-parser-v1",
+  "instance_notes": "Derived from req.query.js parser-mode semantics.",
+  "tags": [
+    "typescript",
+    "express",
+    "request",
+    "query",
+    "upstream_derived"
+  ]
+}

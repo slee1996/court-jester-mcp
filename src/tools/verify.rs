@@ -7,6 +7,7 @@ use crate::types::*;
 pub struct VerifyOptions<'a> {
     pub test_code: Option<&'a str>,
     pub test_source_file: Option<&'a str>,
+    pub tests_only: bool,
     pub complexity_threshold: Option<usize>,
     pub project_dir: Option<&'a str>,
     pub lint_config_path: Option<&'a str>,
@@ -125,7 +126,20 @@ pub async fn verify(
     // Stage 2: Complexity threshold (optional)
     if let Some(threshold) = opts.complexity_threshold {
         let start = Instant::now();
-        let violations = analyze::check_complexity_threshold(&analysis, threshold);
+        let (functions_checked, diff_scoped) = if let Some(diff_str) = opts.diff {
+            let changed_ranges = opts
+                .source_file
+                .map(|path| diff::parse_changed_lines_for_file(diff_str, path))
+                .unwrap_or_else(|| diff::parse_changed_lines(diff_str));
+            (
+                analyze::filter_changed_functions(&analysis, &changed_ranges),
+                true,
+            )
+        } else {
+            (analysis.functions.clone(), false)
+        };
+        let violations =
+            analyze::check_complexity_threshold_for_functions(&functions_checked, threshold);
         let complexity_ms = start.elapsed().as_millis() as u64;
         let complexity_ok = violations.is_empty();
         if !complexity_ok {
@@ -138,6 +152,8 @@ pub async fn verify(
             detail: Some(serde_json::json!({
                 "violations": serde_json::to_value(&violations).unwrap(),
                 "threshold": threshold,
+                "checked_functions": functions_checked.len(),
+                "diff_scoped": diff_scoped,
                 "complexity_ok": complexity_ok,
             })),
             error: if complexity_ok {
@@ -192,8 +208,29 @@ pub async fn verify(
         },
     });
 
+    if opts.tests_only && opts.test_code.is_none() {
+        overall_ok = false;
+        stages.push(VerificationStage {
+            name: "test".into(),
+            ok: false,
+            duration_ms: 0,
+            detail: None,
+            error: Some("tests_only mode requires an authoritative test".into()),
+        });
+        let report_path = if let Some(dir) = opts.output_dir {
+            write_report(dir, &stages, overall_ok, opts.source_file, language)
+        } else {
+            None
+        };
+        return VerificationReport {
+            stages,
+            overall_ok,
+            report_path,
+        };
+    }
+
     // Stage 4: Synthesize + Execute
-    if !analysis.functions.is_empty() {
+    if !opts.tests_only && !analysis.functions.is_empty() {
         // Determine which functions to fuzz
         let functions_to_fuzz: Vec<FunctionInfo> = if let Some(diff_str) = opts.diff {
             let changed_ranges = opts

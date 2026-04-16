@@ -1,0 +1,60 @@
+{
+  "id": "ts-express-res-format-negotiation",
+  "title": "Express clone negotiates res.format using q-values and fallbacks",
+  "repo_fixture": "express_clone_alpha",
+  "prompt": "Fix the Express clone so res.format behaves like Express for this benchmark slice. It must honor Accept q-values, set Vary: Accept, and preserve correct fallback behavior.",
+  "language": "typescript",
+  "bucket": "framework_clone_alpha",
+  "verify_paths": [
+    "index.ts"
+  ],
+  "verify_test_path": "tests/verify_res_format.ts",
+  "setup_commands": [
+    [
+      "python",
+      "{bench_root}/seed_express_clone_bug.py",
+      "{workspace}",
+      "res_format_qvalues"
+    ]
+  ],
+  "setup_cache_key": "express-clone-alpha:res-format-qvalues-v2",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_res_format.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_workspace_test.py",
+    "{workspace}",
+    "tests/hidden_res_format.ts"
+  ],
+  "expected_files": [
+    "index.ts"
+  ],
+  "family": "express_clone_alpha",
+  "bug_class": "framework_semantics",
+  "bug_surface": "response_negotiation",
+  "difficulty": "hard",
+  "golden_patch_description": "Use Accept q-values and correct fallback behavior in res.format.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": true,
+  "cross_file": false,
+  "upstream_benchmark": "express",
+  "upstream_instance_id": "res-format-v1",
+  "instance_notes": "Derived from res.format.js negotiation and fallback semantics.",
+  "tags": [
+    "typescript",
+    "express",
+    "response",
+    "format",
+    "upstream_derived"
+  ]
+}

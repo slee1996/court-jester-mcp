@@ -361,12 +361,28 @@ pub async fn execute(
                 envs.push(("NODE_PATH".into(), format!("{dir}/node_modules")));
             }
 
-            // Prefer Node-based TypeScript runners. `tsx` is the primary path
-            // because it preserves Node API behavior better than Bun for verify.
-            if let Some(tsx_path) = which_binary(&path, "tsx") {
-                (tsx_path, vec![], path, envs)
-            } else if let Some(bun_path) = which_binary(&path, "bun") {
+            let node_path = which_binary(&path, "node");
+            let bun_path = which_binary(&path, "bun");
+            let tsx_path = which_binary(&path, "tsx");
+
+            if let Some(node_path) = node_path {
+                // Prefer Node's built-in TypeScript transform path in the
+                // sandbox. It preserves Node semantics and avoids the IPC
+                // server startup that `tsx` uses, which fails under stricter
+                // sandboxing and creates false positives in execute/verify.
+                (
+                    node_path,
+                    vec![
+                        "--no-warnings".to_string(),
+                        "--experimental-transform-types".to_string(),
+                    ],
+                    path,
+                    envs,
+                )
+            } else if let Some(bun_path) = bun_path {
                 (bun_path, vec!["run".to_string()], path, envs)
+            } else if let Some(tsx_path) = tsx_path {
+                (tsx_path, vec![], path, envs)
             } else {
                 ("npx".to_string(), vec!["tsx".to_string()], path, envs)
             }
@@ -556,5 +572,22 @@ fn err_result(msg: &str) -> ExecutionResult {
         duration_ms: 0,
         timed_out: false,
         memory_error: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::which_binary;
+
+    #[test]
+    fn which_binary_finds_existing_binary_on_path() {
+        let path_env = "/missing:/bin:/usr/bin";
+        assert_eq!(which_binary(path_env, "sh"), Some("/bin/sh".to_string()));
+    }
+
+    #[test]
+    fn which_binary_returns_none_for_missing_binary() {
+        let path_env = "/missing:/also-missing";
+        assert_eq!(which_binary(path_env, "definitely-not-a-real-binary"), None);
     }
 }

@@ -1,0 +1,13 @@
+{
+  "id": "express-clone-alpha-fresh-chunks-v2",
+  "title": "Express clone alpha fresh repo chunked build suite (v2)",
+  "goal": "Find the right chunk size for fresh-repo Express clone construction by comparing tests-only repair against Court Jester on narrower subsystem builds with stronger router-core public coverage and a tighter urlencoded slice.",
+  "suite_kind": "framework_clone_fresh_spec_chunks",
+  "task_ids": [
+    "ts-express-fresh-router-core-v2",
+    "ts-express-fresh-urlencoded",
+    "ts-express-fresh-request-meta",
+    "ts-express-fresh-response-headers",
+    "ts-express-fresh-static"
+  ]
+}

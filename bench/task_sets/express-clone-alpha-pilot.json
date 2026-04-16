@@ -1,0 +1,29 @@
+{
+  "id": "express-clone-alpha-pilot",
+  "title": "Express clone alpha pilot",
+  "goal": "Benchmark Court Jester on a shared Express-clone alpha repo across router, app, request, and response semantics derived from upstream Express tests.",
+  "suite_kind": "framework_clone_alpha",
+  "task_ids": [
+    "ts-express-route-dispatch",
+    "ts-express-app-use-mounting",
+    "ts-express-app-param-routing",
+    "ts-express-app-router-params",
+    "ts-express-app-routes-error",
+    "ts-express-wrapper-json",
+    "ts-express-wrapper-raw",
+    "ts-express-wrapper-text",
+    "ts-express-wrapper-urlencoded",
+    "ts-express-req-baseurl-traversal",
+    "ts-express-req-get",
+    "ts-express-req-protocol",
+    "ts-express-req-query-parser-modes",
+    "ts-express-res-send-body-shape",
+    "ts-express-res-json-settings",
+    "ts-express-res-format-negotiation",
+    "ts-express-res-links",
+    "ts-express-res-location",
+    "ts-express-res-redirect-rendering",
+    "ts-express-res-sendstatus",
+    "ts-express-res-vary"
+  ]
+}

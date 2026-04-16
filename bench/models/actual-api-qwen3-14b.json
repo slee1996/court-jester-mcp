@@ -9,6 +9,6 @@
     "api_key_env": "ACTUAL_API_KEY",
     "temperature": 0.2,
     "max_tokens": 4000,
-    "timeout_seconds": 180
+    "timeout_seconds": 1000
   }
 }

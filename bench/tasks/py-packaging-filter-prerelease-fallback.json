@@ -1,0 +1,54 @@
+{
+  "id": "py-packaging-filter-prerelease-fallback",
+  "title": "Packaging specifier filtering falls back to prereleases only when needed",
+  "repo_fixture": "mini_py_packaging_filter_service",
+  "prompt": "Fix filter_versions so it matches packaging-style prerelease fallback behavior for this benchmark slice: when matching final releases exist they should be returned, but prereleases should be preserved when they are the only matching candidates.",
+  "language": "python",
+  "bucket": "library_semantic_core",
+  "verify_paths": [
+    "filtering.py"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.py",
+  "public_check_commands": [
+    [
+      "python",
+      "tests/public_checks.py"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/py_packaging_filter_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "filtering.py"
+  ],
+  "family": "library_slice",
+  "bug_class": "spec_conformance",
+  "bug_surface": "filtering",
+  "difficulty": "hard",
+  "golden_patch_description": "Match packaging-style prerelease fallback for a narrow Specifier.filter slice without regressing simple stable filtering.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": false,
+  "cross_file": false,
+  "upstream_benchmark": "packaging",
+  "upstream_instance_id": "specifier-filter-prerelease-fallback-v1",
+  "instance_notes": "Compact packaging Specifier.filter slice derived from prerelease fallback semantics documented in packaging and covered in upstream specifier tests.",
+  "tags": [
+    "python",
+    "library",
+    "packaging",
+    "pep440",
+    "specifier",
+    "filter",
+    "prerelease",
+    "spec_conformance",
+    "upstream_derived"
+  ]
+}

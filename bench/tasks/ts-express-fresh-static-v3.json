@@ -1,0 +1,60 @@
+{
+  "id": "ts-express-fresh-static-v3",
+  "title": "Build Express static serving behavior in a fresh repo (v3)",
+  "repo_fixture": "express_clone_alpha_fresh_static",
+  "prompt": "Build the static-file behavior from the visible public spec. This public-repair stress slice includes serving an existing file and safe fallback on traversal attempts, while index-file semantics remain in follow-up checks.",
+  "language": "typescript",
+  "bucket": "framework_clone_fresh_spec_public_repair_stress",
+  "provider_timeout_seconds": 1000,
+  "provider_idle_timeout_seconds": 600,
+  "verify_paths": [
+    "index.ts",
+    "lib/http.ts"
+  ],
+  "verify_test_path": "tests/verify_spec.ts",
+  "verify_tests_only": true,
+  "setup_commands": [],
+  "setup_cache_key": "express-clone-alpha-fresh-static:v3-public-repair-stress",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_spec.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_workspace_test.py",
+    "{workspace}",
+    "tests/hidden_spec.ts"
+  ],
+  "expected_files": [
+    "index.ts",
+    "lib/http.ts"
+  ],
+  "family": "express_clone_alpha",
+  "bug_class": "framework_semantics",
+  "bug_surface": "fresh_static",
+  "difficulty": "hard",
+  "golden_patch_description": "Implement static file serving and traversal fallback for the fresh Express slice, leaving only index-file semantics hidden.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": true,
+  "cross_file": true,
+  "upstream_benchmark": "express",
+  "upstream_instance_id": "fresh-static-v3-public-repair-stress",
+  "instance_notes": "Public-repair stress slice: visible static serving and traversal fallback, hidden index-file behavior, tests-only verify.",
+  "tags": [
+    "typescript",
+    "express",
+    "framework",
+    "fresh_repo",
+    "build_spec",
+    "static",
+    "public_repair_stress"
+  ]
+}

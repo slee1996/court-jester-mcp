@@ -1,0 +1,60 @@
+{
+  "id": "ts-express-app-routes-error",
+  "title": "Express clone only runs route error handlers on propagated errors",
+  "repo_fixture": "express_clone_alpha",
+  "prompt": "Fix the Express clone so route-level error propagation behaves like Express. Non-error handlers must be skipped on errors, error handlers must run in order, and thrown secondary errors should still flow correctly.",
+  "language": "typescript",
+  "bucket": "framework_clone_alpha",
+  "verify_paths": [
+    "index.ts"
+  ],
+  "verify_test_path": "tests/verify_app_routes_error.ts",
+  "setup_commands": [
+    [
+      "python",
+      "{bench_root}/seed_express_clone_bug.py",
+      "{workspace}",
+      "app_routes_error_skip_handlers"
+    ]
+  ],
+  "setup_cache_key": "express-clone-alpha:app-routes-error-v2",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_app_routes_error.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_workspace_test.py",
+    "{workspace}",
+    "tests/hidden_app_routes_error.ts"
+  ],
+  "expected_files": [
+    "index.ts"
+  ],
+  "family": "express_clone_alpha",
+  "bug_class": "framework_semantics",
+  "bug_surface": "route_error_flow",
+  "difficulty": "hard",
+  "golden_patch_description": "Restore route-level error handler dispatch and thrown secondary-error propagation.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": true,
+  "cross_file": false,
+  "upstream_benchmark": "express",
+  "upstream_instance_id": "app-routes-error-v1",
+  "instance_notes": "Derived from app.routes.error.js route-level error handling semantics.",
+  "tags": [
+    "typescript",
+    "express",
+    "errors",
+    "routing",
+    "upstream_derived"
+  ]
+}

@@ -5,6 +5,6 @@
   "model": "gpt-5.3-codex-spark",
   "enabled_by_default": false,
   "metadata": {
-    "timeout_seconds": 420
+    "timeout_seconds": 1000
   }
 }

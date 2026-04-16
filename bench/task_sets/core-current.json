@@ -2,6 +2,7 @@
   "id": "core-current",
   "title": "Current core benchmark set",
   "goal": "Primary product benchmark using the current checked-in task pool.",
+  "suite_kind": "headline_curated",
   "task_ids": [
     "py-billing-country-fallback",
     "py-display-handle-fallback",

@@ -1,0 +1,11 @@
+{
+  "id": "library-semantic-hard-probe-v3",
+  "title": "Library semantic hard probe v3",
+  "goal": "Harder node-semver and qs slice with deeper collection and range semantics, designed to force more real repair behavior than v2.",
+  "suite_kind": "library_semantic_probe",
+  "task_ids": [
+    "ts-semver-max-satisfying-caret-prerelease",
+    "ts-qs-parse-deep-collections",
+    "ts-qs-stringify-deep-collections"
+  ]
+}

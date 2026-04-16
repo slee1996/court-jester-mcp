@@ -2,6 +2,7 @@
   "id": "library-slices",
   "title": "Upstream-derived library spec slices",
   "goal": "Measure whether Court Jester improves agent success on bounded library-spec conformance tasks judged by visible and hidden spec shards.",
+  "suite_kind": "library_spec_slice",
   "task_ids": [
     "ts-lodash-array-slice-1",
     "ts-lodash-object-slice-1"

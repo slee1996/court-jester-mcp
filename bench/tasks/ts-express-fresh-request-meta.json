@@ -1,0 +1,60 @@
+{
+  "id": "ts-express-fresh-request-meta",
+  "title": "Build Express request metadata behavior in a fresh repo",
+  "repo_fixture": "express_clone_alpha_fresh_request_meta",
+  "prompt": "Build the request metadata behavior from the visible public spec. This is a fresh repo with only API scaffolding and one visible public test. Implement request header helpers, trust-proxy semantics, and deeper request decoration behavior for this slice.",
+  "language": "typescript",
+  "bucket": "framework_clone_fresh_spec_chunk",
+  "provider_timeout_seconds": 1000,
+  "provider_idle_timeout_seconds": 180,
+  "verify_paths": [
+    "lib/http.ts",
+    "lib/query.ts",
+    "lib/router.ts"
+  ],
+  "verify_test_path": "tests/verify_spec.ts",
+  "setup_commands": [],
+  "setup_cache_key": "express-clone-alpha-fresh-request-meta:v1",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_spec.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_workspace_test.py",
+    "{workspace}",
+    "tests/hidden_spec.ts"
+  ],
+  "expected_files": [
+    "lib/http.ts",
+    "lib/query.ts",
+    "lib/router.ts"
+  ],
+  "family": "express_clone_alpha",
+  "bug_class": "framework_semantics",
+  "bug_surface": "fresh_request_meta",
+  "difficulty": "hard",
+  "golden_patch_description": "Implement request header lookup, trust proxy protocol handling, and deeper request-query decoration behavior.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": true,
+  "cross_file": true,
+  "upstream_benchmark": "express",
+  "upstream_instance_id": "fresh-request-meta-v1",
+  "instance_notes": "Fresh-repo Express request metadata slice with visible request helpers and deeper query/trust-proxy semantics in follow-up checks.",
+  "tags": [
+    "typescript",
+    "express",
+    "framework",
+    "fresh_repo",
+    "build_spec",
+    "request"
+  ]
+}

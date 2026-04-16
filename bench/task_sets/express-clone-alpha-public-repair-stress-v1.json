@@ -1,0 +1,12 @@
+{
+  "id": "express-clone-alpha-public-repair-stress-v1",
+  "title": "Express clone alpha public-repair stress suite (v1)",
+  "goal": "Isolate fresh-repo Express chunks where the visible public spec is intentionally wide enough that tests-only multishot repair should actually fire, while a smaller hidden edge remains for verify.",
+  "suite_kind": "framework_clone_fresh_spec_public_repair_stress",
+  "task_ids": [
+    "ts-express-fresh-router-core-v3",
+    "ts-express-fresh-body-parsers-v2",
+    "ts-express-fresh-response-headers-v3",
+    "ts-express-fresh-static-v3"
+  ]
+}

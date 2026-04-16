@@ -1,0 +1,11 @@
+{
+  "id": "retry-twice-no-verify",
+  "title": "Retry twice (no verify)",
+  "description": "Give the model two extra blind attempts with no Court Jester verify calls and no evaluator feedback between attempts. Only the final attempt is judged.",
+  "court_jester_mode": "none",
+  "required_tools": [],
+  "block_on_failed_verify": false,
+  "max_repair_rounds": 2,
+  "blind_retry_without_verify": true,
+  "repair_feedback_style": "none"
+}

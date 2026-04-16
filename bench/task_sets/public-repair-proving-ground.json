@@ -1,0 +1,14 @@
+{
+  "id": "public-repair-proving-ground",
+  "title": "Public-repair proving ground",
+  "goal": "Public-augmented task variants designed so visible tests are more likely to trigger realistic public-only repair loops.",
+  "suite_kind": "mechanism_public_repair",
+  "task_ids": [
+    "py-feature-flag-explicit-false-public-repair",
+    "py-preferred-timezone-missing-public-repair",
+    "py-query-string-canonicalization-public-repair",
+    "ts-null-primary-city-public-repair",
+    "ts-query-string-canonicalization-public-repair",
+    "ts-secondary-label-missing-public-repair"
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "id": "ts-null-primary-city-public-repair",
+  "title": "Primary city null handling public-repair probe",
+  "repo_fixture": "mini_ts_city_service",
+  "prompt": "Fix primaryCity so it returns a stable fallback instead of crashing when location data is missing.",
+  "language": "typescript",
+  "bucket": "public_repair_probe",
+  "verify_paths": [
+    "location.ts"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.ts",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_repair_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_primary_city_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "location.ts"
+  ],
+  "tags": [
+    "typescript",
+    "public-repair-probe",
+    "optional_chaining"
+  ],
+  "bug_class": "null_property_access",
+  "expected_public_failure_without_fix": true
+}

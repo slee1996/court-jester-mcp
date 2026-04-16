@@ -1,0 +1,62 @@
+{
+  "id": "ts-express-fresh-body-parsers-v2",
+  "title": "Build the Express body parser wrappers in a fresh repo (v2)",
+  "repo_fixture": "express_clone_alpha_fresh_body_parsers",
+  "prompt": "Build the body parser behavior from the visible public spec. This fresh repo slice is intentionally wider than the urlencoded-only task: implement the JSON and urlencoded wrappers so the public tests pass, while deeper wrapper semantics remain in follow-up checks.",
+  "language": "typescript",
+  "bucket": "framework_clone_fresh_spec_public_repair_stress",
+  "provider_timeout_seconds": 1000,
+  "provider_idle_timeout_seconds": 600,
+  "verify_paths": [
+    "index.ts",
+    "lib/query.ts",
+    "lib/http.ts"
+  ],
+  "verify_test_path": "tests/verify_spec.ts",
+  "verify_tests_only": true,
+  "setup_commands": [],
+  "setup_cache_key": "express-clone-alpha-fresh-body-parsers:v2-public-repair-stress",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_spec.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_workspace_test.py",
+    "{workspace}",
+    "tests/hidden_spec.ts"
+  ],
+  "expected_files": [
+    "index.ts",
+    "lib/query.ts",
+    "lib/http.ts"
+  ],
+  "family": "express_clone_alpha",
+  "bug_class": "framework_semantics",
+  "bug_surface": "fresh_body_parsers",
+  "difficulty": "hard",
+  "golden_patch_description": "Implement JSON and urlencoded body parsing behavior for the fresh Express slice, leaving only deeper nested-array semantics for follow-up checks.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": true,
+  "cross_file": true,
+  "upstream_benchmark": "express",
+  "upstream_instance_id": "fresh-body-parsers-v2-public-repair-stress",
+  "instance_notes": "Public-repair stress slice: visible JSON + extended urlencoded coverage, hidden nested-array follow-up, tests-only verify to avoid framework false positives.",
+  "tags": [
+    "typescript",
+    "express",
+    "framework",
+    "fresh_repo",
+    "build_spec",
+    "body_parser",
+    "public_repair_stress"
+  ]
+}

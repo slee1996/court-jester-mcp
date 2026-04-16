@@ -1,9 +1,11 @@
 {
   "id": "claude-default",
-  "title": "Claude Code default model",
+  "title": "Claude Code Opus 4.6 medium",
   "provider": "claude_cli",
+  "model": "claude-opus-4-6",
+  "reasoning_effort": "medium",
   "enabled_by_default": false,
   "metadata": {
-    "timeout_seconds": 420
+    "timeout_seconds": 1000
   }
 }

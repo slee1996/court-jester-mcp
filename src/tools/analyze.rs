@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use tree_sitter::Parser;
 
 use crate::types::*;
@@ -27,6 +29,9 @@ pub fn analyze(code: &str, language: &Language) -> AnalysisResult {
                 aliases: vec![],
                 imports: vec![],
                 complexity: 1,
+                cognitive_complexity: 0,
+                max_nesting_depth: 0,
+                complexity_breakdown: BTreeMap::new(),
                 parse_error: true,
             }
         }
@@ -34,25 +39,16 @@ pub fn analyze(code: &str, language: &Language) -> AnalysisResult {
 
     let root = tree.root_node();
     let bytes = code.as_bytes();
+    let file_complexity = program_complexity(&root, language, bytes);
 
     let mut functions = vec![];
     let mut classes = vec![];
     let mut aliases = vec![];
     let mut imports = vec![];
-    let mut complexity: usize = 1; // base complexity
 
     match language {
         Language::Python => {
-            visit_python(
-                &root,
-                bytes,
-                &mut functions,
-                &mut classes,
-                &mut aliases,
-                &mut imports,
-                &mut complexity,
-                0,
-            );
+            visit_python(&root, bytes, &mut functions, &mut classes, &mut imports, 0);
         }
         Language::TypeScript => {
             visit_typescript(
@@ -62,7 +58,6 @@ pub fn analyze(code: &str, language: &Language) -> AnalysisResult {
                 &mut classes,
                 &mut aliases,
                 &mut imports,
-                &mut complexity,
                 0,
             );
         }
@@ -73,7 +68,10 @@ pub fn analyze(code: &str, language: &Language) -> AnalysisResult {
         classes,
         aliases,
         imports,
-        complexity,
+        complexity: file_complexity.cyclomatic,
+        cognitive_complexity: file_complexity.cognitive,
+        max_nesting_depth: file_complexity.max_nesting_depth,
+        complexity_breakdown: file_complexity.breakdown,
         parse_error: root.has_error(),
     }
 }
@@ -82,42 +80,256 @@ fn text<'a>(node: &tree_sitter::Node, source: &'a [u8]) -> &'a str {
     node.utf8_text(source).unwrap_or("")
 }
 
-/// Walk a subtree and count control-flow nodes (McCabe complexity).
-fn subtree_complexity(node: &tree_sitter::Node, language: &Language) -> usize {
-    let mut count = 1; // base complexity
-    walk_complexity(node, &mut count, language);
-    count
+#[derive(Debug, Default, Clone)]
+struct ComplexityStats {
+    cyclomatic: usize,
+    cognitive: usize,
+    max_nesting_depth: usize,
+    breakdown: BTreeMap<String, usize>,
 }
 
-fn walk_complexity(node: &tree_sitter::Node, count: &mut usize, language: &Language) {
-    let dominated = match language {
-        Language::Python => matches!(
-            node.kind(),
-            "if_statement"
-                | "elif_clause"
-                | "for_statement"
-                | "while_statement"
-                | "except_clause"
-                | "conditional_expression"
-                | "boolean_operator"
-        ),
-        Language::TypeScript => matches!(
-            node.kind(),
-            "if_statement"
-                | "for_statement"
-                | "for_in_statement"
-                | "while_statement"
-                | "do_statement"
-                | "catch_clause"
-                | "ternary_expression"
-        ),
-    };
-    if dominated {
-        *count += 1;
+#[derive(Clone, Copy)]
+struct Decision {
+    key: &'static str,
+    nesting_sensitive: bool,
+    increases_nesting: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ComplexityEvent {
+    Decision(Decision),
+    NestingOnly,
+}
+
+impl ComplexityStats {
+    fn new() -> Self {
+        Self {
+            cyclomatic: 1,
+            ..Self::default()
+        }
     }
+
+    fn record_decision(&mut self, key: &'static str, nesting: usize, nesting_sensitive: bool) {
+        self.cyclomatic += 1;
+        self.cognitive += if nesting_sensitive { 1 + nesting } else { 1 };
+        *self.breakdown.entry(key.to_string()).or_insert(0) += 1;
+    }
+
+    fn note_nesting(&mut self, nesting: usize) {
+        self.max_nesting_depth = self.max_nesting_depth.max(nesting);
+    }
+}
+
+/// Walk the full file and count control-flow nodes.
+fn program_complexity(
+    root: &tree_sitter::Node,
+    language: &Language,
+    source: &[u8],
+) -> ComplexityStats {
+    let mut stats = ComplexityStats::new();
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        walk_complexity(&child, &mut stats, language, source, 0, false);
+    }
+    stats
+}
+
+/// Walk a callable subtree while ignoring nested callables so parent functions do
+/// not inherit child function complexity.
+fn callable_complexity(
+    root: &tree_sitter::Node,
+    language: &Language,
+    source: &[u8],
+) -> ComplexityStats {
+    let mut stats = ComplexityStats::new();
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        walk_complexity(&child, &mut stats, language, source, 0, true);
+    }
+    stats
+}
+
+fn walk_complexity(
+    node: &tree_sitter::Node,
+    stats: &mut ComplexityStats,
+    language: &Language,
+    source: &[u8],
+    nesting: usize,
+    skip_nested_callables: bool,
+) {
+    if skip_nested_callables && is_callable(node, language) {
+        return;
+    }
+
+    let mut child_nesting = nesting;
+    if let Some(event) = complexity_event(node, language, source) {
+        match event {
+            ComplexityEvent::Decision(decision) => {
+                stats.record_decision(decision.key, nesting, decision.nesting_sensitive);
+                if decision.increases_nesting {
+                    child_nesting += 1;
+                    stats.note_nesting(child_nesting);
+                }
+            }
+            ComplexityEvent::NestingOnly => {
+                child_nesting += 1;
+                stats.note_nesting(child_nesting);
+            }
+        }
+    }
+
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        walk_complexity(&child, count, language);
+        walk_complexity(
+            &child,
+            stats,
+            language,
+            source,
+            child_nesting,
+            skip_nested_callables,
+        );
+    }
+}
+
+fn is_callable(node: &tree_sitter::Node, language: &Language) -> bool {
+    match language {
+        Language::Python => matches!(node.kind(), "function_definition" | "lambda"),
+        Language::TypeScript => matches!(
+            node.kind(),
+            "function_declaration" | "function_expression" | "method_definition" | "arrow_function"
+        ),
+    }
+}
+
+fn complexity_event(
+    node: &tree_sitter::Node,
+    language: &Language,
+    source: &[u8],
+) -> Option<ComplexityEvent> {
+    match language {
+        Language::Python => match node.kind() {
+            "if_statement" => Some(ComplexityEvent::Decision(Decision {
+                key: "if",
+                nesting_sensitive: true,
+                increases_nesting: true,
+            })),
+            "elif_clause" => Some(ComplexityEvent::Decision(Decision {
+                key: "elif",
+                nesting_sensitive: true,
+                increases_nesting: true,
+            })),
+            "for_statement" => Some(ComplexityEvent::Decision(Decision {
+                key: "for",
+                nesting_sensitive: true,
+                increases_nesting: true,
+            })),
+            "while_statement" => Some(ComplexityEvent::Decision(Decision {
+                key: "while",
+                nesting_sensitive: true,
+                increases_nesting: true,
+            })),
+            "except_clause" => Some(ComplexityEvent::Decision(Decision {
+                key: "except",
+                nesting_sensitive: true,
+                increases_nesting: true,
+            })),
+            "conditional_expression" => Some(ComplexityEvent::Decision(Decision {
+                key: "ternary",
+                nesting_sensitive: true,
+                increases_nesting: false,
+            })),
+            "boolean_operator" => Some(ComplexityEvent::Decision(Decision {
+                key: "boolean_op",
+                nesting_sensitive: false,
+                increases_nesting: false,
+            })),
+            "match_statement" => Some(ComplexityEvent::NestingOnly),
+            "case_clause" => Some(ComplexityEvent::Decision(Decision {
+                key: "case",
+                nesting_sensitive: true,
+                increases_nesting: true,
+            })),
+            _ => None,
+        },
+        Language::TypeScript => match node.kind() {
+            "if_statement" => Some(ComplexityEvent::Decision(Decision {
+                key: "if",
+                nesting_sensitive: true,
+                increases_nesting: true,
+            })),
+            "for_statement" => Some(ComplexityEvent::Decision(Decision {
+                key: "for",
+                nesting_sensitive: true,
+                increases_nesting: true,
+            })),
+            "for_in_statement" => {
+                let key = match node
+                    .child_by_field_name("operator")
+                    .map(|n| text(&n, source))
+                {
+                    Some("of") => "for_of",
+                    _ => "for_in",
+                };
+                Some(ComplexityEvent::Decision(Decision {
+                    key,
+                    nesting_sensitive: true,
+                    increases_nesting: true,
+                }))
+            }
+            "while_statement" => Some(ComplexityEvent::Decision(Decision {
+                key: "while",
+                nesting_sensitive: true,
+                increases_nesting: true,
+            })),
+            "do_statement" => Some(ComplexityEvent::Decision(Decision {
+                key: "do",
+                nesting_sensitive: true,
+                increases_nesting: true,
+            })),
+            "catch_clause" => Some(ComplexityEvent::Decision(Decision {
+                key: "catch",
+                nesting_sensitive: true,
+                increases_nesting: true,
+            })),
+            "ternary_expression" => Some(ComplexityEvent::Decision(Decision {
+                key: "ternary",
+                nesting_sensitive: true,
+                increases_nesting: false,
+            })),
+            "switch_statement" => Some(ComplexityEvent::NestingOnly),
+            "switch_case" => Some(ComplexityEvent::Decision(Decision {
+                key: "switch_case",
+                nesting_sensitive: true,
+                increases_nesting: true,
+            })),
+            "switch_default" => Some(ComplexityEvent::Decision(Decision {
+                key: "switch_default",
+                nesting_sensitive: true,
+                increases_nesting: true,
+            })),
+            "binary_expression" => match node
+                .child_by_field_name("operator")
+                .map(|n| text(&n, source))
+            {
+                Some("&&") => Some(ComplexityEvent::Decision(Decision {
+                    key: "logical_and",
+                    nesting_sensitive: false,
+                    increases_nesting: false,
+                })),
+                Some("||") => Some(ComplexityEvent::Decision(Decision {
+                    key: "logical_or",
+                    nesting_sensitive: false,
+                    increases_nesting: false,
+                })),
+                Some("??") => Some(ComplexityEvent::Decision(Decision {
+                    key: "nullish_coalescing",
+                    nesting_sensitive: false,
+                    increases_nesting: false,
+                })),
+                _ => None,
+            },
+            _ => None,
+        },
     }
 }
 
@@ -128,7 +340,7 @@ fn has_self_or_cls_first_param(func_node: &tree_sitter::Node, source: &[u8]) -> 
         None => return false,
     };
     let mut cursor = params_node.walk();
-    for child in params_node.named_children(&mut cursor) {
+    if let Some(child) = params_node.named_children(&mut cursor).next() {
         match child.kind() {
             "identifier" => {
                 let name = text(&child, source);
@@ -157,9 +369,7 @@ fn visit_python(
     source: &[u8],
     functions: &mut Vec<FunctionInfo>,
     classes: &mut Vec<ClassInfo>,
-    aliases: &mut Vec<TypeAliasInfo>,
     imports: &mut Vec<ImportInfo>,
-    complexity: &mut usize,
     func_depth: usize,
 ) {
     let mut child_depth = func_depth;
@@ -175,13 +385,17 @@ fn visit_python(
             let return_type = node
                 .child_by_field_name("return_type")
                 .map(|n| text(&n, source).to_string());
+            let metrics = callable_complexity(node, &Language::Python, source);
             functions.push(FunctionInfo {
                 name,
                 params,
                 return_type,
                 line: node.start_position().row + 1,
                 end_line: node.end_position().row + 1,
-                complexity: subtree_complexity(node, &Language::Python),
+                complexity: metrics.cyclomatic,
+                cognitive_complexity: metrics.cognitive,
+                max_nesting_depth: metrics.max_nesting_depth,
+                complexity_breakdown: metrics.breakdown,
                 is_method,
                 is_nested: func_depth > 0,
                 is_exported,
@@ -208,30 +422,12 @@ fn visit_python(
                 line: node.start_position().row + 1,
             });
         }
-        "if_statement"
-        | "elif_clause"
-        | "for_statement"
-        | "while_statement"
-        | "except_clause"
-        | "conditional_expression"
-        | "boolean_operator" => {
-            *complexity += 1;
-        }
         _ => {}
     }
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        visit_python(
-            &child,
-            source,
-            functions,
-            classes,
-            aliases,
-            imports,
-            complexity,
-            child_depth,
-        );
+        visit_python(&child, source, functions, classes, imports, child_depth);
     }
 }
 
@@ -418,7 +614,6 @@ fn visit_typescript(
     classes: &mut Vec<ClassInfo>,
     aliases: &mut Vec<TypeAliasInfo>,
     imports: &mut Vec<ImportInfo>,
-    complexity: &mut usize,
     func_depth: usize,
 ) {
     let mut child_depth = func_depth;
@@ -432,13 +627,17 @@ fn visit_typescript(
             let return_type = node
                 .child_by_field_name("return_type")
                 .map(|n| type_text(&n, source));
+            let metrics = callable_complexity(node, &Language::TypeScript, source);
             functions.push(FunctionInfo {
                 name,
                 params,
                 return_type,
                 line: node.start_position().row + 1,
                 end_line: node.end_position().row + 1,
-                complexity: subtree_complexity(node, &Language::TypeScript),
+                complexity: metrics.cyclomatic,
+                cognitive_complexity: metrics.cognitive,
+                max_nesting_depth: metrics.max_nesting_depth,
+                complexity_breakdown: metrics.breakdown,
                 is_method: false,
                 is_nested: func_depth > 0,
                 is_exported: ts_is_exported(node),
@@ -454,13 +653,17 @@ fn visit_typescript(
             let return_type = node
                 .child_by_field_name("return_type")
                 .map(|n| type_text(&n, source));
+            let metrics = callable_complexity(node, &Language::TypeScript, source);
             functions.push(FunctionInfo {
                 name,
                 params,
                 return_type,
                 line: node.start_position().row + 1,
                 end_line: node.end_position().row + 1,
-                complexity: subtree_complexity(node, &Language::TypeScript),
+                complexity: metrics.cyclomatic,
+                cognitive_complexity: metrics.cognitive,
+                max_nesting_depth: metrics.max_nesting_depth,
+                complexity_breakdown: metrics.breakdown,
                 is_method: true,
                 is_nested: func_depth > 0,
                 is_exported: false,
@@ -479,13 +682,17 @@ fn visit_typescript(
                     let return_type = value
                         .child_by_field_name("return_type")
                         .map(|n| type_text(&n, source));
+                    let metrics = callable_complexity(&value, &Language::TypeScript, source);
                     functions.push(FunctionInfo {
                         name,
                         params,
                         return_type,
                         line: node.start_position().row + 1,
                         end_line: node.end_position().row + 1,
-                        complexity: subtree_complexity(&value, &Language::TypeScript),
+                        complexity: metrics.cyclomatic,
+                        cognitive_complexity: metrics.cognitive,
+                        max_nesting_depth: metrics.max_nesting_depth,
+                        complexity_breakdown: metrics.breakdown,
                         is_method: false,
                         is_nested: func_depth > 0,
                         is_exported: ts_is_exported(node),
@@ -554,10 +761,6 @@ fn visit_typescript(
                 line: node.start_position().row + 1,
             });
         }
-        "if_statement" | "for_statement" | "for_in_statement" | "while_statement"
-        | "do_statement" | "catch_clause" | "ternary_expression" => {
-            *complexity += 1;
-        }
         _ => {}
     }
 
@@ -570,7 +773,6 @@ fn visit_typescript(
             classes,
             aliases,
             imports,
-            complexity,
             child_depth,
         );
     }
@@ -852,13 +1054,22 @@ pub fn check_complexity_threshold(
     analysis: &AnalysisResult,
     threshold: usize,
 ) -> Vec<ComplexityViolation> {
-    analysis
-        .functions
+    check_complexity_threshold_for_functions(&analysis.functions, threshold)
+}
+
+pub fn check_complexity_threshold_for_functions(
+    functions: &[FunctionInfo],
+    threshold: usize,
+) -> Vec<ComplexityViolation> {
+    functions
         .iter()
         .filter(|f| f.complexity > threshold)
         .map(|f| ComplexityViolation {
             function: f.name.clone(),
             complexity: f.complexity,
+            cognitive_complexity: f.cognitive_complexity,
+            max_nesting_depth: f.max_nesting_depth,
+            complexity_breakdown: f.complexity_breakdown.clone(),
             threshold,
             line: f.line,
         })

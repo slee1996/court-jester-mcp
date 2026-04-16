@@ -1,0 +1,56 @@
+{
+  "id": "ts-express-fresh-response-headers",
+  "title": "Build Express response header helpers in a fresh repo",
+  "repo_fixture": "express_clone_alpha_fresh_response_headers",
+  "prompt": "Build the response helper behavior from the visible public spec. This is a fresh repo with only API scaffolding and one visible public test. Implement response status and header helpers so the clone behaves like Express for this slice.",
+  "language": "typescript",
+  "bucket": "framework_clone_fresh_spec_chunk",
+  "provider_timeout_seconds": 1000,
+  "provider_idle_timeout_seconds": 180,
+  "verify_paths": [
+    "lib/http.ts"
+  ],
+  "verify_test_path": "tests/verify_spec.ts",
+  "setup_commands": [],
+  "setup_cache_key": "express-clone-alpha-fresh-response-headers:v1",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_spec.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_workspace_test.py",
+    "{workspace}",
+    "tests/hidden_spec.ts"
+  ],
+  "expected_files": [
+    "lib/http.ts"
+  ],
+  "family": "express_clone_alpha",
+  "bug_class": "framework_semantics",
+  "bug_surface": "fresh_response_headers",
+  "difficulty": "hard",
+  "golden_patch_description": "Implement response location, link, vary, and sendStatus semantics for the fresh Express slice.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": true,
+  "cross_file": false,
+  "upstream_benchmark": "express",
+  "upstream_instance_id": "fresh-response-headers-v1",
+  "instance_notes": "Fresh-repo Express response-helper slice with public location/link behavior and deeper sendStatus/vary follow-ups.",
+  "tags": [
+    "typescript",
+    "express",
+    "framework",
+    "fresh_repo",
+    "build_spec",
+    "response"
+  ]
+}

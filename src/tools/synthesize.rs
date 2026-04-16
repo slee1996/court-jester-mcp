@@ -50,6 +50,9 @@ pub fn synthesize_calls_for(
         aliases: aliases.to_vec(),
         imports: vec![],
         complexity: 1,
+        cognitive_complexity: 0,
+        max_nesting_depth: 0,
+        complexity_breakdown: std::collections::BTreeMap::new(),
         parse_error: false,
     };
 
@@ -1355,7 +1358,7 @@ fn ts_generator(type_ann: Option<&str>, type_defs: &TsNamedTypes<'_>) -> String 
                         .collect();
                     format!("({{ {} }})", props.join(", "))
                 }
-            } else if t.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
+            } else if t.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
                 "({})".into()
             } else {
                 "undefined".into()
@@ -1419,10 +1422,8 @@ fn ts_type_is_fuzzable(type_ann: Option<&str>, type_defs: &TsNamedTypes<'_>) -> 
                     .fields
                     .iter()
                     .all(|field| ts_type_is_fuzzable(field.type_annotation.as_deref(), type_defs))
-            } else if t.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
-                false
             } else {
-                true
+                !t.chars().next().is_some_and(|c| c.is_ascii_uppercase())
             }
         }
     }
@@ -1478,19 +1479,19 @@ fn is_semver_like_version_type(type_ann: Option<&str>, type_defs: &TsNamedTypes<
                 has_major = field
                     .type_annotation
                     .as_deref()
-                    .map_or(false, |ann| ann.trim() == "number");
+                    .is_some_and(|ann| ann.trim() == "number");
             }
             "minor" => {
                 has_minor = field
                     .type_annotation
                     .as_deref()
-                    .map_or(false, |ann| ann.trim() == "number");
+                    .is_some_and(|ann| ann.trim() == "number");
             }
             "patch" => {
                 has_patch = field
                     .type_annotation
                     .as_deref()
-                    .map_or(false, |ann| ann.trim() == "number");
+                    .is_some_and(|ann| ann.trim() == "number");
             }
             "prerelease" => {
                 has_prerelease = true;
@@ -1977,7 +1978,7 @@ fn extract_two_generic_args(t: &str) -> (String, String) {
     (inner, String::new())
 }
 
-fn split_ts_top_level<'a>(text: &'a str, separator: char) -> Vec<&'a str> {
+fn split_ts_top_level(text: &str, separator: char) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0i32;
     let mut start = 0usize;
@@ -2072,9 +2073,7 @@ const INVOLUTION_PAIRS: &[(&str, &str)] = &[
     ("marshal", "unmarshal"),
 ];
 
-fn find_involution_pairs<'a>(
-    analysis: &'a AnalysisResult,
-) -> Vec<(&'a FunctionInfo, &'a FunctionInfo)> {
+fn find_involution_pairs(analysis: &AnalysisResult) -> Vec<(&FunctionInfo, &FunctionInfo)> {
     let func_map: HashMap<String, &FunctionInfo> = analysis
         .functions
         .iter()

@@ -1,0 +1,60 @@
+{
+  "id": "ts-express-router-dispatch",
+  "title": "Express clone handles mounted router dispatch and missing methods",
+  "repo_fixture": "express_clone_alpha",
+  "prompt": "Fix the Express clone so mounted router dispatch behaves like Express for this benchmark slice. Keep nested router params working, and do not treat a missing req.method like GET when routing.",
+  "language": "typescript",
+  "bucket": "framework_clone_alpha",
+  "verify_paths": [
+    "index.ts"
+  ],
+  "verify_test_path": "tests/verify_router_dispatch.ts",
+  "setup_commands": [
+    [
+      "python",
+      "{bench_root}/seed_express_clone_bug.py",
+      "{workspace}",
+      "router_missing_method"
+    ]
+  ],
+  "setup_cache_key": "express-clone-alpha:router-missing-method",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_router_dispatch.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_workspace_test.py",
+    "{workspace}",
+    "tests/hidden_router_dispatch.ts"
+  ],
+  "expected_files": [
+    "index.ts"
+  ],
+  "family": "express_clone_alpha",
+  "bug_class": "framework_semantics",
+  "bug_surface": "router_dispatch",
+  "difficulty": "hard",
+  "golden_patch_description": "Do not default a missing req.method to GET while preserving mounted router dispatch.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": true,
+  "cross_file": false,
+  "upstream_benchmark": "express",
+  "upstream_instance_id": "router-dispatch-v1",
+  "instance_notes": "Derived from Router.js missing-method and mounted-router semantics.",
+  "tags": [
+    "typescript",
+    "express",
+    "router",
+    "middleware",
+    "upstream_derived"
+  ]
+}

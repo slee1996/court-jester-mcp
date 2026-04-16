@@ -1,0 +1,60 @@
+{
+  "id": "ts-express-wrapper-urlencoded",
+  "title": "Express clone parses form bodies through express.urlencoded",
+  "repo_fixture": "express_clone_alpha",
+  "prompt": "Fix the Express clone so express.urlencoded behaves like Express for this benchmark slice. It should parse urlencoded form bodies, honor the extended option, and ignore non-form content types.",
+  "language": "typescript",
+  "bucket": "framework_clone_alpha",
+  "verify_paths": [
+    "index.ts"
+  ],
+  "verify_test_path": "tests/verify_express_urlencoded.ts",
+  "setup_commands": [
+    [
+      "python",
+      "{bench_root}/seed_express_clone_bug.py",
+      "{workspace}",
+      "express_urlencoded_simple_only"
+    ]
+  ],
+  "setup_cache_key": "express-clone-alpha:express-urlencoded-v1",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_express_urlencoded.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_workspace_test.py",
+    "{workspace}",
+    "tests/hidden_express_urlencoded.ts"
+  ],
+  "expected_files": [
+    "index.ts"
+  ],
+  "family": "express_clone_alpha",
+  "bug_class": "framework_semantics",
+  "bug_surface": "wrapper_urlencoded",
+  "difficulty": "hard",
+  "golden_patch_description": "Restore express.urlencoded parsing, especially nested extended-body handling.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": true,
+  "cross_file": false,
+  "upstream_benchmark": "express",
+  "upstream_instance_id": "express-urlencoded-v1",
+  "instance_notes": "Derived from express.urlencoded.js wrapper semantics.",
+  "tags": [
+    "typescript",
+    "express",
+    "wrapper",
+    "form",
+    "upstream_derived"
+  ]
+}

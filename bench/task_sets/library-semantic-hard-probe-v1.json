@@ -1,0 +1,11 @@
+{
+  "id": "library-semantic-hard-probe-v1",
+  "title": "Library semantic hard probe v1",
+  "goal": "First hard semantic probe built from packaging and qs behavior slices, designed to stress verify-triggered repair on credible upstream-derived semantics.",
+  "suite_kind": "library_semantic_probe",
+  "task_ids": [
+    "py-packaging-version-ordering",
+    "py-packaging-specifier-prerelease-membership",
+    "ts-qs-stringify-nested-nullish"
+  ]
+}

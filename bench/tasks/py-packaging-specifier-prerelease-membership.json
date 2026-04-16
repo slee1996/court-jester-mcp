@@ -1,0 +1,53 @@
+{
+  "id": "py-packaging-specifier-prerelease-membership",
+  "title": "Packaging specifier membership handles prereleases and compatible releases",
+  "repo_fixture": "mini_py_packaging_specifier_service",
+  "prompt": "Fix allows so it matches packaging-style PEP 440 specifier behavior, especially default prerelease exclusion and the upper-bound rules for compatible release operators like ~=1.4 and ~=1.4.5.",
+  "language": "python",
+  "bucket": "library_semantic_core",
+  "verify_paths": [
+    "specifiers.py"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.py",
+  "public_check_commands": [
+    [
+      "python",
+      "tests/public_checks.py"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/py_packaging_specifier_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "specifiers.py"
+  ],
+  "family": "library_slice",
+  "bug_class": "spec_conformance",
+  "bug_surface": "membership",
+  "difficulty": "hard",
+  "golden_patch_description": "Match packaging specifier membership for prerelease exclusion, exact matching, and compatible-release upper-bound behavior.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": false,
+  "uses_project_dir": false,
+  "uses_relative_imports": false,
+  "cross_file": false,
+  "upstream_benchmark": "packaging",
+  "upstream_instance_id": "specifier-membership-v1",
+  "instance_notes": "Compact PEP 440 specifier-membership slice derived from packaging specifier tests.",
+  "tags": [
+    "python",
+    "library",
+    "packaging",
+    "pep440",
+    "specifier",
+    "prerelease",
+    "spec_conformance",
+    "upstream_derived"
+  ]
+}

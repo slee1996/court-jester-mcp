@@ -1,0 +1,9 @@
+{
+  "id": "express-clone-alpha-build-spec",
+  "title": "Express clone alpha build from spec",
+  "goal": "Measure whether agents are more successful building a broad Express clone from a visible public spec with Court Jester than without it.",
+  "suite_kind": "framework_clone_build_spec",
+  "task_ids": [
+    "ts-express-clone-alpha-build-spec"
+  ]
+}

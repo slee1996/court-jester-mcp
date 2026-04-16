@@ -1,0 +1,12 @@
+{
+  "id": "repair-loop-verify-only-2",
+  "title": "Repair loop (verify only) x2",
+  "description": "Allow two repair rounds only after failed Court Jester verify. Public and hidden failures do not trigger repair feedback.",
+  "court_jester_mode": "required",
+  "required_tools": [
+    "verify"
+  ],
+  "block_on_failed_verify": true,
+  "max_repair_rounds": 2,
+  "verify_only_repair": true
+}

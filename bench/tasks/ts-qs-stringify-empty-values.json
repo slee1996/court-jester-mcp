@@ -1,0 +1,53 @@
+{
+  "id": "ts-qs-stringify-empty-values",
+  "title": "QS stringify skips nullish and empty containers while preserving empty strings",
+  "repo_fixture": "mini_ts_qs_stringify_service",
+  "prompt": "Fix stringifyQuery so it matches qs-style empty-value handling for this benchmark slice: null and undefined values should be skipped, empty objects and empty arrays should not emit entries, empty strings should be preserved, and nested object encoding should still use bracket notation.",
+  "language": "typescript",
+  "bucket": "library_semantic_core",
+  "verify_paths": [
+    "stringify.ts"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify_empty.ts",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_empty_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_qs_stringify_empty_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "stringify.ts"
+  ],
+  "family": "library_slice",
+  "bug_class": "spec_conformance",
+  "bug_surface": "serialization",
+  "difficulty": "hard",
+  "golden_patch_description": "Match qs-style nullish skipping and empty-container omission while preserving empty strings and nested bracket encoding.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": false,
+  "cross_file": false,
+  "upstream_benchmark": "qs",
+  "upstream_instance_id": "stringify-empty-values-v1",
+  "instance_notes": "Compact qs stringify slice derived from skipNulls and empty-container semantics documented in the qs README and exercised by upstream stringify tests.",
+  "tags": [
+    "typescript",
+    "library",
+    "qs",
+    "query_string",
+    "stringify",
+    "empty_values",
+    "spec_conformance",
+    "upstream_derived"
+  ]
+}

@@ -1,0 +1,52 @@
+{
+  "id": "py-packaging-version-ordering",
+  "title": "Packaging version ordering matches PEP 440 release phases",
+  "repo_fixture": "mini_py_packaging_version_service",
+  "prompt": "Fix compare_versions so it follows packaging-style PEP 440 ordering across dev, alpha, beta, rc, final, and post releases while still treating equivalent release forms like 1.0 and 1.0.0 as equal.",
+  "language": "python",
+  "bucket": "library_semantic_core",
+  "verify_paths": [
+    "versioning.py"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.py",
+  "public_check_commands": [
+    [
+      "python",
+      "tests/public_checks.py"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/py_packaging_version_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "versioning.py"
+  ],
+  "family": "library_slice",
+  "bug_class": "spec_conformance",
+  "bug_surface": "ordering",
+  "difficulty": "hard",
+  "golden_patch_description": "Match packaging/PEP 440 ordering across release phases without regressing core numeric comparison or equivalent-release equality.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": false,
+  "cross_file": false,
+  "upstream_benchmark": "packaging",
+  "upstream_instance_id": "version-ordering-v1",
+  "instance_notes": "Compact PEP 440 ordering slice derived from packaging version tests.",
+  "tags": [
+    "python",
+    "library",
+    "packaging",
+    "pep440",
+    "ordering",
+    "spec_conformance",
+    "upstream_derived"
+  ]
+}

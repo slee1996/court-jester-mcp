@@ -1,0 +1,61 @@
+{
+  "id": "ts-express-fresh-router-dispatch",
+  "title": "Build the Express router dispatch core in a fresh repo",
+  "repo_fixture": "express_clone_alpha_fresh_router_dispatch",
+  "prompt": "Build the router dispatch core from the visible public spec. This slice is only about mounted child-app dispatch and standalone Route().dispatch behavior. Deeper mounted-path bookkeeping is checked separately.",
+  "language": "typescript",
+  "bucket": "framework_clone_fresh_spec_chunk",
+  "provider_timeout_seconds": 1000,
+  "provider_idle_timeout_seconds": 600,
+  "verify_paths": [
+    "index.ts",
+    "lib/router.ts",
+    "lib/http.ts"
+  ],
+  "verify_test_path": "tests/verify_spec.ts",
+  "verify_tests_only": true,
+  "setup_commands": [],
+  "setup_cache_key": "express-clone-alpha-fresh-router-dispatch:v1",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_spec.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_workspace_test.py",
+    "{workspace}",
+    "tests/hidden_spec.ts"
+  ],
+  "expected_files": [
+    "index.ts",
+    "lib/router.ts",
+    "lib/http.ts"
+  ],
+  "family": "express_clone_alpha",
+  "bug_class": "framework_semantics",
+  "bug_surface": "fresh_router_core",
+  "difficulty": "hard",
+  "golden_patch_description": "Implement mounted child-app dispatch, standalone Route dispatch, and mounted-path bookkeeping for the fresh router-dispatch slice.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": true,
+  "cross_file": true,
+  "upstream_benchmark": "express",
+  "upstream_instance_id": "fresh-router-dispatch-v1",
+  "instance_notes": "Fresh-repo Express router-dispatch slice narrowed to mounted apps, standalone route dispatch, and mounted-path bookkeeping.",
+  "tags": [
+    "typescript",
+    "express",
+    "framework",
+    "fresh_repo",
+    "build_spec",
+    "router"
+  ]
+}

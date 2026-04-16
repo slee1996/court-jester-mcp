@@ -1,0 +1,9 @@
+{
+  "id": "express-clone-alpha-monolith",
+  "title": "Express clone alpha monolith",
+  "goal": "Measure whether agents are more successful repairing a broad shared Express clone with Court Jester than without it.",
+  "suite_kind": "framework_clone_monolith",
+  "task_ids": [
+    "ts-express-clone-alpha-monolith"
+  ]
+}

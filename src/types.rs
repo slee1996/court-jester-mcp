@@ -1,4 +1,10 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -38,6 +44,12 @@ pub struct FunctionInfo {
     pub line: usize,
     pub end_line: usize,
     pub complexity: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cognitive_complexity: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub max_nesting_depth: usize,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub complexity_breakdown: BTreeMap<String, usize>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_method: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -95,6 +107,12 @@ pub struct AnalysisResult {
     pub aliases: Vec<TypeAliasInfo>,
     pub imports: Vec<ImportInfo>,
     pub complexity: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cognitive_complexity: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub max_nesting_depth: usize,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub complexity_breakdown: BTreeMap<String, usize>,
     pub parse_error: bool,
 }
 
@@ -139,6 +157,12 @@ pub struct FuzzFailure {
 pub struct ComplexityViolation {
     pub function: String,
     pub complexity: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cognitive_complexity: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub max_nesting_depth: usize,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub complexity_breakdown: BTreeMap<String, usize>,
     pub threshold: usize,
     pub line: usize,
 }

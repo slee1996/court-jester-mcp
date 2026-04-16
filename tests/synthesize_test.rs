@@ -1,5 +1,6 @@
 use court_jester_mcp::tools::synthesize::synthesize_calls;
 use court_jester_mcp::types::*;
+use std::collections::BTreeMap;
 
 fn make_analysis(functions: Vec<FunctionInfo>, classes: Vec<ClassInfo>) -> AnalysisResult {
     AnalysisResult {
@@ -8,6 +9,9 @@ fn make_analysis(functions: Vec<FunctionInfo>, classes: Vec<ClassInfo>) -> Analy
         aliases: vec![],
         imports: vec![],
         complexity: 1,
+        cognitive_complexity: 0,
+        max_nesting_depth: 0,
+        complexity_breakdown: BTreeMap::new(),
         parse_error: false,
     }
 }
@@ -28,6 +32,9 @@ fn func(name: &str, params: Vec<(&str, Option<&str>)>, ret: Option<&str>) -> Fun
         line: 1,
         end_line: 1,
         complexity: 1,
+        cognitive_complexity: 0,
+        max_nesting_depth: 0,
+        complexity_breakdown: BTreeMap::new(),
         is_method: false,
         is_nested: false,
         is_exported: true,
@@ -62,6 +69,9 @@ fn kwonly_func(
         line: 1,
         end_line: 1,
         complexity: 1,
+        cognitive_complexity: 0,
+        max_nesting_depth: 0,
+        complexity_breakdown: BTreeMap::new(),
         is_method: false,
         is_nested: false,
         is_exported: true,
@@ -494,6 +504,9 @@ fn typescript_fuzzes_resolved_alias_params() {
         }],
         imports: vec![],
         complexity: 1,
+        cognitive_complexity: 0,
+        max_nesting_depth: 0,
+        complexity_breakdown: BTreeMap::new(),
         parse_error: false,
     };
     let code = synthesize_calls(&analysis, &Language::TypeScript);
@@ -997,6 +1010,9 @@ fn python_skips_methods_in_fuzz() {
                 line: 2,
                 end_line: 3,
                 complexity: 1,
+                cognitive_complexity: 0,
+                max_nesting_depth: 0,
+                complexity_breakdown: BTreeMap::new(),
                 is_method: true,
                 is_nested: false,
                 is_exported: false,

@@ -1,0 +1,14 @@
+{
+  "id": "express-clone-alpha-fresh-ladder-v2",
+  "title": "Express clone alpha fresh repo build ladder (v2)",
+  "goal": "Measure fresh-repo Express construction from narrower subsystem builds up through the broad monolith final, using the tighter urlencoded slice and stronger router-core public spec.",
+  "suite_kind": "framework_clone_fresh_spec_ladder",
+  "task_ids": [
+    "ts-express-fresh-router-core-v2",
+    "ts-express-fresh-urlencoded",
+    "ts-express-fresh-request-meta",
+    "ts-express-fresh-response-headers",
+    "ts-express-fresh-static",
+    "ts-express-clone-alpha-fresh-spec"
+  ]
+}

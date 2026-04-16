@@ -5,22 +5,12 @@ use tokio::process::Command;
 
 use crate::types::*;
 
+#[derive(Default)]
 pub struct LintOptions<'a> {
     pub source_file: Option<&'a str>,
     pub project_dir: Option<&'a str>,
     pub config_path: Option<&'a str>,
     pub virtual_file_path: Option<&'a str>,
-}
-
-impl Default for LintOptions<'_> {
-    fn default() -> Self {
-        Self {
-            source_file: None,
-            project_dir: None,
-            config_path: None,
-            virtual_file_path: None,
-        }
-    }
 }
 
 /// Build a PATH that includes common tool install locations (uv, pip, homebrew, cargo).
@@ -532,6 +522,97 @@ async fn lint_typescript(code: &str, opts: &LintOptions<'_>) -> LintResult {
     }
 }
 
+/// Extract the first top-level JSON object from a string that may contain
+/// trailing non-JSON text (biome prints a human-readable summary after the JSON).
+fn extract_json_object(s: &str) -> &str {
+    let start = match s.find('{') {
+        Some(i) => i,
+        None => return s,
+    };
+    let mut depth = 0i32;
+    for (i, c) in s[start..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &s[start..start + i + 1];
+                }
+            }
+            _ => {}
+        }
+    }
+    s
+}
+
+fn parse_biome_output(output: &str) -> LintResult {
+    if output.trim().is_empty() {
+        return LintResult {
+            diagnostics: vec![],
+            error: None,
+            unavailable: false,
+        };
+    }
+
+    // biome --reporter=json outputs JSON followed by a human-readable summary.
+    // Extract just the JSON object (first `{` to its matching `}`).
+    let json_str = extract_json_object(output);
+    let parsed: Result<serde_json::Value, _> = serde_json::from_str(json_str);
+    match parsed {
+        Ok(val) => {
+            let diagnostics = val
+                .get("diagnostics")
+                .and_then(|d| d.as_array())
+                .map(|diags| {
+                    diags
+                        .iter()
+                        .filter_map(|d| {
+                            let rule = d.get("category")?.as_str()?.to_string();
+                            let message = d
+                                .get("description")
+                                .or_else(|| d.get("message"))
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let severity = d
+                                .get("severity")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("warning")
+                                .to_string();
+                            let (line, column) = d
+                                .get("location")
+                                .and_then(|loc| {
+                                    let start = loc.get("start")?;
+                                    let l = start.get("line")?.as_u64()? as usize;
+                                    let c = start.get("column")?.as_u64()? as usize;
+                                    Some((l, c))
+                                })
+                                .unwrap_or((0, 0));
+                            Some(LintDiagnostic {
+                                rule,
+                                message,
+                                line,
+                                column,
+                                severity,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            LintResult {
+                diagnostics,
+                error: None,
+                unavailable: false,
+            }
+        }
+        Err(_) => LintResult {
+            diagnostics: vec![],
+            error: Some("Failed to parse biome output".to_string()),
+            unavailable: false,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -674,96 +755,5 @@ mod tests {
             tool_unavailable_message("ruff"),
             "ruff not available in project, on PATH, or next to court-jester"
         );
-    }
-}
-
-/// Extract the first top-level JSON object from a string that may contain
-/// trailing non-JSON text (biome prints a human-readable summary after the JSON).
-fn extract_json_object(s: &str) -> &str {
-    let start = match s.find('{') {
-        Some(i) => i,
-        None => return s,
-    };
-    let mut depth = 0i32;
-    for (i, c) in s[start..].char_indices() {
-        match c {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return &s[start..start + i + 1];
-                }
-            }
-            _ => {}
-        }
-    }
-    s
-}
-
-fn parse_biome_output(output: &str) -> LintResult {
-    if output.trim().is_empty() {
-        return LintResult {
-            diagnostics: vec![],
-            error: None,
-            unavailable: false,
-        };
-    }
-
-    // biome --reporter=json outputs JSON followed by a human-readable summary.
-    // Extract just the JSON object (first `{` to its matching `}`).
-    let json_str = extract_json_object(output);
-    let parsed: Result<serde_json::Value, _> = serde_json::from_str(json_str);
-    match parsed {
-        Ok(val) => {
-            let diagnostics = val
-                .get("diagnostics")
-                .and_then(|d| d.as_array())
-                .map(|diags| {
-                    diags
-                        .iter()
-                        .filter_map(|d| {
-                            let rule = d.get("category")?.as_str()?.to_string();
-                            let message = d
-                                .get("description")
-                                .or_else(|| d.get("message"))
-                                .and_then(|m| m.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            let severity = d
-                                .get("severity")
-                                .and_then(|s| s.as_str())
-                                .unwrap_or("warning")
-                                .to_string();
-                            let (line, column) = d
-                                .get("location")
-                                .and_then(|loc| {
-                                    let start = loc.get("start")?;
-                                    let l = start.get("line")?.as_u64()? as usize;
-                                    let c = start.get("column")?.as_u64()? as usize;
-                                    Some((l, c))
-                                })
-                                .unwrap_or((0, 0));
-                            Some(LintDiagnostic {
-                                rule,
-                                message,
-                                line,
-                                column,
-                                severity,
-                            })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            LintResult {
-                diagnostics,
-                error: None,
-                unavailable: false,
-            }
-        }
-        Err(_) => LintResult {
-            diagnostics: vec![],
-            error: Some(format!("Failed to parse biome output")),
-            unavailable: false,
-        },
     }
 }

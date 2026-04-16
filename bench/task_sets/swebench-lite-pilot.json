@@ -1,7 +1,8 @@
 {
   "id": "swebench-lite-pilot",
   "title": "SWE-bench-lite pilot",
-  "goal": "Curated repo-shaped external-style pilot tasks judged by real repo-local tests.",
+  "goal": "Held-out external pilot tasks judged by real repo-local tests rather than Court Jester-shaped fixture checks.",
+  "suite_kind": "external_held_out_pilot",
   "task_ids": [
     "py-swebench-lite-cookiejar-quoted"
   ]

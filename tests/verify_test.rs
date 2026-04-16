@@ -2,7 +2,8 @@ use court_jester_mcp::tools::verify::{parse_fuzz_failures, verify, VerifyOptions
 use court_jester_mcp::types::Language;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+use tokio::sync::Mutex;
 
 fn path_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -77,6 +78,7 @@ fn default_opts(test_code: Option<&str>) -> VerifyOptions<'_> {
     VerifyOptions {
         test_code,
         test_source_file: None,
+        tests_only: false,
         complexity_threshold: None,
         project_dir: None,
         lint_config_path: None,
@@ -124,6 +126,60 @@ async fn with_passing_tests() {
 }
 
 #[tokio::test]
+async fn tests_only_verify_skips_execute_stage() {
+    let code = "def inverse(x: int) -> float:\n    return 1 / x";
+    let tests = "assert inverse(2) == 0.5";
+    let opts = VerifyOptions {
+        test_code: Some(tests),
+        test_source_file: None,
+        tests_only: true,
+        complexity_threshold: None,
+        project_dir: None,
+        lint_config_path: None,
+        lint_virtual_file_path: None,
+        diff: None,
+        source_file: None,
+        output_dir: None,
+    };
+    let report = verify(code, &Language::Python, opts).await;
+
+    assert!(report.overall_ok, "report: {:#?}", report.stages);
+    assert!(!report.stages.iter().any(|s| s.name == "execute"));
+    assert!(report.stages.iter().any(|s| s.name == "test" && s.ok));
+}
+
+#[tokio::test]
+async fn tests_only_verify_requires_authoritative_test() {
+    let code = "def inverse(x: int) -> float:\n    return 1 / x";
+    let opts = VerifyOptions {
+        test_code: None,
+        test_source_file: None,
+        tests_only: true,
+        complexity_threshold: None,
+        project_dir: None,
+        lint_config_path: None,
+        lint_virtual_file_path: None,
+        diff: None,
+        source_file: None,
+        output_dir: None,
+    };
+    let report = verify(code, &Language::Python, opts).await;
+
+    assert!(!report.overall_ok, "report: {:#?}", report.stages);
+    assert!(!report.stages.iter().any(|s| s.name == "execute"));
+    let test_stage = report
+        .stages
+        .iter()
+        .find(|s| s.name == "test")
+        .expect("tests_only mode should emit a failing test stage");
+    assert!(!test_stage.ok);
+    assert_eq!(
+        test_stage.error.as_deref(),
+        Some("tests_only mode requires an authoritative test")
+    );
+}
+
+#[tokio::test]
 async fn with_failing_tests() {
     let code = "def double(x: int) -> int:\n    return x * 3"; // bug: *3 instead of *2
     let tests = "assert double(5) == 10";
@@ -135,7 +191,7 @@ async fn with_failing_tests() {
 
 #[tokio::test]
 async fn lint_warnings_are_informational() {
-    let _guard = path_lock().lock().unwrap();
+    let _guard = path_lock().lock().await;
     let tool_dir = install_fake_tool(
         "biome",
         "#!/bin/sh\ncat <<'EOF'\n{\"diagnostics\":[{\"category\":\"lint/style/noNonNullAssertion\",\"description\":\"Avoid non-null assertions.\",\"severity\":\"warning\",\"location\":{\"start\":{\"line\":3,\"column\":12}}}]}\nEOF\nexit 1\n",
@@ -207,6 +263,7 @@ exit 1
         VerifyOptions {
             test_code: None,
             test_source_file: None,
+            tests_only: false,
             complexity_threshold: None,
             project_dir: Some(project_dir.path().to_str().unwrap()),
             lint_config_path: Some(config_path.to_str().unwrap()),
@@ -251,7 +308,7 @@ exit 1
 
 #[tokio::test]
 async fn verify_filters_unused_variable_diagnostics_for_anonymous_inline_snippets() {
-    let _guard = path_lock().lock().unwrap();
+    let _guard = path_lock().lock().await;
     let tool_dir = install_fake_tool(
         "ruff",
         "#!/bin/sh\ncat <<'EOF'\n[{\"code\":\"F841\",\"message\":\"assigned but unused\",\"location\":{\"row\":1,\"column\":1}}]\nEOF\nexit 1\n",
@@ -418,6 +475,7 @@ async fn python_test_stage_can_import_source_module_from_sibling_path() {
     let opts = VerifyOptions {
         test_code: Some(tests),
         test_source_file: None,
+        tests_only: false,
         complexity_threshold: None,
         project_dir: None,
         lint_config_path: None,
@@ -438,6 +496,7 @@ async fn verify_with_threshold_adds_stage() {
     let opts = VerifyOptions {
         test_code: None,
         test_source_file: None,
+        tests_only: false,
         complexity_threshold: Some(3),
         project_dir: None,
         lint_config_path: None,
@@ -450,6 +509,106 @@ async fn verify_with_threshold_adds_stage() {
     assert!(
         report.stages.iter().any(|s| s.name == "complexity"),
         "should have complexity stage"
+    );
+}
+
+#[tokio::test]
+async fn verify_complexity_threshold_scopes_to_changed_functions_in_diff_mode() {
+    let code = "\
+def legacy_complex(x: int) -> int:
+    if x > 0:
+        for i in range(x):
+            if i > 5:
+                return i
+    return x
+
+def changed(x: int) -> int:
+    return x + 1
+";
+    let diff = "@@ -8,2 +8,2 @@\n+def changed(x: int) -> int:\n+    return x + 1\n";
+    let report = verify(
+        code,
+        &Language::Python,
+        VerifyOptions {
+            test_code: None,
+            test_source_file: None,
+            tests_only: false,
+            complexity_threshold: Some(3),
+            project_dir: None,
+            lint_config_path: None,
+            lint_virtual_file_path: None,
+            diff: Some(diff),
+            source_file: None,
+            output_dir: None,
+        },
+    )
+    .await;
+
+    let complexity_stage = report
+        .stages
+        .iter()
+        .find(|s| s.name == "complexity")
+        .expect("complexity stage should be present");
+    assert!(
+        complexity_stage.ok,
+        "only the changed simple function should be checked in diff mode"
+    );
+    let detail = complexity_stage.detail.as_ref().unwrap();
+    assert_eq!(detail["checked_functions"].as_u64(), Some(1));
+    assert_eq!(detail["diff_scoped"].as_bool(), Some(true));
+}
+
+#[tokio::test]
+async fn verify_complexity_stage_reports_cognitive_and_breakdown_details() {
+    let code = "\
+def classify(x: int) -> str:
+    match x:
+        case 0:
+            return \"zero\"
+        case 1:
+            return \"one\"
+        case _:
+            return \"other\"
+";
+    let report = verify(
+        code,
+        &Language::Python,
+        VerifyOptions {
+            test_code: None,
+            test_source_file: None,
+            tests_only: false,
+            complexity_threshold: Some(2),
+            project_dir: None,
+            lint_config_path: None,
+            lint_virtual_file_path: None,
+            diff: None,
+            source_file: None,
+            output_dir: None,
+        },
+    )
+    .await;
+
+    let complexity_stage = report
+        .stages
+        .iter()
+        .find(|s| s.name == "complexity")
+        .expect("complexity stage should be present");
+    assert!(!complexity_stage.ok, "match/case should exceed threshold 2");
+
+    let violations = complexity_stage
+        .detail
+        .as_ref()
+        .and_then(|detail| detail.get("violations"))
+        .and_then(|value| value.as_array())
+        .expect("violations should be present");
+    assert_eq!(violations.len(), 1);
+    assert!(
+        violations[0]["cognitive_complexity"].as_u64().unwrap_or(0) > 0,
+        "violation should include cognitive complexity"
+    );
+    assert_eq!(
+        violations[0]["complexity_breakdown"]["case"].as_u64(),
+        Some(3)
     );
 }
 
@@ -498,6 +657,7 @@ def changed(x: int) -> int:
     let opts = VerifyOptions {
         test_code: None,
         test_source_file: None,
+        tests_only: false,
         complexity_threshold: None,
         project_dir: None,
         lint_config_path: None,
@@ -527,6 +687,7 @@ async fn writes_report_to_output_dir() {
     let opts = VerifyOptions {
         test_code: None,
         test_source_file: None,
+        tests_only: false,
         complexity_threshold: None,
         project_dir: None,
         lint_config_path: None,
@@ -570,6 +731,7 @@ async fn rejected_only_fuzz_run_is_not_counted_as_pass_in_report_summary() {
     let opts = VerifyOptions {
         test_code: None,
         test_source_file: None,
+        tests_only: false,
         complexity_threshold: None,
         project_dir: None,
         lint_config_path: None,
@@ -693,6 +855,7 @@ assert.equal(displayHandle({ profile: { handle: " Admin " }, username: "root" })
     let opts = VerifyOptions {
         test_code: Some(tests),
         test_source_file: Some(test_path.to_str().unwrap()),
+        tests_only: false,
         complexity_threshold: None,
         project_dir: None,
         lint_config_path: None,
@@ -758,6 +921,7 @@ assert.equal(primaryPlanCode({ plans: [null, ""] }), "FREE");
     let opts = VerifyOptions {
         test_code: Some(tests),
         test_source_file: Some(test_path.to_str().unwrap()),
+        tests_only: false,
         complexity_threshold: None,
         project_dir: None,
         lint_config_path: None,
@@ -781,7 +945,7 @@ async fn typescript_test_file_without_imports_uses_source_file_scope() {
         .path()
         .join("tests")
         .join("court_jester_public_verify.ts");
-    std::fs::create_dir_all(&tests_path.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(tests_path.parent().unwrap()).unwrap();
 
     let code = r#"
 export function displayInitials(name: string | null): string {
@@ -801,6 +965,7 @@ if (displayInitials("Spencer Lee") !== "SL") {
     let opts = VerifyOptions {
         test_code: Some(tests),
         test_source_file: Some(tests_path.to_str().unwrap()),
+        tests_only: false,
         complexity_threshold: None,
         project_dir: None,
         lint_config_path: None,

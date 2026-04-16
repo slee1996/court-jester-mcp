@@ -1,0 +1,60 @@
+{
+  "id": "ts-express-res-json-settings",
+  "title": "Express clone res.json honors escape and serializer settings",
+  "repo_fixture": "express_clone_alpha",
+  "prompt": "Fix the Express clone so res.json matches Express for this benchmark slice. Preserve json escape behavior and serializer settings while keeping content-type handling correct.",
+  "language": "typescript",
+  "bucket": "framework_clone_alpha",
+  "verify_paths": [
+    "index.ts"
+  ],
+  "verify_test_path": "tests/verify_res_json.ts",
+  "setup_commands": [
+    [
+      "python",
+      "{bench_root}/seed_express_clone_bug.py",
+      "{workspace}",
+      "res_json_escape_disabled"
+    ]
+  ],
+  "setup_cache_key": "express-clone-alpha:res-json-escape-v1",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_res_json.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_workspace_test.py",
+    "{workspace}",
+    "tests/hidden_res_json.ts"
+  ],
+  "expected_files": [
+    "index.ts"
+  ],
+  "family": "express_clone_alpha",
+  "bug_class": "framework_semantics",
+  "bug_surface": "response_json",
+  "difficulty": "hard",
+  "golden_patch_description": "Restore Express json escape behavior without regressing replacer, spaces, or content-type handling.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": true,
+  "cross_file": false,
+  "upstream_benchmark": "express",
+  "upstream_instance_id": "res-json-v1",
+  "instance_notes": "Derived from res.json.js escape, content-type, replacer, and spaces settings.",
+  "tags": [
+    "typescript",
+    "express",
+    "response",
+    "json",
+    "upstream_derived"
+  ]
+}

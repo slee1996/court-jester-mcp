@@ -1,0 +1,11 @@
+{
+  "id": "public-repair-2",
+  "title": "Public repair x2",
+  "description": "Allow two repair rounds after failed public checks and feed only public test failure output back to the model. Hidden checks stay final-score only.",
+  "court_jester_mode": "none",
+  "required_tools": [],
+  "block_on_failed_verify": false,
+  "max_repair_rounds": 2,
+  "public_only_repair": true,
+  "repair_feedback_style": "detailed"
+}
