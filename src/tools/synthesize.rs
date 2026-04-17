@@ -24,6 +24,7 @@ pub fn synthesize_calls(analysis: &AnalysisResult, language: &Language) -> Strin
 enum ContractKind {
     StringTransform,
     MappingSerializer,
+    QueryStringSerializer,
     Comparator,
 }
 
@@ -203,6 +204,7 @@ for _args in _all_inputs:
                 print(f"  CRASH {name}({{_short_repr(_args)}}): {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
         else:
             _reject += 1
+{query_string_semantic_check}
 _total = _pass + _reject + _crash
 if _crash > 0:
     print(f"FUZZ {name}: {{_pass}} passed, {{_reject}} rejected, {{_crash}} CRASHED (of {{_total}})")
@@ -221,6 +223,8 @@ else:
             boundedness_check = python_boundedness_check(func, &callable_params),
             nonneg_check = python_nonneg_check(func),
             nullish_string_leak_check = python_nullish_string_leak_check(func, &callable_params),
+            query_string_semantic_check =
+                python_query_string_semantic_check(func, &callable_params),
             comparator_check = python_comparator_check(func, &callable_params),
             symmetry_check = python_symmetry_check(func, &callable_params),
         ));
@@ -516,6 +520,22 @@ fn likely_nullish_string_leak(name: &str) -> bool {
         .any(|cue| lower.contains(cue))
 }
 
+fn likely_query_string_semantics(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.contains("query")
+        && [
+            "canonical",
+            "canonicalize",
+            "normalise",
+            "normalize",
+            "serialize",
+            "serialise",
+            "encode",
+        ]
+        .iter()
+        .any(|cue| lower.contains(cue))
+}
+
 /// Names that suggest symmetric behavior (f(a,b) == f(b,a)).
 const SYMMETRIC_NAME_CUES: &[&str] = &["distance", "similarity", "hamming", "gcd"];
 
@@ -608,6 +628,9 @@ fn infer_python_contract(func: &FunctionInfo, params: &[&ParamInfo]) -> Option<C
             return Some(ContractKind::StringTransform);
         }
         if is_python_mapping_type(param_type) && ret_type == "str" {
+            if likely_query_string_semantics(&func.name) {
+                return Some(ContractKind::QueryStringSerializer);
+            }
             return Some(ContractKind::MappingSerializer);
         }
     }
@@ -641,6 +664,9 @@ fn infer_ts_contract(
             return Some(ContractKind::StringTransform);
         }
         if is_ts_mapping_type(param_type, type_defs) && ret_type == "string" {
+            if likely_query_string_semantics(&func.name) {
+                return Some(ContractKind::QueryStringSerializer);
+            }
             return Some(ContractKind::MappingSerializer);
         }
     }
@@ -768,6 +794,37 @@ fn python_nullish_string_leak_check(func: &FunctionInfo, params: &[&ParamInfo]) 
     }
 }
 
+fn python_query_string_semantic_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
+    if infer_python_contract(func, params) != Some(ContractKind::QueryStringSerializer) {
+        return String::new();
+    }
+
+    format!(
+        r#"try:
+    _query_label = "tag/nullish"
+    _query_cases = [
+        ("tag/nullish", {{"tag": ["pro", None, " beta "]}}, [("tag", "pro"), ("tag", "beta")]),
+        ("blank scalar", {{"q": "  ", "page": 2}}, [("page", "2")]),
+        ("accent fold", {{"q": "naïve café"}}, [("q", _ascii_fold("naïve café"))]),
+        ("nested non-scalars", {{"filters": [{{"label": "pro"}}, None, " beta "]}}, [("filters", "beta")]),
+    ]
+    for _query_label, _query_input, _expected_pairs in _query_cases:
+        _query_result = {name}(_query_input)
+        _query_pairs = _parse_qsl(_query_result, keep_blank_values=True)
+        assert _query_pairs == _expected_pairs, f"Query semantics ({{_query_label}}): {{_query_pairs!r}} != {{_expected_pairs!r}} from {{repr(_query_result)}}"
+except Exception as _e:
+    if _is_crash(_e):
+        _crash += 1
+        _FUZZ_RESULTS.append({{"function": "{name}", "input": f"query semantics:{{_query_label}}",
+            "error_type": type(_e).__name__, "message": _clip_text(str(_e)),
+            "severity": "crash" if isinstance(_e, _CRASH_TYPES) else "property_violation"}})
+        if _crash == 1:
+            print(f"  CRASH {name}(query semantics): {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
+"#,
+        name = func.name,
+    )
+}
+
 fn python_comparator_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
     if infer_python_contract(func, params) == Some(ContractKind::Comparator) {
         format!(
@@ -798,6 +855,8 @@ fn python_symmetry_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
 const PYTHON_FUZZ_PRELUDE: &str = r#"
 import random as _rng
 import json as _json
+import unicodedata as _unicodedata
+from urllib.parse import parse_qsl as _parse_qsl
 _rng.seed(42)
 _fuzz_failures = 0
 _FUZZ_RESULTS = []
@@ -946,6 +1005,10 @@ def _string_leaks_nullish(value):
         return False
     _lower = value.lower()
     return ("none" in _lower) or ("null" in _lower) or ("undefined" in _lower)
+
+def _ascii_fold(value):
+    text = value if isinstance(value, str) else str(value)
+    return _unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
 
 def _cmp_sign(value):
     if isinstance(value, bool):
@@ -1104,13 +1167,20 @@ fn synthesize_typescript(analysis: &AnalysisResult, type_defs: &TsNamedTypes<'_>
             String::new()
         };
 
+        let query_string_semantic_check =
+            ts_query_string_semantic_check(func, &param_types, ret_type, type_defs);
+
         code.push_str(&format!(
             r#"
-_fuzzOne("{name}", {iters}, () => [{gen_list}], (args: unknown[]) => ({name} as Function)(...args), {typecheck}, [{param_type_list}], [{properties_list}]);
+{{
+  const _fuzzOk = _fuzzOne("{name}", {iters}, () => [{gen_list}], (args: unknown[]) => ({name} as Function)(...args), {typecheck}, [{param_type_list}], [{properties_list}]);
+{query_string_semantic_check}
+}}
 "#,
             name = func.name,
             iters = FUZZ_ITERATIONS,
             typecheck = ts_type_check_fn(ret_type),
+            query_string_semantic_check = query_string_semantic_check,
         ));
 
         any_synthesized = true;
@@ -1457,6 +1527,49 @@ fn ts_edge_type_name_for_param(
     ts_edge_type_name(type_ann, type_defs)
 }
 
+fn ts_query_string_semantic_check(
+    func: &FunctionInfo,
+    param_types: &[String],
+    ret_type: &str,
+    type_defs: &TsNamedTypes<'_>,
+) -> String {
+    if infer_ts_contract(func, param_types, ret_type, type_defs)
+        != Some(ContractKind::QueryStringSerializer)
+    {
+        return String::new();
+    }
+
+    format!(
+        r#"  if (_fuzzOk) {{
+    let _queryLabel = "tag/nullish";
+    try {{
+      const _queryCases: Array<[string, Record<string, unknown>, Array<[string, string]>]> = [
+        ["tag/nullish", {{ tag: ["pro", null, " beta "] }}, [["tag", "pro"], ["tag", "beta"]]],
+        ["blank scalar", {{ q: "  ", page: 2 }}, [["page", "2"]]],
+        ["accent fold", {{ q: "naïve café" }}, [["q", _asciiFold("naïve café")]]],
+      ];
+      for (const [_label, _queryInput, _expectedPairs] of _queryCases) {{
+        _queryLabel = _label;
+        const _queryResult = String(({name} as Function)(_queryInput));
+        const _queryPairs = Array.from(new URLSearchParams(_queryResult).entries());
+        if (!_nanSafeEq(_queryPairs, _expectedPairs)) {{
+          throw new Error(`Query semantics (${{_label}}): ${{JSON.stringify(_queryPairs)}} !== ${{JSON.stringify(_expectedPairs)}} from ${{_queryResult}}`);
+        }}
+      }}
+    }} catch (_e: unknown) {{
+      _fuzzResults.push({{function: "{name}", input: `query semantics:${{_queryLabel}}`,
+        error_type: _e instanceof Error ? _e.constructor.name : "unknown",
+        message: _clipText(_e instanceof Error ? _e.message : String(_e)),
+        severity: "property_violation"}});
+      console.log(`  CRASH {name}(query semantics): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
+      _fuzzTotalFailures++;
+    }}
+  }}
+"#,
+        name = func.name,
+    )
+}
+
 fn is_semver_like_version_type(type_ann: Option<&str>, type_defs: &TsNamedTypes<'_>) -> bool {
     let resolved = match type_ann {
         Some(t) => ts_effective_type(t, type_defs),
@@ -1767,6 +1880,10 @@ function _stringLeaksNullish(value: string): boolean {
   return lower.includes("null") || lower.includes("undefined");
 }
 
+function _asciiFold(value: string): string {
+  return value.normalize("NFKD").replace(/[\u0300-\u036f]/g, "");
+}
+
 function _cmpSign(value: unknown): number {
   if (typeof value !== "number" || Number.isNaN(value)) {
     throw new Error(`Comparator returned non-numeric value: ${JSON.stringify(value)}`);
@@ -1825,7 +1942,7 @@ function _fuzzOne(
   expectedType: string | null,
   paramTypes: string[] = [],
   properties: string[] = [],
-) {
+): boolean {
   let pass = 0, reject = 0, crash = 0;
   let firstCrash = "";
   const allInputs: unknown[][] = [];
@@ -1917,11 +2034,14 @@ function _fuzzOne(
     console.log(`FUZZ ${name}: ${pass} passed, ${reject} rejected, ${crash} CRASHED (of ${total})`);
     console.log(firstCrash);
     _fuzzTotalFailures++;
+    return false;
   } else if (pass === 0) {
     console.log(`FUZZ ${name}: all ${total} inputs rejected (nothing tested)`);
     _fuzzTotalFailures++;
+    return false;
   } else {
     console.log(`FUZZ ${name}: ${pass} passed, ${reject} rejected (of ${total})`);
+    return true;
   }
 }
 "#;

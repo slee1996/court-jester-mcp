@@ -465,6 +465,143 @@ def canonical_query(params: dict[str, object]) -> str:
 }
 
 #[tokio::test]
+async fn query_string_blank_and_unicode_semantics_fail_verify() {
+    let code = r#"
+from urllib.parse import quote_plus
+
+def canonical_query(params: dict[str, object]) -> str:
+    parts: list[str] = []
+    for key in sorted(params):
+        value = params[key]
+        if value is None:
+            continue
+        if isinstance(value, list):
+            for item in value:
+                if item is None:
+                    continue
+                parts.append(f"{quote_plus(str(key))}={quote_plus(str(item).strip())}")
+        else:
+            parts.append(f"{quote_plus(str(key))}={quote_plus(str(value).strip())}")
+    return "&".join(parts)
+"#;
+    let report = verify(code, &Language::Python, default_opts(None)).await;
+
+    assert!(!report.overall_ok, "report: {:#?}", report.stages);
+
+    let exec_stage = report
+        .stages
+        .iter()
+        .find(|s| s.name == "execute")
+        .expect("execute stage should be present");
+    assert!(
+        !exec_stage.ok,
+        "query-like serialization that keeps blanks or accents should fail verify"
+    );
+}
+
+#[tokio::test]
+async fn query_string_canonicalization_can_pass_verify() {
+    let code = r#"
+from urllib.parse import quote_plus
+import unicodedata
+
+def _canonical_scalar(value: object) -> str | None:
+    if value is None or isinstance(value, (dict, list, tuple, set)):
+        return None
+    text = unicodedata.normalize("NFKD", str(value).strip()).encode("ascii", "ignore").decode("ascii")
+    return text or None
+
+def canonical_query(params: dict[str, object]) -> str:
+    parts: list[str] = []
+    for key in sorted(params):
+        raw = params[key]
+        values = raw if isinstance(raw, list) else [raw]
+        for item in values:
+            text = _canonical_scalar(item)
+            if text is None:
+                continue
+            parts.append(f"{quote_plus(str(key))}={quote_plus(text)}")
+    return "&".join(parts)
+"#;
+    let report = verify(code, &Language::Python, default_opts(None)).await;
+
+    assert!(report.overall_ok, "report: {:#?}", report.stages);
+    assert!(report.stages.iter().any(|s| s.name == "execute" && s.ok));
+}
+
+#[tokio::test]
+async fn typescript_query_string_blank_and_unicode_semantics_fail_verify() {
+    let code = r#"
+export function canonicalQuery(params: Record<string, unknown>): string {
+  const entries: string[] = [];
+  for (const key of Object.keys(params).sort()) {
+    const value = params[key];
+    if (value == null) {
+      continue;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (item == null) {
+          continue;
+        }
+        entries.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(item).trim())}`);
+      }
+    } else {
+      entries.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value).trim())}`);
+    }
+  }
+  return entries.join("&");
+}
+"#;
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+
+    assert!(!report.overall_ok, "report: {:#?}", report.stages);
+
+    let exec_stage = report
+        .stages
+        .iter()
+        .find(|s| s.name == "execute")
+        .expect("execute stage should be present");
+    assert!(
+        !exec_stage.ok,
+        "query-like serialization that keeps blanks or accents should fail verify"
+    );
+}
+
+#[tokio::test]
+async fn typescript_query_string_canonicalization_can_pass_verify() {
+    let code = r#"
+function canonicalScalar(value: unknown): string | null {
+  if (value == null || Array.isArray(value) || (typeof value === "object" && value !== null)) {
+    return null;
+  }
+  const text = String(value).trim().normalize("NFKD").replace(/[\u0300-\u036f]/g, "");
+  return text.length > 0 ? text : null;
+}
+
+export function canonicalQuery(params: Record<string, unknown>): string {
+  const entries: string[] = [];
+  for (const key of Object.keys(params).sort()) {
+    const raw = params[key];
+    const values = Array.isArray(raw) ? raw : [raw];
+    for (const item of values) {
+      const text = canonicalScalar(item);
+      if (text == null) {
+        continue;
+      }
+      entries.push(`${encodeURIComponent(key)}=${encodeURIComponent(text)}`);
+    }
+  }
+  return entries.join("&");
+}
+"#;
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+
+    assert!(report.overall_ok, "report: {:#?}", report.stages);
+    assert!(report.stages.iter().any(|s| s.name == "execute" && s.ok));
+}
+
+#[tokio::test]
 async fn python_test_stage_can_import_source_module_from_sibling_path() {
     let dir = tempfile::tempdir().unwrap();
     let source_path = dir.path().join("billing.py");

@@ -153,6 +153,52 @@ fn python_average_order_value_is_not_treated_as_comparator() {
 }
 
 #[test]
+fn python_query_string_serializer_gets_semantic_examples() {
+    let a = make_analysis(
+        vec![func(
+            "canonical_query",
+            vec![("params", Some("dict[str, object]"))],
+            Some("str"),
+        )],
+        vec![],
+    );
+    let code = synthesize_calls(&a, &Language::Python);
+    assert!(
+        code.contains("_parse_qsl"),
+        "query-string harness should parse query output, got: {code}"
+    );
+    assert!(
+        code.contains("query semantics:{_query_label}"),
+        "query-string harness should label semantic failures, got: {code}"
+    );
+    assert!(
+        code.contains("_ascii_fold(\"naïve café\")"),
+        "query-string harness should check accent folding, got: {code}"
+    );
+    assert!(
+        code.contains("{\"filters\": [{\"label\": \"pro\"}, None, \" beta \"]}"),
+        "query-string harness should cover nested non-scalars, got: {code}"
+    );
+}
+
+#[test]
+fn python_non_query_serializer_skips_query_semantics() {
+    let a = make_analysis(
+        vec![func(
+            "serialize_profile",
+            vec![("profile", Some("dict[str, object]"))],
+            Some("str"),
+        )],
+        vec![],
+    );
+    let code = synthesize_calls(&a, &Language::Python);
+    assert!(
+        !code.contains("query semantics:{_query_label}"),
+        "non-query serializer should not get query semantics, got: {code}"
+    );
+}
+
+#[test]
 fn python_no_idempotency_for_different_types() {
     let a = make_analysis(
         vec![func(
@@ -457,6 +503,31 @@ fn typescript_uses_interface_fields() {
     assert!(
         code.contains("email: _fuzzBool()"),
         "optional should use random null, got: {code}"
+    );
+}
+
+#[test]
+fn typescript_query_string_serializer_gets_semantic_examples() {
+    let a = make_analysis(
+        vec![func(
+            "canonicalQuery",
+            vec![("params", Some("Record<string, unknown>"))],
+            Some("string"),
+        )],
+        vec![],
+    );
+    let code = synthesize_calls(&a, &Language::TypeScript);
+    assert!(
+        code.contains("new URLSearchParams"),
+        "query-string harness should decode query output, got: {code}"
+    );
+    assert!(
+        code.contains("query semantics:${_queryLabel}"),
+        "query-string harness should label semantic failures, got: {code}"
+    );
+    assert!(
+        code.contains("_asciiFold(\"naïve café\")"),
+        "query-string harness should check accent folding, got: {code}"
     );
 }
 
