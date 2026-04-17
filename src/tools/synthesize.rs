@@ -112,6 +112,26 @@ fn ts_effective_type(type_name: &str, defs: &TsNamedTypes<'_>) -> String {
     ts_resolve_alias_text(type_name, defs).unwrap_or_else(|| type_name.trim().to_string())
 }
 
+fn is_synth_top_level_candidate(func: &FunctionInfo) -> bool {
+    !func.name.starts_with('_') && !func.is_method && !func.is_nested
+}
+
+fn synth_candidate_functions<'a>(functions: &'a [FunctionInfo]) -> Vec<&'a FunctionInfo> {
+    let top_level: Vec<&FunctionInfo> = functions
+        .iter()
+        .filter(|func| is_synth_top_level_candidate(func))
+        .collect();
+
+    if top_level.iter().any(|func| func.is_exported) {
+        top_level
+            .into_iter()
+            .filter(|func| func.is_exported)
+            .collect()
+    } else {
+        top_level
+    }
+}
+
 // ── Python fuzz harness ─────────────────────────────────────────────────────
 
 fn synthesize_python(analysis: &AnalysisResult, type_defs: &HashMap<&str, &ClassInfo>) -> String {
@@ -122,11 +142,7 @@ fn synthesize_python(analysis: &AnalysisResult, type_defs: &HashMap<&str, &Class
 
     let mut any_synthesized = false;
 
-    for func in &analysis.functions {
-        if func.name.starts_with('_') || func.is_method || func.is_nested {
-            continue;
-        }
-
+    for func in synth_candidate_functions(&analysis.functions) {
         let callable_params: Vec<&ParamInfo> = func
             .params
             .iter()
@@ -238,10 +254,7 @@ else:
 
     // Factory exercise: for functions containing nested functions,
     // call the factory and exercise the returned object's callables
-    for func in &analysis.functions {
-        if func.name.starts_with('_') || func.is_method || func.is_nested {
-            continue;
-        }
+    for func in synth_candidate_functions(&analysis.functions) {
         let has_nested = analysis
             .functions
             .iter()
@@ -1041,11 +1054,7 @@ fn synthesize_typescript(analysis: &AnalysisResult, type_defs: &TsNamedTypes<'_>
 
     let mut any_synthesized = false;
 
-    for func in &analysis.functions {
-        if func.name.starts_with('_') || func.is_method || func.is_nested {
-            continue;
-        }
-
+    for func in synth_candidate_functions(&analysis.functions) {
         let callable_params: Vec<&ParamInfo> = func
             .params
             .iter()
@@ -1212,11 +1221,7 @@ fn synthesize_typescript_factory_exercise(
 ) -> String {
     let mut code = String::new();
 
-    for func in &analysis.functions {
-        if func.name.starts_with('_') || func.is_method || func.is_nested {
-            continue;
-        }
-
+    for func in synth_candidate_functions(&analysis.functions) {
         // Check if this function contains nested functions
         let has_nested = analysis
             .functions
@@ -2194,20 +2199,17 @@ const INVOLUTION_PAIRS: &[(&str, &str)] = &[
 ];
 
 fn find_involution_pairs(analysis: &AnalysisResult) -> Vec<(&FunctionInfo, &FunctionInfo)> {
+    let candidates = synth_candidate_functions(&analysis.functions);
     let func_map: HashMap<String, &FunctionInfo> = analysis
         .functions
         .iter()
-        .filter(|f| !f.name.starts_with('_') && !f.is_method && !f.is_nested)
         .map(|f| (f.name.to_lowercase(), f))
         .collect();
 
     let mut result = vec![];
     let mut seen: Vec<String> = vec![];
 
-    for func in &analysis.functions {
-        if func.name.starts_with('_') || func.is_method || func.is_nested {
-            continue;
-        }
+    for func in candidates {
         let params: Vec<_> = func
             .params
             .iter()

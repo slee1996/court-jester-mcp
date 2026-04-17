@@ -532,6 +532,31 @@ fn typescript_query_string_serializer_gets_semantic_examples() {
 }
 
 #[test]
+fn typescript_prefers_exported_surface_over_internal_helpers() {
+    let mut helper = func(
+        "encode",
+        vec![("key", Some("string")), ("value", Some("string"))],
+        Some("string"),
+    );
+    helper.is_exported = false;
+    let api = func(
+        "canonicalQuery",
+        vec![("params", Some("Record<string, unknown>"))],
+        Some("string"),
+    );
+    let a = make_analysis(vec![helper, api], vec![]);
+    let code = synthesize_calls(&a, &Language::TypeScript);
+    assert!(
+        code.contains("_fuzzOne(\"canonicalQuery\""),
+        "exported surface should still be fuzzed, got: {code}"
+    );
+    assert!(
+        !code.contains("_fuzzOne(\"encode\""),
+        "internal helper should be skipped when exported surface exists, got: {code}"
+    );
+}
+
+#[test]
 fn typescript_skips_unresolved_alias_params_in_fuzz() {
     let a = make_analysis(
         vec![
