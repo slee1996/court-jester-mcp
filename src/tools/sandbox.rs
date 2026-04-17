@@ -184,6 +184,15 @@ fn has_python_relative_imports(code: &str) -> bool {
     })
 }
 
+fn is_valid_python_module_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first == '_' || first.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
 fn has_typescript_relative_imports(code: &str) -> bool {
     code.lines().any(|line| {
         let trimmed = line.trim();
@@ -661,6 +670,18 @@ fn find_python_package_root(start_dir: &std::path::Path) -> Option<(std::path::P
     Some((dir, module_prefix))
 }
 
+fn module_run_for_python_source(
+    source_path: &std::path::Path,
+) -> Option<(std::path::PathBuf, String)> {
+    let parent = source_path.parent()?;
+    let stem = source_path.file_stem()?.to_str()?;
+    if !is_valid_python_module_name(stem) {
+        return None;
+    }
+    let (pkg_root_parent, module_prefix) = find_python_package_root(parent)?;
+    Some((pkg_root_parent, format!("{module_prefix}.{stem}")))
+}
+
 /// Execute code in a sandboxed subprocess with resource limits.
 /// When `source_file` is provided, the code is written as a sibling file so that
 /// sibling Python imports and relative imports resolve correctly.
@@ -694,16 +715,18 @@ pub async fn execute(
     // For Python with relative imports, we need to run as a module (`python -m`)
     // so track the module path and package root for command construction later.
     let mut python_module_run: Option<(std::path::PathBuf, String)> = None;
-    let direct_source_file = match language {
+    let mut direct_source_file = match language {
         Language::TypeScript => source_matches_disk(code, source_file),
-        Language::Python => {
-            if has_python_relative_imports(code) {
-                None
-            } else {
-                source_matches_disk(code, source_file)
-            }
-        }
+        Language::Python => source_matches_disk(code, source_file),
     };
+    if matches!(language, Language::Python) && has_relative_imports {
+        python_module_run = direct_source_file
+            .as_deref()
+            .and_then(module_run_for_python_source);
+        if python_module_run.is_none() {
+            direct_source_file = None;
+        }
+    }
 
     let (file_path, _cleanup) = if let Some(source_path) = direct_source_file {
         (source_path, None)

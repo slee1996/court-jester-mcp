@@ -155,6 +155,33 @@ async fn source_file_resolves_relative_imports() {
 }
 
 #[tokio::test]
+async fn python_relative_import_source_file_executes_original_module_when_code_matches_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let pkg = dir.path().join("mypkg");
+    std::fs::create_dir(&pkg).unwrap();
+    std::fs::write(pkg.join("__init__.py"), "").unwrap();
+    std::fs::write(pkg.join("helper.py"), "VALUE = 42").unwrap();
+
+    let source_path = pkg.join("main.py");
+    let code = "from .helper import VALUE\nfrom pathlib import Path\nprint(VALUE)\nprint(Path(__file__).name)";
+    std::fs::write(&source_path, code).unwrap();
+
+    let r = execute(
+        code,
+        &Language::Python,
+        10.0,
+        128,
+        None,
+        Some(source_path.to_str().unwrap()),
+    )
+    .await;
+
+    assert_eq!(r.exit_code, Some(0), "stderr: {}", r.stderr);
+    let lines: Vec<_> = r.stdout.lines().collect();
+    assert_eq!(lines, vec!["42", "main.py"]);
+}
+
+#[tokio::test]
 async fn source_file_cleanup() {
     // Verify that sibling fuzz files are cleaned up after execution
     let dir = tempfile::tempdir().unwrap();
