@@ -1792,6 +1792,7 @@ fn ts_semver_caret_semantic_check(
     try {{
       const _caretCases: Array<[string, string, boolean]> = [
         ["1.3.0-beta.1", "^1.2.3", false],
+        ["1.0.2-beta.3", "^1.0.2", false],
         ["0.3.0", "^0.2.3", false],
         ["0.2.9", "^0.2.3", true],
         ["0.0.4", "^0.0.3", false],

@@ -612,6 +612,10 @@ fn typescript_semver_caret_gets_zero_major_semantics() {
         "semver caret harness should exclude prereleases, got: {code}"
     );
     assert!(
+        code.contains("\"1.0.2-beta.3\", \"^1.0.2\", false"),
+        "semver caret harness should exclude prereleases for stable same-core ranges, got: {code}"
+    );
+    assert!(
         code.contains("\"0.3.0\", \"^0.2.3\", false"),
         "semver caret harness should enforce zero-major upper bounds, got: {code}"
     );
