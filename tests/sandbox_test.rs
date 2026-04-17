@@ -87,6 +87,27 @@ async fn python_project_dir_imports_local_module() {
 }
 
 #[tokio::test]
+async fn python_source_file_executes_original_file_when_code_matches_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("main.py");
+    let code = "import os\nprint(os.path.basename(__file__))";
+    std::fs::write(&source_path, code).unwrap();
+
+    let r = execute(
+        code,
+        &Language::Python,
+        10.0,
+        128,
+        None,
+        Some(source_path.to_str().unwrap()),
+    )
+    .await;
+
+    assert_eq!(r.exit_code, Some(0), "stderr: {}", r.stderr);
+    assert_eq!(r.stdout.trim(), "main.py");
+}
+
+#[tokio::test]
 async fn project_dir_still_has_resource_limits() {
     let dir = tempfile::tempdir().unwrap();
     let r = execute(

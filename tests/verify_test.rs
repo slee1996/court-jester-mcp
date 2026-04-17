@@ -1008,6 +1008,50 @@ assert.equal(displayHandle({ profile: { handle: " Admin " }, username: "root" })
 }
 
 #[tokio::test]
+async fn python_test_stage_executes_original_test_file_when_code_matches_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_dir = dir.path().join("src");
+    let tests_dir = dir.path().join("tests");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::create_dir_all(&tests_dir).unwrap();
+
+    let source_path = src_dir.join("app.py");
+    let test_path = tests_dir.join("test_app.py");
+    let code = r#"
+def add(a: int, b: int) -> int:
+    return a + b
+"#;
+    let tests = r#"
+from pathlib import Path
+
+from src.app import add
+
+assert add(2, 3) == 5
+assert Path(__file__).name == "test_app.py"
+"#;
+    std::fs::write(&source_path, code).unwrap();
+    std::fs::write(&test_path, tests).unwrap();
+
+    let opts = VerifyOptions {
+        test_code: Some(tests),
+        test_source_file: Some(test_path.to_str().unwrap()),
+        tests_only: true,
+        complexity_threshold: None,
+        project_dir: Some(dir.path().to_str().unwrap()),
+        lint_config_path: None,
+        lint_virtual_file_path: None,
+        diff: None,
+        source_file: Some(source_path.to_str().unwrap()),
+        output_dir: None,
+    };
+    let report = verify(code, &Language::Python, opts).await;
+
+    assert!(report.overall_ok, "report: {:#?}", report.stages);
+    assert!(!report.stages.iter().any(|s| s.name == "execute"));
+    assert!(report.stages.iter().any(|s| s.name == "test" && s.ok));
+}
+
+#[tokio::test]
 async fn typescript_normalize_helper_can_return_blank_when_api_handles_fallback() {
     let dir = tempfile::tempdir().unwrap();
     let src_dir = dir.path().join("src");

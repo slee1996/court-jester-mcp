@@ -451,10 +451,7 @@ fn should_retry_typescript_with_loader(result: &ExecutionResult) -> bool {
         && result.stderr.contains("does not provide an export named")
 }
 
-fn typescript_source_matches_disk(
-    code: &str,
-    source_file: Option<&str>,
-) -> Option<std::path::PathBuf> {
+fn source_matches_disk(code: &str, source_file: Option<&str>) -> Option<std::path::PathBuf> {
     let source_file = source_file?;
     let disk_code = std::fs::read_to_string(source_file).ok()?;
     if disk_code != code {
@@ -697,11 +694,18 @@ pub async fn execute(
     // For Python with relative imports, we need to run as a module (`python -m`)
     // so track the module path and package root for command construction later.
     let mut python_module_run: Option<(std::path::PathBuf, String)> = None;
-    let direct_typescript_file = matches!(language, Language::TypeScript)
-        .then(|| typescript_source_matches_disk(code, source_file))
-        .flatten();
+    let direct_source_file = match language {
+        Language::TypeScript => source_matches_disk(code, source_file),
+        Language::Python => {
+            if has_python_relative_imports(code) {
+                None
+            } else {
+                source_matches_disk(code, source_file)
+            }
+        }
+    };
 
-    let (file_path, _cleanup) = if let Some(source_path) = direct_typescript_file {
+    let (file_path, _cleanup) = if let Some(source_path) = direct_source_file {
         (source_path, None)
     } else if use_sibling {
         let src = source_file.unwrap();
