@@ -432,6 +432,61 @@ def beta_checkout_enabled(config: dict | None) -> bool:
 }
 
 #[tokio::test]
+async fn typescript_feature_flag_explicit_false_fails_verify() {
+    let code = r#"
+type Config = {
+  flags?: {
+    betaCheckout?: boolean | null;
+  } | null;
+} | null;
+
+function defaultFlags(): { betaCheckout: boolean } {
+  return { betaCheckout: true };
+}
+
+export function betaCheckoutEnabled(config: Config): boolean {
+  return config?.flags?.betaCheckout || defaultFlags().betaCheckout;
+}
+"#;
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+
+    assert!(!report.overall_ok, "report: {:#?}", report.stages);
+
+    let exec_stage = report
+        .stages
+        .iter()
+        .find(|s| s.name == "execute")
+        .expect("execute stage should be present");
+    assert!(
+        !exec_stage.ok,
+        "feature flag resolver should fail verify when explicit false is overridden"
+    );
+}
+
+#[tokio::test]
+async fn typescript_feature_flag_explicit_false_can_pass_verify() {
+    let code = r#"
+type Config = {
+  flags?: {
+    betaCheckout?: boolean | null;
+  } | null;
+} | null;
+
+function defaultFlags(): { betaCheckout: boolean } {
+  return { betaCheckout: true };
+}
+
+export function betaCheckoutEnabled(config: Config): boolean {
+  return config?.flags?.betaCheckout ?? defaultFlags().betaCheckout;
+}
+"#;
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+
+    assert!(report.overall_ok, "report: {:#?}", report.stages);
+    assert!(report.stages.iter().any(|s| s.name == "execute" && s.ok));
+}
+
+#[tokio::test]
 async fn query_string_nullish_leak_fails_verify() {
     let code = r#"
 from urllib.parse import quote_plus

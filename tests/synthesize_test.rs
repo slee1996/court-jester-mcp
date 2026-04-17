@@ -532,6 +532,42 @@ fn typescript_query_string_serializer_gets_semantic_examples() {
 }
 
 #[test]
+fn typescript_feature_flag_resolver_gets_explicit_false_semantics() {
+    let classes = vec![ClassInfo {
+        name: "Config".into(),
+        bases: vec![],
+        line: 1,
+        fields: vec![FieldInfo {
+            name: "flags".into(),
+            type_annotation: Some("{ betaCheckout?: boolean | null } | null".into()),
+            optional: true,
+            has_default: false,
+        }],
+    }];
+    let a = make_analysis(
+        vec![func(
+            "betaCheckoutEnabled",
+            vec![("config", Some("Config"))],
+            Some("boolean"),
+        )],
+        classes,
+    );
+    let code = synthesize_calls(&a, &Language::TypeScript);
+    assert!(
+        code.contains("feature flag semantics:${_flagLabel}"),
+        "feature-flag harness should label semantic failures, got: {code}"
+    );
+    assert!(
+        code.contains("_explicitFalse !== false"),
+        "feature-flag harness should preserve explicit false overrides, got: {code}"
+    );
+    assert!(
+        code.contains("flags: { [_flagKey]: null }"),
+        "feature-flag harness should compare nested null to fallback, got: {code}"
+    );
+}
+
+#[test]
 fn typescript_prefers_exported_surface_over_internal_helpers() {
     let mut helper = func(
         "encode",

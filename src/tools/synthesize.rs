@@ -549,6 +549,15 @@ fn likely_query_string_semantics(name: &str) -> bool {
         .any(|cue| lower.contains(cue))
 }
 
+fn feature_flag_key_from_function_name(name: &str) -> Option<String> {
+    let stem = name.strip_suffix("Enabled")?;
+    let mut chars = stem.chars();
+    let first = chars.next()?;
+    let mut key = first.to_lowercase().collect::<String>();
+    key.push_str(chars.as_str());
+    Some(key)
+}
+
 /// Names that suggest symmetric behavior (f(a,b) == f(b,a)).
 const SYMMETRIC_NAME_CUES: &[&str] = &["distance", "similarity", "hamming", "gcd"];
 
@@ -631,6 +640,68 @@ fn is_ts_mapping_type(type_name: &str, type_defs: &TsNamedTypes<'_>) -> bool {
     let effective = ts_effective_type(type_name, type_defs);
     let trimmed = effective.trim();
     trimmed.starts_with("Record<") || looks_like_ts_object_type(trimmed)
+}
+
+fn is_boolean_like_ts_type(type_name: &str) -> bool {
+    let branches = split_ts_top_level(type_name.trim(), '|');
+    if branches.len() > 1 {
+        return branches
+            .iter()
+            .all(|branch| matches!(branch.trim(), "boolean" | "null" | "undefined"));
+    }
+    matches!(type_name.trim(), "boolean" | "null" | "undefined")
+}
+
+fn ts_object_field_type(
+    type_name: &str,
+    field_name: &str,
+    type_defs: &TsNamedTypes<'_>,
+) -> Option<String> {
+    let trimmed = type_name.trim();
+    if let Some(resolved) = ts_resolve_alias_text(trimmed, type_defs) {
+        return ts_object_field_type(&resolved, field_name, type_defs);
+    }
+
+    let union_branches = split_ts_top_level(trimmed, '|');
+    if union_branches.len() > 1 {
+        for branch in union_branches {
+            let branch = branch.trim();
+            if matches!(branch, "null" | "undefined") {
+                continue;
+            }
+            if let Some(found) = ts_object_field_type(branch, field_name, type_defs) {
+                return Some(found);
+            }
+        }
+        return None;
+    }
+
+    let intersection_branches = split_ts_top_level(trimmed, '&');
+    if intersection_branches.len() > 1 {
+        for branch in intersection_branches {
+            if let Some(found) = ts_object_field_type(branch.trim(), field_name, type_defs) {
+                return Some(found);
+            }
+        }
+        return None;
+    }
+
+    if let Some(class) = ts_class_def(trimmed, type_defs) {
+        return class
+            .fields
+            .iter()
+            .find(|field| field.name == field_name)
+            .and_then(|field| field.type_annotation.clone());
+    }
+
+    if looks_like_ts_object_type(trimmed) {
+        return extract_ts_object_type_fields_from_text(trimmed)
+            .into_iter()
+            .find(|field| field.name == field_name)
+            .and_then(|field| field.type_annotation);
+    }
+
+    None
 }
 
 fn infer_python_contract(func: &FunctionInfo, params: &[&ParamInfo]) -> Option<ContractKind> {
@@ -1178,18 +1249,22 @@ fn synthesize_typescript(analysis: &AnalysisResult, type_defs: &TsNamedTypes<'_>
 
         let query_string_semantic_check =
             ts_query_string_semantic_check(func, &param_types, ret_type, type_defs);
+        let feature_flag_override_check =
+            ts_feature_flag_override_check(func, &param_types, ret_type, type_defs);
 
         code.push_str(&format!(
             r#"
 {{
   const _fuzzOk = _fuzzOne("{name}", {iters}, () => [{gen_list}], (args: unknown[]) => ({name} as Function)(...args), {typecheck}, [{param_type_list}], [{properties_list}]);
 {query_string_semantic_check}
+{feature_flag_override_check}
 }}
 "#,
             name = func.name,
             iters = FUZZ_ITERATIONS,
             typecheck = ts_type_check_fn(ret_type),
             query_string_semantic_check = query_string_semantic_check,
+            feature_flag_override_check = feature_flag_override_check,
         ));
 
         any_synthesized = true;
@@ -1572,6 +1647,64 @@ fn ts_query_string_semantic_check(
   }}
 "#,
         name = func.name,
+    )
+}
+
+fn ts_feature_flag_override_check(
+    func: &FunctionInfo,
+    param_types: &[String],
+    ret_type: &str,
+    type_defs: &TsNamedTypes<'_>,
+) -> String {
+    if param_types.len() != 1 || ret_type.trim() != "boolean" || !is_api_surface(func) {
+        return String::new();
+    }
+    let flag_key = match feature_flag_key_from_function_name(&func.name) {
+        Some(flag_key) => flag_key,
+        None => return String::new(),
+    };
+    let flags_type = match ts_object_field_type(param_types[0].trim(), "flags", type_defs) {
+        Some(flags_type) => flags_type,
+        None => return String::new(),
+    };
+    let flag_value_type = match ts_object_field_type(&flags_type, &flag_key, type_defs) {
+        Some(flag_value_type) => flag_value_type,
+        None => return String::new(),
+    };
+    if !is_boolean_like_ts_type(&flag_value_type) {
+        return String::new();
+    }
+
+    format!(
+        r#"  if (_fuzzOk) {{
+    let _flagLabel = "explicit false override";
+    try {{
+      const _flagKey = "{flag_key}";
+      const _flagFallback = Boolean(({name} as Function)({{}}));
+      const _nullFlags = Boolean(({name} as Function)({{ flags: null }}));
+      if (_nullFlags !== _flagFallback) {{
+        throw new Error(`Feature flag semantics (flags null): ${{JSON.stringify(_nullFlags)}} !== ${{JSON.stringify(_flagFallback)}}`);
+      }}
+      const _nullFlagValue = Boolean(({name} as Function)({{ flags: {{ [_flagKey]: null }} }}));
+      if (_nullFlagValue !== _flagFallback) {{
+        throw new Error(`Feature flag semantics (flag null): ${{JSON.stringify(_nullFlagValue)}} !== ${{JSON.stringify(_flagFallback)}}`);
+      }}
+      const _explicitFalse = Boolean(({name} as Function)({{ flags: {{ [_flagKey]: false }} }}));
+      if (_explicitFalse !== false) {{
+        throw new Error(`Feature flag semantics (explicit false): ${{JSON.stringify(_explicitFalse)}} !== false`);
+      }}
+    }} catch (_e: unknown) {{
+      _fuzzResults.push({{function: "{name}", input: `feature flag semantics:${{_flagLabel}}`,
+        error_type: _e instanceof Error ? _e.constructor.name : "unknown",
+        message: _clipText(_e instanceof Error ? _e.message : String(_e)),
+        severity: "property_violation"}});
+      console.log(`  CRASH {name}(feature flag semantics): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
+      _fuzzTotalFailures++;
+    }}
+  }}
+"#,
+        name = func.name,
+        flag_key = flag_key,
     )
 }
 
