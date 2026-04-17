@@ -195,7 +195,7 @@ setInterval(() => {}, 1000);
     );
 }
 #[tokio::test]
-async fn typescript_source_file_handles_type_alias_import_runtime_on_node() {
+async fn typescript_source_file_retries_with_node_loader_for_type_alias_imports() {
     let bun_ok = std::process::Command::new("bun")
         .arg("--version")
         .output()
@@ -220,7 +220,8 @@ function pick(object: Record<string, unknown>, path: PathValue): unknown {
   return object[key];
 }
 
-console.log(String(pick({ timezone: "UTC" }, "timezone")));
+const mode = process.execArgv.includes("--import") ? "loader" : "transform";
+console.log(`${mode}:${String(pick({ timezone: "UTC" }, "timezone"))}`);
 "#;
     std::fs::write(&source_path, code).unwrap();
 
@@ -235,11 +236,11 @@ console.log(String(pick({ timezone: "UTC" }, "timezone")));
     .await;
 
     assert_eq!(result.exit_code, Some(0), "stderr: {}", result.stderr);
-    assert_eq!(result.stdout.trim(), "UTC");
+    assert_eq!(result.stdout.trim(), "loader:UTC");
 }
 
 #[tokio::test]
-async fn typescript_source_file_prefers_node_loader_over_bun() {
+async fn typescript_source_file_prefers_node_transform_over_bun_for_plain_relative_imports() {
     let bun_ok = std::process::Command::new("bun")
         .arg("--version")
         .output()
@@ -262,7 +263,8 @@ async fn typescript_source_file_prefers_node_loader_over_bun() {
 import { value } from "./helper.ts";
 
 const runtime = typeof process.versions.bun === "string" ? "bun" : "node";
-console.log(`${runtime}:${value}`);
+const mode = process.execArgv.includes("--import") ? "loader" : "transform";
+console.log(`${mode}:${runtime}:${value}`);
 "#;
     std::fs::write(&source_path, code).unwrap();
 
@@ -277,7 +279,7 @@ console.log(`${runtime}:${value}`);
     .await;
 
     assert_eq!(result.exit_code, Some(0), "stderr: {}", result.stderr);
-    assert_eq!(result.stdout.trim(), "node:7");
+    assert_eq!(result.stdout.trim(), "transform:node:7");
 }
 
 #[tokio::test]

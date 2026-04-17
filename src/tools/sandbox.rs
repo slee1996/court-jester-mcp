@@ -194,6 +194,318 @@ fn has_typescript_relative_imports(code: &str) -> bool {
     })
 }
 
+fn parse_quoted_path(input: &str) -> Option<String> {
+    let quote = input.chars().find(|c| *c == '"' || *c == '\'')?;
+    let start = input.find(quote)? + 1;
+    let end = start + input[start..].find(quote)?;
+    Some(input[start..end].to_string())
+}
+
+fn resolve_typescript_import_file(
+    source_file: &str,
+    import_path: &str,
+) -> Option<std::path::PathBuf> {
+    let source_dir = std::path::Path::new(source_file).parent()?;
+    let base = source_dir.join(import_path);
+
+    if base.exists() {
+        return Some(base);
+    }
+    for ext in [".ts", ".tsx", "/index.ts", "/index.tsx"] {
+        let candidate = std::path::PathBuf::from(format!("{}{}", base.display(), ext));
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn extract_typescript_named_relative_imports(code: &str) -> Vec<(String, Vec<String>)> {
+    let mut imports = Vec::new();
+
+    for statement in code.split(';') {
+        let normalized = statement.replace('\n', " ");
+        let trimmed = normalized.trim();
+        if !trimmed.starts_with("import ") || trimmed.starts_with("import type ") {
+            continue;
+        }
+        let (clause, from_clause) = match trimmed[7..].split_once(" from ") {
+            Some(parts) => parts,
+            None => continue,
+        };
+        let open = match clause.find('{') {
+            Some(index) => index,
+            None => continue,
+        };
+        let close = match clause.rfind('}') {
+            Some(index) => index,
+            None => continue,
+        };
+        let path = match parse_quoted_path(from_clause) {
+            Some(path) if path.starts_with("./") || path.starts_with("../") => path,
+            _ => continue,
+        };
+        let names = clause[open + 1..close]
+            .split(',')
+            .filter_map(|entry| {
+                let entry = entry.trim();
+                if entry.is_empty() {
+                    return None;
+                }
+                let entry = entry.strip_prefix("type ").unwrap_or(entry);
+                let export_name = entry
+                    .split_once(" as ")
+                    .map(|(name, _)| name)
+                    .unwrap_or(entry)
+                    .trim();
+                (!export_name.is_empty()).then(|| export_name.to_string())
+            })
+            .collect::<Vec<_>>();
+        if !names.is_empty() {
+            imports.push((path, names));
+        }
+    }
+
+    imports
+}
+
+fn target_exports_name_only_as_type(code: &str, name: &str) -> bool {
+    let type_alias_prefix = format!("export type {name}");
+    let interface_prefix = format!("export interface {name}");
+
+    code.lines().any(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with(&type_alias_prefix) || trimmed.starts_with(&interface_prefix)
+    })
+}
+
+fn has_typescript_type_only_relative_imports_inner(
+    code: &str,
+    source_file: &str,
+    visited: &mut std::collections::HashSet<String>,
+) -> bool {
+    let source_key = std::fs::canonicalize(source_file)
+        .unwrap_or_else(|_| std::path::PathBuf::from(source_file))
+        .to_string_lossy()
+        .to_string();
+    if !visited.insert(source_key) {
+        return false;
+    }
+
+    extract_typescript_named_relative_imports(code)
+        .into_iter()
+        .any(|(import_path, names)| {
+            let resolved = match resolve_typescript_import_file(source_file, &import_path) {
+                Some(path) => path,
+                None => return false,
+            };
+            let imported_code = match std::fs::read_to_string(&resolved) {
+                Ok(code) => code,
+                Err(_) => return false,
+            };
+            names
+                .iter()
+                .any(|name| target_exports_name_only_as_type(&imported_code, name))
+                || has_typescript_type_only_relative_imports_inner(
+                    &imported_code,
+                    resolved.to_str().unwrap_or_default(),
+                    visited,
+                )
+        })
+}
+
+fn has_typescript_type_only_relative_imports(code: &str, source_file: Option<&str>) -> bool {
+    let source_file = match source_file {
+        Some(source_file) => source_file,
+        None => return false,
+    };
+
+    has_typescript_type_only_relative_imports_inner(
+        code,
+        source_file,
+        &mut std::collections::HashSet::new(),
+    )
+}
+
+fn should_retry_typescript_with_loader(result: &ExecutionResult) -> bool {
+    !result.timed_out
+        && !result.memory_error
+        && result.exit_code != Some(0)
+        && result.stderr.contains("does not provide an export named")
+}
+
+async fn run_sandbox_process(
+    interpreter: &str,
+    extra_args: &[String],
+    file_path: &std::path::Path,
+    python_module_run: Option<(&std::path::Path, &str)>,
+    source_file: Option<&str>,
+    project_dir: Option<&str>,
+    path_env: &str,
+    extra_envs: &[(String, String)],
+    timeout_seconds: f64,
+    memory_mb: u64,
+    language: &Language,
+) -> ExecutionResult {
+    let mut cmd = Command::new(interpreter);
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
+
+    if let Some((pkg_root_parent, module_path)) = python_module_run {
+        cmd.arg("-m");
+        cmd.arg(module_path);
+        cmd.current_dir(pkg_root_parent);
+    } else {
+        cmd.arg(file_path);
+    }
+
+    if python_module_run.is_none() {
+        if let Some(src) = source_file {
+            if let Some(parent) = std::path::Path::new(src).parent() {
+                cmd.current_dir(parent);
+            }
+        } else if let Some(dir) = project_dir {
+            cmd.current_dir(dir);
+        }
+    }
+
+    cmd.env_clear();
+    cmd.env("PATH", path_env);
+    let home_dir = project_dir
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()));
+    cmd.env("HOME", &home_dir);
+    for (k, v) in extra_envs {
+        cmd.env(k, v);
+    }
+
+    let mem_bytes = memory_mb * 1024 * 1024;
+    let cpu_secs = timeout_seconds.ceil() as u64;
+    let is_typescript = matches!(language, Language::TypeScript);
+    unsafe {
+        cmd.pre_exec(move || {
+            use nix::sys::resource::{setrlimit, Resource};
+
+            libc::setsid();
+
+            if !is_typescript {
+                let _ = setrlimit(Resource::RLIMIT_AS, mem_bytes, mem_bytes);
+                let _ = setrlimit(Resource::RLIMIT_DATA, mem_bytes, mem_bytes);
+                setrlimit(Resource::RLIMIT_CPU, cpu_secs, cpu_secs)
+                    .map_err(std::io::Error::from)?;
+            }
+            let ten_mb = 10 * 1024 * 1024;
+            let _ = setrlimit(Resource::RLIMIT_FSIZE, ten_mb, ten_mb);
+
+            Ok(())
+        });
+    }
+
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.stdin(std::process::Stdio::null());
+    cmd.kill_on_drop(true);
+
+    let start = Instant::now();
+
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return ExecutionResult {
+                stdout: String::new(),
+                stderr: format!("Failed to spawn process: {e}"),
+                exit_code: None,
+                duration_ms: start.elapsed().as_millis() as u64,
+                timed_out: false,
+                memory_error: false,
+            };
+        }
+    };
+
+    let child_pid = child.id().unwrap_or(0);
+    let mem_limit_bytes = mem_bytes;
+
+    let memory_killed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let memory_killed_clone = memory_killed.clone();
+
+    let monitor_handle = if child_pid > 0 {
+        Some(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let rss = get_process_group_rss_bytes(child_pid);
+                if rss > mem_limit_bytes {
+                    memory_killed_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                    unsafe {
+                        libc::kill(-(child_pid as i32), libc::SIGKILL);
+                        libc::kill(child_pid as i32, libc::SIGKILL);
+                    }
+                    break;
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs_f64(timeout_seconds),
+        child.wait_with_output(),
+    )
+    .await;
+
+    if let Some(handle) = monitor_handle {
+        handle.abort();
+    }
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let was_memory_killed = memory_killed.load(std::sync::atomic::Ordering::SeqCst);
+
+    match result {
+        Ok(Ok(output)) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let memory_error = was_memory_killed
+                || stderr.contains("MemoryError")
+                || stderr.contains("Cannot allocate memory")
+                || stderr.contains("ENOMEM")
+                || stderr.contains("JavaScript heap out of memory");
+
+            ExecutionResult {
+                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                stderr: if was_memory_killed && stderr.is_empty() {
+                    format!("Killed: memory limit exceeded ({memory_mb} MB)")
+                } else {
+                    stderr
+                },
+                exit_code: output.status.code(),
+                duration_ms,
+                timed_out: false,
+                memory_error,
+            }
+        }
+        Ok(Err(e)) => ExecutionResult {
+            stdout: String::new(),
+            stderr: format!("Failed to spawn process: {e}"),
+            exit_code: None,
+            duration_ms,
+            timed_out: false,
+            memory_error: false,
+        },
+        Err(_) => ExecutionResult {
+            stdout: String::new(),
+            stderr: if was_memory_killed {
+                format!("Killed: memory limit exceeded ({memory_mb} MB)")
+            } else {
+                "Process timed out".to_string()
+            },
+            exit_code: None,
+            duration_ms,
+            timed_out: !was_memory_killed,
+            memory_error: was_memory_killed,
+        },
+    }
+}
+
 /// Walk up from a directory to find the Python package root.
 /// Returns the deepest ancestor that has __init__.py in it,
 /// plus the path from there to the starting dir.
@@ -340,7 +652,7 @@ pub async fn execute(
         home
     );
 
-    let (interpreter, extra_args, path_env, extra_envs) = match language {
+    let (path_env, extra_envs, interpreter, extra_args, loader_fallback) = match language {
         Language::Python => {
             let mut python = "python3".to_string();
             let mut path = base_path.to_string();
@@ -357,7 +669,7 @@ pub async fn execute(
                 envs.push(("PYTHONPATH".into(), dir.to_string()));
             }
 
-            (python, vec![], path, envs)
+            (path, envs, python, vec![], None)
         }
         Language::TypeScript => {
             let inherited_path = std::env::var("PATH").unwrap_or_default();
@@ -377,238 +689,93 @@ pub async fn execute(
             let bun_path = which_binary(&path, "bun");
             let tsx_path = which_binary(&path, "tsx");
             let tsx_loader_path = tsx_path.as_deref().and_then(tsx_loader_path);
-            let prefer_node_loader = has_typescript_relative_imports(code);
+            let has_relative_imports = has_typescript_relative_imports(code);
+            let requires_node_loader = has_relative_imports
+                && tsx_loader_path.is_some()
+                && has_typescript_type_only_relative_imports(code, source_file);
 
-            if prefer_node_loader {
-                if let (Some(node_path), Some(tsx_loader_path)) =
-                    (node_path.clone(), tsx_loader_path)
-                {
-                    // File-backed TypeScript needs full TS module semantics
-                    // across imports. Use Node with tsx's loader directly so we
-                    // stay on Node without paying for the tsx CLI's IPC server.
-                    (
-                        node_path,
-                        vec!["--import".to_string(), tsx_loader_path],
-                        path,
-                        envs,
-                    )
-                } else if let Some(node_path) = node_path {
-                    (
-                        node_path,
-                        vec![
-                            "--no-warnings".to_string(),
-                            "--experimental-transform-types".to_string(),
-                        ],
-                        path,
-                        envs,
-                    )
-                } else if let Some(bun_path) = bun_path {
-                    (bun_path, vec!["run".to_string()], path, envs)
-                } else if let Some(tsx_path) = tsx_path {
-                    // Last resort: tsx CLI can bootstrap TypeScript execution,
-                    // but it opens an IPC server that stricter sandboxes may
-                    // reject.
-                    (tsx_path, vec![], path, envs)
+            if let Some(node_path) = node_path {
+                let transform_args = vec![
+                    "--no-warnings".to_string(),
+                    "--experimental-transform-types".to_string(),
+                ];
+                let loader_fallback = if has_relative_imports && !requires_node_loader {
+                    tsx_loader_path
+                        .clone()
+                        .map(|loader| (node_path.clone(), vec!["--import".to_string(), loader]))
                 } else {
-                    ("npx".to_string(), vec!["tsx".to_string()], path, envs)
-                }
-            } else if let Some(node_path) = node_path {
+                    None
+                };
+
                 // Prefer Node's built-in TypeScript transform path for
-                // standalone snippets. It avoids the IPC server startup that
-                // `tsx` uses, which fails under stricter sandboxing and
-                // creates false positives in execute/verify.
+                // standalone snippets. For relative-import TypeScript we still
+                // try the transform path first, then retry with tsx's loader
+                // only for the module/type-only export failure it fixes.
                 (
-                    node_path,
-                    vec![
-                        "--no-warnings".to_string(),
-                        "--experimental-transform-types".to_string(),
-                    ],
                     path,
                     envs,
+                    node_path,
+                    if requires_node_loader {
+                        vec![
+                            "--import".to_string(),
+                            tsx_loader_path.clone().unwrap_or_default(),
+                        ]
+                    } else {
+                        transform_args
+                    },
+                    loader_fallback,
                 )
             } else if let Some(bun_path) = bun_path {
-                (bun_path, vec!["run".to_string()], path, envs)
+                (path, envs, bun_path, vec!["run".to_string()], None)
             } else if let Some(tsx_path) = tsx_path {
-                (tsx_path, vec![], path, envs)
+                // Last resort: tsx CLI can bootstrap TypeScript execution,
+                // but it opens an IPC server that stricter sandboxes may
+                // reject.
+                (path, envs, tsx_path, vec![], None)
             } else {
-                ("npx".to_string(), vec!["tsx".to_string()], path, envs)
+                (path, envs, "npx".to_string(), vec!["tsx".to_string()], None)
             }
         }
     };
 
-    let mut cmd = Command::new(&interpreter);
-    for arg in &extra_args {
-        cmd.arg(arg);
-    }
-
-    // For Python module execution, use `-m module.path` instead of file path
-    if let Some((ref pkg_root_parent, ref module_path)) = python_module_run {
-        cmd.arg("-m");
-        cmd.arg(module_path);
-        cmd.current_dir(pkg_root_parent);
-    } else {
-        cmd.arg(&file_path);
-    }
-
-    // Set working directory (if not already set by python_module_run)
-    if python_module_run.is_none() {
-        if let Some(src) = source_file {
-            if let Some(parent) = std::path::Path::new(src).parent() {
-                cmd.current_dir(parent);
-            }
-        } else if let Some(dir) = project_dir {
-            cmd.current_dir(dir);
-        }
-    }
-
-    // Minimal environment — no API keys, etc.
-    cmd.env_clear();
-    cmd.env("PATH", &path_env);
-    // HOME is needed by npx (cache lookup for tsx) and some packages.
-    let home_dir = project_dir
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()));
-    cmd.env("HOME", &home_dir);
-    for (k, v) in &extra_envs {
-        cmd.env(k, v);
-    }
-
-    // Resource limits via pre_exec (effective on Linux; best-effort on macOS)
-    let mem_bytes = memory_mb * 1024 * 1024;
-    let cpu_secs = timeout_seconds.ceil() as u64;
-    let is_typescript = matches!(language, Language::TypeScript);
-    unsafe {
-        cmd.pre_exec(move || {
-            use nix::sys::resource::{setrlimit, Resource};
-
-            // Create new process group so we can kill all children
-            libc::setsid();
-
-            // Skip rlimits for TypeScript — V8 reserves GBs of virtual address
-            // space (breaks RLIMIT_AS), and npx tsx burns several seconds of CPU
-            // just on startup (breaks RLIMIT_CPU). Rely on tokio timeout + RSS
-            // monitor instead.
-            if !is_typescript {
-                let _ = setrlimit(Resource::RLIMIT_AS, mem_bytes, mem_bytes);
-                let _ = setrlimit(Resource::RLIMIT_DATA, mem_bytes, mem_bytes);
-                setrlimit(Resource::RLIMIT_CPU, cpu_secs, cpu_secs)
-                    .map_err(std::io::Error::from)?;
-            }
-            let ten_mb = 10 * 1024 * 1024;
-            let _ = setrlimit(Resource::RLIMIT_FSIZE, ten_mb, ten_mb);
-
-            Ok(())
-        });
-    }
-
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    cmd.stdin(std::process::Stdio::null());
-    cmd.kill_on_drop(true);
-
-    let start = Instant::now();
-
-    // Spawn the child so we can poll process-group RSS for memory enforcement.
-    let child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            return ExecutionResult {
-                stdout: String::new(),
-                stderr: format!("Failed to spawn process: {e}"),
-                exit_code: None,
-                duration_ms: start.elapsed().as_millis() as u64,
-                timed_out: false,
-                memory_error: false,
-            };
-        }
-    };
-
-    let child_pid = child.id().unwrap_or(0);
-    let mem_limit_bytes = mem_bytes;
-
-    // RSS monitor: poll the whole process group so wrapper commands and spawned
-    // children count against the same memory budget.
-    let memory_killed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let memory_killed_clone = memory_killed.clone();
-
-    let monitor_handle = if child_pid > 0 {
-        Some(tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                let rss = get_process_group_rss_bytes(child_pid);
-                if rss > mem_limit_bytes {
-                    memory_killed_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-                    // Kill entire process group (negative PID) to catch child processes
-                    unsafe {
-                        libc::kill(-(child_pid as i32), libc::SIGKILL);
-                        // Also kill parent directly in case setsid didn't take effect
-                        libc::kill(child_pid as i32, libc::SIGKILL);
-                    }
-                    break;
-                }
-            }
-        }))
-    } else {
-        None
-    };
-
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs_f64(timeout_seconds),
-        child.wait_with_output(),
+    let python_module_run = python_module_run
+        .as_ref()
+        .map(|(pkg_root_parent, module_path)| (pkg_root_parent.as_path(), module_path.as_str()));
+    let result = run_sandbox_process(
+        &interpreter,
+        &extra_args,
+        &file_path,
+        python_module_run,
+        source_file,
+        project_dir,
+        &path_env,
+        &extra_envs,
+        timeout_seconds,
+        memory_mb,
+        language,
     )
     .await;
 
-    // Stop the monitor
-    if let Some(handle) = monitor_handle {
-        handle.abort();
-    }
-
-    let duration_ms = start.elapsed().as_millis() as u64;
-    let was_memory_killed = memory_killed.load(std::sync::atomic::Ordering::SeqCst);
-
-    match result {
-        Ok(Ok(output)) => {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            let memory_error = was_memory_killed
-                || stderr.contains("MemoryError")
-                || stderr.contains("Cannot allocate memory")
-                || stderr.contains("ENOMEM")
-                || stderr.contains("JavaScript heap out of memory");
-
-            ExecutionResult {
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                stderr: if was_memory_killed && stderr.is_empty() {
-                    format!("Killed: memory limit exceeded ({memory_mb} MB)")
-                } else {
-                    stderr
-                },
-                exit_code: output.status.code(),
-                duration_ms,
-                timed_out: false,
-                memory_error,
-            }
+    if let Some((loader_interpreter, loader_args)) = loader_fallback {
+        if should_retry_typescript_with_loader(&result) {
+            return run_sandbox_process(
+                &loader_interpreter,
+                &loader_args,
+                &file_path,
+                python_module_run,
+                source_file,
+                project_dir,
+                &path_env,
+                &extra_envs,
+                timeout_seconds,
+                memory_mb,
+                language,
+            )
+            .await;
         }
-        Ok(Err(e)) => ExecutionResult {
-            stdout: String::new(),
-            stderr: format!("Failed to spawn process: {e}"),
-            exit_code: None,
-            duration_ms,
-            timed_out: false,
-            memory_error: false,
-        },
-        Err(_) => ExecutionResult {
-            stdout: String::new(),
-            stderr: if was_memory_killed {
-                format!("Killed: memory limit exceeded ({memory_mb} MB)")
-            } else {
-                "Process timed out".to_string()
-            },
-            exit_code: None,
-            duration_ms,
-            timed_out: !was_memory_killed,
-            memory_error: was_memory_killed,
-        },
     }
+
+    result
 }
 
 fn err_result(msg: &str) -> ExecutionResult {
@@ -624,7 +791,11 @@ fn err_result(msg: &str) -> ExecutionResult {
 
 #[cfg(test)]
 mod tests {
-    use super::which_binary;
+    use super::{
+        has_typescript_type_only_relative_imports, should_retry_typescript_with_loader,
+        which_binary,
+    };
+    use crate::types::ExecutionResult;
 
     #[test]
     fn which_binary_finds_existing_binary_on_path() {
@@ -636,5 +807,117 @@ mod tests {
     fn which_binary_returns_none_for_missing_binary() {
         let path_env = "/missing:/also-missing";
         assert_eq!(which_binary(path_env, "definitely-not-a-real-binary"), None);
+    }
+
+    #[test]
+    fn retries_loader_for_type_only_export_failure() {
+        let result = ExecutionResult {
+            stdout: String::new(),
+            stderr: "SyntaxError: The requested module './internals.ts' does not provide an export named 'PathValue'".to_string(),
+            exit_code: Some(1),
+            duration_ms: 1,
+            timed_out: false,
+            memory_error: false,
+        };
+        assert!(should_retry_typescript_with_loader(&result));
+    }
+
+    #[test]
+    fn does_not_retry_loader_for_ordinary_runtime_failure() {
+        let result = ExecutionResult {
+            stdout: String::new(),
+            stderr: "TypeError: Cannot read properties of null (reading 'plans')".to_string(),
+            exit_code: Some(1),
+            duration_ms: 1,
+            timed_out: false,
+            memory_error: false,
+        };
+        assert!(!should_retry_typescript_with_loader(&result));
+    }
+
+    #[test]
+    fn detects_type_only_relative_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("main.ts");
+        let helper_path = dir.path().join("internals.ts");
+        std::fs::write(
+            &helper_path,
+            "export type PathValue = string | number;\nexport const value = 7;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &source_path,
+            "import { PathValue, value } from \"./internals.ts\";\nconsole.log(value);\n",
+        )
+        .unwrap();
+
+        let code = std::fs::read_to_string(&source_path).unwrap();
+        assert!(has_typescript_type_only_relative_imports(
+            &code,
+            Some(source_path.to_str().unwrap())
+        ));
+    }
+
+    #[test]
+    fn ignores_plain_value_relative_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("main.ts");
+        let helper_path = dir.path().join("helper.ts");
+        std::fs::write(&helper_path, "export const value = 7;\n").unwrap();
+        std::fs::write(
+            &source_path,
+            "import { value } from \"./helper.ts\";\nconsole.log(value);\n",
+        )
+        .unwrap();
+
+        let code = std::fs::read_to_string(&source_path).unwrap();
+        assert!(!has_typescript_type_only_relative_imports(
+            &code,
+            Some(source_path.to_str().unwrap())
+        ));
+    }
+
+    #[test]
+    fn detects_multiline_type_only_relative_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("main.ts");
+        let helper_path = dir.path().join("internals.ts");
+        std::fs::write(&helper_path, "export type PathValue = string | number;\n").unwrap();
+        std::fs::write(
+            &source_path,
+            "import {\n  PathValue,\n} from \"./internals.ts\";\nconsole.log('ok');\n",
+        )
+        .unwrap();
+
+        let code = std::fs::read_to_string(&source_path).unwrap();
+        assert!(has_typescript_type_only_relative_imports(
+            &code,
+            Some(source_path.to_str().unwrap())
+        ));
+    }
+
+    #[test]
+    fn detects_transitive_type_only_relative_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("test.ts");
+        let object_path = dir.path().join("object.ts");
+        let helper_path = dir.path().join("internals.ts");
+        std::fs::write(&helper_path, "export type PathValue = string | number;\n").unwrap();
+        std::fs::write(
+            &object_path,
+            "import { PathValue } from \"./internals.ts\";\nexport function pick(path: PathValue): string { return String(path); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &source_path,
+            "import { pick } from \"./object.ts\";\nconsole.log(pick(\"x\"));\n",
+        )
+        .unwrap();
+
+        let code = std::fs::read_to_string(&source_path).unwrap();
+        assert!(has_typescript_type_only_relative_imports(
+            &code,
+            Some(source_path.to_str().unwrap())
+        ));
     }
 }
