@@ -1253,6 +1253,8 @@ fn synthesize_typescript(analysis: &AnalysisResult, type_defs: &TsNamedTypes<'_>
             ts_feature_flag_override_check(func, &param_types, ret_type, type_defs);
         let semver_compare_semantic_check =
             ts_semver_compare_semantic_check(func, &param_types, ret_type);
+        let semver_caret_semantic_check =
+            ts_semver_caret_semantic_check(func, &param_types, ret_type);
 
         code.push_str(&format!(
             r#"
@@ -1261,6 +1263,7 @@ fn synthesize_typescript(analysis: &AnalysisResult, type_defs: &TsNamedTypes<'_>
 {query_string_semantic_check}
 {feature_flag_override_check}
 {semver_compare_semantic_check}
+{semver_caret_semantic_check}
 }}
 "#,
             name = func.name,
@@ -1269,6 +1272,7 @@ fn synthesize_typescript(analysis: &AnalysisResult, type_defs: &TsNamedTypes<'_>
             query_string_semantic_check = query_string_semantic_check,
             feature_flag_override_check = feature_flag_override_check,
             semver_compare_semantic_check = semver_compare_semantic_check,
+            semver_caret_semantic_check = semver_caret_semantic_check,
         ));
 
         any_synthesized = true;
@@ -1758,6 +1762,53 @@ fn ts_semver_compare_semantic_check(
         message: _clipText(_e instanceof Error ? _e.message : String(_e)),
         severity: "property_violation"}});
       console.log(`  CRASH {name}(semver compare semantics): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
+      _fuzzTotalFailures++;
+    }}
+  }}
+"#,
+        name = func.name,
+    )
+}
+
+fn ts_semver_caret_semantic_check(
+    func: &FunctionInfo,
+    param_types: &[String],
+    ret_type: &str,
+) -> String {
+    let lower = func.name.to_lowercase();
+    if param_types.len() != 2
+        || param_types[0].trim() != "string"
+        || param_types[1].trim() != "string"
+        || ret_type.trim() != "boolean"
+        || !is_api_surface(func)
+        || !lower.contains("caret")
+    {
+        return String::new();
+    }
+
+    format!(
+        r#"  if (_fuzzOk) {{
+    let _caretLabel = "prerelease exclusion";
+    try {{
+      const _caretCases: Array<[string, string, boolean]> = [
+        ["1.3.0-beta.1", "^1.2.3", false],
+        ["0.3.0", "^0.2.3", false],
+        ["0.2.9", "^0.2.3", true],
+        ["0.0.4", "^0.0.3", false],
+      ];
+      for (const [_version, _range, _expected] of _caretCases) {{
+        _caretLabel = `${{_version}} in ${{_range}}`;
+        const _actual = Boolean(({name} as Function)(_version, _range));
+        if (_actual !== _expected) {{
+          throw new Error(`Semver caret semantics (${{_caretLabel}}): ${{JSON.stringify(_actual)}} !== ${{JSON.stringify(_expected)}}`);
+        }}
+      }}
+    }} catch (_e: unknown) {{
+      _fuzzResults.push({{function: "{name}", input: `semver caret semantics:${{_caretLabel}}`,
+        error_type: _e instanceof Error ? _e.constructor.name : "unknown",
+        message: _clipText(_e instanceof Error ? _e.message : String(_e)),
+        severity: "property_violation"}});
+      console.log(`  CRASH {name}(semver caret semantics): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
       _fuzzTotalFailures++;
     }}
   }}

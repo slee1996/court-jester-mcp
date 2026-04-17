@@ -611,6 +611,135 @@ export function compareVersions(left: string, right: string): number {
 }
 
 #[tokio::test]
+async fn typescript_semver_caret_prerelease_fails_verify() {
+    let code = r#"
+type ParsedVersion = {
+  major: number;
+  minor: number;
+  patch: number;
+  prerelease: string[] | null;
+};
+
+function parseVersion(input: string): ParsedVersion | null {
+  const normalized = input.trim().replace(/^v/i, "").split("+", 1)[0];
+  const [core, prereleaseText] = normalized.split("-", 2);
+  const parts = core.split(".");
+  if (parts.length !== 3) {
+    return null;
+  }
+  const [major, minor, patch] = parts.map((part) => Number.parseInt(part, 10));
+  if ([major, minor, patch].some((part) => Number.isNaN(part) || part < 0)) {
+    return null;
+  }
+  return {
+    major,
+    minor,
+    patch,
+    prerelease: prereleaseText ? prereleaseText.split(".") : null,
+  };
+}
+
+function compareCore(left: ParsedVersion, right: ParsedVersion): number {
+  if (left.major !== right.major) return left.major < right.major ? -1 : 1;
+  if (left.minor !== right.minor) return left.minor < right.minor ? -1 : 1;
+  if (left.patch !== right.patch) return left.patch < right.patch ? -1 : 1;
+  return 0;
+}
+
+export function matchesCaret(version: string, range: string): boolean {
+  if (!range.startsWith("^")) {
+    return false;
+  }
+  const candidate = parseVersion(version);
+  const base = parseVersion(range.slice(1));
+  if (!candidate || !base) {
+    return false;
+  }
+  if (compareCore(candidate, base) < 0) {
+    return false;
+  }
+  return candidate.major === base.major;
+}
+"#;
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+
+    assert!(!report.overall_ok, "report: {:#?}", report.stages);
+
+    let exec_stage = report
+        .stages
+        .iter()
+        .find(|s| s.name == "execute")
+        .expect("execute stage should be present");
+    assert!(
+        !exec_stage.ok,
+        "semver caret matcher should fail verify when prereleases and zero-major bounds are ignored"
+    );
+}
+
+#[tokio::test]
+async fn typescript_semver_caret_prerelease_can_pass_verify() {
+    let code = r#"
+type ParsedVersion = {
+  major: number;
+  minor: number;
+  patch: number;
+  prerelease: string[] | null;
+};
+
+function parseVersion(input: string): ParsedVersion | null {
+  const normalized = input.trim().replace(/^v/i, "").split("+", 1)[0];
+  const [core, prereleaseText] = normalized.split("-", 2);
+  const parts = core.split(".");
+  if (parts.length !== 3) {
+    return null;
+  }
+  const [major, minor, patch] = parts.map((part) => Number.parseInt(part, 10));
+  if ([major, minor, patch].some((part) => Number.isNaN(part) || part < 0)) {
+    return null;
+  }
+  return {
+    major,
+    minor,
+    patch,
+    prerelease: prereleaseText ? prereleaseText.split(".") : null,
+  };
+}
+
+function compareCore(left: ParsedVersion, right: ParsedVersion): number {
+  if (left.major !== right.major) return left.major < right.major ? -1 : 1;
+  if (left.minor !== right.minor) return left.minor < right.minor ? -1 : 1;
+  if (left.patch !== right.patch) return left.patch < right.patch ? -1 : 1;
+  return 0;
+}
+
+export function matchesCaret(version: string, range: string): boolean {
+  if (!range.startsWith("^")) {
+    return false;
+  }
+  const candidate = parseVersion(version);
+  const base = parseVersion(range.slice(1));
+  if (!candidate || !base || candidate.prerelease != null) {
+    return false;
+  }
+  if (compareCore(candidate, base) < 0) {
+    return false;
+  }
+  if (base.major > 0) {
+    return candidate.major === base.major;
+  }
+  if (base.minor > 0) {
+    return candidate.major === 0 && candidate.minor === base.minor;
+  }
+  return candidate.major === 0 && candidate.minor === 0 && candidate.patch === base.patch;
+}
+"#;
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+
+    assert!(report.overall_ok, "report: {:#?}", report.stages);
+    assert!(report.stages.iter().any(|s| s.name == "execute" && s.ok));
+}
+
+#[tokio::test]
 async fn query_string_nullish_leak_fails_verify() {
     let code = r#"
 from urllib.parse import quote_plus

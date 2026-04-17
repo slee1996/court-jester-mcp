@@ -593,6 +593,31 @@ fn typescript_semver_compare_gets_prerelease_semantics() {
 }
 
 #[test]
+fn typescript_semver_caret_gets_zero_major_semantics() {
+    let a = make_analysis(
+        vec![func(
+            "matchesCaret",
+            vec![("version", Some("string")), ("range", Some("string"))],
+            Some("boolean"),
+        )],
+        vec![],
+    );
+    let code = synthesize_calls(&a, &Language::TypeScript);
+    assert!(
+        code.contains("semver caret semantics:${_caretLabel}"),
+        "semver caret harness should label semantic failures, got: {code}"
+    );
+    assert!(
+        code.contains("\"1.3.0-beta.1\", \"^1.2.3\", false"),
+        "semver caret harness should exclude prereleases, got: {code}"
+    );
+    assert!(
+        code.contains("\"0.3.0\", \"^0.2.3\", false"),
+        "semver caret harness should enforce zero-major upper bounds, got: {code}"
+    );
+}
+
+#[test]
 fn typescript_prefers_exported_surface_over_internal_helpers() {
     let mut helper = func(
         "encode",
