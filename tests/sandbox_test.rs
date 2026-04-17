@@ -240,6 +240,58 @@ console.log(`${mode}:${String(pick({ timezone: "UTC" }, "timezone"))}`);
 }
 
 #[tokio::test]
+async fn typescript_source_file_uses_loader_for_type_only_reexport_chain() {
+    let bun_ok = std::process::Command::new("bun")
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    assert!(bun_ok, "bun must be available for this regression test");
+
+    let dir = tempfile::tempdir().unwrap();
+    let helper_path = dir.path().join("internals.ts");
+    let index_path = dir.path().join("index.ts");
+    let source_path = dir.path().join("object.ts");
+
+    std::fs::write(
+        &helper_path,
+        "export type PathValue = string | number | Array<string | number>;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &index_path,
+        "export type { PathValue } from \"./internals.ts\";\n",
+    )
+    .unwrap();
+
+    let code = r#"
+import { PathValue } from "./index.ts";
+
+function pick(object: Record<string, unknown>, path: PathValue): unknown {
+  const key = String(path);
+  return object[key];
+}
+
+const mode = process.execArgv.includes("--import") ? "loader" : "transform";
+console.log(`${mode}:${String(pick({ timezone: "UTC" }, "timezone"))}`);
+"#;
+    std::fs::write(&source_path, code).unwrap();
+
+    let result = execute(
+        code,
+        &Language::TypeScript,
+        10.0,
+        128,
+        None,
+        Some(source_path.to_str().unwrap()),
+    )
+    .await;
+
+    assert_eq!(result.exit_code, Some(0), "stderr: {}", result.stderr);
+    assert_eq!(result.stdout.trim(), "loader:UTC");
+}
+
+#[tokio::test]
 async fn typescript_source_file_prefers_node_transform_over_bun_for_plain_relative_imports() {
     let bun_ok = std::process::Command::new("bun")
         .arg("--version")

@@ -269,14 +269,129 @@ fn extract_typescript_named_relative_imports(code: &str) -> Vec<(String, Vec<Str
     imports
 }
 
-fn target_exports_name_only_as_type(code: &str, name: &str) -> bool {
+#[derive(Debug)]
+struct RelativeReexportSpecifier {
+    source_name: String,
+    exported_name: String,
+    type_only: bool,
+}
+
+fn extract_typescript_named_relative_reexports(
+    code: &str,
+) -> Vec<(String, Vec<RelativeReexportSpecifier>)> {
+    let mut reexports = Vec::new();
+
+    for statement in code.split(';') {
+        let normalized = statement.replace('\n', " ");
+        let trimmed = normalized.trim();
+        if !trimmed.starts_with("export ") {
+            continue;
+        }
+        let (clause, from_clause) = match trimmed[7..].split_once(" from ") {
+            Some(parts) => parts,
+            None => continue,
+        };
+        let path = match parse_quoted_path(from_clause) {
+            Some(path) if path.starts_with("./") || path.starts_with("../") => path,
+            _ => continue,
+        };
+
+        let clause = clause.trim();
+        let statement_type_only = clause.starts_with("type ");
+        let open = match clause.find('{') {
+            Some(index) => index,
+            None => continue,
+        };
+        let close = match clause.rfind('}') {
+            Some(index) => index,
+            None => continue,
+        };
+
+        let specifiers = clause[open + 1..close]
+            .split(',')
+            .filter_map(|entry| {
+                let entry = entry.trim();
+                if entry.is_empty() {
+                    return None;
+                }
+                let entry_type_only = statement_type_only || entry.starts_with("type ");
+                let entry = entry.strip_prefix("type ").unwrap_or(entry).trim();
+                let (source_name, exported_name) = entry
+                    .split_once(" as ")
+                    .map(|(source_name, exported_name)| (source_name.trim(), exported_name.trim()))
+                    .unwrap_or((entry, entry));
+                if source_name.is_empty() || exported_name.is_empty() {
+                    return None;
+                }
+                Some(RelativeReexportSpecifier {
+                    source_name: source_name.to_string(),
+                    exported_name: exported_name.to_string(),
+                    type_only: entry_type_only,
+                })
+            })
+            .collect::<Vec<_>>();
+        if !specifiers.is_empty() {
+            reexports.push((path, specifiers));
+        }
+    }
+
+    reexports
+}
+
+fn source_key(source_file: &str) -> String {
+    std::fs::canonicalize(source_file)
+        .unwrap_or_else(|_| std::path::PathBuf::from(source_file))
+        .to_string_lossy()
+        .to_string()
+}
+
+fn target_exports_name_only_as_type(
+    code: &str,
+    source_file: &str,
+    name: &str,
+    visited: &mut std::collections::HashSet<String>,
+) -> bool {
+    let visit_key = format!("{}::{name}", source_key(source_file));
+    if !visited.insert(visit_key) {
+        return false;
+    }
+
     let type_alias_prefix = format!("export type {name}");
     let interface_prefix = format!("export interface {name}");
 
-    code.lines().any(|line| {
+    if code.lines().any(|line| {
         let trimmed = line.trim_start();
         trimmed.starts_with(&type_alias_prefix) || trimmed.starts_with(&interface_prefix)
-    })
+    }) {
+        return true;
+    }
+
+    extract_typescript_named_relative_reexports(code)
+        .into_iter()
+        .any(|(import_path, specifiers)| {
+            specifiers.into_iter().any(|specifier| {
+                if specifier.exported_name != name {
+                    return false;
+                }
+                if specifier.type_only {
+                    return true;
+                }
+                let resolved = match resolve_typescript_import_file(source_file, &import_path) {
+                    Some(path) => path,
+                    None => return false,
+                };
+                let imported_code = match std::fs::read_to_string(&resolved) {
+                    Ok(code) => code,
+                    Err(_) => return false,
+                };
+                target_exports_name_only_as_type(
+                    &imported_code,
+                    resolved.to_str().unwrap_or_default(),
+                    &specifier.source_name,
+                    visited,
+                )
+            })
+        })
 }
 
 fn has_typescript_type_only_relative_imports_inner(
@@ -284,10 +399,7 @@ fn has_typescript_type_only_relative_imports_inner(
     source_file: &str,
     visited: &mut std::collections::HashSet<String>,
 ) -> bool {
-    let source_key = std::fs::canonicalize(source_file)
-        .unwrap_or_else(|_| std::path::PathBuf::from(source_file))
-        .to_string_lossy()
-        .to_string();
+    let source_key = source_key(source_file);
     if !visited.insert(source_key) {
         return false;
     }
@@ -303,9 +415,15 @@ fn has_typescript_type_only_relative_imports_inner(
                 Ok(code) => code,
                 Err(_) => return false,
             };
-            names
-                .iter()
-                .any(|name| target_exports_name_only_as_type(&imported_code, name))
+            let mut export_visited = std::collections::HashSet::new();
+            names.iter().any(|name| {
+                target_exports_name_only_as_type(
+                    &imported_code,
+                    resolved.to_str().unwrap_or_default(),
+                    name,
+                    &mut export_visited,
+                )
+            })
                 || has_typescript_type_only_relative_imports_inner(
                     &imported_code,
                     resolved.to_str().unwrap_or_default(),
@@ -911,6 +1029,56 @@ mod tests {
         std::fs::write(
             &source_path,
             "import { pick } from \"./object.ts\";\nconsole.log(pick(\"x\"));\n",
+        )
+        .unwrap();
+
+        let code = std::fs::read_to_string(&source_path).unwrap();
+        assert!(has_typescript_type_only_relative_imports(
+            &code,
+            Some(source_path.to_str().unwrap())
+        ));
+    }
+
+    #[test]
+    fn detects_type_only_relative_reexports() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("main.ts");
+        let index_path = dir.path().join("index.ts");
+        let helper_path = dir.path().join("internals.ts");
+        std::fs::write(&helper_path, "export type PathValue = string | number;\n").unwrap();
+        std::fs::write(
+            &index_path,
+            "export type { PathValue } from \"./internals.ts\";\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &source_path,
+            "import { PathValue } from \"./index.ts\";\nconsole.log(String(\"x\" as PathValue));\n",
+        )
+        .unwrap();
+
+        let code = std::fs::read_to_string(&source_path).unwrap();
+        assert!(has_typescript_type_only_relative_imports(
+            &code,
+            Some(source_path.to_str().unwrap())
+        ));
+    }
+
+    #[test]
+    fn detects_value_reexports_of_type_only_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("main.ts");
+        let index_path = dir.path().join("index.ts");
+        let helper_path = dir.path().join("internals.ts");
+        std::fs::write(&helper_path, "export type PathValue = string | number;\n").unwrap();
+        std::fs::write(
+            &index_path,
+            "export { PathValue } from \"./internals.ts\";\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &source_path,
+            "import { PathValue } from \"./index.ts\";\nconsole.log(String(\"x\" as PathValue));\n",
         )
         .unwrap();
 
