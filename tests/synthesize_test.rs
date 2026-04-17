@@ -622,6 +622,42 @@ fn typescript_semver_caret_gets_zero_major_semantics() {
 }
 
 #[test]
+fn typescript_defaults_gets_null_and_inherited_semantics() {
+    let a = make_analysis(
+        vec![func(
+            "defaults",
+            vec![
+                ("object", Some("T")),
+                ("...sources", Some("Array<object | null | undefined>")),
+            ],
+            Some("T"),
+        )],
+        vec![],
+    );
+    let code = synthesize_calls(&a, &Language::TypeScript);
+    assert!(
+        code.contains("_fuzzOne(\"defaults\""),
+        "defaults should become fuzzable despite a generic target, got: {code}"
+    );
+    assert!(
+        code.contains("_fuzzObject()"),
+        "defaults should use object-shaped fuzz inputs, got: {code}"
+    );
+    assert!(
+        code.contains("defaults semantics:${_defaultsLabel}"),
+        "defaults harness should label semantic failures, got: {code}"
+    );
+    assert!(
+        code.contains("({ a: null }, { a: 1 })"),
+        "defaults harness should preserve null targets, got: {code}"
+    );
+    assert!(
+        code.contains("Object.create(_defaultsProto)"),
+        "defaults harness should exercise inherited enumerable keys, got: {code}"
+    );
+}
+
+#[test]
 fn typescript_prefers_exported_surface_over_internal_helpers() {
     let mut helper = func(
         "encode",

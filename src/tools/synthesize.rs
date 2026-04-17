@@ -558,6 +558,10 @@ fn feature_flag_key_from_function_name(name: &str) -> Option<String> {
     Some(key)
 }
 
+fn likely_defaults_semantics(name: &str) -> bool {
+    name.trim().eq_ignore_ascii_case("defaults")
+}
+
 /// Names that suggest symmetric behavior (f(a,b) == f(b,a)).
 const SYMMETRIC_NAME_CUES: &[&str] = &["distance", "similarity", "hamming", "gcd"];
 
@@ -579,6 +583,38 @@ fn likely_symmetric(name: &str) -> bool {
 
 fn is_api_surface(func: &FunctionInfo) -> bool {
     !func.is_method && !func.is_nested && func.is_exported
+}
+
+fn is_ts_type_param_like(type_name: &str) -> bool {
+    let trimmed = type_name.trim();
+    !trimmed.is_empty()
+        && trimmed
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_uppercase())
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn is_ts_defaults_semantic_target(
+    func: &FunctionInfo,
+    param_types: &[String],
+    ret_type: &str,
+    type_defs: &TsNamedTypes<'_>,
+) -> bool {
+    if !is_api_surface(func) || !likely_defaults_semantics(&func.name) || param_types.is_empty() {
+        return false;
+    }
+
+    let target_type = param_types[0].trim();
+    let ret_type = ret_type.trim();
+    !target_type.is_empty()
+        && ret_type == target_type
+        && (is_ts_type_param_like(target_type)
+            || is_ts_mapping_type(target_type, type_defs)
+            || looks_like_ts_object_type(target_type)
+            || ts_class_def(target_type, type_defs).is_some())
 }
 
 fn ts_has_structured_input_type(type_name: &str, type_defs: &TsNamedTypes<'_>) -> bool {
@@ -1131,7 +1167,7 @@ fn synthesize_typescript(analysis: &AnalysisResult, type_defs: &TsNamedTypes<'_>
             .iter()
             .filter(|p| !p.name.starts_with('*'))
             .collect();
-        if !ts_params_are_fuzzable(&callable_params, type_defs) {
+        if !ts_params_are_fuzzable(func, &callable_params, type_defs) {
             continue;
         }
         let ret_type = func.return_type.as_deref().unwrap_or("");
@@ -1249,6 +1285,8 @@ fn synthesize_typescript(analysis: &AnalysisResult, type_defs: &TsNamedTypes<'_>
 
         let query_string_semantic_check =
             ts_query_string_semantic_check(func, &param_types, ret_type, type_defs);
+        let defaults_semantic_check =
+            ts_defaults_semantic_check(func, &param_types, ret_type, type_defs);
         let feature_flag_override_check =
             ts_feature_flag_override_check(func, &param_types, ret_type, type_defs);
         let semver_compare_semantic_check =
@@ -1261,6 +1299,7 @@ fn synthesize_typescript(analysis: &AnalysisResult, type_defs: &TsNamedTypes<'_>
 {{
   const _fuzzOk = _fuzzOne("{name}", {iters}, () => [{gen_list}], (args: unknown[]) => ({name} as Function)(...args), {typecheck}, [{param_type_list}], [{properties_list}]);
 {query_string_semantic_check}
+{defaults_semantic_check}
 {feature_flag_override_check}
 {semver_compare_semantic_check}
 {semver_caret_semantic_check}
@@ -1270,6 +1309,7 @@ fn synthesize_typescript(analysis: &AnalysisResult, type_defs: &TsNamedTypes<'_>
             iters = FUZZ_ITERATIONS,
             typecheck = ts_type_check_fn(ret_type),
             query_string_semantic_check = query_string_semantic_check,
+            defaults_semantic_check = defaults_semantic_check,
             feature_flag_override_check = feature_flag_override_check,
             semver_compare_semantic_check = semver_compare_semantic_check,
             semver_caret_semantic_check = semver_caret_semantic_check,
@@ -1320,7 +1360,7 @@ fn synthesize_typescript_factory_exercise(
             .iter()
             .filter(|p| !p.name.starts_with('*'))
             .collect();
-        if !ts_params_are_fuzzable(&callable_params, type_defs) {
+        if !ts_params_are_fuzzable(func, &callable_params, type_defs) {
             continue;
         }
         let generators: Vec<String> = callable_params
@@ -1525,10 +1565,30 @@ fn ts_generator(type_ann: Option<&str>, type_defs: &TsNamedTypes<'_>) -> String 
     }
 }
 
-fn ts_params_are_fuzzable(params: &[&ParamInfo], type_defs: &TsNamedTypes<'_>) -> bool {
-    params
+fn ts_params_are_fuzzable(
+    func: &FunctionInfo,
+    params: &[&ParamInfo],
+    type_defs: &TsNamedTypes<'_>,
+) -> bool {
+    if params
         .iter()
         .all(|param| ts_type_is_fuzzable(param.type_annotation.as_deref(), type_defs))
+    {
+        return true;
+    }
+
+    if !is_api_surface(func) || !likely_defaults_semantics(&func.name) || params.is_empty() {
+        return false;
+    }
+
+    let target_type = params[0].type_annotation.as_deref().unwrap_or("").trim();
+    let ret_type = func.return_type.as_deref().unwrap_or("").trim();
+    !target_type.is_empty()
+        && ret_type == target_type
+        && is_ts_type_param_like(target_type)
+        && params[1..]
+            .iter()
+            .all(|param| ts_type_is_fuzzable(param.type_annotation.as_deref(), type_defs))
 }
 
 fn ts_type_is_fuzzable(type_ann: Option<&str>, type_defs: &TsNamedTypes<'_>) -> bool {
@@ -1591,13 +1651,19 @@ fn ts_generator_for_param(
     contract: Option<ContractKind>,
     type_ann: Option<&str>,
     type_defs: &TsNamedTypes<'_>,
-    _index: usize,
-    _func: &FunctionInfo,
+    index: usize,
+    func: &FunctionInfo,
 ) -> String {
     if contract == Some(ContractKind::Comparator)
         && is_semver_like_version_type(type_ann, type_defs)
     {
         return "_fuzzSemverVersion()".to_string();
+    }
+    if index == 0
+        && likely_defaults_semantics(&func.name)
+        && type_ann.is_some_and(is_ts_type_param_like)
+    {
+        return "_fuzzObject()".to_string();
     }
     ts_generator(type_ann, type_defs)
 }
@@ -1650,6 +1716,50 @@ fn ts_query_string_semantic_check(
         message: _clipText(_e instanceof Error ? _e.message : String(_e)),
         severity: "property_violation"}});
       console.log(`  CRASH {name}(query semantics): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
+      _fuzzTotalFailures++;
+    }}
+  }}
+"#,
+        name = func.name,
+    )
+}
+
+fn ts_defaults_semantic_check(
+    func: &FunctionInfo,
+    param_types: &[String],
+    ret_type: &str,
+    type_defs: &TsNamedTypes<'_>,
+) -> String {
+    if !is_ts_defaults_semantic_target(func, param_types, ret_type, type_defs) {
+        return String::new();
+    }
+
+    format!(
+        r#"  if (_fuzzOk) {{
+    let _defaultsLabel = "null target preserves value";
+    try {{
+      const _nullTarget = ({name} as Function)({{ a: null }}, {{ a: 1 }}) as Record<string, unknown>;
+      if (_nullTarget.a !== null) {{
+        throw new Error(`Defaults semantics (${{_defaultsLabel}}): ${{JSON.stringify(_nullTarget.a)}} !== null`);
+      }}
+      _defaultsLabel = "undefined target accepts source";
+      const _undefinedTarget = ({name} as Function)({{ a: undefined }}, {{ a: 1 }}) as Record<string, unknown>;
+      if (_undefinedTarget.a !== 1) {{
+        throw new Error(`Defaults semantics (${{_defaultsLabel}}): ${{JSON.stringify(_undefinedTarget.a)}} !== 1`);
+      }}
+      _defaultsLabel = "inherited source keys";
+      const _defaultsProto = {{ inherited: 7 }};
+      const _defaultsSource = Object.create(_defaultsProto) as Record<string, unknown>;
+      const _inheritedTarget = ({name} as Function)({{}}, _defaultsSource) as Record<string, unknown>;
+      if (_inheritedTarget.inherited !== 7) {{
+        throw new Error(`Defaults semantics (${{_defaultsLabel}}): ${{JSON.stringify(_inheritedTarget.inherited)}} !== 7`);
+      }}
+    }} catch (_e: unknown) {{
+      _fuzzResults.push({{function: "{name}", input: `defaults semantics:${{_defaultsLabel}}`,
+        error_type: _e instanceof Error ? _e.constructor.name : "unknown",
+        message: _clipText(_e instanceof Error ? _e.message : String(_e)),
+        severity: "property_violation"}});
+      console.log(`  CRASH {name}(defaults semantics): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
       _fuzzTotalFailures++;
     }}
   }}

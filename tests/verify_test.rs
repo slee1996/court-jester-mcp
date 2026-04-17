@@ -821,6 +821,77 @@ export function matchesCaret(version: string, range: string): boolean {
 }
 
 #[tokio::test]
+async fn typescript_defaults_null_override_and_inherited_keys_fail_verify() {
+    let code = r#"
+const objectProto = Object.prototype;
+
+function shouldAssignDefault(object: Record<string, unknown>, key: string): boolean {
+  const value = object[key];
+  return value == null || (value === objectProto[key] && !Object.hasOwn(object, key));
+}
+
+export function defaults<T extends object>(object: T, ...sources: Array<object | null | undefined>): T {
+  const target = Object(object) as Record<string, unknown>;
+  for (const source of sources) {
+    if (source == null) {
+      continue;
+    }
+    for (const key of Object.keys(source)) {
+      if (shouldAssignDefault(target, key)) {
+        target[key] = (source as Record<string, unknown>)[key];
+      }
+    }
+  }
+  return target as T;
+}
+"#;
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+
+    assert!(!report.overall_ok, "report: {:#?}", report.stages);
+
+    let exec_stage = report
+        .stages
+        .iter()
+        .find(|s| s.name == "execute")
+        .expect("execute stage should be present");
+    assert!(
+        !exec_stage.ok,
+        "defaults should fail verify when null targets are overwritten or inherited keys are skipped"
+    );
+}
+
+#[tokio::test]
+async fn typescript_defaults_null_override_and_inherited_keys_can_pass_verify() {
+    let code = r#"
+const objectProto = Object.prototype;
+
+function shouldAssignDefault(object: Record<string, unknown>, key: string): boolean {
+  const value = object[key];
+  return value === undefined || (value === objectProto[key] && !Object.hasOwn(object, key));
+}
+
+export function defaults<T extends object>(object: T, ...sources: Array<object | null | undefined>): T {
+  const target = Object(object) as Record<string, unknown>;
+  for (const source of sources) {
+    if (source == null) {
+      continue;
+    }
+    for (const key in Object(source)) {
+      if (shouldAssignDefault(target, key)) {
+        target[key] = (source as Record<string, unknown>)[key];
+      }
+    }
+  }
+  return target as T;
+}
+"#;
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+
+    assert!(report.overall_ok, "report: {:#?}", report.stages);
+    assert!(report.stages.iter().any(|s| s.name == "execute" && s.ok));
+}
+
+#[tokio::test]
 async fn query_string_nullish_leak_fails_verify() {
     let code = r#"
 from urllib.parse import quote_plus
