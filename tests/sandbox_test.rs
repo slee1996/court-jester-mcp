@@ -358,3 +358,31 @@ console.log(hasLoader ? "loader" : "transform");
     assert_eq!(result.exit_code, Some(0), "stderr: {}", result.stderr);
     assert_eq!(result.stdout.trim(), "transform");
 }
+
+#[tokio::test]
+async fn typescript_source_file_executes_original_file_when_code_matches_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("main.ts");
+
+    let code = r#"
+console.log(process.argv[1]);
+"#;
+    std::fs::write(&source_path, code).unwrap();
+
+    let result = execute(
+        code,
+        &Language::TypeScript,
+        10.0,
+        128,
+        None,
+        Some(source_path.to_str().unwrap()),
+    )
+    .await;
+
+    assert_eq!(result.exit_code, Some(0), "stderr: {}", result.stderr);
+    assert!(
+        result.stdout.trim().ends_with("main.ts"),
+        "should execute original source file, got: {}",
+        result.stdout
+    );
+}
