@@ -6,6 +6,7 @@ This folder now has a small canonical set at the top level, with older planning 
 
 - [court-jester-overview.md](court-jester-overview.md): what Court Jester is, why it exists, and how the benchmark is meant to answer product questions
 - [release-readiness-private-beta.md](release-readiness-private-beta.md): current release bar and honest status read
+- [release-notes-0.1.6.md](release-notes-0.1.6.md): release summary and validation for version `0.1.6`
 - [release-notes-0.1.5.md](release-notes-0.1.5.md): release summary and validation for version `0.1.5`
 - [benchmark-2026-04-10.md](benchmark-2026-04-10.md): current strongest benchmark summary
 - [benchmark-2026-03-26.md](benchmark-2026-03-26.md): earlier six-task benchmark summary
