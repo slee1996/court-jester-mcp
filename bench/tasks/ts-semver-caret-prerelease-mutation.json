@@ -1,0 +1,59 @@
+{
+  "id": "ts-semver-caret-prerelease-mutation",
+  "title": "Seeded TypeScript semver-caret mutation from existing repo example",
+  "repo_fixture": "mini_ts_semver_caret_service_fixed",
+  "prompt": "Repair the seeded semver caret mutation so prerelease candidates are excluded and zero-major ranges enforce the correct upper bounds.",
+  "language": "typescript",
+  "bucket": "verify_mutation_recall",
+  "verify_paths": [
+    "range.ts"
+  ],
+  "setup_commands": [
+    [
+      "python",
+      "{bench_root}/materialize_mutation.py",
+      "{workspace}",
+      "range.ts",
+      "{bench_root}/repos/mini_ts_semver_caret_service/range.ts"
+    ]
+  ],
+  "setup_cache_key": "mutation-ts-semver-caret-prerelease-v1",
+  "verify_test_path": "tests/court_jester_public_verify.ts",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_semver_caret_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "range.ts"
+  ],
+  "family": "mutation_seed",
+  "bug_class": "mutation_seed",
+  "bug_surface": "semver_membership",
+  "difficulty": "medium",
+  "seeded_variant_of": "ts-semver-caret-prerelease",
+  "golden_patch_description": "Restore prerelease exclusion and zero-major caret semantics after seeding the existing repo bug into a known-good base fixture.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "execute"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": false,
+  "uses_project_dir": false,
+  "uses_relative_imports": false,
+  "cross_file": false,
+  "tags": [
+    "typescript",
+    "mutation_seed",
+    "verify_mutation_recall",
+    "semver",
+    "caret",
+    "prerelease"
+  ]
+}

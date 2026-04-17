@@ -63,6 +63,9 @@ The benchmark is intentionally split into different suite roles. Do not treat ev
 - `known-good-corpus`
   - `suite_kind: false_positive_control`
   - local false-positive control on already-correct implementations
+- `verify-mutation-seeds-v1`
+  - `suite_kind: verify_mutation_recall`
+  - seeded-bug recall suite built by copying buggy source files from existing repo fixtures into known-good base fixtures during task setup
 - `swebench-lite-known-good`
   - `suite_kind: external_false_positive_control`
   - upstream-derived false-positive control via gold patches
@@ -91,6 +94,8 @@ The benchmark is intentionally split into different suite roles. Do not treat ev
 Recommended usage:
 
 - use `core-current` for the headline CLI utility number
+- use `verify-mutation-seeds-v1` with `noop + advisory` when you want a pure verify-recall read on seeded bugs
+- pair `verify-mutation-seeds-v1` with `known-good-corpus` when you want recall and local specificity together
 - use `public-repair-proving-ground` for public-vs-verify mechanism questions
 - use `known-good-corpus` and `swebench-lite-known-good` for false-positive control
 - use `swebench-lite-pilot` as the first external held-out sanity slice
@@ -140,8 +145,13 @@ Current Express alpha status:
 - `bench/evaluators/`: hidden evaluator scripts
 - `bench/results/`: run artifacts and summaries
 - `bench/run_matrix.py`: matrix runner
+- `bench/materialize_mutation.py`: task-setup helper that copies seeded bug files from existing repo fixtures into the copied workspace
 - `bench/summarize_runs.py`: result summarizer
 - `bench/dashboard.py`: live local dashboard server
+
+Mutation recall and broader verify-eval planning:
+
+- [bench/verify-eval-roadmap.md](/Users/spencerlee/court-jester-mcp/bench/verify-eval-roadmap.md)
 
 Each run directory now records more than the final outcome:
 

@@ -82,6 +82,63 @@ class SummarizeRunsTest(unittest.TestCase):
         self.assertAlmostEqual(summary["avg_agent_trace_overhead_estimate_ms"], 105.0)
         self.assertEqual(summary["repair_feedback_styles"], '{"detailed": 1}')
 
+    def test_summarize_items_reports_verify_expectation_classifier_metrics(self) -> None:
+        summary = summarize_items(
+            [
+                {
+                    "verify_failed": True,
+                    "task_metadata": {
+                        "expected_verify_outcome": "fail",
+                        "expected_verify_failure_kinds": ["execute"],
+                    },
+                    "verify_summary": {"failed_stage_counts": {"execute": 1}},
+                    "failure_details": {"verify_failure_stage": "execute"},
+                },
+                {
+                    "verify_failed": False,
+                    "task_metadata": {
+                        "expected_verify_outcome": "fail",
+                        "expected_verify_failure_kinds": ["execute"],
+                    },
+                    "verify_summary": {"failed_stage_counts": {}},
+                    "failure_details": {},
+                },
+                {
+                    "verify_failed": False,
+                    "task_metadata": {
+                        "expected_verify_outcome": "pass",
+                        "expected_verify_failure_kinds": [],
+                    },
+                    "verify_summary": {"failed_stage_counts": {}},
+                    "failure_details": {},
+                },
+                {
+                    "verify_failed": True,
+                    "task_metadata": {
+                        "expected_verify_outcome": "pass",
+                        "expected_verify_failure_kinds": [],
+                    },
+                    "verify_summary": {"failed_stage_counts": {"test": 1}},
+                    "failure_details": {"verify_failure_stage": "test"},
+                },
+            ]
+        )
+
+        self.assertEqual(summary["verify_expectation_items"], 4)
+        self.assertEqual(summary["expected_verify_passes"], 2)
+        self.assertEqual(summary["expected_verify_fails"], 2)
+        self.assertEqual(summary["verify_true_positives"], 1)
+        self.assertEqual(summary["verify_false_negatives"], 1)
+        self.assertEqual(summary["verify_true_negatives"], 1)
+        self.assertEqual(summary["verify_false_positives"], 1)
+        self.assertAlmostEqual(summary["verify_outcome_accuracy"], 0.5)
+        self.assertAlmostEqual(summary["verify_recall"], 0.5)
+        self.assertAlmostEqual(summary["verify_specificity"], 0.5)
+        self.assertAlmostEqual(summary["verify_precision"], 0.5)
+        self.assertEqual(summary["verify_failure_kind_expectations"], 2)
+        self.assertEqual(summary["verify_failure_kind_hits"], 1)
+        self.assertAlmostEqual(summary["verify_failure_kind_hit_rate"], 0.5)
+
     def test_iter_lift_rows_compares_policy_against_baseline(self) -> None:
         rows = iter_lift_rows(
             {

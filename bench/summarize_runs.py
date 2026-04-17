@@ -40,6 +40,28 @@ def main() -> int:
     bug_class_summaries = summarize_grouped(bug_class_grouped)
     task_summaries = summarize_grouped(task_grouped)
 
+    print("verify_expectation_metrics")
+    print(
+        "model_id,policy_id,policy_role,total,verify_expectation_items,expected_verify_passes,"
+        "expected_verify_fails,verify_true_positives,verify_false_negatives,verify_true_negatives,"
+        "verify_false_positives,verify_outcome_accuracy,verify_recall,verify_specificity,"
+        "verify_precision,verify_failure_kind_expectations,verify_failure_kind_hits,"
+        "verify_failure_kind_hit_rate"
+    )
+    for (model_id, policy_id), summary in sorted(grouped_summaries.items()):
+        print(
+            f"{model_id},{policy_id},{policy_role(policy_id)},{summary['total']},"
+            f"{summary['verify_expectation_items']},{summary['expected_verify_passes']},"
+            f"{summary['expected_verify_fails']},{summary['verify_true_positives']},"
+            f"{summary['verify_false_negatives']},{summary['verify_true_negatives']},"
+            f"{summary['verify_false_positives']},{format_metric(summary['verify_outcome_accuracy'])},"
+            f"{format_metric(summary['verify_recall'])},{format_metric(summary['verify_specificity'])},"
+            f"{format_metric(summary['verify_precision'])},"
+            f"{summary['verify_failure_kind_expectations']},{summary['verify_failure_kind_hits']},"
+            f"{format_metric(summary['verify_failure_kind_hit_rate'])}"
+        )
+
+    print()
     print("headline_repair_loop_success")
     print(
         "model_id,policy_id,policy_role,total,successes,success_rate,repaired_after_verify_failure,"
@@ -333,6 +355,31 @@ def summarize_items(items: list[dict[str, object]]) -> dict[str, object]:
     product_successes_per_hour = optional_ratio(successes, total_product_loop_hours)
     product_minutes_per_success = optional_ratio(total_product_loop_ms / 60_000.0, successes)
     verify_recovery_rate = optional_ratio(repaired_after_verify_failure, verify_triggered_repairs)
+    (
+        verify_expectation_items,
+        expected_verify_passes,
+        expected_verify_fails,
+        verify_true_positives,
+        verify_false_negatives,
+        verify_true_negatives,
+        verify_false_positives,
+        verify_failure_kind_expectations,
+        verify_failure_kind_hits,
+    ) = summarize_verify_expectations(items)
+    verify_outcome_accuracy = optional_ratio(
+        verify_true_positives + verify_true_negatives,
+        verify_expectation_items,
+    )
+    verify_recall = optional_ratio(verify_true_positives, expected_verify_fails)
+    verify_specificity = optional_ratio(verify_true_negatives, expected_verify_passes)
+    verify_precision = optional_ratio(
+        verify_true_positives,
+        verify_true_positives + verify_false_positives,
+    )
+    verify_failure_kind_hit_rate = optional_ratio(
+        verify_failure_kind_hits,
+        verify_failure_kind_expectations,
+    )
     failure_counts = defaultdict(int)
     repair_trigger_counts = defaultdict(int)
     repair_feedback_style_counts = defaultdict(int)
@@ -361,6 +408,20 @@ def summarize_items(items: list[dict[str, object]]) -> dict[str, object]:
         "repaired_after_verify_failure": repaired_after_verify_failure,
         "repaired_after_public_failure": repaired_after_public_failure,
         "verify_recovery_rate": verify_recovery_rate,
+        "verify_expectation_items": verify_expectation_items,
+        "expected_verify_passes": expected_verify_passes,
+        "expected_verify_fails": expected_verify_fails,
+        "verify_true_positives": verify_true_positives,
+        "verify_false_negatives": verify_false_negatives,
+        "verify_true_negatives": verify_true_negatives,
+        "verify_false_positives": verify_false_positives,
+        "verify_outcome_accuracy": verify_outcome_accuracy,
+        "verify_recall": verify_recall,
+        "verify_specificity": verify_specificity,
+        "verify_precision": verify_precision,
+        "verify_failure_kind_expectations": verify_failure_kind_expectations,
+        "verify_failure_kind_hits": verify_failure_kind_hits,
+        "verify_failure_kind_hit_rate": verify_failure_kind_hit_rate,
         "avg_attempts": avg_attempts,
         "total_end_to_end_ms": total_end_to_end_ms,
         "avg_end_to_end_ms": avg_end_to_end_ms,
@@ -475,6 +536,101 @@ def repair_sources_for_item(item: dict[str, object]) -> list[str]:
     if source:
         return [str(source)]
     return []
+
+
+def summarize_verify_expectations(
+    items: list[dict[str, object]],
+) -> tuple[int, int, int, int, int, int, int, int, int]:
+    verify_expectation_items = 0
+    expected_verify_passes = 0
+    expected_verify_fails = 0
+    verify_true_positives = 0
+    verify_false_negatives = 0
+    verify_true_negatives = 0
+    verify_false_positives = 0
+    verify_failure_kind_expectations = 0
+    verify_failure_kind_hits = 0
+
+    for item in items:
+        expected = expected_verify_outcome_for_item(item)
+        if expected is None:
+            continue
+        verify_expectation_items += 1
+        actual_failed = bool(item.get("verify_failed"))
+        if expected == "fail":
+            expected_verify_fails += 1
+            if actual_failed:
+                verify_true_positives += 1
+            else:
+                verify_false_negatives += 1
+        else:
+            expected_verify_passes += 1
+            if actual_failed:
+                verify_false_positives += 1
+            else:
+                verify_true_negatives += 1
+
+        expected_failure_kinds = expected_verify_failure_kinds_for_item(item)
+        if expected == "fail" and expected_failure_kinds:
+            verify_failure_kind_expectations += 1
+            if actual_failed and verify_failure_kind_matched(item, expected_failure_kinds):
+                verify_failure_kind_hits += 1
+
+    return (
+        verify_expectation_items,
+        expected_verify_passes,
+        expected_verify_fails,
+        verify_true_positives,
+        verify_false_negatives,
+        verify_true_negatives,
+        verify_false_positives,
+        verify_failure_kind_expectations,
+        verify_failure_kind_hits,
+    )
+
+
+def expected_verify_outcome_for_item(item: dict[str, object]) -> str | None:
+    metadata = item.get("task_metadata")
+    if not isinstance(metadata, dict):
+        return None
+    value = metadata.get("expected_verify_outcome")
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"pass", "fail"}:
+        return normalized
+    return None
+
+
+def expected_verify_failure_kinds_for_item(item: dict[str, object]) -> list[str]:
+    metadata = item.get("task_metadata")
+    if not isinstance(metadata, dict):
+        return []
+    value = metadata.get("expected_verify_failure_kinds")
+    if not isinstance(value, list):
+        return []
+    return [str(kind) for kind in value if str(kind).strip()]
+
+
+def verify_failure_kind_matched(item: dict[str, object], expected_failure_kinds: list[str]) -> bool:
+    failure_stage = None
+    failure_details = item.get("failure_details")
+    if isinstance(failure_details, dict):
+        raw_stage = failure_details.get("verify_failure_stage")
+        if isinstance(raw_stage, str):
+            failure_stage = raw_stage
+
+    failed_stage_counts: dict[str, object] = {}
+    verify_summary = item.get("verify_summary")
+    if isinstance(verify_summary, dict):
+        raw_counts = verify_summary.get("failed_stage_counts")
+        if isinstance(raw_counts, dict):
+            failed_stage_counts = raw_counts
+
+    observed = {str(name) for name in failed_stage_counts.keys()}
+    if failure_stage:
+        observed.add(failure_stage)
+    return any(kind in observed for kind in expected_failure_kinds)
 
 
 def optional_ratio(numerator: float, denominator: float) -> float | None:

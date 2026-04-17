@@ -1,0 +1,15 @@
+{
+  "id": "verify-mutation-seeds-v1",
+  "title": "Verify Mutation Seeds v1",
+  "goal": "Measure Court Jester verify recall on seeded bugs pulled from existing repo examples and applied to known-good base fixtures.",
+  "suite_kind": "verify_mutation_recall",
+  "task_ids": [
+    "py-query-string-canonicalization-mutation",
+    "ts-query-string-canonicalization-mutation",
+    "ts-feature-flag-explicit-false-mutation",
+    "ts-semver-compare-prerelease-mutation",
+    "ts-semver-caret-prerelease-mutation",
+    "ts-lodash-array-slice-1-mutation",
+    "ts-lodash-object-slice-1-mutation"
+  ]
+}

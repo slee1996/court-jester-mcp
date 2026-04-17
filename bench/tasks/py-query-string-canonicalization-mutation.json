@@ -1,0 +1,59 @@
+{
+  "id": "py-query-string-canonicalization-mutation",
+  "title": "Seeded Python query-string mutation from existing repo example",
+  "repo_fixture": "mini_py_query_string_service_fixed",
+  "prompt": "Repair the seeded query-string mutation so canonical query strings skip blank values, preserve list order, and normalize accented characters to ASCII before URL encoding.",
+  "language": "python",
+  "bucket": "verify_mutation_recall",
+  "verify_paths": [
+    "query.py"
+  ],
+  "setup_commands": [
+    [
+      "python",
+      "{bench_root}/materialize_mutation.py",
+      "{workspace}",
+      "query.py",
+      "{bench_root}/repos/mini_py_query_string_service/query.py"
+    ]
+  ],
+  "setup_cache_key": "mutation-py-query-string-canonicalization-v1",
+  "verify_test_path": "tests/court_jester_public_verify.py",
+  "public_check_commands": [
+    [
+      "python",
+      "tests/public_checks.py"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/py_query_string_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "query.py"
+  ],
+  "family": "mutation_seed",
+  "bug_class": "mutation_seed",
+  "bug_surface": "serialization",
+  "difficulty": "medium",
+  "seeded_variant_of": "py-query-string-canonicalization",
+  "golden_patch_description": "Restore canonical query-string serialization after seeding the existing repo bug into a known-good base fixture.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "execute"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": false,
+  "uses_project_dir": false,
+  "uses_relative_imports": false,
+  "cross_file": false,
+  "tags": [
+    "python",
+    "mutation_seed",
+    "verify_mutation_recall",
+    "serialization",
+    "query_string",
+    "normalization"
+  ]
+}

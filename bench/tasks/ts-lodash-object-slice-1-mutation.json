@@ -1,0 +1,68 @@
+{
+  "id": "ts-lodash-object-slice-1-mutation",
+  "title": "Seeded lodash object mutation from existing repo example",
+  "repo_fixture": "mini_ts_lodash_object_service_fixed",
+  "prompt": "Repair the seeded lodash object mutation so get, has, and pick match lodash 4.17.21 semantics around array indices, nullish traversal, and sparse path selection.",
+  "language": "typescript",
+  "bucket": "verify_mutation_recall",
+  "verify_paths": [
+    "object.ts",
+    "internals.ts"
+  ],
+  "setup_commands": [
+    [
+      "python",
+      "{bench_root}/materialize_mutation.py",
+      "{workspace}",
+      "object.ts",
+      "{bench_root}/repos/mini_ts_lodash_object_service/object.ts"
+    ],
+    [
+      "python",
+      "{bench_root}/materialize_mutation.py",
+      "{workspace}",
+      "internals.ts",
+      "{bench_root}/repos/mini_ts_lodash_object_service/internals.ts"
+    ]
+  ],
+  "setup_cache_key": "mutation-ts-lodash-object-slice-1-v1",
+  "verify_test_path": "tests/court_jester_public_verify.ts",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_lodash_object_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "object.ts",
+    "internals.ts"
+  ],
+  "family": "mutation_seed",
+  "bug_class": "mutation_seed",
+  "bug_surface": "cross_file",
+  "difficulty": "medium",
+  "seeded_variant_of": "ts-lodash-object-slice-1",
+  "golden_patch_description": "Restore the upstream-derived lodash object shard after seeding the existing repo bug into a known-good base fixture.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": false,
+  "cross_file": true,
+  "tags": [
+    "typescript",
+    "mutation_seed",
+    "verify_mutation_recall",
+    "library",
+    "lodash",
+    "object"
+  ]
+}
