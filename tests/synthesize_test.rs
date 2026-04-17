@@ -568,6 +568,31 @@ fn typescript_feature_flag_resolver_gets_explicit_false_semantics() {
 }
 
 #[test]
+fn typescript_semver_compare_gets_prerelease_semantics() {
+    let a = make_analysis(
+        vec![func(
+            "compareVersions",
+            vec![("left", Some("string")), ("right", Some("string"))],
+            Some("number"),
+        )],
+        vec![],
+    );
+    let code = synthesize_calls(&a, &Language::TypeScript);
+    assert!(
+        code.contains("semver compare semantics:${_semverLabel}"),
+        "semver compare harness should label semantic failures, got: {code}"
+    );
+    assert!(
+        code.contains("\"1.0.0-beta.1\", \"1.0.0\", -1"),
+        "semver compare harness should check prerelease-vs-release ordering, got: {code}"
+    );
+    assert!(
+        code.contains("\"1.0.0+build.1\", \"1.0.0+build.9\", 0"),
+        "semver compare harness should ignore build metadata, got: {code}"
+    );
+}
+
+#[test]
 fn typescript_prefers_exported_surface_over_internal_helpers() {
     let mut helper = func(
         "encode",

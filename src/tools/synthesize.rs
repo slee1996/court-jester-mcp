@@ -1251,6 +1251,8 @@ fn synthesize_typescript(analysis: &AnalysisResult, type_defs: &TsNamedTypes<'_>
             ts_query_string_semantic_check(func, &param_types, ret_type, type_defs);
         let feature_flag_override_check =
             ts_feature_flag_override_check(func, &param_types, ret_type, type_defs);
+        let semver_compare_semantic_check =
+            ts_semver_compare_semantic_check(func, &param_types, ret_type);
 
         code.push_str(&format!(
             r#"
@@ -1258,6 +1260,7 @@ fn synthesize_typescript(analysis: &AnalysisResult, type_defs: &TsNamedTypes<'_>
   const _fuzzOk = _fuzzOne("{name}", {iters}, () => [{gen_list}], (args: unknown[]) => ({name} as Function)(...args), {typecheck}, [{param_type_list}], [{properties_list}]);
 {query_string_semantic_check}
 {feature_flag_override_check}
+{semver_compare_semantic_check}
 }}
 "#,
             name = func.name,
@@ -1265,6 +1268,7 @@ fn synthesize_typescript(analysis: &AnalysisResult, type_defs: &TsNamedTypes<'_>
             typecheck = ts_type_check_fn(ret_type),
             query_string_semantic_check = query_string_semantic_check,
             feature_flag_override_check = feature_flag_override_check,
+            semver_compare_semantic_check = semver_compare_semantic_check,
         ));
 
         any_synthesized = true;
@@ -1705,6 +1709,60 @@ fn ts_feature_flag_override_check(
 "#,
         name = func.name,
         flag_key = flag_key,
+    )
+}
+
+fn ts_semver_compare_semantic_check(
+    func: &FunctionInfo,
+    param_types: &[String],
+    ret_type: &str,
+) -> String {
+    let lower = func.name.to_lowercase();
+    if param_types.len() != 2
+        || param_types[0].trim() != "string"
+        || param_types[1].trim() != "string"
+        || ret_type.trim() != "number"
+        || !is_api_surface(func)
+        || !ANTISYMMETRIC_NAME_CUES
+            .iter()
+            .any(|cue| lower.contains(cue))
+        || !(lower.contains("version") || lower.contains("semver"))
+    {
+        return String::new();
+    }
+
+    format!(
+        r#"  if (_fuzzOk) {{
+    let _semverLabel = "prerelease ordering";
+    try {{
+      const _semverCases: Array<[string, string, number]> = [
+        ["1.0.0-beta.1", "1.0.0", -1],
+        ["1.0.0-alpha", "1.0.0-alpha.1", -1],
+        ["1.0.0-beta.11", "1.0.0-beta.2", 1],
+        ["1.0.0+build.1", "1.0.0+build.9", 0],
+      ];
+      for (const [_left, _right, _expected] of _semverCases) {{
+        _semverLabel = `${{_left}} vs ${{_right}}`;
+        const _cmp = ({name} as Function)(_left, _right);
+        if (_cmpSign(_cmp) !== _cmpSign(_expected)) {{
+          throw new Error(`Semver compare semantics (${{_semverLabel}}): ${{JSON.stringify(_cmp)}} !== ${{_expected}}`);
+        }}
+        const _rev = ({name} as Function)(_right, _left);
+        if (_cmpSign(_rev) !== -_cmpSign(_expected)) {{
+          throw new Error(`Semver compare antisymmetry (${{_semverLabel}}): ${{JSON.stringify(_rev)}} !== ${{-_cmpSign(_expected)}}`);
+        }}
+      }}
+    }} catch (_e: unknown) {{
+      _fuzzResults.push({{function: "{name}", input: `semver compare semantics:${{_semverLabel}}`,
+        error_type: _e instanceof Error ? _e.constructor.name : "unknown",
+        message: _clipText(_e instanceof Error ? _e.message : String(_e)),
+        severity: "property_violation"}});
+      console.log(`  CRASH {name}(semver compare semantics): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
+      _fuzzTotalFailures++;
+    }}
+  }}
+"#,
+        name = func.name,
     )
 }
 
