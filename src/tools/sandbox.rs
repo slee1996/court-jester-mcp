@@ -155,6 +155,14 @@ fn which_binary(path_env: &str, binary: &str) -> Option<String> {
     None
 }
 
+fn tsx_loader_path(tsx_binary: &str) -> Option<String> {
+    let canonical = std::fs::canonicalize(tsx_binary).ok()?;
+    let loader = canonical.parent()?.join("loader.mjs");
+    loader
+        .exists()
+        .then(|| loader.to_string_lossy().to_string())
+}
+
 /// RAII guard that deletes files on drop (for sibling fuzz files).
 struct CleanupFiles {
     paths: Vec<std::path::PathBuf>,
@@ -173,6 +181,16 @@ fn has_python_relative_imports(code: &str) -> bool {
     code.lines().any(|line| {
         let trimmed = line.trim();
         trimmed.starts_with("from .") && trimmed.contains("import")
+    })
+}
+
+fn has_typescript_relative_imports(code: &str) -> bool {
+    code.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.contains("from \"./")
+            || trimmed.contains("from './")
+            || trimmed.contains("from \"../")
+            || trimmed.contains("from '../")
     })
 }
 
@@ -220,13 +238,7 @@ pub async fn execute(
     // - Otherwise, write to a temp directory (isolated, avoids polluting stdlib dirs etc.)
     let has_relative_imports = match language {
         Language::Python => has_python_relative_imports(code),
-        Language::TypeScript => code.lines().any(|l| {
-            let t = l.trim();
-            t.contains("from \"./")
-                || t.contains("from './")
-                || t.contains("from \"../")
-                || t.contains("from '../")
-        }),
+        Language::TypeScript => has_typescript_relative_imports(code),
     };
     let use_sibling = match language {
         Language::Python => source_file.is_some(),
@@ -364,12 +376,47 @@ pub async fn execute(
             let node_path = which_binary(&path, "node");
             let bun_path = which_binary(&path, "bun");
             let tsx_path = which_binary(&path, "tsx");
+            let tsx_loader_path = tsx_path.as_deref().and_then(tsx_loader_path);
+            let prefer_node_loader = has_typescript_relative_imports(code);
 
-            if let Some(node_path) = node_path {
-                // Prefer Node's built-in TypeScript transform path in the
-                // sandbox. It preserves Node semantics and avoids the IPC
-                // server startup that `tsx` uses, which fails under stricter
-                // sandboxing and creates false positives in execute/verify.
+            if prefer_node_loader {
+                if let (Some(node_path), Some(tsx_loader_path)) =
+                    (node_path.clone(), tsx_loader_path)
+                {
+                    // File-backed TypeScript needs full TS module semantics
+                    // across imports. Use Node with tsx's loader directly so we
+                    // stay on Node without paying for the tsx CLI's IPC server.
+                    (
+                        node_path,
+                        vec!["--import".to_string(), tsx_loader_path],
+                        path,
+                        envs,
+                    )
+                } else if let Some(node_path) = node_path {
+                    (
+                        node_path,
+                        vec![
+                            "--no-warnings".to_string(),
+                            "--experimental-transform-types".to_string(),
+                        ],
+                        path,
+                        envs,
+                    )
+                } else if let Some(bun_path) = bun_path {
+                    (bun_path, vec!["run".to_string()], path, envs)
+                } else if let Some(tsx_path) = tsx_path {
+                    // Last resort: tsx CLI can bootstrap TypeScript execution,
+                    // but it opens an IPC server that stricter sandboxes may
+                    // reject.
+                    (tsx_path, vec![], path, envs)
+                } else {
+                    ("npx".to_string(), vec!["tsx".to_string()], path, envs)
+                }
+            } else if let Some(node_path) = node_path {
+                // Prefer Node's built-in TypeScript transform path for
+                // standalone snippets. It avoids the IPC server startup that
+                // `tsx` uses, which fails under stricter sandboxing and
+                // creates false positives in execute/verify.
                 (
                     node_path,
                     vec![

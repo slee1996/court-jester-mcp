@@ -1,6 +1,21 @@
 use court_jester_mcp::tools::sandbox::execute;
 use court_jester_mcp::types::Language;
 
+fn tsx_loader_from_path() -> Option<String> {
+    let path_env = std::env::var("PATH").ok()?;
+    for dir in path_env.split(':') {
+        let candidate = std::path::Path::new(dir).join("tsx");
+        if candidate.exists() {
+            let canonical = std::fs::canonicalize(candidate).ok()?;
+            let loader = canonical.parent()?.join("loader.mjs");
+            if loader.exists() {
+                return Some(loader.to_string_lossy().to_string());
+            }
+        }
+    }
+    None
+}
+
 #[tokio::test]
 async fn python_hello_world() {
     let r = execute("print('hello')", &Language::Python, 10.0, 128, None, None).await;
@@ -178,4 +193,114 @@ setInterval(() => {}, 1000);
         "expected child-process RSS to trip memory limit, got: {:?}",
         r
     );
+}
+#[tokio::test]
+async fn typescript_source_file_handles_type_alias_import_runtime_on_node() {
+    let bun_ok = std::process::Command::new("bun")
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    assert!(bun_ok, "bun must be available for this regression test");
+
+    let dir = tempfile::tempdir().unwrap();
+    let helper_path = dir.path().join("internals.ts");
+    let source_path = dir.path().join("object.ts");
+
+    std::fs::write(
+        &helper_path,
+        "export type PathValue = string | number | Array<string | number>;\n",
+    )
+    .unwrap();
+    let code = r#"
+import { PathValue } from "./internals.ts";
+
+function pick(object: Record<string, unknown>, path: PathValue): unknown {
+  const key = String(path);
+  return object[key];
+}
+
+console.log(String(pick({ timezone: "UTC" }, "timezone")));
+"#;
+    std::fs::write(&source_path, code).unwrap();
+
+    let result = execute(
+        code,
+        &Language::TypeScript,
+        10.0,
+        128,
+        None,
+        Some(source_path.to_str().unwrap()),
+    )
+    .await;
+
+    assert_eq!(result.exit_code, Some(0), "stderr: {}", result.stderr);
+    assert_eq!(result.stdout.trim(), "UTC");
+}
+
+#[tokio::test]
+async fn typescript_source_file_prefers_node_loader_over_bun() {
+    let bun_ok = std::process::Command::new("bun")
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    assert!(bun_ok, "bun must be available for this regression test");
+
+    let tsx_loader = tsx_loader_from_path();
+    assert!(
+        tsx_loader.is_some(),
+        "tsx loader must be available for this regression test"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let helper_path = dir.path().join("helper.ts");
+    let source_path = dir.path().join("main.ts");
+
+    std::fs::write(&helper_path, "export const value = 7;\n").unwrap();
+    let code = r#"
+import { value } from "./helper.ts";
+
+const runtime = typeof process.versions.bun === "string" ? "bun" : "node";
+console.log(`${runtime}:${value}`);
+"#;
+    std::fs::write(&source_path, code).unwrap();
+
+    let result = execute(
+        code,
+        &Language::TypeScript,
+        10.0,
+        128,
+        None,
+        Some(source_path.to_str().unwrap()),
+    )
+    .await;
+
+    assert_eq!(result.exit_code, Some(0), "stderr: {}", result.stderr);
+    assert_eq!(result.stdout.trim(), "node:7");
+}
+
+#[tokio::test]
+async fn typescript_project_dir_without_imports_uses_node_transform_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("main.ts");
+
+    let code = r#"
+const hasLoader = process.execArgv.includes("--import");
+console.log(hasLoader ? "loader" : "transform");
+"#;
+    std::fs::write(&source_path, code).unwrap();
+
+    let result = execute(
+        code,
+        &Language::TypeScript,
+        10.0,
+        128,
+        Some(dir.path().to_str().unwrap()),
+        Some(source_path.to_str().unwrap()),
+    )
+    .await;
+
+    assert_eq!(result.exit_code, Some(0), "stderr: {}", result.stderr);
+    assert_eq!(result.stdout.trim(), "transform");
 }
