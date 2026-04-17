@@ -246,7 +246,13 @@ pub async fn verify(
         let mut all_classes = analysis.classes.clone();
         let mut all_aliases = analysis.aliases.clone();
         if let Some(src) = opts.source_file {
-            let imported = analyze::resolve_imported_types(&analysis, src, language);
+            let referenced_names = analyze::referenced_type_names_for_functions(&functions_to_fuzz);
+            let imported = analyze::resolve_imported_types_for_names(
+                &analysis,
+                src,
+                language,
+                &referenced_names,
+            );
             all_classes.extend(imported.classes);
             all_aliases.extend(imported.aliases);
         }

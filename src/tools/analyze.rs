@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use tree_sitter::Parser;
 
@@ -898,6 +898,49 @@ fn extract_ts_params(func: &tree_sitter::Node, source: &[u8]) -> Vec<ParamInfo> 
 
 // ── Import resolution ───────────────────────────────────────────────────────
 
+#[derive(Debug, Clone)]
+enum ParsedImportBinding {
+    Named {
+        local_name: String,
+        exported_name: String,
+    },
+    Namespace {
+        local_name: String,
+    },
+    Default {
+        local_name: String,
+    },
+    Wildcard,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedImport {
+    path: String,
+    bindings: Vec<ParsedImportBinding>,
+}
+
+type ImportRequest = Option<HashSet<String>>;
+
+#[derive(Default)]
+struct ImportResolutionState {
+    known_classes: HashSet<String>,
+    known_aliases: HashSet<String>,
+    processed_requests: HashMap<String, ImportRequest>,
+}
+
+/// Return referenced type names from the function surface that verify is about
+/// to fuzz.
+pub fn referenced_type_names_for_functions(functions: &[FunctionInfo]) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for func in functions {
+        for param in &func.params {
+            collect_annotation_names(param.type_annotation.as_deref(), &mut names);
+        }
+        collect_annotation_names(func.return_type.as_deref(), &mut names);
+    }
+    names
+}
+
 /// Resolve relative imports from analyzed code, analyze those files, and return
 /// additional named type definitions found in imported modules.
 /// This allows the fuzzer to construct proper objects or expand aliases.
@@ -913,26 +956,24 @@ pub fn resolve_imported_types(
     };
 
     // Collect known type names so we don't duplicate.
-    let known_classes: std::collections::HashSet<&str> =
-        analysis.classes.iter().map(|c| c.name.as_str()).collect();
-    let known_aliases: std::collections::HashSet<&str> =
-        analysis.aliases.iter().map(|a| a.name.as_str()).collect();
+    let known_classes: HashSet<&str> = analysis.classes.iter().map(|c| c.name.as_str()).collect();
+    let known_aliases: HashSet<&str> = analysis.aliases.iter().map(|a| a.name.as_str()).collect();
 
     let mut resolved_types = ResolvedTypeInfo::default();
-    let mut resolved_paths = std::collections::HashSet::new();
+    let mut resolved_paths = HashSet::new();
 
     for import in &analysis.imports {
-        let path = match parse_import_path(&import.statement, language) {
-            Some(p) => p,
+        let parsed = match parse_import(&import.statement, language) {
+            Some(parsed) => parsed,
             None => continue,
         };
 
         // Only resolve relative imports
-        if !path.starts_with('.') {
+        if !parsed.path.starts_with('.') {
             continue;
         }
 
-        let resolved = resolve_import_file(source_dir, &path, language);
+        let resolved = resolve_import_file(source_dir, &parsed.path, language);
         let resolved = match resolved {
             Some(r) => r,
             None => continue,
@@ -965,30 +1006,438 @@ pub fn resolve_imported_types(
     resolved_types
 }
 
-/// Extract the module path from an import statement.
-fn parse_import_path(statement: &str, language: &Language) -> Option<String> {
-    match language {
-        Language::TypeScript => {
-            // Match: from "path" or from 'path'
-            let from_idx = statement.find("from ")?;
-            let rest = &statement[from_idx + 5..];
-            let quote = rest.chars().find(|c| *c == '"' || *c == '\'')?;
-            let start = rest.find(quote)? + 1;
-            let end = start + rest[start..].find(quote)?;
-            Some(rest[start..end].to_string())
+/// Resolve only the imported type definitions reachable from the referenced
+/// names that the current verify pass will exercise.
+pub fn resolve_imported_types_for_names(
+    analysis: &AnalysisResult,
+    source_file: &str,
+    language: &Language,
+    referenced_names: &HashSet<String>,
+) -> ResolvedTypeInfo {
+    let mut state = ImportResolutionState {
+        known_classes: analysis.classes.iter().map(|c| c.name.clone()).collect(),
+        known_aliases: analysis.aliases.iter().map(|a| a.name.clone()).collect(),
+        processed_requests: HashMap::new(),
+    };
+
+    resolve_imported_types_for_request(
+        analysis,
+        std::path::Path::new(source_file),
+        language,
+        Some(referenced_names.clone()),
+        &mut state,
+    )
+}
+
+fn resolve_imported_types_for_request(
+    analysis: &AnalysisResult,
+    source_path: &std::path::Path,
+    language: &Language,
+    requested_names: ImportRequest,
+    state: &mut ImportResolutionState,
+) -> ResolvedTypeInfo {
+    let source_dir = match source_path.parent() {
+        Some(d) => d,
+        None => return ResolvedTypeInfo::default(),
+    };
+
+    let closure = expand_local_type_closure(analysis, requested_names.as_ref());
+    let local_class_names: HashSet<&str> =
+        analysis.classes.iter().map(|c| c.name.as_str()).collect();
+    let local_alias_names: HashSet<&str> =
+        analysis.aliases.iter().map(|a| a.name.as_str()).collect();
+
+    let mut resolved_types = ResolvedTypeInfo::default();
+
+    for class in &analysis.classes {
+        if closure.contains(class.name.as_str()) && state.known_classes.insert(class.name.clone()) {
+            resolved_types.classes.push(class.clone());
         }
-        Language::Python => {
-            // Match: from .module import ... or from .pkg.module import ...
-            let trimmed = statement.trim();
-            if trimmed.starts_with("from .") {
-                let rest = &trimmed[5..]; // after "from "
-                let end = rest.find(' ').unwrap_or(rest.len());
-                Some(rest[..end].to_string())
-            } else {
-                None
+    }
+    for alias in &analysis.aliases {
+        if closure.contains(alias.name.as_str()) && state.known_aliases.insert(alias.name.clone()) {
+            resolved_types.aliases.push(alias.clone());
+        }
+    }
+
+    let unresolved_names: HashSet<String> = closure
+        .iter()
+        .filter(|name| {
+            !local_class_names.contains(name.as_str()) && !local_alias_names.contains(name.as_str())
+        })
+        .cloned()
+        .collect();
+
+    let mut requests_by_path: HashMap<String, (std::path::PathBuf, ImportRequest)> = HashMap::new();
+    for import in &analysis.imports {
+        let parsed = match parse_import(&import.statement, language) {
+            Some(parsed) => parsed,
+            None => continue,
+        };
+        if !parsed.path.starts_with('.') {
+            continue;
+        }
+        let request = match request_for_import(&parsed, &unresolved_names) {
+            Some(request) => request,
+            None => continue,
+        };
+
+        let resolved = match resolve_import_file(source_dir, &parsed.path, language) {
+            Some(path) => path,
+            None => continue,
+        };
+        let key = resolved.to_string_lossy().to_string();
+        requests_by_path
+            .entry(key)
+            .and_modify(|(_, existing)| merge_import_request(existing, &request))
+            .or_insert((resolved, request));
+    }
+
+    for (path_key, (resolved, request)) in requests_by_path {
+        let delta = match note_import_request(&mut state.processed_requests, &path_key, &request) {
+            Some(delta) => delta,
+            None => continue,
+        };
+
+        let code = match std::fs::read_to_string(&resolved) {
+            Ok(code) => code,
+            Err(_) => continue,
+        };
+        let imported = analyze(&code, language);
+        let nested =
+            resolve_imported_types_for_request(&imported, &resolved, language, delta, state);
+        resolved_types.classes.extend(nested.classes);
+        resolved_types.aliases.extend(nested.aliases);
+    }
+
+    resolved_types
+}
+
+fn expand_local_type_closure(
+    analysis: &AnalysisResult,
+    requested_names: Option<&HashSet<String>>,
+) -> HashSet<String> {
+    let mut closure = HashSet::new();
+    let class_map: HashMap<&str, &ClassInfo> = analysis
+        .classes
+        .iter()
+        .map(|class| (class.name.as_str(), class))
+        .collect();
+    let alias_map: HashMap<&str, &TypeAliasInfo> = analysis
+        .aliases
+        .iter()
+        .map(|alias| (alias.name.as_str(), alias))
+        .collect();
+
+    let seed_names: Vec<String> = match requested_names {
+        Some(names) => names.iter().cloned().collect(),
+        None => analysis
+            .classes
+            .iter()
+            .map(|class| class.name.clone())
+            .chain(analysis.aliases.iter().map(|alias| alias.name.clone()))
+            .collect(),
+    };
+
+    let mut queue: VecDeque<String> = seed_names.into();
+    while let Some(name) = queue.pop_front() {
+        if !closure.insert(name.clone()) {
+            continue;
+        }
+
+        if let Some(class) = class_map.get(name.as_str()) {
+            for field in &class.fields {
+                enqueue_annotation_names(field.type_annotation.as_deref(), &mut queue, &closure);
+            }
+            continue;
+        }
+
+        if let Some(alias) = alias_map.get(name.as_str()) {
+            // Object aliases are already represented as ClassInfo fields, which avoids
+            // mistaking property names for imported type names.
+            if !class_map.contains_key(name.as_str()) {
+                enqueue_annotation_names(
+                    Some(alias.type_annotation.as_str()),
+                    &mut queue,
+                    &closure,
+                );
             }
         }
     }
+
+    closure
+}
+
+fn enqueue_annotation_names(
+    annotation: Option<&str>,
+    queue: &mut VecDeque<String>,
+    seen: &HashSet<String>,
+) {
+    let mut names = HashSet::new();
+    collect_annotation_names(annotation, &mut names);
+    for name in names {
+        if !seen.contains(&name) {
+            queue.push_back(name);
+        }
+    }
+}
+
+fn collect_annotation_names(annotation: Option<&str>, names: &mut HashSet<String>) {
+    let Some(annotation) = annotation else {
+        return;
+    };
+
+    let mut current = String::new();
+    for ch in annotation.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' || ch == '.' {
+            current.push(ch);
+            continue;
+        }
+
+        flush_type_token(&mut current, names);
+    }
+    flush_type_token(&mut current, names);
+}
+
+fn flush_type_token(current: &mut String, names: &mut HashSet<String>) {
+    if current.is_empty() {
+        return;
+    }
+    let token = std::mem::take(current);
+    let trimmed = token.trim_matches('.');
+    if trimmed.is_empty() {
+        return;
+    }
+    names.insert(trimmed.to_string());
+    if let Some(root) = trimmed.split('.').next() {
+        if !root.is_empty() {
+            names.insert(root.to_string());
+        }
+    }
+}
+
+fn request_for_import(
+    parsed: &ParsedImport,
+    unresolved_names: &HashSet<String>,
+) -> Option<ImportRequest> {
+    if unresolved_names.is_empty() {
+        return None;
+    }
+
+    let mut requested_exports = HashSet::new();
+    let mut needs_full_module = false;
+
+    for binding in &parsed.bindings {
+        match binding {
+            ParsedImportBinding::Named {
+                local_name,
+                exported_name,
+            } => {
+                if unresolved_names.contains(local_name) {
+                    requested_exports.insert(exported_name.clone());
+                }
+            }
+            ParsedImportBinding::Namespace { local_name }
+            | ParsedImportBinding::Default { local_name } => {
+                if unresolved_names.contains(local_name) {
+                    needs_full_module = true;
+                }
+            }
+            ParsedImportBinding::Wildcard => {
+                needs_full_module = true;
+            }
+        }
+    }
+
+    if needs_full_module {
+        Some(None)
+    } else if requested_exports.is_empty() {
+        None
+    } else {
+        Some(Some(requested_exports))
+    }
+}
+
+fn merge_import_request(existing: &mut ImportRequest, request: &ImportRequest) {
+    match (&mut *existing, request) {
+        (_, None) => *existing = None,
+        (Some(existing_names), Some(request_names)) => {
+            existing_names.extend(request_names.iter().cloned());
+        }
+        (None, _) => {}
+    }
+}
+
+fn note_import_request(
+    processed_requests: &mut HashMap<String, ImportRequest>,
+    path_key: &str,
+    request: &ImportRequest,
+) -> Option<ImportRequest> {
+    match processed_requests.get_mut(path_key) {
+        Some(existing) => match (&mut *existing, request) {
+            (None, _) => None,
+            (_, None) => {
+                *existing = None;
+                Some(None)
+            }
+            (Some(existing_names), Some(request_names)) => {
+                let delta: HashSet<String> = request_names
+                    .iter()
+                    .filter(|name| !existing_names.contains(*name))
+                    .cloned()
+                    .collect();
+                if delta.is_empty() {
+                    None
+                } else {
+                    existing_names.extend(delta.iter().cloned());
+                    Some(Some(delta))
+                }
+            }
+        },
+        None => {
+            processed_requests.insert(path_key.to_string(), request.clone());
+            Some(request.clone())
+        }
+    }
+}
+
+/// Extract the module path plus imported symbol bindings from an import statement.
+fn parse_import(statement: &str, language: &Language) -> Option<ParsedImport> {
+    match language {
+        Language::TypeScript => parse_typescript_import(statement),
+        Language::Python => parse_python_import(statement),
+    }
+}
+
+fn parse_typescript_import(statement: &str) -> Option<ParsedImport> {
+    let trimmed = statement.trim().trim_end_matches(';');
+    if !trimmed.starts_with("import ") {
+        return None;
+    }
+    let from_idx = trimmed.find("from ")?;
+    let clause = trimmed["import ".len()..from_idx].trim();
+    let rest = &trimmed[from_idx + 5..];
+    let quote = rest.chars().find(|c| *c == '"' || *c == '\'')?;
+    let start = rest.find(quote)? + 1;
+    let end = start + rest[start..].find(quote)?;
+    let path = rest[start..end].to_string();
+    let mut bindings = Vec::new();
+
+    parse_typescript_import_clause(clause, &mut bindings);
+    if bindings.is_empty() {
+        return None;
+    }
+
+    Some(ParsedImport { path, bindings })
+}
+
+fn parse_typescript_import_clause(clause: &str, bindings: &mut Vec<ParsedImportBinding>) {
+    let trimmed = clause.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    let trimmed = trimmed.strip_prefix("type ").unwrap_or(trimmed).trim();
+    if trimmed.starts_with('{') {
+        parse_typescript_named_imports(trimmed, bindings);
+        return;
+    }
+    if let Some(local_name) = trimmed.strip_prefix("* as ").map(str::trim) {
+        if !local_name.is_empty() {
+            bindings.push(ParsedImportBinding::Namespace {
+                local_name: local_name.to_string(),
+            });
+        }
+        return;
+    }
+    if let Some((default_part, rest)) = trimmed.split_once(',') {
+        let default_local = default_part.trim();
+        if !default_local.is_empty() {
+            bindings.push(ParsedImportBinding::Default {
+                local_name: default_local.to_string(),
+            });
+        }
+        parse_typescript_import_clause(rest, bindings);
+        return;
+    }
+
+    bindings.push(ParsedImportBinding::Default {
+        local_name: trimmed.to_string(),
+    });
+}
+
+fn parse_typescript_named_imports(clause: &str, bindings: &mut Vec<ParsedImportBinding>) {
+    let start = match clause.find('{') {
+        Some(idx) => idx,
+        None => return,
+    };
+    let end = match clause.rfind('}') {
+        Some(idx) if idx > start => idx,
+        _ => return,
+    };
+    let inner = &clause[start + 1..end];
+    for part in inner.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let part = part.strip_prefix("type ").unwrap_or(part).trim();
+        let (exported_name, local_name) = match part.split_once(" as ") {
+            Some((exported_name, local_name)) => (exported_name.trim(), local_name.trim()),
+            None => (part, part),
+        };
+        if exported_name.is_empty() || local_name.is_empty() {
+            continue;
+        }
+        bindings.push(ParsedImportBinding::Named {
+            local_name: local_name.to_string(),
+            exported_name: exported_name.to_string(),
+        });
+    }
+}
+
+fn parse_python_import(statement: &str) -> Option<ParsedImport> {
+    let trimmed = statement.trim();
+    if !trimmed.starts_with("from ") {
+        return None;
+    }
+
+    let rest = &trimmed["from ".len()..];
+    let import_idx = rest.find(" import ")?;
+    let path = rest[..import_idx].trim().to_string();
+    let imported = rest[import_idx + " import ".len()..].trim();
+    if imported.is_empty() {
+        return None;
+    }
+
+    let mut bindings = Vec::new();
+    if imported == "*" {
+        bindings.push(ParsedImportBinding::Wildcard);
+    } else {
+        for part in imported.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let (exported_name, local_name) = match part.split_once(" as ") {
+                Some((exported_name, local_name)) => (exported_name.trim(), local_name.trim()),
+                None => (part, part),
+            };
+            if exported_name.is_empty() || local_name.is_empty() {
+                continue;
+            }
+            bindings.push(ParsedImportBinding::Named {
+                local_name: local_name.to_string(),
+                exported_name: exported_name.to_string(),
+            });
+        }
+    }
+
+    if bindings.is_empty() {
+        return None;
+    }
+
+    Some(ParsedImport { path, bindings })
 }
 
 /// Resolve a relative import path to an actual file.

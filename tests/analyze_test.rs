@@ -364,6 +364,108 @@ fn resolve_imported_types_from_parent_python_relative_path() {
     assert_eq!(imported.classes[0].fields.len(), 2);
 }
 
+#[test]
+fn resolve_imported_types_for_names_only_loads_referenced_bindings() {
+    let dir = tempfile::tempdir().unwrap();
+
+    std::fs::write(
+        dir.path().join("types.ts"),
+        "\
+export type Foo = { id: number; };
+export type Bar = { name: string; };
+",
+    )
+    .unwrap();
+
+    let main_path = dir.path().join("main.ts");
+    std::fs::write(
+        &main_path,
+        "\
+import type { Foo, Bar } from \"./types\";
+export function onlyFoo(value: Foo): number { return value.id; }
+",
+    )
+    .unwrap();
+
+    let code = std::fs::read_to_string(&main_path).unwrap();
+    let analysis = analyze(&code, &Language::TypeScript);
+    let referenced = analyze::referenced_type_names_for_functions(&analysis.functions);
+    let imported = analyze::resolve_imported_types_for_names(
+        &analysis,
+        main_path.to_str().unwrap(),
+        &Language::TypeScript,
+        &referenced,
+    );
+
+    assert!(
+        imported.classes.iter().any(|class| class.name == "Foo"),
+        "referenced Foo should resolve"
+    );
+    assert!(
+        !imported.classes.iter().any(|class| class.name == "Bar"),
+        "unreferenced Bar should not resolve"
+    );
+    assert!(
+        imported.aliases.iter().any(|alias| alias.name == "Foo"),
+        "referenced Foo alias should resolve"
+    );
+    assert!(
+        !imported.aliases.iter().any(|alias| alias.name == "Bar"),
+        "unreferenced Bar alias should not resolve"
+    );
+}
+
+#[test]
+fn resolve_imported_types_for_names_keeps_transitive_dependencies() {
+    let dir = tempfile::tempdir().unwrap();
+
+    std::fs::write(
+        dir.path().join("shared.ts"),
+        "export type PathValue = string | number;",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("types.ts"),
+        "\
+import type { PathValue } from \"./shared\";
+export type Profile = { key: PathValue; };
+",
+    )
+    .unwrap();
+
+    let main_path = dir.path().join("main.ts");
+    std::fs::write(
+        &main_path,
+        "\
+import type { Profile } from \"./types\";
+export function profileKey(value: Profile): string | number { return value.key; }
+",
+    )
+    .unwrap();
+
+    let code = std::fs::read_to_string(&main_path).unwrap();
+    let analysis = analyze(&code, &Language::TypeScript);
+    let referenced = analyze::referenced_type_names_for_functions(&analysis.functions);
+    let imported = analyze::resolve_imported_types_for_names(
+        &analysis,
+        main_path.to_str().unwrap(),
+        &Language::TypeScript,
+        &referenced,
+    );
+
+    assert!(
+        imported.classes.iter().any(|class| class.name == "Profile"),
+        "referenced Profile should resolve"
+    );
+    assert!(
+        imported
+            .aliases
+            .iter()
+            .any(|alias| alias.name == "PathValue"),
+        "transitive PathValue alias should resolve"
+    );
+}
+
 // ── Per-function complexity (Change 2) ──────────────────────────────────────
 
 #[test]
