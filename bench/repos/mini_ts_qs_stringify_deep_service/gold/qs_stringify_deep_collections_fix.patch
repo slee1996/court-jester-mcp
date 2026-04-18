@@ -1,0 +1,56 @@
+--- a/stringify.ts
++++ b/stringify.ts
+@@ -2,10 +2,31 @@
+   return encodeURIComponent(value);
+ }
+ 
+-function appendScalar(entries: string[], key: string, value: unknown): void {
++function appendEntries(entries: string[], key: string, value: unknown): void {
+   if (value === undefined || value === null) {
+     return;
+   }
++  if (Array.isArray(value)) {
++    if (value.length === 0) {
++      return;
++    }
++    const arrayKey = key.includes("[") ? `${key}[]` : key;
++    for (const item of value) {
++      appendEntries(entries, arrayKey, item);
++    }
++    return;
++  }
++  if (typeof value === "object") {
++    const objectValue = value as Record<string, unknown>;
++    const childKeys = Object.keys(objectValue).sort();
++    if (childKeys.length === 0) {
++      return;
++    }
++    for (const childKey of childKeys) {
++      appendEntries(entries, `${key}[${childKey}]`, objectValue[childKey]);
++    }
++    return;
++  }
+   entries.push(`${encodePart(key)}=${encodePart(String(value))}`);
+ }
+ 
+@@ -13,19 +34,7 @@
+   const entries: string[] = [];
+   for (const key of Object.keys(input).sort()) {
+     const value = input[key];
+-    if (Array.isArray(value)) {
+-      for (const item of value) {
+-        appendScalar(entries, key, item);
+-      }
+-      continue;
+-    }
+-    if (value && typeof value === "object") {
+-      for (const childKey of Object.keys(value as Record<string, unknown>).sort()) {
+-        appendScalar(entries, `${key}[${childKey}]`, (value as Record<string, unknown>)[childKey]);
+-      }
+-      continue;
+-    }
+-    appendScalar(entries, key, value);
++    appendEntries(entries, key, value);
+   }
+   return entries.join("&");
+ }

@@ -20,6 +20,10 @@
     "{bench_root}/evaluators/ts_qs_parse_deep_hidden.py",
     "{workspace}"
   ],
+  "gold_patch_path": "gold/qs_parse_deep_collections_fix.patch",
+  "gold_changed_files": [
+    "parse.ts"
+  ],
   "expected_files": [
     "parse.ts"
   ],

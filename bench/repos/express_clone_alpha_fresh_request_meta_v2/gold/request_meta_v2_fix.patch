@@ -1,0 +1,137 @@
+--- a/lib/http.ts
++++ b/lib/http.ts
+@@ -123,7 +123,9 @@
+     request.header = request.get;
+   }
+   if (typeof request.protocol !== "string") {
+-    request.protocol = request.encrypted === true ? "https" : "http";
++    const trustProxy = request.app?.__settings.get("trust proxy");
++    const forwarded = trustProxy ? requestHeader(request, "x-forwarded-proto")?.split(",", 1)[0]?.trim().toLowerCase() : undefined;
++    request.protocol = forwarded || (request.encrypted === true ? "https" : "http");
+   }
+   if (typeof request.secure !== "boolean") {
+     request.secure = request.protocol === "https";
+--- a/lib/query.ts
++++ b/lib/query.ts
+@@ -4,7 +4,72 @@
+   return decodeURIComponent(value.replace(/\+/g, " "));
+ }
+ 
+-function parseFlat(input: string): Record<string, unknown> {
++function assignNested(target: Record<string, unknown>, key: string, value: string): void {
++  const parts = key
++    .replace(/\]/g, "")
++    .split("[")
++    .filter(Boolean);
++  if (parts.length === 0) {
++    return;
++  }
++  let cursor: Record<string, unknown> | unknown[] = target;
++  for (let index = 0; index < parts.length; index += 1) {
++    const part = parts[index]!;
++    const isLast = index === parts.length - 1;
++    if (Array.isArray(cursor)) {
++      if (part === "") {
++        if (isLast) {
++          cursor.push(value);
++          return;
++        }
++        const child: Record<string, unknown> = {};
++        cursor.push(child);
++        cursor = child;
++        continue;
++      }
++      const numeric = Number(part);
++      const slot = Number.isInteger(numeric) && numeric >= 0 ? numeric : cursor.length;
++      if (isLast) {
++        cursor[slot] = value;
++        return;
++      }
++      const existing = cursor[slot];
++      if (existing && typeof existing === "object") {
++        cursor = existing as Record<string, unknown> | unknown[];
++      } else {
++        const child: Record<string, unknown> = {};
++        cursor[slot] = child;
++        cursor = child;
++      }
++      continue;
++    }
++    const nextPart = parts[index + 1];
++    if (isLast) {
++      const existing = cursor[part];
++      if (existing === undefined) {
++        cursor[part] = value;
++        return;
++      }
++      if (Array.isArray(existing)) {
++        existing.push(value);
++        return;
++      }
++      cursor[part] = [existing, value];
++      return;
++    }
++    const wantsArray = nextPart === "" || /^\d+$/.test(nextPart || "");
++    const existing = cursor[part];
++    if (existing && typeof existing === "object") {
++      cursor = existing as Record<string, unknown> | unknown[];
++      continue;
++    }
++    const child: Record<string, unknown> | unknown[] = wantsArray ? [] : {};
++    cursor[part] = child;
++    cursor = child;
++  }
++}
++
++function parseSimple(input: string): Record<string, unknown> {
+   const result: Record<string, unknown> = {};
+   if (!input.trim()) {
+     return result;
+@@ -14,11 +79,35 @@
+       continue;
+     }
+     const [rawKey, rawValue = ""] = segment.split("=", 2);
+-    result[decodePart(rawKey)] = decodePart(rawValue);
++    const key = decodePart(rawKey);
++    const value = decodePart(rawValue);
++    const existing = result[key];
++    if (existing === undefined) {
++      result[key] = value;
++    } else if (Array.isArray(existing)) {
++      existing.push(value);
++    } else {
++      result[key] = [existing, value];
++    }
+   }
+   return result;
+ }
+ 
++function parseExtended(input: string): Record<string, unknown> {
++  const result: Record<string, unknown> = {};
++  if (!input.trim()) {
++    return result;
++  }
++  for (const segment of input.split("&")) {
++    if (!segment) {
++      continue;
++    }
++    const [rawKey, rawValue = ""] = segment.split("=", 2);
++    assignNested(result, decodePart(rawKey), decodePart(rawValue));
++  }
++  return result;
++}
++
+ export function normalizeQueryParserSetting(input: unknown): QueryParserSetting {
+   if (input === undefined || input === true) {
+     return "simple";
+@@ -42,6 +131,8 @@
+   if (typeof setting === "function") {
+     return setting(input);
+   }
+-  // TODO(build-spec): implement duplicate-key and nested extended parsing.
+-  return parseFlat(input);
++  if (setting === "extended") {
++    return parseExtended(input);
++  }
++  return parseSimple(input);
+ }

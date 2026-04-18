@@ -71,7 +71,7 @@ The benchmark is intentionally split into different suite roles. Do not treat ev
   - upstream-derived false-positive control via gold patches
 - `external-known-good-replay`
   - `suite_kind: external_false_positive_control`
-  - broader upstream-derived false-positive control via task-local gold patches across requests-style, packaging, node-semver, and lodash repo tasks
+  - broader upstream-derived false-positive control via task-local gold patches across requests-style, packaging, node-semver, lodash, qs, and fresh Express repo tasks
 - `swebench-lite-pilot`
   - `suite_kind: external_held_out_pilot`
   - held-out external slice that is not built from Court Jester-shaped fixture tasks

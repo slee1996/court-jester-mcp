@@ -11,6 +11,15 @@
     "ts-semver-compare-prerelease",
     "ts-semver-caret-prerelease",
     "ts-lodash-array-slice-1",
-    "ts-lodash-object-slice-1"
+    "ts-lodash-object-slice-1",
+    "ts-qs-parse-nested-brackets",
+    "ts-qs-parse-deep-collections",
+    "ts-qs-stringify-empty-values",
+    "ts-qs-stringify-nested-nullish",
+    "ts-qs-stringify-deep-collections",
+    "ts-express-fresh-response-headers-v2",
+    "ts-express-fresh-request-meta-v2",
+    "ts-express-fresh-urlencoded-v2",
+    "ts-express-fresh-static-file-v2"
   ]
 }

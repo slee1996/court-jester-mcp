@@ -28,6 +28,11 @@
     "{workspace}",
     "tests/hidden_spec.ts"
   ],
+  "gold_patch_path": "gold/request_meta_v2_fix.patch",
+  "gold_changed_files": [
+    "lib/http.ts",
+    "lib/query.ts"
+  ],
   "expected_files": [
     "lib/http.ts",
     "lib/query.ts",

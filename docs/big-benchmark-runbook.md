@@ -29,7 +29,7 @@ As of this runbook:
 - [core-current.json](../bench/task_sets/core-current.json): `39` tasks
 - [library-slices.json](../bench/task_sets/library-slices.json): `2` tasks
 - [known-good-corpus.json](../bench/task_sets/known-good-corpus.json): `8` local tasks
-- [external-known-good-replay.json](../bench/task_sets/external-known-good-replay.json): `8` external gold-patch replay tasks
+- [external-known-good-replay.json](../bench/task_sets/external-known-good-replay.json): `17` external gold-patch replay tasks
 - [swebench-lite-known-good.json](../bench/task_sets/swebench-lite-known-good.json): `1` focused SWE-bench-style replay
 
 The core set is already large enough to be meaningful.
@@ -103,7 +103,7 @@ python -m bench.run_matrix \
 
 Run count:
 
-- `8 tasks x 1 model x 1 policy x 10 repeats = 80 runs`
+- `17 tasks x 1 model x 1 policy x 10 repeats = 170 runs`
 
 This is the upstream replay control. Read it by replay success, not `verify_expectation_metrics`, because the underlying task manifests still encode the buggy-state verify expectation.
 
@@ -179,13 +179,13 @@ It still does **not** prove:
 Before using this as the primary release case, expand these two sets:
 
 - library slices: grow from `2` to `6-10` tasks
-- external known-good replay: grow from `8` to `12-16` tasks
+- external known-good replay: grow from `17` to `20-24` tasks
 
 The strongest next package would be:
 
 - core utility: current `468` runs
 - expanded library slices: roughly `160` runs
-- expanded external known-good replay: roughly `120-160` runs
+- expanded external known-good replay: roughly `200-240` runs
 
 ## Recommended Execution Order
 

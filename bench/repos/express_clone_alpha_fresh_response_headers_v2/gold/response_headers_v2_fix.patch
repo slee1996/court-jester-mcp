@@ -1,0 +1,64 @@
+--- a/lib/http.ts
++++ b/lib/http.ts
+@@ -6,6 +6,30 @@
+   return name.toLowerCase();
+ }
+ 
++function encodeLocation(value: string): string {
++  return encodeURI(value);
++}
++
++function mergeVary(existing: string | undefined, next: string): string {
++  const entries: string[] = [];
++  const seen = new Set<string>();
++  for (const source of [existing || "", next]) {
++    for (const part of source.split(",")) {
++      const item = part.trim();
++      if (!item) {
++        continue;
++      }
++      const lowered = item.toLowerCase();
++      if (seen.has(lowered)) {
++        continue;
++      }
++      seen.add(lowered);
++      entries.push(item);
++    }
++  }
++  return entries.join(", ");
++}
++
+ export function pathnameFromUrl(value: string | undefined): string {
+   if (!value) {
+     return "/";
+@@ -188,13 +212,19 @@
+   if (typeof response.sendStatus !== "function") {
+     response.sendStatus = (code: number) => {
+       response.status?.(code);
+-      return response.send?.(String(code));
++      if (code === 204 || code === 205 || code === 304) {
++        response.end?.("");
++        return response;
++      }
++      return response.send?.(STATUS_TEXT[code] || String(code));
+     };
+   }
+   if (typeof response.location !== "function") {
+     response.location = (value: string) => {
+       const target =
+-        value === "back" ? requestHeader(request, "referer") || requestHeader(request, "referrer") || "/" : value;
++        value === "back"
++          ? requestHeader(request, "referer") || requestHeader(request, "referrer") || "/"
++          : encodeLocation(value);
+       response.setHeader?.("Location", target);
+       return response;
+     };
+@@ -210,7 +240,7 @@
+   }
+   if (typeof response.vary !== "function") {
+     response.vary = (field: string) => {
+-      response.setHeader?.("Vary", field);
++      response.setHeader?.("Vary", mergeVary(response.getHeader?.("Vary"), field));
+       return response;
+     };
+   }

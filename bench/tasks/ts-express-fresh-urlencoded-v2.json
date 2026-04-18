@@ -27,6 +27,10 @@
     "{workspace}",
     "tests/hidden_spec.ts"
   ],
+  "gold_patch_path": "gold/urlencoded_v2_fix.patch",
+  "gold_changed_files": [
+    "lib/query.ts"
+  ],
   "expected_files": [
     "index.ts",
     "lib/query.ts"

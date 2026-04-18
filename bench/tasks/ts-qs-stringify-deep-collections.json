@@ -20,6 +20,10 @@
     "{bench_root}/evaluators/ts_qs_stringify_deep_hidden.py",
     "{workspace}"
   ],
+  "gold_patch_path": "gold/qs_stringify_deep_collections_fix.patch",
+  "gold_changed_files": [
+    "stringify.ts"
+  ],
   "expected_files": [
     "stringify.ts"
   ],

@@ -26,6 +26,10 @@
     "{workspace}",
     "tests/hidden_spec.ts"
   ],
+  "gold_patch_path": "gold/response_headers_v2_fix.patch",
+  "gold_changed_files": [
+    "lib/http.ts"
+  ],
   "expected_files": [
     "lib/http.ts"
   ],

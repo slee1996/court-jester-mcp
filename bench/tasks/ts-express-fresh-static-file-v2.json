@@ -27,6 +27,10 @@
     "{workspace}",
     "tests/hidden_spec.ts"
   ],
+  "gold_patch_path": "gold/static_file_v2_fix.patch",
+  "gold_changed_files": [
+    "index.ts"
+  ],
   "expected_files": [
     "index.ts",
     "lib/http.ts"
