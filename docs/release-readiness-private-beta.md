@@ -189,30 +189,31 @@ Current evidence supports continuing toward a private beta.
 
 Current evidence does not yet justify a broad public claim that Court Jester is generally ready for all users and all agent workflows.
 
-Updated utility and reliability read on 2026-04-10:
+Updated utility and reliability read on 2026-04-18:
 
-- clean strict `core-current` utility run:
-  - `claude-default`: `35 / 39` baseline -> `37 / 39` verify-only repair loop
-  - `codex-default`: `36 / 39` baseline -> `39 / 39` verify-only repair loop
+- repeated strict `core-current` utility run:
+  - `claude-default`: `102 / 117` baseline -> `116 / 117` verify-only repair loop
+  - `codex-default`: `107 / 117` baseline -> `116 / 117` verify-only repair loop
 - aggregate:
-  - `71 / 78` baseline -> `76 / 78` verify-only repair loop
+  - `209 / 234` baseline -> `232 / 234` verify-only repair loop
+  - `89.3% -> 99.1%`
+  - `+23` saved tasks
 - repair attribution:
-  - `11` repair rounds were triggered by Court Jester `verify`
+  - `31` repair rounds were triggered by Court Jester `verify`
   - `0` repair rounds were triggered by public or hidden evaluator feedback
-  - `10` verify-triggered repair rounds ended in success
-- known-good control:
-  - `20 / 20` success under `noop + required-final`
-- provider caveat:
-  - one Claude run in the strict benchmark still failed as `provider_error`
-  - provider failures are now classified separately enough that they do not contaminate the utility read
+  - `29` verify-triggered repair rounds ended in success
+- false-positive gauntlet:
+  - `80 / 80` success on the local `known-good-corpus` under `noop + required-final`
+  - `190 / 190` success on `external-known-good-replay` under `noop + required-final --use-task-gold-patches`
+  - `270 / 270` combined clean control passes
 
 Interpretation:
 
-- the clean utility evidence is stronger than it was in March
-- the strictest current benchmark still shows real lift
+- the clean utility evidence is stronger than it was in March and stronger than the earlier `76 / 78` strict run
+- the strictest current benchmark still shows real lift after the verifier was tightened against false positives
 - the strongest current evidence is now specifically about verify-triggered repair, not evaluator-feedback-triggered retry
-- the immediate known-good false-positive blocker remains cleared on the expanded local control corpus
-- current external provider health is still a separate release risk because it can contaminate fresh reruns even when the benchmark logic is sound
+- the immediate false-positive blocker remains cleared on both the local corpus and the broader external replay lane
+- provider health still matters operationally, but it no longer dominates the benchmark read here
 
 Updated false-positive control result on 2026-04-17:
 

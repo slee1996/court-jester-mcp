@@ -6,10 +6,13 @@ This folder now has a small canonical set at the top level, with older planning 
 
 - [court-jester-overview.md](court-jester-overview.md): what Court Jester is, why it exists, and how the benchmark is meant to answer product questions
 - [release-readiness-private-beta.md](release-readiness-private-beta.md): current release bar and honest status read
+- [release-notes-0.1.8.md](release-notes-0.1.8.md): release summary and validation for version `0.1.8`
 - [release-notes-0.1.7.md](release-notes-0.1.7.md): release summary and validation for version `0.1.7`
 - [release-notes-0.1.6.md](release-notes-0.1.6.md): release summary and validation for version `0.1.6`
 - [release-notes-0.1.5.md](release-notes-0.1.5.md): release summary and validation for version `0.1.5`
-- [benchmark-2026-04-10.md](benchmark-2026-04-10.md): current strongest benchmark summary
+- [benchmark-methodology.md](benchmark-methodology.md): detailed explanation of the benchmark design, control lanes, attribution logic, and interpretation rules
+- [benchmark-2026-04-18.md](benchmark-2026-04-18.md): current strongest benchmark summary, covering the expanded false-positive gauntlet and repeated `core-current` rerun
+- [benchmark-2026-04-10.md](benchmark-2026-04-10.md): earlier strict verify-only benchmark summary
 - [benchmark-2026-03-26.md](benchmark-2026-03-26.md): earlier six-task benchmark summary
 - [swebench-lite-plan.md](swebench-lite-plan.md): concrete plan for an external SWE-bench-style validation slice
 - [big-benchmark-runbook.md](big-benchmark-runbook.md): exact commands and pass/fail criteria for the large release-evidence run

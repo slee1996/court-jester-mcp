@@ -2,6 +2,11 @@
 
 Date: 2026-04-10
 
+Historical note:
+
+- this writeup was the strongest strict verify-only result as of 2026-04-10
+- it is now superseded by [benchmark-2026-04-18.md](benchmark-2026-04-18.md)
+
 ## Summary
 
 We now have a stronger causal benchmark than the earlier repeated `repair-loop` run.

@@ -18,7 +18,9 @@ The harness is intentionally separate from the Rust CLI. `court-jester` stays fo
 
 Benchmark writeups:
 
+- `docs/benchmark-methodology.md`
 - `docs/benchmark-2026-04-10.md`
+- `docs/benchmark-2026-04-18.md`
 - `docs/benchmark-2026-03-26.md`
 - `docs/archive/benchmark-2026-03-18.md`
 - `docs/archive/benchmark-and-fuzzing-2026-03-20.md`
@@ -35,7 +37,9 @@ Current headline run:
 - `39` tasks
 - models: `codex-default`, `claude-default`
 - policies: `baseline`, `repair-loop-verify-only`
-- result: `71 / 78` baseline -> `76 / 78` verify-only repair loop
+- repeats: `3`
+- result: `209 / 234` baseline -> `232 / 234` verify-only repair loop
+- false-positive gauntlet: `270 / 270` clean control passes
 - repair triggers: verify-only, with `0` public-trigger and `0` hidden-trigger repairs
 
 Next causal-control run:
@@ -72,7 +76,7 @@ The benchmark is intentionally split into different suite roles. Do not treat ev
 - `external-known-good-replay`
   - `suite_kind: external_false_positive_control`
   - broader upstream-derived false-positive control via task-local gold patches across requests-style, packaging, node-semver, lodash, qs, and fresh Express repo tasks
-  - current clean lane: `19/19`, then `38/38` over repeats under `noop + required-final --use-task-gold-patches`
+  - current clean lane: `190/190` under `noop + required-final --use-task-gold-patches --repeats 10`
 - `swebench-lite-pilot`
   - `suite_kind: external_held_out_pilot`
   - held-out external slice that is not built from Court Jester-shaped fixture tasks

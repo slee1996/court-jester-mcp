@@ -192,14 +192,17 @@ That makes it easy to use in:
 
 ## Evidence
 
-Court Jester's current headline benchmark is a 39-task verify-only repair policy on `core-current`.
+Court Jester's current headline benchmark is a repeated 39-task verify-only repair policy on `core-current`.
 
-- Claude: `35 / 39` baseline -> `37 / 39` with verify-guided repair
-- Codex: `36 / 39` baseline -> `39 / 39` with verify-guided repair
-- Known-good false-positive control: `20 / 20` passes
+- Claude: `102 / 117` baseline -> `116 / 117` with verify-guided repair
+- Codex: `107 / 117` baseline -> `116 / 117` with verify-guided repair
+- Aggregate: `209 / 234` baseline -> `232 / 234` with verify-guided repair
+- False-positive gauntlet: `270 / 270` passes (`80 / 80` local known-good, `190 / 190` external replay)
 
 More detail:
 
+- [docs/benchmark-2026-04-18.md](docs/benchmark-2026-04-18.md)
+- [docs/benchmark-methodology.md](docs/benchmark-methodology.md)
 - [docs/benchmark-2026-04-10.md](docs/benchmark-2026-04-10.md)
 - [docs/swebench-lite-plan.md](docs/swebench-lite-plan.md)
 - [docs/court-jester-overview.md](docs/court-jester-overview.md)
