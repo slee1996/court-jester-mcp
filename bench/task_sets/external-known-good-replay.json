@@ -7,6 +7,10 @@
     "py-swebench-lite-cookiejar-quoted",
     "py-packaging-version-ordering",
     "py-packaging-specifier-prerelease-membership",
-    "py-packaging-filter-prerelease-fallback"
+    "py-packaging-filter-prerelease-fallback",
+    "ts-semver-compare-prerelease",
+    "ts-semver-caret-prerelease",
+    "ts-lodash-array-slice-1",
+    "ts-lodash-object-slice-1"
   ]
 }

@@ -21,6 +21,11 @@
     "{bench_root}/evaluators/ts_lodash_object_hidden.py",
     "{workspace}"
   ],
+  "gold_patch_path": "gold/lodash_object_slice_fix.patch",
+  "gold_changed_files": [
+    "object.ts",
+    "internals.ts"
+  ],
   "expected_files": [
     "object.ts",
     "internals.ts"
@@ -39,6 +44,9 @@
   "uses_project_dir": false,
   "uses_relative_imports": false,
   "cross_file": true,
+  "upstream_benchmark": "lodash",
+  "upstream_instance_id": "object-slice-v1",
+  "instance_notes": "Compact Lodash 4.17.21 slice covering defaults, pick, and omit semantics.",
   "tags": [
     "typescript",
     "library",

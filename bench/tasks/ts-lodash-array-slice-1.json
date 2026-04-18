@@ -21,6 +21,11 @@
     "{bench_root}/evaluators/ts_lodash_array_hidden.py",
     "{workspace}"
   ],
+  "gold_patch_path": "gold/lodash_array_slice_fix.patch",
+  "gold_changed_files": [
+    "array.ts",
+    "internals.ts"
+  ],
   "expected_files": [
     "array.ts",
     "internals.ts"
@@ -39,6 +44,9 @@
   "uses_project_dir": false,
   "uses_relative_imports": false,
   "cross_file": true,
+  "upstream_benchmark": "lodash",
+  "upstream_instance_id": "array-slice-v1",
+  "instance_notes": "Compact Lodash 4.17.21 slice covering chunk, flatten, and uniq semantics.",
   "tags": [
     "typescript",
     "library",

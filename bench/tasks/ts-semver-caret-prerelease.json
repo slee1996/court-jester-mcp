@@ -20,13 +20,21 @@
     "{bench_root}/evaluators/ts_semver_caret_hidden.py",
     "{workspace}"
   ],
+  "gold_patch_path": "gold/semver_caret_prerelease_fix.patch",
+  "gold_changed_files": [
+    "range.ts"
+  ],
   "expected_files": [
     "range.ts"
   ],
+  "upstream_benchmark": "node-semver",
+  "upstream_instance_id": "caret-prerelease-v1",
+  "instance_notes": "Compact node-semver caret slice covering prerelease exclusion and zero-major upper-bound semantics.",
   "tags": [
     "typescript",
     "semver",
     "range",
-    "caret"
+    "caret",
+    "upstream_derived"
   ]
 }

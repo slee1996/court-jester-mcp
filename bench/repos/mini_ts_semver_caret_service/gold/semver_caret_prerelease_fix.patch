@@ -1,0 +1,22 @@
+--- a/range.ts
++++ b/range.ts
+@@ -37,11 +37,17 @@
+   }
+   const candidate = parseVersion(version);
+   const base = parseVersion(range.slice(1));
+-  if (!candidate || !base) {
++  if (!candidate || !base || candidate.prerelease != null) {
+     return false;
+   }
+   if (compareCore(candidate, base) < 0) {
+     return false;
+   }
+-  return candidate.major === base.major;
++  if (base.major > 0) {
++    return candidate.major === base.major;
++  }
++  if (base.minor > 0) {
++    return candidate.major === 0 && candidate.minor === base.minor;
++  }
++  return candidate.major === 0 && candidate.minor === 0 && candidate.patch === base.patch;
+ }

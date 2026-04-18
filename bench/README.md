@@ -71,7 +71,7 @@ The benchmark is intentionally split into different suite roles. Do not treat ev
   - upstream-derived false-positive control via gold patches
 - `external-known-good-replay`
   - `suite_kind: external_false_positive_control`
-  - broader upstream-derived false-positive control via task-local gold patches across SWE-bench-style and packaging-style repo tasks
+  - broader upstream-derived false-positive control via task-local gold patches across requests-style, packaging, node-semver, and lodash repo tasks
 - `swebench-lite-pilot`
   - `suite_kind: external_held_out_pilot`
   - held-out external slice that is not built from Court Jester-shaped fixture tasks
@@ -301,7 +301,7 @@ Replay task-level gold patches instead of asking a provider to edit the workspac
 
 ```bash
 python -m bench.run_matrix \
-  --task-set swebench-lite-known-good \
+  --task-set external-known-good-replay \
   --models noop \
   --policies required-final \
   --use-task-gold-patches \
@@ -309,6 +309,8 @@ python -m bench.run_matrix \
 ```
 
 This is intended for known-good control runs on upstream-derived tasks. The runner will apply `gold_patch_path`, then run `verify`, public checks, and hidden checks normally.
+
+For gold-patch replay lanes, read the run by replay success, not `verify_expectation_metrics`. The task manifests still describe the buggy state, so that table remains useful for bug tasks but intentionally looks wrong when you replay a known-good patch.
 
 Run the local already-correct control corpus without gold patches:
 

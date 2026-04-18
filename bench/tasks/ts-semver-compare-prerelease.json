@@ -20,13 +20,21 @@
     "{bench_root}/evaluators/ts_semver_compare_hidden.py",
     "{workspace}"
   ],
+  "gold_patch_path": "gold/semver_compare_prerelease_fix.patch",
+  "gold_changed_files": [
+    "compare.ts"
+  ],
   "expected_files": [
     "compare.ts"
   ],
+  "upstream_benchmark": "node-semver",
+  "upstream_instance_id": "compare-prerelease-v1",
+  "instance_notes": "Compact node-semver comparison slice covering prerelease ordering and build-metadata insensitivity.",
   "tags": [
     "typescript",
     "semver",
     "comparison",
-    "prerelease"
+    "prerelease",
+    "upstream_derived"
   ]
 }

@@ -1,0 +1,70 @@
+--- a/array.ts
++++ b/array.ts
+@@ -1,7 +1,10 @@
+ import { normalizeChunkSize, sameValueZero } from "./internals.ts";
+ 
+-export function chunk<T>(values: T[], size = 1): T[][] {
++export function chunk<T>(values: T[], size?: number): T[][] {
+   const normalized = normalizeChunkSize(size);
++  if (!Array.isArray(values) || values.length === 0 || normalized < 1) {
++    return [];
++  }
+   const result: T[][] = [];
+   for (let index = 0; index < values.length; index += normalized) {
+     result.push(values.slice(index, index + normalized));
+@@ -9,25 +12,25 @@
+   return result;
+ }
+ 
+-export function flatten<T>(values: Array<T | T[]>): Array<T | T[]> {
++export function flatten<T>(values: unknown): Array<T | T[]> {
++  if (!Array.isArray(values)) {
++    return [];
++  }
+   const result: Array<T | T[]> = [];
+   for (const value of values) {
+     if (Array.isArray(value)) {
+-      for (const inner of value) {
+-        if (Array.isArray(inner)) {
+-          result.push(...flatten(inner as Array<T | T[]>));
+-        } else {
+-          result.push(inner);
+-        }
+-      }
++      result.push(...value);
+     } else {
+-      result.push(value);
++      result.push(value as T);
+     }
+   }
+   return result;
+ }
+ 
+ export function uniq<T>(values: T[]): T[] {
++  if (!Array.isArray(values) || values.length === 0) {
++    return [];
++  }
+   const result: T[] = [];
+   for (const value of values) {
+     if (!result.some((existing) => sameValueZero(existing, value))) {
+--- a/internals.ts
++++ b/internals.ts
+@@ -1,10 +1,14 @@
+-export function normalizeChunkSize(size: number | undefined): number {
+-  if (size == null || !Number.isFinite(size)) {
++export function normalizeChunkSize(size: unknown): number {
++  if (size === undefined) {
+     return 1;
+   }
+-  return Math.max(1, Math.trunc(size));
++  const coerced = Number(size);
++  if (!Number.isFinite(coerced)) {
++    return 0;
++  }
++  return Math.max(Math.trunc(coerced), 0);
+ }
+ 
+ export function sameValueZero(left: unknown, right: unknown): boolean {
+-  return left === right;
++  return left === right || (left !== left && right !== right);
+ }

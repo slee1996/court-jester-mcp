@@ -29,7 +29,7 @@ As of this runbook:
 - [core-current.json](../bench/task_sets/core-current.json): `39` tasks
 - [library-slices.json](../bench/task_sets/library-slices.json): `2` tasks
 - [known-good-corpus.json](../bench/task_sets/known-good-corpus.json): `8` local tasks
-- [external-known-good-replay.json](../bench/task_sets/external-known-good-replay.json): `4` external gold-patch replay tasks
+- [external-known-good-replay.json](../bench/task_sets/external-known-good-replay.json): `8` external gold-patch replay tasks
 - [swebench-lite-known-good.json](../bench/task_sets/swebench-lite-known-good.json): `1` focused SWE-bench-style replay
 
 The core set is already large enough to be meaningful.
@@ -72,7 +72,7 @@ Run count:
 
 This is a pressure test for spec-conformance repair behavior, not the main release argument.
 
-### 3. Known-Good False-Positive Run
+### 3. Local Known-Good False-Positive Run
 
 ```bash
 python -m bench.run_matrix \
@@ -85,16 +85,35 @@ python -m bench.run_matrix \
 
 Run count:
 
-- `2 tasks x 1 model x 1 policy x 10 repeats = 20 runs`
+- `8 tasks x 1 model x 1 policy x 10 repeats = 80 runs`
 
-This is the current false-positive control.
+This is the local already-correct control.
 
-### 4. Summaries
+### 4. External Replay False-Positive Run
+
+```bash
+python -m bench.run_matrix \
+  --task-set external-known-good-replay \
+  --models noop \
+  --policies required-final \
+  --use-task-gold-patches \
+  --repeats 10 \
+  --output-dir /tmp/court-jester-external-known-good-big
+```
+
+Run count:
+
+- `8 tasks x 1 model x 1 policy x 10 repeats = 80 runs`
+
+This is the upstream replay control. Read it by replay success, not `verify_expectation_metrics`, because the underlying task manifests still encode the buggy-state verify expectation.
+
+### 5. Summaries
 
 ```bash
 python -m bench.summarize_runs /tmp/court-jester-core-big
 python -m bench.summarize_runs /tmp/court-jester-library-big
 python -m bench.summarize_runs /tmp/court-jester-known-good-big
+python -m bench.summarize_runs /tmp/court-jester-external-known-good-big
 ```
 
 ## How To Read The Results
@@ -117,12 +136,14 @@ Warning signs:
 
 Success criteria:
 
-- zero hard verify failures on the known-good corpus
+- zero hard verify failures on the local known-good corpus
+- zero blocked gold-patch replays on the external replay lane
 - no repair needed for known-good tasks
 
 Warning signs:
 
 - any `verify_stronger_than_eval` classification
+- any failed gold-patch replay on the external lane
 - repeated stage failures on already-correct code
 
 ### Reliability Gate
@@ -158,26 +179,29 @@ It still does **not** prove:
 Before using this as the primary release case, expand these two sets:
 
 - library slices: grow from `2` to `6-10` tasks
-- external known-good replay: grow from `4` to `8-12` tasks
+- external known-good replay: grow from `8` to `12-16` tasks
 
 The strongest next package would be:
 
 - core utility: current `468` runs
 - expanded library slices: roughly `160` runs
-- expanded external known-good replay: roughly `80-120` runs
+- expanded external known-good replay: roughly `120-160` runs
 
 ## Recommended Execution Order
 
-1. Run known-good first.
+1. Run local known-good first.
 This catches fresh false positives before spending time on the large utility matrix.
 
-2. Run core utility second.
+2. Run external replay second.
+This checks broader upstream-derived false positives before the utility spend.
+
+3. Run core utility third.
 This is the main evidence run.
 
-3. Run library slices third.
+4. Run library slices fourth.
 This adds pressure-test evidence without blocking the main release read.
 
-4. Run the stress harness separately if the goal is a full private-beta packet.
+5. Run the stress harness separately if the goal is a full private-beta packet.
 
 ## Notes
 
