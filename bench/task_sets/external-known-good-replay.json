@@ -17,9 +17,11 @@
     "ts-qs-stringify-empty-values",
     "ts-qs-stringify-nested-nullish",
     "ts-qs-stringify-deep-collections",
+    "ts-semver-max-satisfying-caret-prerelease",
     "ts-express-fresh-response-headers-v2",
     "ts-express-fresh-request-meta-v2",
     "ts-express-fresh-urlencoded-v2",
-    "ts-express-fresh-static-file-v2"
+    "ts-express-fresh-static-file-v2",
+    "ts-express-fresh-body-parsers-v2"
   ]
 }

@@ -1,0 +1,218 @@
+--- a/index.ts
++++ b/index.ts
+@@ -3,14 +3,24 @@
+ 
+ import { parseQueryString } from "./lib/query.ts";
+ import { createApplication, Route, Router } from "./lib/router.ts";
+-import { createHttpError, pathnameFromUrl, requestBodyText, requestContentType } from "./lib/http.ts";
+-import type { ApplicationLike, Handler, MiddlewareFactoryOptions, StaticMiddlewareOptions } from "./lib/types.ts";
++import {
++  createHttpError,
++  pathnameFromUrl,
++  requestBodyText,
++  requestContentType,
++} from "./lib/http.ts";
++import type {
++  ApplicationLike,
++  Handler,
++  MiddlewareFactoryOptions,
++  StaticMiddlewareOptions,
++} from "./lib/types.ts";
+ 
+ function createJsonMiddleware(options?: MiddlewareFactoryOptions): Handler {
+   const strict = options?.strict !== false;
+   return (req, _res, next) => {
+     const contentType = requestContentType(req);
+-    if (!contentType || !contentType.includes("json")) {
++    if (!contentType || (contentType !== "application/json" && !contentType.endsWith("+json"))) {
+       next();
+       return;
+     }
+@@ -79,18 +89,57 @@
+       next();
+       return;
+     }
++
+     let targetPath = pathnameFromUrl(req.url || req.originalUrl || "/");
+-    if ((targetPath === "/" || targetPath === "") && indexFile) {
+-      targetPath = `/${indexFile}`;
++    try {
++      targetPath = decodeURIComponent(targetPath || "/");
++    } catch {
++      next(createHttpError(400, "failed to decode path"));
++      return;
+     }
+-    const filePath = path.resolve(resolvedRoot, `.${path.posix.normalize(targetPath)}`);
++
++    let relativePath = targetPath;
++    if ((relativePath === "/" || relativePath === "") && indexFile) {
++      relativePath = `/${indexFile}`;
++    }
++    const normalized = path.posix.normalize(relativePath);
++    const candidate = path.resolve(resolvedRoot, `.${normalized}`);
++    if (candidate !== resolvedRoot && !candidate.startsWith(`${resolvedRoot}${path.sep}`)) {
++      next();
++      return;
++    }
++
++    let stats: fs.Stats;
+     try {
+-      const body = fs.readFileSync(filePath);
+-      res.type?.(path.extname(filePath));
+-      res.send?.(body);
++      stats = fs.statSync(candidate);
+     } catch {
+       next();
++      return;
+     }
++
++    let filePath = candidate;
++    if (stats.isDirectory()) {
++      if (!indexFile) {
++        next();
++        return;
++      }
++      filePath = path.join(candidate, indexFile);
++      try {
++        stats = fs.statSync(filePath);
++      } catch {
++        next();
++        return;
++      }
++    }
++
++    if (!stats.isFile()) {
++      next();
++      return;
++    }
++
++    res.type?.(path.extname(filePath));
++    const body = fs.readFileSync(filePath);
++    res.send?.(body);
+   };
+ }
+ 
+--- a/lib/query.ts
++++ b/lib/query.ts
+@@ -4,7 +4,72 @@
+   return decodeURIComponent(value.replace(/\+/g, " "));
+ }
+ 
+-function parseFlat(input: string): Record<string, unknown> {
++function assignNested(target: Record<string, unknown>, key: string, value: string): void {
++  const parts = key
++    .replace(/\]/g, "")
++    .split("[")
++    .filter(Boolean);
++  if (parts.length === 0) {
++    return;
++  }
++  let cursor: Record<string, unknown> | unknown[] = target;
++  for (let index = 0; index < parts.length; index += 1) {
++    const part = parts[index]!;
++    const isLast = index === parts.length - 1;
++    if (Array.isArray(cursor)) {
++      if (part === "") {
++        if (isLast) {
++          cursor.push(value);
++          return;
++        }
++        const child: Record<string, unknown> = {};
++        cursor.push(child);
++        cursor = child;
++        continue;
++      }
++      const numeric = Number(part);
++      const slot = Number.isInteger(numeric) && numeric >= 0 ? numeric : cursor.length;
++      if (isLast) {
++        cursor[slot] = value;
++        return;
++      }
++      const existing = cursor[slot];
++      if (existing && typeof existing === "object") {
++        cursor = existing as Record<string, unknown> | unknown[];
++      } else {
++        const child: Record<string, unknown> = {};
++        cursor[slot] = child;
++        cursor = child;
++      }
++      continue;
++    }
++    const nextPart = parts[index + 1];
++    if (isLast) {
++      const existing = cursor[part];
++      if (existing === undefined) {
++        cursor[part] = value;
++        return;
++      }
++      if (Array.isArray(existing)) {
++        existing.push(value);
++        return;
++      }
++      cursor[part] = [existing, value];
++      return;
++    }
++    const wantsArray = nextPart === "" || /^\d+$/.test(nextPart || "");
++    const existing = cursor[part];
++    if (existing && typeof existing === "object") {
++      cursor = existing as Record<string, unknown> | unknown[];
++      continue;
++    }
++    const child: Record<string, unknown> | unknown[] = wantsArray ? [] : {};
++    cursor[part] = child;
++    cursor = child;
++  }
++}
++
++function parseSimple(input: string): Record<string, unknown> {
+   const result: Record<string, unknown> = {};
+   if (!input.trim()) {
+     return result;
+@@ -14,11 +79,35 @@
+       continue;
+     }
+     const [rawKey, rawValue = ""] = segment.split("=", 2);
+-    result[decodePart(rawKey)] = decodePart(rawValue);
++    const key = decodePart(rawKey);
++    const value = decodePart(rawValue);
++    const existing = result[key];
++    if (existing === undefined) {
++      result[key] = value;
++    } else if (Array.isArray(existing)) {
++      existing.push(value);
++    } else {
++      result[key] = [existing, value];
++    }
+   }
+   return result;
+ }
+ 
++function parseExtended(input: string): Record<string, unknown> {
++  const result: Record<string, unknown> = {};
++  if (!input.trim()) {
++    return result;
++  }
++  for (const segment of input.split("&")) {
++    if (!segment) {
++      continue;
++    }
++    const [rawKey, rawValue = ""] = segment.split("=", 2);
++    assignNested(result, decodePart(rawKey), decodePart(rawValue));
++  }
++  return result;
++}
++
+ export function normalizeQueryParserSetting(input: unknown): QueryParserSetting {
+   if (input === undefined || input === true) {
+     return "simple";
+@@ -42,6 +131,8 @@
+   if (typeof setting === "function") {
+     return setting(input);
+   }
+-  // TODO(build-spec): implement duplicate-key and nested extended parsing.
+-  return parseFlat(input);
++  if (setting === "extended") {
++    return parseExtended(input);
++  }
++  return parseSimple(input);
+ }

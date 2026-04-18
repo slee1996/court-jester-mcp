@@ -44,6 +44,11 @@
   "upstream_benchmark": "node-semver",
   "upstream_instance_id": "max-satisfying-caret-prerelease-v1",
   "instance_notes": "Cross-file maxSatisfying slice derived from node-semver range and max-satisfying semantics.",
+  "gold_patch_path": "gold/semver_max_satisfying_fix.patch",
+  "gold_changed_files": [
+    "compare.ts",
+    "range.ts"
+  ],
   "tags": [
     "typescript",
     "library",

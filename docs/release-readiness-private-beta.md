@@ -219,7 +219,12 @@ Updated false-positive control result on 2026-04-17:
 - initial run exposed a real blocker: [ts-lodash-object-slice-1-known-good.json](../bench/tasks/ts-lodash-object-slice-1-known-good.json) failed with `verify_stronger_than_eval`
 - root cause: TypeScript fuzz synthesis treated unresolved named aliases such as `PathValue` as generic objects, producing impossible inputs for same-file helper functions
 - after broadening the corpus and fixing export-surface detection plus malformed-URI rejection, the local [known-good-corpus.json](../bench/task_sets/known-good-corpus.json) passed `8/8` and then `16/16` over repeats under `noop + required-final`
-- the broader external [external-known-good-replay.json](../bench/task_sets/external-known-good-replay.json) replay now covers `17` upstream-derived repo tasks across requests-style cookies, packaging, node-semver, lodash, qs, and fresh Express spec chunks, and it passed `17/17` and then `34/34` over repeats under `noop + required-final --use-task-gold-patches`
+- the broader external [external-known-good-replay.json](../bench/task_sets/external-known-good-replay.json) replay now covers `19` upstream-derived repo tasks across requests-style cookies, packaging, node-semver, lodash, qs, and fresh Express spec chunks, and it passed `19/19` and then `38/38` over repeats under `noop + required-final --use-task-gold-patches`
+
+Two additional upstream replay probes were intentionally left out of the headline lane on 2026-04-17:
+
+- `ts-express-fresh-router-core-v2` currently surfaces a real verifier false positive (`verify_stronger_than_eval`) on generic helper fuzz in `lib/http.ts`
+- `ts-express-fresh-static-v3` still needs a better upstream-grounded gold source before it is an honest known-good replay item
 
 That clears the immediate false-positive blocker on both the current local corpus and a broad external replay lane that is no longer dominated by a single library family. The next bar is pushing further into held-out repo-shaped controls and provider-backed false-positive validation.
 

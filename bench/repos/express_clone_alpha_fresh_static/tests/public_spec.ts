@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import express from "../index.ts";
 import { invoke } from "./harness.ts";
 
 {
-  const root = path.join(import.meta.dir, "..", "static");
+  const root = path.join(fileURLToPath(new URL("..", import.meta.url)), "static");
   const app = express();
   app.use((express as any).static(root));
   const response = await invoke(app, { url: "/hello.txt" });
@@ -15,7 +16,7 @@ import { invoke } from "./harness.ts";
 }
 
 {
-  const root = path.join(import.meta.dir, "..", "static");
+  const root = path.join(fileURLToPath(new URL("..", import.meta.url)), "static");
   const app = express();
   app.use((express as any).static(root));
   app.use((_req, res) => {

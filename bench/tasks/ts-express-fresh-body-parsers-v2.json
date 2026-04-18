@@ -50,6 +50,11 @@
   "upstream_benchmark": "express",
   "upstream_instance_id": "fresh-body-parsers-v2-public-repair-stress",
   "instance_notes": "Public-repair stress slice: visible JSON + extended urlencoded coverage, hidden nested-array follow-up, tests-only verify to avoid framework false positives.",
+  "gold_patch_path": "gold/body_parsers_v2_fix.patch",
+  "gold_changed_files": [
+    "index.ts",
+    "lib/query.ts"
+  ],
   "tags": [
     "typescript",
     "express",

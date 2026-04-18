@@ -72,6 +72,7 @@ The benchmark is intentionally split into different suite roles. Do not treat ev
 - `external-known-good-replay`
   - `suite_kind: external_false_positive_control`
   - broader upstream-derived false-positive control via task-local gold patches across requests-style, packaging, node-semver, lodash, qs, and fresh Express repo tasks
+  - current clean lane: `19/19`, then `38/38` over repeats under `noop + required-final --use-task-gold-patches`
 - `swebench-lite-pilot`
   - `suite_kind: external_held_out_pilot`
   - held-out external slice that is not built from Court Jester-shaped fixture tasks
@@ -311,6 +312,8 @@ python -m bench.run_matrix \
 This is intended for known-good control runs on upstream-derived tasks. The runner will apply `gold_patch_path`, then run `verify`, public checks, and hidden checks normally.
 
 For gold-patch replay lanes, read the run by replay success, not `verify_expectation_metrics`. The task manifests still describe the buggy state, so that table remains useful for bug tasks but intentionally looks wrong when you replay a known-good patch.
+
+Not every candidate task belongs in the replay gauntlet yet. Keep the lane semantically honest: if a gold patch only partially fixes a task or if replay surfaces a verifier false positive such as `verify_stronger_than_eval`, leave that task out of `external-known-good-replay` and treat it as follow-up false-positive work instead of padding the headline number.
 
 Run the local already-correct control corpus without gold patches:
 
