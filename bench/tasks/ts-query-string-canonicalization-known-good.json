@@ -1,0 +1,45 @@
+{
+  "id": "ts-query-string-canonicalization-known-good",
+  "title": "Known-good TypeScript query-string shard should pass without repair",
+  "repo_fixture": "mini_ts_query_string_service_fixed",
+  "prompt": "The implementation in this workspace is expected to already satisfy the upstream-derived query-string shard. Make no behavior change unless you find a real spec mismatch.",
+  "language": "typescript",
+  "bucket": "known_good_corpus",
+  "verify_paths": [
+    "query.ts"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.ts",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_query_string_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "query.ts"
+  ],
+  "family": "known_good",
+  "bug_class": "false_positive_control",
+  "bug_surface": "serialization",
+  "difficulty": "medium",
+  "golden_patch_description": "No semantic change required; this query-string fixture is already correct.",
+  "expected_verify_outcome": "pass",
+  "expected_verify_failure_kinds": [],
+  "expected_hidden_failure_without_fix": false,
+  "expected_public_failure_without_fix": false,
+  "uses_project_dir": false,
+  "uses_relative_imports": false,
+  "cross_file": false,
+  "tags": [
+    "typescript",
+    "known_good",
+    "serialization",
+    "query_string",
+    "false_positive_control"
+  ]
+}

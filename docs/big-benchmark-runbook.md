@@ -28,11 +28,12 @@ As of this runbook:
 
 - [core-current.json](../bench/task_sets/core-current.json): `39` tasks
 - [library-slices.json](../bench/task_sets/library-slices.json): `2` tasks
-- [known-good-corpus.json](../bench/task_sets/known-good-corpus.json): `2` tasks
+- [known-good-corpus.json](../bench/task_sets/known-good-corpus.json): `8` local tasks
+- [swebench-lite-known-good.json](../bench/task_sets/swebench-lite-known-good.json): `1` external gold-patch replay
 
 The core set is already large enough to be meaningful.
 
-The library and known-good sets are still too small to carry the release case by themselves. They are important, but they should be treated as supporting evidence until expanded.
+The library set is still too small to carry the release case by itself. The known-good controls are now materially better than the original two-task sample, but they are still supporting evidence rather than a standalone release case.
 
 ## Recommended Run Package
 
@@ -156,13 +157,13 @@ It still does **not** prove:
 Before using this as the primary release case, expand these two sets:
 
 - library slices: grow from `2` to `6-10` tasks
-- known-good corpus: grow from `2` to `8-12` tasks
+- external known-good replay: grow from `1` to `4-6` tasks
 
 The strongest next package would be:
 
 - core utility: current `468` runs
 - expanded library slices: roughly `160` runs
-- expanded known-good corpus: roughly `100` runs
+- expanded external known-good replay: roughly `40-60` runs
 
 ## Recommended Execution Order
 

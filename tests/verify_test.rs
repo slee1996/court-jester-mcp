@@ -1382,6 +1382,38 @@ async fn value_error_is_treated_as_a_crash() {
 }
 
 #[tokio::test]
+async fn typescript_malformed_uri_is_treated_as_reject_not_crash() {
+    let code = r#"
+export function decodeSegment(value: string): string {
+    return decodeURIComponent(value);
+}
+"#;
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+
+    assert!(
+        report.overall_ok,
+        "malformed URI inputs should be rejected, not fail verify: {:#?}",
+        report.stages
+    );
+
+    let exec_stage = report
+        .stages
+        .iter()
+        .find(|s| s.name == "execute")
+        .expect("execute stage should be present");
+    assert!(exec_stage.ok, "execute stage should pass: {:?}", exec_stage.error);
+
+    let failures = exec_stage
+        .detail
+        .as_ref()
+        .and_then(|detail| detail.get("fuzz_failures"));
+    assert!(
+        failures.is_none(),
+        "malformed URI rejections should not be recorded as fuzz failures: {failures:?}"
+    );
+}
+
+#[tokio::test]
 async fn fuzz_failures_truncate_large_inputs_and_messages() {
     let code =
         "def explode(name: str) -> str:\n    if len(name) < 1000:\n        return name\n    raise TypeError('x' * 500)";

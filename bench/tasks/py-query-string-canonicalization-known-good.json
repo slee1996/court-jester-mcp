@@ -1,0 +1,45 @@
+{
+  "id": "py-query-string-canonicalization-known-good",
+  "title": "Known-good Python query-string shard should pass without repair",
+  "repo_fixture": "mini_py_query_string_service_fixed",
+  "prompt": "The implementation in this workspace is expected to already satisfy the upstream-derived query-string shard. Make no behavior change unless you find a real spec mismatch.",
+  "language": "python",
+  "bucket": "known_good_corpus",
+  "verify_paths": [
+    "query.py"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.py",
+  "public_check_commands": [
+    [
+      "python",
+      "tests/public_checks.py"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/py_query_string_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "query.py"
+  ],
+  "family": "known_good",
+  "bug_class": "false_positive_control",
+  "bug_surface": "serialization",
+  "difficulty": "medium",
+  "golden_patch_description": "No semantic change required; this query-string fixture is already correct.",
+  "expected_verify_outcome": "pass",
+  "expected_verify_failure_kinds": [],
+  "expected_hidden_failure_without_fix": false,
+  "expected_public_failure_without_fix": false,
+  "uses_project_dir": false,
+  "uses_relative_imports": false,
+  "cross_file": false,
+  "tags": [
+    "python",
+    "known_good",
+    "serialization",
+    "query_string",
+    "false_positive_control"
+  ]
+}

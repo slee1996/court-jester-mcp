@@ -198,16 +198,17 @@ Interpretation:
 - the clean utility evidence is stronger than it was in March
 - the strictest current benchmark still shows real lift
 - the strongest current evidence is now specifically about verify-triggered repair, not evaluator-feedback-triggered retry
-- the immediate known-good false-positive blocker remains cleared on the current small control corpus
+- the immediate known-good false-positive blocker remains cleared on the expanded local control corpus
 - current external provider health is still a separate release risk because it can contaminate fresh reruns even when the benchmark logic is sound
 
-Updated false-positive control result on 2026-04-09:
+Updated false-positive control result on 2026-04-17:
 
 - initial run exposed a real blocker: [ts-lodash-object-slice-1-known-good.json](../bench/tasks/ts-lodash-object-slice-1-known-good.json) failed with `verify_stronger_than_eval`
 - root cause: TypeScript fuzz synthesis treated unresolved named aliases such as `PathValue` as generic objects, producing impossible inputs for same-file helper functions
-- after fixing synthesis and rebuilding the release binary, the known-good corpus passed `2/2` under `noop + required-final`
+- after broadening the corpus and fixing export-surface detection plus malformed-URI rejection, the local [known-good-corpus.json](../bench/task_sets/known-good-corpus.json) passed `8/8` and then `16/16` over repeats under `noop + required-final`
+- the external [swebench-lite-known-good.json](../bench/task_sets/swebench-lite-known-good.json) replay also passed `1/1` with task gold patches
 
-That clears the immediate false-positive blocker on the current control corpus, but it is still only a two-task sample. The next bar is broadening the known-good set rather than assuming this one fix is enough.
+That clears the immediate false-positive blocker on the current local corpus. The next bar is broadening the external known-good replay set rather than assuming one external control task is enough.
 
 The next milestone is clear:
 

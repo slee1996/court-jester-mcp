@@ -60,6 +60,7 @@ pub fn analyze(code: &str, language: &Language) -> AnalysisResult {
                 &mut imports,
                 0,
             );
+            mark_typescript_explicit_exports(&root, bytes, &mut functions);
         }
     }
 
@@ -787,6 +788,102 @@ fn ts_is_exported(node: &tree_sitter::Node) -> bool {
         current = candidate.parent();
     }
     false
+}
+
+fn mark_typescript_explicit_exports(
+    root: &tree_sitter::Node,
+    source: &[u8],
+    functions: &mut [FunctionInfo],
+) {
+    let exported_names = collect_typescript_explicit_exports(root, source);
+    if exported_names.is_empty() {
+        return;
+    }
+
+    for func in functions.iter_mut() {
+        if !func.is_method && !func.is_nested && exported_names.contains(&func.name) {
+            func.is_exported = true;
+        }
+    }
+}
+
+fn collect_typescript_explicit_exports(
+    root: &tree_sitter::Node,
+    source: &[u8],
+) -> HashSet<String> {
+    let mut exported_names = HashSet::new();
+    let mut cursor = root.walk();
+
+    for child in root.named_children(&mut cursor) {
+        if child.kind() != "export_statement" {
+            continue;
+        }
+
+        let stmt = text(&child, source).trim().trim_end_matches(';').trim();
+        let body = stmt.strip_prefix("export").unwrap_or(stmt).trim();
+        if body.starts_with('{') {
+            if body.contains(" from ") {
+                continue;
+            }
+            collect_typescript_named_exports(body, &mut exported_names);
+            continue;
+        }
+
+        if let Some(rest) = body.strip_prefix("default ").map(str::trim) {
+            if let Some(local_name) = parse_typescript_default_export_local(rest) {
+                exported_names.insert(local_name);
+            }
+        }
+    }
+
+    exported_names
+}
+
+fn collect_typescript_named_exports(clause: &str, names: &mut HashSet<String>) {
+    let start = match clause.find('{') {
+        Some(idx) => idx,
+        None => return,
+    };
+    let end = match clause.rfind('}') {
+        Some(idx) if idx > start => idx,
+        _ => return,
+    };
+    let inner = &clause[start + 1..end];
+
+    for part in inner.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let local_name = match part.split_once(" as ") {
+            Some((local_name, _exported_name)) => local_name.trim(),
+            None => part,
+        };
+        if !local_name.is_empty() && local_name != "default" {
+            names.insert(local_name.to_string());
+        }
+    }
+}
+
+fn parse_typescript_default_export_local(rest: &str) -> Option<String> {
+    if rest.is_empty() {
+        return None;
+    }
+    let candidate = rest
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '$'))
+        .next()
+        .unwrap_or("")
+        .trim();
+    if candidate.is_empty() {
+        return None;
+    }
+    if matches!(
+        candidate,
+        "function" | "class" | "async" | "const" | "let" | "var"
+    ) {
+        return None;
+    }
+    Some(candidate.to_string())
 }
 
 /// Extract fields from a TypeScript interface or class body.

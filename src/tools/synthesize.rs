@@ -2267,10 +2267,15 @@ function _shortJson(value: unknown, limit = _FUZZ_TEXT_LIMIT): string {
 }
 
 // Crash detection: real bugs vs intentional validation errors
+function _isMalformedUriError(e: unknown): boolean {
+  return e instanceof URIError && /malformed uri|uri malformed/i.test(e.message);
+}
+
 function _isCrash(e: unknown): boolean {
   if (e instanceof TypeError) return true;
   if (e instanceof RangeError) return true;
   if (e instanceof ReferenceError) return true;
+  if (_isMalformedUriError(e)) return false;
   if (e instanceof URIError) return true;
   // Property check violations (type, idempotency, consistency)
   if (e instanceof Error && (

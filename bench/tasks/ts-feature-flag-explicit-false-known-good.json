@@ -1,0 +1,47 @@
+{
+  "id": "ts-feature-flag-explicit-false-known-good",
+  "title": "Known-good TypeScript feature-flag shard should pass without repair",
+  "repo_fixture": "mini_ts_feature_flag_service_fixed",
+  "prompt": "The implementation in this workspace is expected to already satisfy the upstream-derived feature-flag shard. Make no behavior change unless you find a real spec mismatch.",
+  "language": "typescript",
+  "bucket": "known_good_corpus",
+  "verify_paths": [
+    "flags.ts",
+    "defaults.ts"
+  ],
+  "verify_test_path": "tests/court_jester_public_verify.ts",
+  "public_check_commands": [
+    [
+      "bun",
+      "tests/public_checks.ts"
+    ]
+  ],
+  "hidden_check_command": [
+    "python",
+    "{bench_root}/evaluators/ts_feature_flag_hidden.py",
+    "{workspace}"
+  ],
+  "expected_files": [
+    "flags.ts",
+    "defaults.ts"
+  ],
+  "family": "known_good",
+  "bug_class": "false_positive_control",
+  "bug_surface": "nullish_fallback",
+  "difficulty": "medium",
+  "golden_patch_description": "No semantic change required; this feature-flag fixture is already correct.",
+  "expected_verify_outcome": "pass",
+  "expected_verify_failure_kinds": [],
+  "expected_hidden_failure_without_fix": false,
+  "expected_public_failure_without_fix": false,
+  "uses_project_dir": false,
+  "uses_relative_imports": true,
+  "cross_file": true,
+  "tags": [
+    "typescript",
+    "known_good",
+    "feature_flags",
+    "nullish_fallback",
+    "false_positive_control"
+  ]
+}

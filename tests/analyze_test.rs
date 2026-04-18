@@ -138,6 +138,29 @@ fn typescript_export_arrow_function() {
 }
 
 #[test]
+fn typescript_export_list_and_default_export_mark_locals_exported() {
+    let code = "\
+function helper(): number { return 0; }
+function Route(path: string): string { return path; }
+const Router = (path: string): string => path.toUpperCase();
+function express(): string { return \"ok\"; }
+export { Route, Router };
+export default express;
+";
+    let r = analyze(code, &Language::TypeScript);
+    let exported: std::collections::HashMap<&str, bool> = r
+        .functions
+        .iter()
+        .map(|func| (func.name.as_str(), func.is_exported))
+        .collect();
+
+    assert_eq!(exported.get("helper"), Some(&false));
+    assert_eq!(exported.get("Route"), Some(&true));
+    assert_eq!(exported.get("Router"), Some(&true));
+    assert_eq!(exported.get("express"), Some(&true));
+}
+
+#[test]
 fn typescript_arrow_block_body() {
     let code = "const process = (x: string): string => {\n  if (x.length > 10) return x.slice(0, 10);\n  return x;\n};";
     let r = analyze(code, &Language::TypeScript);

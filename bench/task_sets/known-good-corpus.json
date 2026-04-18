@@ -4,7 +4,13 @@
   "goal": "Measure whether Court Jester wrongly fails already-correct implementations under gating and repair policies.",
   "suite_kind": "false_positive_control",
   "task_ids": [
+    "py-query-string-canonicalization-known-good",
+    "ts-query-string-canonicalization-known-good",
+    "ts-feature-flag-explicit-false-known-good",
+    "ts-semver-compare-prerelease-known-good",
+    "ts-semver-caret-prerelease-known-good",
     "ts-lodash-array-slice-1-known-good",
-    "ts-lodash-object-slice-1-known-good"
+    "ts-lodash-object-slice-1-known-good",
+    "ts-express-clone-alpha-known-good"
   ]
 }
