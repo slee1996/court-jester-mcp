@@ -20,6 +20,10 @@
     "{bench_root}/evaluators/py_packaging_specifier_hidden.py",
     "{workspace}"
   ],
+  "gold_patch_path": "gold/specifier_membership_fix.patch",
+  "gold_changed_files": [
+    "specifiers.py"
+  ],
   "expected_files": [
     "specifiers.py"
   ],

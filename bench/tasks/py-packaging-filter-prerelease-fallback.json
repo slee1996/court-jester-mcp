@@ -20,6 +20,10 @@
     "{bench_root}/evaluators/py_packaging_filter_hidden.py",
     "{workspace}"
   ],
+  "gold_patch_path": "gold/filter_prerelease_fallback_fix.patch",
+  "gold_changed_files": [
+    "filtering.py"
+  ],
   "expected_files": [
     "filtering.py"
   ],

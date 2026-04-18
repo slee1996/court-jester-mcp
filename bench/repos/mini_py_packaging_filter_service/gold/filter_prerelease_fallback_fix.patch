@@ -1,0 +1,97 @@
+--- a/filtering.py
++++ b/filtering.py
+@@ -1,29 +1,36 @@
+ import re
+ 
+ 
+-_CORE_RE = re.compile(r"^\s*[vV]?(\d+)(?:\.(\d+))?(?:\.(\d+))?")
++_VERSION_RE = re.compile(
++    r"^\s*[vV]?(?P<core>\d+(?:\.\d+){0,2})(?:(?:\.|-)?(?P<phase>dev|a|b|rc|post)(?P<num>\d+))?\s*$",
++    re.IGNORECASE,
++)
++_PHASE_ORDER = {"dev": 0, "a": 1, "b": 2, "rc": 3, "": 4, "post": 5}
+ 
+ 
+ def _normalize(value: str) -> str:
+     return value.strip().lstrip("vV")
+ 
+ 
+-def _core_tuple(value: str) -> tuple[int, int, int]:
+-    match = _CORE_RE.match(value)
++def _parse_version(value: str) -> tuple[tuple[int, int, int], int, int, str]:
++    match = _VERSION_RE.match(value)
+     if match is None:
+-        return (0, 0, 0)
+-    major, minor, patch = match.groups()
+-    return (int(major), int(minor or 0), int(patch or 0))
++        return (0, 0, 0), _PHASE_ORDER[""], 0, ""
++    release_segments = [int(part) for part in match.group("core").split(".")]
++    while len(release_segments) < 3:
++        release_segments.append(0)
++    phase = (match.group("phase") or "").lower()
++    phase_number = int(match.group("num") or 0)
++    return tuple(release_segments[:3]), _PHASE_ORDER[phase], phase_number, phase
+ 
+ 
+ def _has_prerelease(value: str) -> bool:
+-    lowered = value.lower()
+-    return any(token in lowered for token in ("a", "b", "rc", "dev"))
++    return _parse_version(value)[3] in {"dev", "a", "b", "rc"}
+ 
+ 
+ def _compare_core(left: str, right: str) -> int:
+-    left_core = _core_tuple(left)
+-    right_core = _core_tuple(right)
++    left_core = _parse_version(left)[0]
++    right_core = _parse_version(right)[0]
+     if left_core < right_core:
+         return -1
+     if left_core > right_core:
+@@ -31,24 +38,43 @@
+     return 0
+ 
+ 
+-def _matches(version: str, specifier: str) -> bool:
++def _matches(version: str, specifier: str, allow_prerelease_fallback: bool = False) -> bool:
+     specifier = specifier.strip()
+     if not specifier:
+         return True
+     if specifier.startswith(">="):
++        target = specifier[2:].strip()
++        if _has_prerelease(version) and not allow_prerelease_fallback:
++            return False
++        if _has_prerelease(version) and allow_prerelease_fallback:
++            return _compare_core(version, target) >= 0
+         return _compare_core(version, specifier[2:]) >= 0
+     if specifier.startswith("<"):
++        target = specifier[1:].strip()
++        if _has_prerelease(version) and not allow_prerelease_fallback:
++            return False
++        if _has_prerelease(version) and allow_prerelease_fallback:
++            return _compare_core(version, target) < 0
+         return _compare_core(version, specifier[1:]) < 0
+     if specifier.startswith("=="):
++        if _has_prerelease(version):
++            return False
+         return _normalize(version) == _normalize(specifier[2:])
+     return False
+ 
+ 
+ def filter_versions(candidates: list[str], specifier: str) -> list[str]:
+-    matches: list[str] = []
++    stable_matches: list[str] = []
++    prerelease_matches: list[str] = []
++
+     for candidate in candidates:
+         if _has_prerelease(candidate):
++            if _matches(candidate, specifier, allow_prerelease_fallback=True):
++                prerelease_matches.append(candidate)
+             continue
+         if _matches(candidate, specifier):
+-            matches.append(candidate)
+-    return matches
++            stable_matches.append(candidate)
++
++    if stable_matches:
++        return stable_matches
++    return prerelease_matches

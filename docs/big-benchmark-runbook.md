@@ -29,7 +29,8 @@ As of this runbook:
 - [core-current.json](../bench/task_sets/core-current.json): `39` tasks
 - [library-slices.json](../bench/task_sets/library-slices.json): `2` tasks
 - [known-good-corpus.json](../bench/task_sets/known-good-corpus.json): `8` local tasks
-- [swebench-lite-known-good.json](../bench/task_sets/swebench-lite-known-good.json): `1` external gold-patch replay
+- [external-known-good-replay.json](../bench/task_sets/external-known-good-replay.json): `4` external gold-patch replay tasks
+- [swebench-lite-known-good.json](../bench/task_sets/swebench-lite-known-good.json): `1` focused SWE-bench-style replay
 
 The core set is already large enough to be meaningful.
 
@@ -157,13 +158,13 @@ It still does **not** prove:
 Before using this as the primary release case, expand these two sets:
 
 - library slices: grow from `2` to `6-10` tasks
-- external known-good replay: grow from `1` to `4-6` tasks
+- external known-good replay: grow from `4` to `8-12` tasks
 
 The strongest next package would be:
 
 - core utility: current `468` runs
 - expanded library slices: roughly `160` runs
-- expanded external known-good replay: roughly `40-60` runs
+- expanded external known-good replay: roughly `80-120` runs
 
 ## Recommended Execution Order
 

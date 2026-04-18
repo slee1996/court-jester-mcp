@@ -206,9 +206,9 @@ Updated false-positive control result on 2026-04-17:
 - initial run exposed a real blocker: [ts-lodash-object-slice-1-known-good.json](../bench/tasks/ts-lodash-object-slice-1-known-good.json) failed with `verify_stronger_than_eval`
 - root cause: TypeScript fuzz synthesis treated unresolved named aliases such as `PathValue` as generic objects, producing impossible inputs for same-file helper functions
 - after broadening the corpus and fixing export-surface detection plus malformed-URI rejection, the local [known-good-corpus.json](../bench/task_sets/known-good-corpus.json) passed `8/8` and then `16/16` over repeats under `noop + required-final`
-- the external [swebench-lite-known-good.json](../bench/task_sets/swebench-lite-known-good.json) replay also passed `1/1` with task gold patches
+- the broader external [external-known-good-replay.json](../bench/task_sets/external-known-good-replay.json) replay passed `4/4` and then `8/8` over repeats under `noop + required-final --use-task-gold-patches`
 
-That clears the immediate false-positive blocker on the current local corpus. The next bar is broadening the external known-good replay set rather than assuming one external control task is enough.
+That clears the immediate false-positive blocker on both the current local corpus and a broader external replay lane. The next bar is continuing to grow the external replay set so it is not dominated by a single library family.
 
 The next milestone is clear:
 

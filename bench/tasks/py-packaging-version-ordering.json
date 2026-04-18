@@ -20,6 +20,10 @@
     "{bench_root}/evaluators/py_packaging_version_hidden.py",
     "{workspace}"
   ],
+  "gold_patch_path": "gold/version_ordering_fix.patch",
+  "gold_changed_files": [
+    "versioning.py"
+  ],
   "expected_files": [
     "versioning.py"
   ],

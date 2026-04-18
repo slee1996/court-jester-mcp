@@ -69,6 +69,9 @@ The benchmark is intentionally split into different suite roles. Do not treat ev
 - `swebench-lite-known-good`
   - `suite_kind: external_false_positive_control`
   - upstream-derived false-positive control via gold patches
+- `external-known-good-replay`
+  - `suite_kind: external_false_positive_control`
+  - broader upstream-derived false-positive control via task-local gold patches across SWE-bench-style and packaging-style repo tasks
 - `swebench-lite-pilot`
   - `suite_kind: external_held_out_pilot`
   - held-out external slice that is not built from Court Jester-shaped fixture tasks
@@ -97,7 +100,8 @@ Recommended usage:
 - use `verify-mutation-seeds-v1` with `noop + advisory` when you want a pure verify-recall read on seeded bugs
 - pair `verify-mutation-seeds-v1` with `known-good-corpus` when you want recall and local specificity together
 - use `public-repair-proving-ground` for public-vs-verify mechanism questions
-- use `known-good-corpus` and `swebench-lite-known-good` for false-positive control
+- use `known-good-corpus` and `external-known-good-replay` for the main false-positive controls
+- use `swebench-lite-known-good` when you specifically want the original single-task SWE-bench-style replay
 - use `swebench-lite-pilot` as the first external held-out sanity slice
 - use `express-clone-alpha-pilot` when you want a product-shaped framework benchmark rather than independent micro-fixtures
 - use `express-clone-alpha-monolith` when you want the closest current benchmark to the real product thesis: broad shared-library repair, not isolated surface patches

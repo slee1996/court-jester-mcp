@@ -1,0 +1,12 @@
+{
+  "id": "external-known-good-replay",
+  "title": "External Known-good Replay Control",
+  "goal": "Replay task-local gold patches for upstream-derived repo tasks and verify they are not blocked.",
+  "suite_kind": "external_false_positive_control",
+  "task_ids": [
+    "py-swebench-lite-cookiejar-quoted",
+    "py-packaging-version-ordering",
+    "py-packaging-specifier-prerelease-membership",
+    "py-packaging-filter-prerelease-fallback"
+  ]
+}
