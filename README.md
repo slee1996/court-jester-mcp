@@ -1,10 +1,12 @@
 # Court Jester
 
-> **Experimental**: Court Jester is under active development. CLI flags, output fields, and behavior may still change.
+> **Public alpha / experimental**: Court Jester is under active development. CLI flags, output fields, and behavior may still change. The benchmark evidence is strong, but the tool is still early and should be treated as an alpha verifier, not a stable general-purpose coding product.
 
 **Court Jester is a CLI for making AI-generated Python and TypeScript code fail as fast as possible before the agent declares victory.**
 
 AI agents are good at writing plausible code and bad at knowing when they are actually finished. Court Jester shows up the moment the code starts looking a little too sure of itself: it runs right after the edit, tries to break the changed file immediately, and turns "this looks done" into a concrete repro the agent can repair.
+
+Today, the clearest way to think about Court Jester is: a strong alpha for Python and TypeScript repair loops, especially on library and utility code, not a polished universal answer for arbitrary repos.
 
 ```text
 agent edits code -> court-jester verify -> fast concrete failure?
