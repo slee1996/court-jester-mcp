@@ -185,35 +185,40 @@ python -m bench.summarize_runs /tmp/court-jester-external-known-good
 
 ## Current Read
 
-Current evidence supports continuing toward a private beta.
+Current evidence supports expanding beyond a single-user workflow.
 
-Current evidence does not yet justify a broad public claim that Court Jester is generally ready for all users and all agent workflows.
+Current evidence still does not justify a broad public claim that Court Jester is generally ready for all users, all repos, and all agent workflows.
 
-Updated utility and reliability read on 2026-04-18:
+Updated read on 2026-04-20:
 
-- repeated strict `core-current` utility run:
-  - `claude-default`: `102 / 117` baseline -> `116 / 117` verify-only repair loop
-  - `codex-default`: `107 / 117` baseline -> `116 / 117` verify-only repair loop
-- aggregate:
-  - `209 / 234` baseline -> `232 / 234` verify-only repair loop
-  - `89.3% -> 99.1%`
-  - `+23` saved tasks
-- repair attribution:
-  - `31` repair rounds were triggered by Court Jester `verify`
-  - `0` repair rounds were triggered by public or hidden evaluator feedback
-  - `29` verify-triggered repair rounds ended in success
+- one-repair primary causal matrix on `core-current`:
+  - `baseline`: `208 / 234`
+  - `public-repair-1`: `205 / 234`
+  - `retry-once-no-verify`: `216 / 234`
+  - `repair-loop-verify-only`: `230 / 234`
+- one-repair proving ground:
+  - `baseline`: `11 / 36`
+  - `public-repair-1`: `14 / 36`
+  - `retry-once-no-verify`: `19 / 36`
+  - `repair-loop-verify-only`: `25 / 36`
+- two-repair robustness on `core-current`:
+  - `baseline`: `137 / 156`
+  - `public-repair-2`: `140 / 156`
+  - `retry-twice-no-verify`: `150 / 156`
+  - `repair-loop-verify-only-2`: `156 / 156`
 - false-positive gauntlet:
-  - `80 / 80` success on the local `known-good-corpus` under `noop + required-final`
-  - `190 / 190` success on `external-known-good-replay` under `noop + required-final --use-task-gold-patches`
+  - `80 / 80` success on the local `known-good-corpus`
+  - `190 / 190` success on `external-known-good-replay`
   - `270 / 270` combined clean control passes
 
 Interpretation:
 
-- the clean utility evidence is stronger than it was in March and stronger than the earlier `76 / 78` strict run
-- the strictest current benchmark still shows real lift after the verifier was tightened against false positives
-- the strongest current evidence is now specifically about verify-triggered repair, not evaluator-feedback-triggered retry
-- the immediate false-positive blocker remains cleared on both the local corpus and the broader external replay lane
-- provider health still matters operationally, but it no longer dominates the benchmark read here
+- the current package is stronger than the earlier April 18 utility rerun because it now includes matched public-repair and blind-retry controls
+- verifier-guided repair beat both public-test-guided repair and blind extra retries in the primary matrix
+- public repair remained a fair live comparator on the proving ground, but still lost there too
+- the ranking survived a larger retry budget in the two-step robustness run
+- the false-positive blocker remains cleared on both the local corpus and the broader upstream replay lane
+- provider health and repo-shape limitations still matter, but the core utility and attribution story is now much harder to dismiss as "just retries helped"
 
 Updated false-positive control result on 2026-04-17:
 

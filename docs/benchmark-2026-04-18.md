@@ -2,6 +2,8 @@
 
 Date: 2026-04-18
 
+Superseded by [benchmark-2026-04-20.md](benchmark-2026-04-20.md), which adds the completed public-repair and blind-retry control package on top of this broader April 18 rerun.
+
 ## Summary
 
 This is the strongest benchmark package in the repo so far.

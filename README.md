@@ -23,6 +23,27 @@ It is just a CLI. No MCP transport, editor plugin, or custom agent integration l
 - Uses the target project's Ruff and Biome config instead of detached temp-dir defaults
 - Returns structured JSON so automation can make decisions on pass/fail
 
+## Where It Helps Most
+
+- Library and utility code more than full application code
+- Shared helpers, parsers, serializers, normalizers, validators, and cross-file semantic logic
+- Python and TypeScript agent loops where you want to verify a changed file immediately after an edit
+- Spec-like behavior where small semantic mistakes matter a lot
+- Hidden semantic bugs that slip past obvious happy-path checks
+- Nullish, fallback, defaulting, canonicalization, and cross-file behavior that looks plausible but is still wrong
+- Repair loops where the model benefits from a concrete failing repro instead of generic feedback
+- Projects that already have local tool context such as `.venv`, `node_modules`, Ruff, Biome, or authoritative test files
+
+## Where It Is Not The Right Tool Yet
+
+- Large app codebases where most value lives in integration glue, UI state, routing, auth flows, or framework wiring
+- Product surfaces where end-to-end app behavior matters more than local file semantics
+- Broad arbitrary-repo claims: the benchmark story is strong, but it is still an alpha, not a general guarantee on any repo
+- Languages beyond Python and TypeScript
+- Full CI replacement: Court Jester is a hostile verifier for agent loops, not a substitute for a real test suite
+- Large framework or monolith construction tasks as a universal default workflow
+- Security or secrecy-critical judging: hidden-eval benchmarking is a harness feature, not a hardened external judge
+
 ## Install
 
 Fastest path:
@@ -192,15 +213,28 @@ That makes it easy to use in:
 
 ## Evidence
 
-Court Jester's current headline benchmark is a repeated 39-task verify-only repair policy on `core-current`.
+Court Jester's strongest finished benchmark package is now the full causal-control package, not just the earlier one-arm verify-only rerun.
 
-- Claude: `102 / 117` baseline -> `116 / 117` with verify-guided repair
-- Codex: `107 / 117` baseline -> `116 / 117` with verify-guided repair
-- Aggregate: `209 / 234` baseline -> `232 / 234` with verify-guided repair
+- One-repair causal matrix on `core-current`:
+  - `baseline`: `208 / 234`
+  - `public-repair-1`: `205 / 234`
+  - `retry-once-no-verify`: `216 / 234`
+  - `repair-loop-verify-only`: `230 / 234`
+- Public-repair proving ground:
+  - `baseline`: `11 / 36`
+  - `public-repair-1`: `14 / 36`
+  - `retry-once-no-verify`: `19 / 36`
+  - `repair-loop-verify-only`: `25 / 36`
+- Two-repair robustness on `core-current`:
+  - `baseline`: `137 / 156`
+  - `public-repair-2`: `140 / 156`
+  - `retry-twice-no-verify`: `150 / 156`
+  - `repair-loop-verify-only-2`: `156 / 156`
 - False-positive gauntlet: `270 / 270` passes (`80 / 80` local known-good, `190 / 190` external replay)
 
 More detail:
 
+- [docs/benchmark-2026-04-20.md](docs/benchmark-2026-04-20.md)
 - [docs/benchmark-2026-04-18.md](docs/benchmark-2026-04-18.md)
 - [docs/benchmark-methodology.md](docs/benchmark-methodology.md)
 - [docs/benchmark-2026-04-10.md](docs/benchmark-2026-04-10.md)

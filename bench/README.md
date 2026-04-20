@@ -19,6 +19,7 @@ The harness is intentionally separate from the Rust CLI. `court-jester` stays fo
 Benchmark writeups:
 
 - `docs/benchmark-methodology.md`
+- `docs/benchmark-2026-04-20.md`
 - `docs/benchmark-2026-04-10.md`
 - `docs/benchmark-2026-04-18.md`
 - `docs/benchmark-2026-03-26.md`
@@ -31,22 +32,33 @@ Release-positioning and current release bar:
 
 - `docs/release-readiness-private-beta.md`
 
-Current headline run:
+Current strongest completed package:
 
-- `core-current` task set
-- `39` tasks
-- models: `codex-default`, `claude-default`
-- policies: `baseline`, `repair-loop-verify-only`
-- repeats: `3`
-- result: `209 / 234` baseline -> `232 / 234` verify-only repair loop
-- false-positive gauntlet: `270 / 270` clean control passes
-- repair triggers: verify-only, with `0` public-trigger and `0` hidden-trigger repairs
+- false-positive gauntlet:
+  - local known-good `80 / 80`
+  - external replay `190 / 190`
+  - combined `270 / 270`
+- one-repair primary causal matrix on `core-current`:
+  - `baseline`: `208 / 234`
+  - `public-repair-1`: `205 / 234`
+  - `retry-once-no-verify`: `216 / 234`
+  - `repair-loop-verify-only`: `230 / 234`
+- one-repair proving ground:
+  - `baseline`: `11 / 36`
+  - `public-repair-1`: `14 / 36`
+  - `retry-once-no-verify`: `19 / 36`
+  - `repair-loop-verify-only`: `25 / 36`
+- two-repair robustness on `core-current`:
+  - `baseline`: `137 / 156`
+  - `public-repair-2`: `140 / 156`
+  - `retry-twice-no-verify`: `150 / 156`
+  - `repair-loop-verify-only-2`: `156 / 156`
 
-Next causal-control run:
+The current repo story is therefore stronger than the earlier April 18 headline run:
 
-- compare `baseline`, `public-repair-1`, `repair-loop-verify-only`, `public-repair-2`, and `repair-loop-verify-only-2`
-- match public-tests-only repair against verify-guided repair at one extra attempt and two extra attempts
-- keep hidden evaluation final-score only so the comparator is realistic instead of oracle-gated
+- verify-guided repair beat both public-test-guided repair and blind retries in the matched one-repair matrix
+- public repair remained a fair live comparator on the proving ground, but still lost
+- the ranking survived a larger retry budget in the two-step robustness run
 
 Large-scale product-clone roadmap:
 
