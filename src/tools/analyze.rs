@@ -807,10 +807,7 @@ fn mark_typescript_explicit_exports(
     }
 }
 
-fn collect_typescript_explicit_exports(
-    root: &tree_sitter::Node,
-    source: &[u8],
-) -> HashSet<String> {
+fn collect_typescript_explicit_exports(root: &tree_sitter::Node, source: &[u8]) -> HashSet<String> {
     let mut exported_names = HashSet::new();
     let mut cursor = root.walk();
 
@@ -1600,16 +1597,39 @@ pub fn check_complexity_threshold(
     analysis: &AnalysisResult,
     threshold: usize,
 ) -> Vec<ComplexityViolation> {
-    check_complexity_threshold_for_functions(&analysis.functions, threshold)
+    check_complexity_threshold_for_functions_with_metric(
+        &analysis.functions,
+        threshold,
+        ComplexityMetric::Cyclomatic,
+    )
 }
 
 pub fn check_complexity_threshold_for_functions(
     functions: &[FunctionInfo],
     threshold: usize,
 ) -> Vec<ComplexityViolation> {
+    check_complexity_threshold_for_functions_with_metric(
+        functions,
+        threshold,
+        ComplexityMetric::Cyclomatic,
+    )
+}
+
+fn function_complexity_value(function: &FunctionInfo, metric: ComplexityMetric) -> usize {
+    match metric {
+        ComplexityMetric::Cyclomatic => function.complexity,
+        ComplexityMetric::Cognitive => function.cognitive_complexity,
+    }
+}
+
+pub fn check_complexity_threshold_for_functions_with_metric(
+    functions: &[FunctionInfo],
+    threshold: usize,
+    metric: ComplexityMetric,
+) -> Vec<ComplexityViolation> {
     functions
         .iter()
-        .filter(|f| f.complexity > threshold)
+        .filter(|f| function_complexity_value(f, metric) > threshold)
         .map(|f| ComplexityViolation {
             function: f.name.clone(),
             complexity: f.complexity,

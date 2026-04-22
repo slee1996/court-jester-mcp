@@ -1,6 +1,6 @@
 use court_jester_mcp::tools::lint::{lint, lint_with_options, LintOptions};
 use court_jester_mcp::tools::verify::{verify, VerifyOptions};
-use court_jester_mcp::types::Language;
+use court_jester_mcp::types::{ComplexityMetric, ExecuteGate, Language, ReportLevel};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -147,12 +147,18 @@ fn verify_keeps_python_lint_runner_errors_advisory() {
             test_source_file: None,
             tests_only: false,
             complexity_threshold: None,
+            complexity_metric: ComplexityMetric::Cyclomatic,
             project_dir: None,
             lint_config_path: None,
             lint_virtual_file_path: None,
             diff: None,
+            suppressions: None,
+            suppression_source: None,
+            auto_seed: true,
             source_file: None,
             output_dir: None,
+            report_level: ReportLevel::Full,
+            execute_gate: ExecuteGate::All,
         },
     ));
 

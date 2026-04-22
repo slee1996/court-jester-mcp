@@ -1376,16 +1376,38 @@ fn typescript_promise_generator() {
 fn typescript_web_platform_generators() {
     let a = make_analysis(
         vec![
-            func("readHeaders", vec![("headers", Some("Headers"))], Some("string")),
-            func("readRequest", vec![("request", Some("Request"))], Some("boolean")),
-            func("rewriteParams", vec![("params", Some("URLSearchParams"))], Some("string")),
-            func("inspectResponse", vec![("response", Some("Response"))], Some("number")),
+            func(
+                "readHeaders",
+                vec![("headers", Some("Headers"))],
+                Some("string"),
+            ),
+            func(
+                "readRequest",
+                vec![("request", Some("Request"))],
+                Some("boolean"),
+            ),
+            func(
+                "rewriteParams",
+                vec![("params", Some("URLSearchParams"))],
+                Some("string"),
+            ),
+            func(
+                "inspectResponse",
+                vec![("response", Some("Response"))],
+                Some("number"),
+            ),
         ],
         vec![],
     );
     let code = synthesize_calls(&a, &Language::TypeScript);
-    assert!(code.contains("_fuzzHeaders()"), "Headers should use _fuzzHeaders(), got: {code}");
-    assert!(code.contains("_fuzzRequest()"), "Request should use _fuzzRequest(), got: {code}");
+    assert!(
+        code.contains("_fuzzHeaders()"),
+        "Headers should use _fuzzHeaders(), got: {code}"
+    );
+    assert!(
+        code.contains("_fuzzRequest()"),
+        "Request should use _fuzzRequest(), got: {code}"
+    );
     assert!(
         code.contains("_fuzzUrlSearchParams()"),
         "URLSearchParams should use _fuzzUrlSearchParams(), got: {code}"

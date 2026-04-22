@@ -244,13 +244,6 @@ setInterval(() => {}, 1000);
 }
 #[tokio::test]
 async fn typescript_source_file_retries_with_node_loader_for_type_alias_imports() {
-    let bun_ok = std::process::Command::new("bun")
-        .arg("--version")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false);
-    assert!(bun_ok, "bun must be available for this regression test");
-
     let dir = tempfile::tempdir().unwrap();
     let helper_path = dir.path().join("internals.ts");
     let source_path = dir.path().join("object.ts");
@@ -289,13 +282,6 @@ console.log(`${mode}:${String(pick({ timezone: "UTC" }, "timezone"))}`);
 
 #[tokio::test]
 async fn typescript_source_file_uses_loader_for_type_only_reexport_chain() {
-    let bun_ok = std::process::Command::new("bun")
-        .arg("--version")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false);
-    assert!(bun_ok, "bun must be available for this regression test");
-
     let dir = tempfile::tempdir().unwrap();
     let helper_path = dir.path().join("internals.ts");
     let index_path = dir.path().join("index.ts");
@@ -341,13 +327,6 @@ console.log(`${mode}:${String(pick({ timezone: "UTC" }, "timezone"))}`);
 
 #[tokio::test]
 async fn typescript_source_file_prefers_node_transform_over_bun_for_plain_relative_imports() {
-    let bun_ok = std::process::Command::new("bun")
-        .arg("--version")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false);
-    assert!(bun_ok, "bun must be available for this regression test");
-
     let tsx_loader = tsx_loader_from_path();
     assert!(
         tsx_loader.is_some(),

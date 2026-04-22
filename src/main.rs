@@ -1,7 +1,7 @@
 use std::env;
 use std::process::ExitCode;
 
-use court_jester_mcp::types::Language;
+use court_jester_mcp::types::{ComplexityMetric, ExecuteGate, Language, ReportLevel};
 use court_jester_mcp::{detect_project_dir, parse_language, tools};
 
 const USAGE: &str = "\
@@ -26,9 +26,14 @@ VERIFY OPTIONS:
   --test-file <PATH>         Test file to include as an authoritative stage
   --tests-only               Skip fuzz-execute and run only the authoritative test stage
   --output-dir <PATH>        Directory to write persistent JSON reports
+  --report-level <LEVEL>     full | minimal (default full)
+  --suppressions-file <PATH> JSON suppression rules for known findings
+  --no-auto-seed             Disable seed extraction from nearby tests and literal call sites
   --diff-file <PATH>         Unified-diff file — only inspect changed functions
   --profile <NAME>           Verification profile preset (currently: security => complexity 20)
+  --complexity-metric <NAME> cyclomatic | cognitive (default cyclomatic)
   --complexity-threshold <N> Fail if any function exceeds this complexity (changed functions only when --diff-file is set)
+  --execute-gate <MODE>      all | crash | none (default all; no_inputs_reached is always diagnostic)
 
 EXECUTE OPTIONS:
   --timeout-seconds <F>      Sandbox timeout (default 10)
@@ -81,7 +86,7 @@ async fn main() -> ExitCode {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct CliArgs {
     file: Option<String>,
     language: Option<String>,
@@ -91,9 +96,14 @@ struct CliArgs {
     test_file: Option<String>,
     tests_only: bool,
     output_dir: Option<String>,
+    report_level: ReportLevel,
+    suppressions_file: Option<String>,
+    no_auto_seed: bool,
     diff_file: Option<String>,
     profile: Option<String>,
+    complexity_metric: ComplexityMetric,
     complexity_threshold: Option<usize>,
+    execute_gate: ExecuteGate,
     timeout_seconds: Option<f64>,
     memory_mb: Option<u64>,
 }
@@ -119,8 +129,28 @@ fn parse_flags(rest: &[String]) -> Result<CliArgs, String> {
             "--test-file" => out.test_file = Some(take_value(&mut i)?),
             "--tests-only" => out.tests_only = true,
             "--output-dir" => out.output_dir = Some(take_value(&mut i)?),
+            "--report-level" => {
+                let raw = take_value(&mut i)?;
+                out.report_level = ReportLevel::parse(&raw).ok_or_else(|| {
+                    format!(
+                        "--report-level must be one of: full, minimal (got '{}')",
+                        raw
+                    )
+                })?;
+            }
+            "--suppressions-file" => out.suppressions_file = Some(take_value(&mut i)?),
+            "--no-auto-seed" => out.no_auto_seed = true,
             "--diff-file" => out.diff_file = Some(take_value(&mut i)?),
             "--profile" => out.profile = Some(take_value(&mut i)?),
+            "--complexity-metric" => {
+                let raw = take_value(&mut i)?;
+                out.complexity_metric = ComplexityMetric::parse(&raw).ok_or_else(|| {
+                    format!(
+                        "--complexity-metric must be one of: cyclomatic, cognitive (got '{}')",
+                        raw
+                    )
+                })?;
+            }
             "--complexity-threshold" => {
                 let raw = take_value(&mut i)?;
                 out.complexity_threshold = Some(raw.parse::<usize>().map_err(|_| {
@@ -129,6 +159,15 @@ fn parse_flags(rest: &[String]) -> Result<CliArgs, String> {
                         raw
                     )
                 })?);
+            }
+            "--execute-gate" => {
+                let raw = take_value(&mut i)?;
+                out.execute_gate = ExecuteGate::parse(&raw).ok_or_else(|| {
+                    format!(
+                        "--execute-gate must be one of: all, crash, none (got '{}')",
+                        raw
+                    )
+                })?;
             }
             "--timeout-seconds" => {
                 let raw = take_value(&mut i)?;
@@ -147,7 +186,18 @@ fn parse_flags(rest: &[String]) -> Result<CliArgs, String> {
                 print!("{}", USAGE);
                 std::process::exit(0);
             }
-            other => return Err(format!("unknown flag '{}'", other)),
+            other => {
+                if other.starts_with("--") && other.contains(' ') {
+                    let mut parts = other.split_whitespace();
+                    if let (Some(flag_name), Some(flag_value)) = (parts.next(), parts.next()) {
+                        return Err(format!(
+                            "unknown flag '{}'; did you mean '{}' and '{}' as separate arguments?",
+                            other, flag_name, flag_value
+                        ));
+                    }
+                }
+                return Err(format!("unknown flag '{}'", other));
+            }
         }
         i += 1;
     }
@@ -213,22 +263,41 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
     match cmd {
         "verify" => {
             let test_code = read_optional_file(args.test_file.as_deref())?;
+            let suppressions = read_optional_file(args.suppressions_file.as_deref())?;
+            if let Some(raw) = suppressions.as_deref() {
+                serde_json::from_str::<serde_json::Value>(raw).map_err(|e| {
+                    format!(
+                        "invalid suppressions file '{}': {}",
+                        args.suppressions_file.as_deref().unwrap_or("<inline>"),
+                        e
+                    )
+                })?;
+            }
             let diff = read_optional_file(args.diff_file.as_deref())?;
             let opts = tools::verify::VerifyOptions {
                 test_code: test_code.as_deref(),
                 test_source_file: args.test_file.as_deref(),
                 complexity_threshold,
+                complexity_metric: args.complexity_metric,
                 project_dir: project_dir.as_deref(),
                 lint_config_path: args.config_path.as_deref(),
                 lint_virtual_file_path: args.virtual_file_path.as_deref(),
                 diff: diff.as_deref(),
+                suppressions: suppressions.as_deref(),
+                suppression_source: args.suppressions_file.as_deref(),
+                auto_seed: !args.no_auto_seed,
                 source_file: Some(file.as_str()),
                 output_dir: args.output_dir.as_deref(),
+                report_level: args.report_level,
+                execute_gate: args.execute_gate,
                 tests_only: args.tests_only,
             };
             let report = tools::verify::verify(&code, &language, opts).await;
-            let json = serde_json::to_string_pretty(&report)
-                .map_err(|e| format!("failed to serialize verify report: {}", e))?;
+            let json = serde_json::to_string_pretty(&tools::verify::report_json_value(
+                &report,
+                args.report_level,
+            ))
+            .map_err(|e| format!("failed to serialize verify report: {}", e))?;
             println!("{}", json);
             if !report.overall_ok {
                 std::process::exit(1);
@@ -246,9 +315,15 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
                 value["changed_functions"] = serde_json::to_value(&changed_fns).unwrap();
             }
             if let Some(threshold) = complexity_threshold {
-                let violations = tools::analyze::check_complexity_threshold(&analysis, threshold);
+                let violations =
+                    tools::analyze::check_complexity_threshold_for_functions_with_metric(
+                        &analysis.functions,
+                        threshold,
+                        args.complexity_metric,
+                    );
                 value["complexity_violations"] = serde_json::to_value(&violations).unwrap();
                 value["complexity_ok"] = serde_json::Value::Bool(violations.is_empty());
+                value["complexity_metric"] = serde_json::to_value(args.complexity_metric).unwrap();
             }
             println!(
                 "{}",
@@ -304,6 +379,7 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{parse_flags, resolve_complexity_threshold};
+    use court_jester_mcp::types::{ComplexityMetric, ExecuteGate, ReportLevel};
 
     #[test]
     fn security_profile_maps_to_complexity_threshold_20() {
@@ -321,5 +397,39 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(resolve_complexity_threshold(&args).unwrap(), Some(12));
+    }
+
+    #[test]
+    fn report_level_and_execute_gate_parse() {
+        let args = parse_flags(&[
+            "--report-level".into(),
+            "minimal".into(),
+            "--complexity-metric".into(),
+            "cognitive".into(),
+            "--execute-gate".into(),
+            "crash".into(),
+        ])
+        .unwrap();
+        assert_eq!(args.report_level, ReportLevel::Minimal);
+        assert_eq!(args.complexity_metric, ComplexityMetric::Cognitive);
+        assert_eq!(args.execute_gate, ExecuteGate::Crash);
+    }
+
+    #[test]
+    fn fused_flag_error_suggests_split_arguments() {
+        let error = parse_flags(&["--diff-file /tmp/example.diff".into()]).unwrap_err();
+        assert!(error.contains("did you mean '--diff-file' and '/tmp/example.diff'"));
+    }
+
+    #[test]
+    fn fused_config_flag_error_suggests_split_arguments() {
+        let error = parse_flags(&["--config-path biome.json".into()]).unwrap_err();
+        assert!(error.contains("did you mean '--config-path' and 'biome.json'"));
+    }
+
+    #[test]
+    fn no_auto_seed_flag_parses() {
+        let args = parse_flags(&["--no-auto-seed".into()]).unwrap();
+        assert!(args.no_auto_seed);
     }
 }

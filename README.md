@@ -4,7 +4,7 @@
 
 **Court Jester is a CLI for making AI-generated Python and TypeScript code fail as fast as possible before the agent declares victory.**
 
-AI agents are good at writing plausible code and bad at knowing when they are actually finished. Court Jester shows up the moment the code starts looking a little too sure of itself: it runs right after the edit, tries to break the changed file immediately, and turns "this looks done" into a concrete repro the agent can repair.
+AI coding agents confidently ship code that looks right but quietly breaks on edge cases. They don't know what they don't know. Court Jester runs right after the edit, tries to break the changed file immediately, and turns "this looks done" into a concrete repro the agent can repair.
 
 Today, the clearest way to think about Court Jester is: a strong alpha for Python and TypeScript repair loops, especially on library and utility code, not a polished universal answer for arbitrary repos.
 
@@ -16,6 +16,13 @@ agent edits code -> court-jester verify -> fast concrete failure?
 ```
 
 It is just a CLI. No MCP transport, editor plugin, or custom agent integration layer is required.
+
+Release and CI wiring docs:
+
+- [CHANGELOG.md](CHANGELOG.md)
+- [docs/report-schema.md](docs/report-schema.md)
+- [docs/ci-adoption.md](docs/ci-adoption.md)
+- [docs/proof-points.md](docs/proof-points.md)
 
 ## Why Use It
 
@@ -61,6 +68,7 @@ The install script:
 - downloads the latest release binary for your platform
 - does not require a Rust toolchain
 - does not require agent transport setup
+- prints a Biome follow-up when no sibling or `PATH` Biome is available for TypeScript lint
 
 If `~/.local/bin` is not on `PATH`, add:
 
@@ -84,7 +92,8 @@ Court Jester itself is one binary, but some stages rely on tools from the projec
 
 - Python lint: [Ruff](https://docs.astral.sh/ruff/installation/)
 - TypeScript lint: [Biome](https://biomejs.dev/guides/getting-started/)
-- TypeScript execute/verify: [bun](https://bun.sh)
+- TypeScript execute/verify: [Node.js](https://nodejs.org/) (Node 24+ recommended)
+- Bun is only needed when the target repo is Bun-native and Court Jester falls back to the repo runtime for compatibility
 
 Tool resolution order:
 
@@ -140,6 +149,8 @@ court-jester verify \
   --test-file tests/semver.test.ts
 ```
 
+TypeScript `--test-file` runs under Node. Test files that import `bun:test` are not currently supported as authoritative tests; use a Node-runnable test file instead, or omit `--test-file`.
+
 Write JSON reports to disk:
 
 ```bash
@@ -167,6 +178,8 @@ court-jester --help
 | `parse` | Tree-sitter AST extraction | Yes |
 | `complexity` | Optional complexity gate | Only if you set a threshold |
 | `lint` | Ruff or Biome in the target project context | No, advisory only |
+| `coverage` | Reports exactly which functions were fuzzed, skipped, or blocked | No |
+| `portability` | Preserves strict-Node portability issues separately from behavior | No |
 | `execute` | Synthesized fuzz/property checks in a sandbox | Yes |
 | `test` | Optional caller-supplied test file | Yes |
 
@@ -190,8 +203,13 @@ Useful `verify` flags:
 - `--test-file <PATH>`: add an authoritative test stage
 - `--tests-only`: skip fuzz execute and run only the authoritative test stage
 - `--output-dir <PATH>`: persist JSON reports
+- `--report-level full|minimal`: choose full debug output or CI-sized reports
+- `--suppressions-file <PATH>`: JSON suppression rules for known findings
+- `--no-auto-seed`: disable automatic seed extraction from nearby tests and simple literal call sites
 - `--diff-file <PATH>`: only inspect changed functions from a unified diff
+- `--complexity-metric cyclomatic|cognitive`: choose which complexity metric drives threshold failures
 - `--complexity-threshold <N>`: fail when a function exceeds the threshold
+- `--execute-gate all|crash|none`: choose which execute severities fail the run
 
 Sandbox flags for `execute`:
 
@@ -205,6 +223,8 @@ Use `court-jester --help` for the full CLI help text.
 - `0`: command succeeded and the code passed
 - `1`: the code failed verification or execution, but Court Jester still returned structured JSON
 - `2`: CLI usage or setup error
+
+Verify reports now carry `schema_version: 2` at the top level. The stability contract for stage names and JSON keys lives in [docs/report-schema.md](docs/report-schema.md).
 
 That makes it easy to use in:
 

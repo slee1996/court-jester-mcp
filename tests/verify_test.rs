@@ -1,5 +1,7 @@
-use court_jester_mcp::tools::verify::{parse_fuzz_failures, verify, VerifyOptions};
-use court_jester_mcp::types::Language;
+use court_jester_mcp::tools::verify::{
+    parse_fuzz_failures, report_json_value, verify, VerifyOptions,
+};
+use court_jester_mcp::types::{ComplexityMetric, ExecuteGate, Language, ReportLevel};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -80,12 +82,18 @@ fn default_opts(test_code: Option<&str>) -> VerifyOptions<'_> {
         test_source_file: None,
         tests_only: false,
         complexity_threshold: None,
+        complexity_metric: ComplexityMetric::Cyclomatic,
         project_dir: None,
         lint_config_path: None,
         lint_virtual_file_path: None,
         diff: None,
+        suppressions: None,
+        suppression_source: None,
+        auto_seed: true,
         source_file: None,
         output_dir: None,
+        report_level: ReportLevel::Full,
+        execute_gate: ExecuteGate::All,
     }
 }
 
@@ -134,12 +142,18 @@ async fn tests_only_verify_skips_execute_stage() {
         test_source_file: None,
         tests_only: true,
         complexity_threshold: None,
+        complexity_metric: ComplexityMetric::Cyclomatic,
         project_dir: None,
         lint_config_path: None,
         lint_virtual_file_path: None,
         diff: None,
+        suppressions: None,
+        suppression_source: None,
+        auto_seed: true,
         source_file: None,
         output_dir: None,
+        report_level: ReportLevel::Full,
+        execute_gate: ExecuteGate::All,
     };
     let report = verify(code, &Language::Python, opts).await;
 
@@ -156,12 +170,18 @@ async fn tests_only_verify_requires_authoritative_test() {
         test_source_file: None,
         tests_only: true,
         complexity_threshold: None,
+        complexity_metric: ComplexityMetric::Cyclomatic,
         project_dir: None,
         lint_config_path: None,
         lint_virtual_file_path: None,
         diff: None,
+        suppressions: None,
+        suppression_source: None,
+        auto_seed: true,
         source_file: None,
         output_dir: None,
+        report_level: ReportLevel::Full,
+        execute_gate: ExecuteGate::All,
     };
     let report = verify(code, &Language::Python, opts).await;
 
@@ -265,12 +285,18 @@ exit 1
             test_source_file: None,
             tests_only: false,
             complexity_threshold: None,
+            complexity_metric: ComplexityMetric::Cyclomatic,
             project_dir: Some(project_dir.path().to_str().unwrap()),
             lint_config_path: Some(config_path.to_str().unwrap()),
             lint_virtual_file_path: None,
             diff: None,
+            suppressions: None,
+            suppression_source: None,
+            auto_seed: true,
             source_file: Some(source_path.to_str().unwrap()),
             output_dir: None,
+            report_level: ReportLevel::Full,
+            execute_gate: ExecuteGate::All,
         },
     )
     .await;
@@ -1074,12 +1100,18 @@ async fn python_test_stage_can_import_source_module_from_sibling_path() {
         test_source_file: None,
         tests_only: false,
         complexity_threshold: None,
+        complexity_metric: ComplexityMetric::Cyclomatic,
         project_dir: None,
         lint_config_path: None,
         lint_virtual_file_path: None,
         diff: None,
+        suppressions: None,
+        suppression_source: None,
+        auto_seed: true,
         source_file: Some(source_path.to_str().unwrap()),
         output_dir: None,
+        report_level: ReportLevel::Full,
+        execute_gate: ExecuteGate::All,
     };
     let report = verify(code, &Language::Python, opts).await;
 
@@ -1095,12 +1127,18 @@ async fn verify_with_threshold_adds_stage() {
         test_source_file: None,
         tests_only: false,
         complexity_threshold: Some(3),
+        complexity_metric: ComplexityMetric::Cyclomatic,
         project_dir: None,
         lint_config_path: None,
         lint_virtual_file_path: None,
         diff: None,
+        suppressions: None,
+        suppression_source: None,
+        auto_seed: true,
         source_file: None,
         output_dir: None,
+        report_level: ReportLevel::Full,
+        execute_gate: ExecuteGate::All,
     };
     let report = verify(code, &Language::Python, opts).await;
     assert!(
@@ -1131,12 +1169,18 @@ def changed(x: int) -> int:
             test_source_file: None,
             tests_only: false,
             complexity_threshold: Some(3),
+            complexity_metric: ComplexityMetric::Cyclomatic,
             project_dir: None,
             lint_config_path: None,
             lint_virtual_file_path: None,
             diff: Some(diff),
+            suppressions: None,
+            suppression_source: None,
+            auto_seed: true,
             source_file: None,
             output_dir: None,
+            report_level: ReportLevel::Full,
+            execute_gate: ExecuteGate::All,
         },
     )
     .await;
@@ -1175,12 +1219,18 @@ def classify(x: int) -> str:
             test_source_file: None,
             tests_only: false,
             complexity_threshold: Some(2),
+            complexity_metric: ComplexityMetric::Cyclomatic,
             project_dir: None,
             lint_config_path: None,
             lint_virtual_file_path: None,
             diff: None,
+            suppressions: None,
+            suppression_source: None,
+            auto_seed: true,
             source_file: None,
             output_dir: None,
+            report_level: ReportLevel::Full,
+            execute_gate: ExecuteGate::All,
         },
     )
     .await;
@@ -1207,6 +1257,56 @@ def classify(x: int) -> str:
         violations[0]["complexity_breakdown"]["case"].as_u64(),
         Some(3)
     );
+}
+
+#[tokio::test]
+async fn verify_can_gate_on_cognitive_complexity() {
+    let code = r#"
+def check_access(a: bool, b: bool, c: bool) -> int:
+    if a:
+        if b:
+            if c:
+                return 1
+    return 0
+"#;
+    let report = verify(
+        code,
+        &Language::Python,
+        VerifyOptions {
+            test_code: None,
+            test_source_file: None,
+            tests_only: false,
+            complexity_threshold: Some(5),
+            complexity_metric: ComplexityMetric::Cognitive,
+            project_dir: None,
+            lint_config_path: None,
+            lint_virtual_file_path: None,
+            diff: None,
+            suppressions: None,
+            suppression_source: None,
+            auto_seed: true,
+            source_file: None,
+            output_dir: None,
+            report_level: ReportLevel::Full,
+            execute_gate: ExecuteGate::All,
+        },
+    )
+    .await;
+
+    let complexity_stage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "complexity")
+        .expect("complexity stage should be present");
+    assert!(
+        !complexity_stage.ok,
+        "cognitive complexity should exceed threshold 5"
+    );
+    let detail = complexity_stage.detail.as_ref().unwrap();
+    assert_eq!(detail["metric"].as_str(), Some("cognitive"));
+    let violations = detail["violations"].as_array().unwrap();
+    assert_eq!(violations.len(), 1);
+    assert_eq!(violations[0]["function"].as_str(), Some("check_access"));
 }
 
 #[tokio::test]
@@ -1256,12 +1356,18 @@ def changed(x: int) -> int:
         test_source_file: None,
         tests_only: false,
         complexity_threshold: None,
+        complexity_metric: ComplexityMetric::Cyclomatic,
         project_dir: None,
         lint_config_path: None,
         lint_virtual_file_path: None,
         diff: Some(diff),
+        suppressions: None,
+        suppression_source: None,
+        auto_seed: true,
         source_file: None,
         output_dir: None,
+        report_level: ReportLevel::Full,
+        execute_gate: ExecuteGate::All,
     };
     let report = verify(code, &Language::Python, opts).await;
     // Should pass since changed() is a simple function
@@ -1275,6 +1381,13 @@ def changed(x: int) -> int:
             "untouched should not be fuzzed in diff mode, got: {stdout}"
         );
     }
+    let coverage = report
+        .stages
+        .iter()
+        .find(|s| s.name == "coverage")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("coverage stage should be present");
+    assert_eq!(coverage["diff_scoped"].as_bool(), Some(true));
 }
 
 #[tokio::test]
@@ -1286,12 +1399,18 @@ async fn writes_report_to_output_dir() {
         test_source_file: None,
         tests_only: false,
         complexity_threshold: None,
+        complexity_metric: ComplexityMetric::Cyclomatic,
         project_dir: None,
         lint_config_path: None,
         lint_virtual_file_path: None,
         diff: None,
+        suppressions: None,
+        suppression_source: None,
+        auto_seed: true,
         source_file: None,
         output_dir: Some(dir.path().to_str().unwrap()),
+        report_level: ReportLevel::Full,
+        execute_gate: ExecuteGate::All,
     };
     let report = verify(code, &Language::Python, opts).await;
 
@@ -1305,10 +1424,41 @@ async fn writes_report_to_output_dir() {
     // Verify it's valid JSON with expected structure
     let content = std::fs::read_to_string(&path).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(
+        parsed
+            .get("schema_version")
+            .and_then(|value| value.as_u64()),
+        Some(2)
+    );
     assert!(parsed.get("meta").is_some());
     assert!(parsed.get("summary").is_some());
     assert!(parsed.get("stages").is_some());
     assert!(parsed.get("overall_ok").is_some());
+}
+
+#[tokio::test]
+async fn minimal_report_level_omits_full_parse_detail() {
+    let code = "def add(a: int, b: int) -> int:\n    return a + b";
+    let mut opts = default_opts(None);
+    opts.report_level = ReportLevel::Minimal;
+    let report = verify(code, &Language::Python, opts).await;
+    let json = report_json_value(&report, ReportLevel::Minimal);
+
+    assert_eq!(json["schema_version"].as_u64(), Some(2));
+    assert!(json.get("summary").is_some());
+
+    let parse_stage = json["stages"]
+        .as_array()
+        .and_then(|stages| {
+            stages
+                .iter()
+                .find(|stage| stage.get("name").and_then(|value| value.as_str()) == Some("parse"))
+        })
+        .expect("parse stage should be present");
+    assert!(
+        parse_stage.get("detail").is_none(),
+        "minimal report should omit full parse detail: {parse_stage:?}"
+    );
 }
 
 #[tokio::test]
@@ -1330,19 +1480,38 @@ async fn rejected_only_fuzz_run_is_not_counted_as_pass_in_report_summary() {
         test_source_file: None,
         tests_only: false,
         complexity_threshold: None,
+        complexity_metric: ComplexityMetric::Cyclomatic,
         project_dir: None,
         lint_config_path: None,
         lint_virtual_file_path: None,
         diff: None,
+        suppressions: None,
+        suppression_source: None,
+        auto_seed: true,
         source_file: None,
         output_dir: Some(dir.path().to_str().unwrap()),
+        report_level: ReportLevel::Full,
+        execute_gate: ExecuteGate::All,
     };
     let report = verify(code, &Language::Python, opts).await;
 
     assert!(
-        !report.overall_ok,
-        "rejected-only fuzz run should fail verify"
+        report.overall_ok,
+        "rejected-only fuzz run should be diagnostic only"
     );
+    let execute_stage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("execute stage should be present");
+    assert!(
+        execute_stage.ok,
+        "execute stage should stay green for no-inputs-only runs"
+    );
+    let execute_detail = execute_stage.detail.as_ref().unwrap();
+    assert_eq!(execute_detail["no_inputs_reached"].as_u64(), Some(1));
+    assert_eq!(execute_detail["execute_gate_failed"].as_bool(), Some(false));
+
     let path = report.report_path.unwrap();
     let content = std::fs::read_to_string(&path).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -1350,6 +1519,195 @@ async fn rejected_only_fuzz_run_is_not_counted_as_pass_in_report_summary() {
     assert_eq!(summary.get("functions_fuzzed").unwrap().as_u64(), Some(1));
     assert_eq!(summary.get("fuzz_pass").unwrap().as_u64(), Some(0));
     assert_eq!(summary.get("fuzz_crash").unwrap().as_u64(), Some(0));
+    assert_eq!(
+        summary.get("fuzz_no_inputs_reached").unwrap().as_u64(),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn execute_gate_crash_allows_property_violations() {
+    let code = r#"
+export function compareScore(a: number, b: number): number {
+  return 1;
+}
+"#;
+
+    let report_default = verify(code, &Language::TypeScript, default_opts(None)).await;
+    assert!(
+        !report_default.overall_ok,
+        "default execute gate should fail property violations: {:#?}",
+        report_default.stages
+    );
+
+    let mut crash_only_opts = default_opts(None);
+    crash_only_opts.execute_gate = ExecuteGate::Crash;
+    let report = verify(code, &Language::TypeScript, crash_only_opts).await;
+    assert!(
+        report.overall_ok,
+        "crash-only execute gate should allow property violations: {:#?}",
+        report.stages
+    );
+
+    let execute_stage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("execute stage should be present");
+    assert!(
+        execute_stage.ok,
+        "execute stage should remain green under crash gate"
+    );
+    let detail = execute_stage.detail.as_ref().unwrap();
+    assert_eq!(detail["execute_gate"].as_str(), Some("crash"));
+    assert_eq!(
+        detail["finding_counts"]["property_violation"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0,
+        true
+    );
+    assert_eq!(detail["execute_gate_failed"].as_bool(), Some(false));
+}
+
+#[tokio::test]
+async fn execute_findings_can_be_suppressed_without_failing_verify() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("first_char.py");
+    let code = "def first_char(s: str) -> str:\n    return s[0]\n";
+    std::fs::write(&source_path, code).unwrap();
+
+    let suppressions = r#"
+{
+  "rules": [
+    {
+      "path": "first_char.py",
+      "stage": "execute",
+      "function": "first_char",
+      "severity": "crash",
+      "error_type": "IndexError"
+    }
+  ]
+}
+"#;
+    let report = verify(
+        code,
+        &Language::Python,
+        VerifyOptions {
+            test_code: None,
+            test_source_file: None,
+            tests_only: false,
+            complexity_threshold: None,
+            complexity_metric: ComplexityMetric::Cyclomatic,
+            project_dir: None,
+            lint_config_path: None,
+            lint_virtual_file_path: None,
+            diff: None,
+            suppressions: Some(suppressions),
+            suppression_source: Some(".court-jester-ignore.json"),
+            auto_seed: true,
+            source_file: Some(source_path.to_str().unwrap()),
+            output_dir: None,
+            report_level: ReportLevel::Full,
+            execute_gate: ExecuteGate::All,
+        },
+    )
+    .await;
+
+    assert!(
+        report.overall_ok,
+        "suppressed execute finding should not fail verify"
+    );
+    let execute_stage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("execute stage should be present");
+    assert!(
+        execute_stage.ok,
+        "execute stage should stay green when all findings are suppressed"
+    );
+    let detail = execute_stage.detail.as_ref().unwrap();
+    assert_eq!(
+        detail["suppression_source"].as_str(),
+        Some(".court-jester-ignore.json")
+    );
+    assert_eq!(detail["finding_counts"]["crash"].as_u64(), Some(0));
+    assert!(
+        detail["suppressed_finding_counts"]["crash"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0,
+        "expected suppressed crash findings"
+    );
+    let suppressed = detail["suppressed_fuzz_failures"].as_array().unwrap();
+    assert!(!suppressed.is_empty(), "expected suppressed fuzz failures");
+    assert_eq!(suppressed[0]["function"].as_str(), Some("first_char"));
+    assert!(report.summary.suppressed_fuzz_findings > 0);
+}
+
+#[tokio::test]
+async fn complexity_violations_can_be_suppressed_by_function_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("authz.py");
+    let code = r#"
+def check_access(a: bool, b: bool, c: bool) -> int:
+    if a:
+        if b:
+            if c:
+                return 1
+    return 0
+"#;
+    std::fs::write(&source_path, code).unwrap();
+    let suppressions = r#"
+{
+  "rules": [
+    {
+      "path": "authz.py",
+      "stage": "complexity",
+      "function": "check_access"
+    }
+  ]
+}
+"#;
+    let report = verify(
+        code,
+        &Language::Python,
+        VerifyOptions {
+            test_code: None,
+            test_source_file: None,
+            tests_only: false,
+            complexity_threshold: Some(2),
+            complexity_metric: ComplexityMetric::Cyclomatic,
+            project_dir: None,
+            lint_config_path: None,
+            lint_virtual_file_path: None,
+            diff: None,
+            suppressions: Some(suppressions),
+            suppression_source: Some(".court-jester-ignore.json"),
+            auto_seed: true,
+            source_file: Some(source_path.to_str().unwrap()),
+            output_dir: None,
+            report_level: ReportLevel::Full,
+            execute_gate: ExecuteGate::All,
+        },
+    )
+    .await;
+
+    assert!(
+        report.overall_ok,
+        "suppressed complexity violation should not fail verify"
+    );
+    let complexity_stage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "complexity")
+        .expect("complexity stage should be present");
+    assert!(complexity_stage.ok);
+    let detail = complexity_stage.detail.as_ref().unwrap();
+    assert_eq!(detail["violations"].as_array().unwrap().len(), 0);
+    assert_eq!(detail["suppressed_violations"].as_array().unwrap().len(), 1);
+    assert_eq!(report.summary.suppressed_complexity_violations, 1);
 }
 
 #[tokio::test]
@@ -1401,7 +1759,11 @@ export function decodeSegment(value: string): string {
         .iter()
         .find(|s| s.name == "execute")
         .expect("execute stage should be present");
-    assert!(exec_stage.ok, "execute stage should pass: {:?}", exec_stage.error);
+    assert!(
+        exec_stage.ok,
+        "execute stage should pass: {:?}",
+        exec_stage.error
+    );
 
     let failures = exec_stage
         .detail
@@ -1476,6 +1838,123 @@ class Reader {
 }
 
 #[tokio::test]
+async fn zero_arg_object_getter_is_classified_as_no_fuzzable_surface() {
+    let code = r#"
+export function ensureScraper(): { enabled: boolean } {
+  return process.env.SCRAPER_TOKEN ? { enabled: true } : { enabled: false };
+}
+"#;
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+
+    assert!(report.overall_ok, "report: {:#?}", report.stages);
+    assert!(
+        !report.stages.iter().any(|stage| stage.name == "execute"),
+        "no-fuzzable-surface function should not synthesize execute work"
+    );
+
+    let coverage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "coverage")
+        .and_then(|stage| stage.detail.as_ref())
+        .and_then(|detail| detail.get("functions"))
+        .and_then(|value| value.as_array())
+        .expect("coverage stage should contain per-function entries");
+    let ensure_scraper = coverage
+        .iter()
+        .find(|entry| {
+            entry.get("function").and_then(|value| value.as_str()) == Some("ensureScraper")
+        })
+        .expect("ensureScraper coverage should be present");
+    assert_eq!(
+        ensure_scraper
+            .get("status")
+            .and_then(|value| value.as_str()),
+        Some("skipped_no_fuzzable_surface")
+    );
+}
+
+#[tokio::test]
+async fn zero_arg_primitive_helper_can_still_be_fuzzed() {
+    let code = r#"
+export function buildVersion(): number {
+  return 42;
+}
+"#;
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+
+    let coverage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "coverage")
+        .and_then(|stage| stage.detail.as_ref())
+        .and_then(|detail| detail.get("functions"))
+        .and_then(|value| value.as_array())
+        .expect("coverage stage should contain per-function entries");
+    let build_version = coverage
+        .iter()
+        .find(|entry| {
+            entry.get("function").and_then(|value| value.as_str()) == Some("buildVersion")
+        })
+        .expect("buildVersion coverage should be present");
+    assert_eq!(
+        build_version.get("status").and_then(|value| value.as_str()),
+        Some("fuzzed")
+    );
+}
+
+#[tokio::test]
+async fn crash_can_be_classified_as_type_signature_wider_than_usage() {
+    let code = r#"
+export function jsonResponse(status: number): string {
+  return new Response("ok", { status }).statusText;
+}
+
+jsonResponse(200);
+jsonResponse(201);
+"#;
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+
+    let execute_stage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("execute stage should be present");
+    let failures = execute_stage
+        .detail
+        .as_ref()
+        .and_then(|detail| detail.get("fuzz_failures"))
+        .and_then(|value| value.as_array())
+        .expect("fuzz failures should be present");
+    assert!(
+        failures.iter().any(|failure| {
+            failure
+                .get("classification")
+                .and_then(|value| value.as_str())
+                == Some("type_signature_wider_than_usage")
+        }),
+        "expected a wide-type classification in: {failures:#?}"
+    );
+    let classified = failures
+        .iter()
+        .find(|failure| {
+            failure
+                .get("classification")
+                .and_then(|value| value.as_str())
+                == Some("type_signature_wider_than_usage")
+        })
+        .unwrap();
+    assert!(
+        classified
+            .get("suggestion")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .contains("200, 201"),
+        "expected observed literal suggestion, got: {classified:#?}"
+    );
+}
+
+#[tokio::test]
 async fn verify_separates_portability_warning_from_execute_success() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("bun.lock"), "").unwrap();
@@ -1496,12 +1975,18 @@ export function add(input: number): number {
         test_source_file: None,
         tests_only: false,
         complexity_threshold: None,
+        complexity_metric: ComplexityMetric::Cyclomatic,
         project_dir: Some(dir.path().to_str().unwrap()),
         lint_config_path: None,
         lint_virtual_file_path: None,
         diff: None,
+        suppressions: None,
+        suppression_source: None,
+        auto_seed: true,
         source_file: Some(source_path.to_str().unwrap()),
         output_dir: None,
+        report_level: ReportLevel::Full,
+        execute_gate: ExecuteGate::All,
     };
     let report = verify(code, &Language::TypeScript, opts).await;
 
@@ -1520,6 +2005,25 @@ export function add(input: number): number {
         .detail
         .as_ref()
         .expect("portability stage should include details");
+    assert_eq!(
+        portability_detail["reason"].as_str(),
+        Some("err_module_not_found")
+    );
+    assert!(
+        portability_detail["failing_imports"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .any(|value| value.as_str().unwrap_or("").contains("helper")),
+        "expected failing import list to include helper"
+    );
+    assert!(
+        portability_detail["fix_hint"]
+            .as_str()
+            .unwrap_or("")
+            .contains("explicit Node ESM file extensions"),
+        "expected a Node ESM fix hint"
+    );
     let node_stderr = portability_detail["node_result"]["stderr"]
         .as_str()
         .unwrap_or("");
@@ -1533,13 +2037,119 @@ export function add(input: number): number {
         .iter()
         .find(|stage| stage.name == "execute")
         .expect("execute stage should be present");
-    assert!(execute_stage.ok, "execute stage should succeed: {:?}", execute_stage.error);
+    assert!(
+        execute_stage.ok,
+        "execute stage should succeed: {:?}",
+        execute_stage.error
+    );
     let runtime = execute_stage
         .detail
         .as_ref()
         .and_then(|detail| detail.get("runtime"))
         .and_then(|value| value.as_str());
     assert_eq!(runtime, Some("bun"));
+}
+
+#[tokio::test]
+async fn auto_seed_uses_nearby_test_literals_for_execute_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_dir = dir.path().join("src");
+    let tests_dir = dir.path().join("tests");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::create_dir_all(&tests_dir).unwrap();
+
+    let source_path = src_dir.join("host_label.ts");
+    let test_path = tests_dir.join("host_label.test.ts");
+    let code = r#"
+export function hostLabel(url: string): string {
+  if (!url.startsWith("https://")) {
+    throw new Error("invalid base url");
+  }
+  return new URL(url).host;
+}
+"#;
+    let test_code = r#"
+import { hostLabel } from "../src/host_label.ts";
+
+hostLabel("https://example.com");
+"#;
+    std::fs::write(&source_path, code).unwrap();
+    std::fs::write(&test_path, test_code).unwrap();
+
+    let report_seeded = verify(
+        code,
+        &Language::TypeScript,
+        VerifyOptions {
+            test_code: None,
+            test_source_file: None,
+            tests_only: false,
+            complexity_threshold: None,
+            complexity_metric: ComplexityMetric::Cyclomatic,
+            project_dir: None,
+            lint_config_path: None,
+            lint_virtual_file_path: None,
+            diff: None,
+            suppressions: None,
+            suppression_source: None,
+            auto_seed: true,
+            source_file: Some(source_path.to_str().unwrap()),
+            output_dir: None,
+            report_level: ReportLevel::Full,
+            execute_gate: ExecuteGate::All,
+        },
+    )
+    .await;
+    let seeded_execute = report_seeded
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("execute stage should be present");
+    assert_eq!(seeded_execute["no_inputs_reached"].as_u64(), Some(0));
+    assert!(
+        seeded_execute["seed_input_count"].as_u64().unwrap_or(0) > 0,
+        "expected seeded inputs in execute detail"
+    );
+    assert!(
+        seeded_execute["seed_sources"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .any(|value| value.as_str() == Some(test_path.to_string_lossy().as_ref())),
+        "expected nearby test path in seed sources"
+    );
+
+    let report_unseeded = verify(
+        code,
+        &Language::TypeScript,
+        VerifyOptions {
+            test_code: None,
+            test_source_file: None,
+            tests_only: false,
+            complexity_threshold: None,
+            complexity_metric: ComplexityMetric::Cyclomatic,
+            project_dir: None,
+            lint_config_path: None,
+            lint_virtual_file_path: None,
+            diff: None,
+            suppressions: None,
+            suppression_source: None,
+            auto_seed: false,
+            source_file: Some(source_path.to_str().unwrap()),
+            output_dir: None,
+            report_level: ReportLevel::Full,
+            execute_gate: ExecuteGate::All,
+        },
+    )
+    .await;
+    let unseeded_execute = report_unseeded
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("execute stage should be present");
+    assert_eq!(unseeded_execute["no_inputs_reached"].as_u64(), Some(1));
+    assert_eq!(unseeded_execute["seed_input_count"].as_u64(), Some(0));
 }
 
 #[tokio::test]
@@ -1615,12 +2225,18 @@ assert.equal(displayHandle({ profile: { handle: " Admin " }, username: "root" })
         test_source_file: Some(test_path.to_str().unwrap()),
         tests_only: false,
         complexity_threshold: None,
+        complexity_metric: ComplexityMetric::Cyclomatic,
         project_dir: None,
         lint_config_path: None,
         lint_virtual_file_path: None,
         diff: None,
+        suppressions: None,
+        suppression_source: None,
+        auto_seed: true,
         source_file: Some(source_path.to_str().unwrap()),
         output_dir: None,
+        report_level: ReportLevel::Full,
+        execute_gate: ExecuteGate::All,
     };
     let report = verify(code, &Language::TypeScript, opts).await;
 
@@ -1658,12 +2274,18 @@ assert Path(__file__).name == "test_app.py"
         test_source_file: Some(test_path.to_str().unwrap()),
         tests_only: true,
         complexity_threshold: None,
+        complexity_metric: ComplexityMetric::Cyclomatic,
         project_dir: Some(dir.path().to_str().unwrap()),
         lint_config_path: None,
         lint_virtual_file_path: None,
         diff: None,
+        suppressions: None,
+        suppression_source: None,
+        auto_seed: true,
         source_file: Some(source_path.to_str().unwrap()),
         output_dir: None,
+        report_level: ReportLevel::Full,
+        execute_gate: ExecuteGate::All,
     };
     let report = verify(code, &Language::Python, opts).await;
 
@@ -1701,12 +2323,18 @@ assert Path(__file__).name == "test_app.py"
         test_source_file: Some(test_path.to_str().unwrap()),
         tests_only: true,
         complexity_threshold: None,
+        complexity_metric: ComplexityMetric::Cyclomatic,
         project_dir: Some(dir.path().to_str().unwrap()),
         lint_config_path: None,
         lint_virtual_file_path: None,
         diff: None,
+        suppressions: None,
+        suppression_source: None,
+        auto_seed: true,
         source_file: Some(source_path.to_str().unwrap()),
         output_dir: None,
+        report_level: ReportLevel::Full,
+        execute_gate: ExecuteGate::All,
     };
     let report = verify(code, &Language::Python, opts).await;
 
@@ -1768,12 +2396,18 @@ assert.equal(primaryPlanCode({ plans: [null, ""] }), "FREE");
         test_source_file: Some(test_path.to_str().unwrap()),
         tests_only: false,
         complexity_threshold: None,
+        complexity_metric: ComplexityMetric::Cyclomatic,
         project_dir: None,
         lint_config_path: None,
         lint_virtual_file_path: None,
         diff: None,
+        suppressions: None,
+        suppression_source: None,
+        auto_seed: true,
         source_file: Some(normalizers_path.to_str().unwrap()),
         output_dir: None,
+        report_level: ReportLevel::Full,
+        execute_gate: ExecuteGate::All,
     };
     let report = verify(normalizers, &Language::TypeScript, opts).await;
 
@@ -1812,12 +2446,18 @@ if (displayInitials("Spencer Lee") !== "SL") {
         test_source_file: Some(tests_path.to_str().unwrap()),
         tests_only: false,
         complexity_threshold: None,
+        complexity_metric: ComplexityMetric::Cyclomatic,
         project_dir: None,
         lint_config_path: None,
         lint_virtual_file_path: None,
         diff: None,
+        suppressions: None,
+        suppression_source: None,
+        auto_seed: true,
         source_file: Some(src_path.to_str().unwrap()),
         output_dir: None,
+        report_level: ReportLevel::Full,
+        execute_gate: ExecuteGate::All,
     };
     let report = verify(code, &Language::TypeScript, opts).await;
 

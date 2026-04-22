@@ -1,0 +1,556 @@
+{
+  "schema_version": 2,
+  "created_at": "2026-04-22",
+  "last_updated": "2026-04-22",
+  "source": {
+    "type": "structured_user_feedback",
+    "summary": "Feedback from running Court Jester across ~15 files from 0.1.x through 0.1.9.",
+    "headline": "0.1.9 is close to CI-worthy; remaining blockers are suppression, output stability, and a few categorization bugs."
+  },
+  "status_summary": {
+    "done": [
+      "CJ-101",
+      "CJ-102",
+      "CJ-103",
+      "CJ-104",
+      "CJ-105",
+      "CJ-106",
+      "CJ-107",
+      "CJ-108",
+      "CJ-109",
+      "CJ-110",
+      "CJ-111",
+      "CJ-112",
+      "CJ-113",
+      "CJ-115",
+      "CJ-116"
+    ],
+    "planned": [
+      "CJ-114"
+    ]
+  },
+  "prioritization": {
+    "strategy": "Prioritize trust and CI adoption first: fix incorrect accounting, separate diagnostics from failures, stabilize report contracts, reduce artifact size, then add suppression and gating. Defer capability-expansion and workflow packaging until the machine interface is stable.",
+    "execution_order": [
+      "CJ-101",
+      "CJ-104",
+      "CJ-102",
+      "CJ-103",
+      "CJ-106",
+      "CJ-105",
+      "CJ-107",
+      "CJ-115",
+      "CJ-108",
+      "CJ-109",
+      "CJ-113",
+      "CJ-110",
+      "CJ-111",
+      "CJ-112",
+      "CJ-116",
+      "CJ-114"
+    ],
+    "remaining_execution_order": [
+      "CJ-114"
+    ],
+    "phases": [
+      {
+        "id": "phase-1",
+        "name": "CI Trust Foundation",
+        "goal": "Make current outputs trustworthy enough to gate on in CI.",
+        "task_ids": [
+          "CJ-101",
+          "CJ-104",
+          "CJ-102",
+          "CJ-103",
+          "CJ-106"
+        ]
+      },
+      {
+        "id": "phase-2",
+        "name": "Adoption Blockers",
+        "goal": "Give teams the controls and docs they need to keep CJ on in real workflows.",
+        "task_ids": [
+          "CJ-105",
+          "CJ-107",
+          "CJ-115",
+          "CJ-108"
+        ]
+      },
+      {
+        "id": "phase-3",
+        "name": "Signal Refinement",
+        "goal": "Improve finding quality and machine-readable categorization without broadening scope too aggressively.",
+        "task_ids": [
+          "CJ-109",
+          "CJ-113",
+          "CJ-110",
+          "CJ-111"
+        ]
+      },
+      {
+        "id": "phase-4",
+        "name": "Coverage And Workflow Expansion",
+        "goal": "Expand reach and package the experience once the core CI contract is stable.",
+        "task_ids": [
+          "CJ-112",
+          "CJ-116",
+          "CJ-114"
+        ]
+      }
+    ]
+  },
+  "tasks": [
+    {
+      "id": "CJ-101",
+      "title": "Fix diff_scoped reporting when --diff-file is active",
+      "status": "done",
+      "priority": "P0",
+      "priority_rank": 1,
+      "estimate": "S",
+      "type": "bug",
+      "theme": "ci_adoption",
+      "phase": "phase-1",
+      "target_release": "0.1.10",
+      "depends_on": [],
+      "problem": "Coverage JSON can report diff_scoped as null even when diff filtering clearly ran.",
+      "evidence": [
+        "scraper-jobs.ts run reported diff_scoped: null while counts.skipped_diff_filtered was 9"
+      ],
+      "deliverables": [
+        "Reproduce the mismatch through the CLI JSON output path",
+        "Set diff_scoped deterministically whenever a diff was supplied",
+        "Add a regression test that covers --diff-file end to end"
+      ],
+      "acceptance_criteria": [
+        "coverage.detail.diff_scoped is true whenever --diff-file is provided and diff filtering is applied",
+        "CLI JSON output matches the internal verify-stage accounting",
+        "A targeted regression test fails before the fix and passes after it"
+      ]
+    },
+    {
+      "id": "CJ-102",
+      "title": "Add schema_version to JSON reports and publish a stability contract",
+      "status": "done",
+      "priority": "P0",
+      "priority_rank": 3,
+      "estimate": "S",
+      "type": "feature",
+      "theme": "ci_adoption",
+      "phase": "phase-1",
+      "target_release": "0.1.10",
+      "depends_on": [],
+      "problem": "CI and dashboard consumers have no machine-readable versioning signal for report shape changes.",
+      "evidence": [
+        "User feedback requested a top-level schema_version field to prevent silent breakage on upgrades"
+      ],
+      "deliverables": [
+        "Add top-level schema_version to every JSON report",
+        "Document stage-name and JSON-key stability guarantees",
+        "Define how schema changes will be versioned across releases"
+      ],
+      "acceptance_criteria": [
+        "All report-producing commands emit schema_version at the top level",
+        "Docs state whether stage names are stable, append-only, or version-gated",
+        "Future schema-breaking changes have a documented bump process"
+      ]
+    },
+    {
+      "id": "CJ-103",
+      "title": "Add report-level controls to cap artifact size",
+      "status": "done",
+      "priority": "P0",
+      "priority_rank": 4,
+      "estimate": "M",
+      "type": "feature",
+      "theme": "ci_adoption",
+      "phase": "phase-1",
+      "target_release": "0.1.10",
+      "depends_on": [
+        "CJ-102"
+      ],
+      "problem": "Single-file JSON outputs are already large enough to create CI artifact bloat.",
+      "evidence": [
+        "sn-normalize.json was 72KB",
+        "hotel-cache.json was 38KB for a single-file run"
+      ],
+      "deliverables": [
+        "Add --report-level minimal|full",
+        "Define which fields are retained in minimal mode",
+        "Document intended use in CI and local debugging workflows"
+      ],
+      "acceptance_criteria": [
+        "Minimal mode preserves pass/fail, findings, stage outcomes, and schema_version",
+        "Full mode remains backward-compatible with the current detailed output",
+        "Docs explain when to use minimal versus full reports"
+      ]
+    },
+    {
+      "id": "CJ-104",
+      "title": "Split execute-stage severities so no_inputs_reached is diagnostic, not failing",
+      "status": "done",
+      "priority": "P0",
+      "priority_rank": 2,
+      "estimate": "M",
+      "type": "bug",
+      "theme": "signal_quality",
+      "phase": "phase-1",
+      "target_release": "0.1.10",
+      "depends_on": [],
+      "problem": "The execute stage can go ok=false even when the only issue is that generated inputs were all rejected.",
+      "evidence": [
+        "buildSignedScrapeUrl rejected all 45 generated inputs and the execute stage still failed despite no crash"
+      ],
+      "deliverables": [
+        "Introduce a distinct no_inputs_reached outcome",
+        "Separate diagnostic severities from stage-failing severities",
+        "Update summary accounting and docs to reflect the new taxonomy"
+      ],
+      "acceptance_criteria": [
+        "All-inputs-rejected runs are visible in the report but do not fail the execute stage by default",
+        "Real crash findings still fail the execute stage",
+        "Regression coverage exists for the all-inputs-rejected case"
+      ]
+    },
+    {
+      "id": "CJ-105",
+      "title": "Add a suppression or baseline mechanism for known findings",
+      "status": "done",
+      "priority": "P0",
+      "priority_rank": 6,
+      "estimate": "L",
+      "type": "feature",
+      "theme": "ci_adoption",
+      "phase": "phase-2",
+      "target_release": "0.1.10",
+      "depends_on": [
+        "CJ-102",
+        "CJ-104"
+      ],
+      "problem": "Teams need a way to keep CI on without disabling entire stages after the first known false positive.",
+      "evidence": [
+        "User feedback explicitly called out suppression as the main blocker to CI adoption"
+      ],
+      "deliverables": [
+        "Choose a suppression model: ignore file, inline directives, baseline snapshot, or a combination",
+        "Allow suppressions by path, stage, and function or finding key",
+        "Record suppressed findings explicitly in JSON output"
+      ],
+      "acceptance_criteria": [
+        "A known false positive can be suppressed without disabling execute globally",
+        "Suppressed findings remain auditable in the report",
+        "Docs explain precedence, matching, and update workflow"
+      ]
+    },
+    {
+      "id": "CJ-106",
+      "title": "Add granular execute-stage gating controls",
+      "status": "done",
+      "priority": "P0",
+      "priority_rank": 5,
+      "estimate": "M",
+      "type": "feature",
+      "theme": "ci_adoption",
+      "phase": "phase-1",
+      "target_release": "0.1.10",
+      "depends_on": [
+        "CJ-104"
+      ],
+      "problem": "Users can currently gate on the whole execute stage but not on finding severity classes.",
+      "evidence": [
+        "Requested behavior: fail on crash severity only, allow property_violation, ignore no_inputs_reached"
+      ],
+      "deliverables": [
+        "Add an execute-gate flag or config surface",
+        "Define the supported execute severities and default gate behavior",
+        "Document common CI profiles"
+      ],
+      "acceptance_criteria": [
+        "Users can configure execute gating at severity granularity",
+        "The default gate remains sensible for local runs",
+        "The selected gating policy is visible in the report or CLI output"
+      ]
+    },
+    {
+      "id": "CJ-107",
+      "title": "Publish a real CHANGELOG and release semantics notes",
+      "status": "done",
+      "priority": "P0",
+      "priority_rank": 7,
+      "estimate": "S",
+      "type": "docs",
+      "theme": "release_hygiene",
+      "phase": "phase-2",
+      "target_release": "0.1.10",
+      "depends_on": [],
+      "problem": "Teams cannot easily tell when findings changed because tool semantics changed versus because code changed.",
+      "evidence": [
+        "User feedback called out the silent determinism heuristic change and lack of visible version history"
+      ],
+      "deliverables": [
+        "Add CHANGELOG.md covering at least 0.1.7 through current",
+        "Call out semantic changes that can affect findings",
+        "Link release notes from the README or docs index"
+      ],
+      "acceptance_criteria": [
+        "Every release notes semantic shifts that can change findings or stage outcomes",
+        "A new user can find release history from the repo root",
+        "The changelog distinguishes bug fixes, output-shape changes, and benchmark/docs updates"
+      ]
+    },
+    {
+      "id": "CJ-108",
+      "title": "Improve fused-flag parse errors for shell-script invocation mistakes",
+      "status": "done",
+      "priority": "P1",
+      "priority_rank": 9,
+      "estimate": "S",
+      "type": "ux",
+      "theme": "cli_ergonomics",
+      "phase": "phase-2",
+      "target_release": "0.1.10",
+      "depends_on": [],
+      "problem": "When a flag and value are accidentally fused into one token, the CLI error is correct but not helpful.",
+      "evidence": [
+        "Example: unknown flag '--diff-file /tmp/x.diff' when args were passed as a single token"
+      ],
+      "deliverables": [
+        "Detect common fused-flag forms in parse errors",
+        "Suggest the intended split tokens in the error message",
+        "Add regression tests for representative bad invocations"
+      ],
+      "acceptance_criteria": [
+        "The CLI suggests splitting the flag and value when it sees a fused flag token",
+        "Existing valid flag parsing behavior is unchanged",
+        "Tests cover at least --diff-file and one other path-valued flag"
+      ]
+    },
+    {
+      "id": "CJ-109",
+      "title": "Structure portability output into machine-readable fields",
+      "status": "done",
+      "priority": "P1",
+      "priority_rank": 10,
+      "estimate": "M",
+      "type": "feature",
+      "theme": "signal_quality",
+      "phase": "phase-3",
+      "target_release": "0.1.11",
+      "depends_on": [
+        "CJ-102"
+      ],
+      "problem": "Portability failures are still mostly raw stderr, which is hard to aggregate and automate against.",
+      "evidence": [
+        "Requested structure: failing_imports, reason, and fix_hint instead of a raw Node stack trace blob"
+      ],
+      "deliverables": [
+        "Parse known portability failure classes into structured fields",
+        "Preserve raw stderr for debugging without making it the primary interface",
+        "Document the portability taxonomy"
+      ],
+      "acceptance_criteria": [
+        "Common Node ESM/module-load portability failures are emitted as structured JSON",
+        "Raw stderr is still available in full reports",
+        "At least one fix_hint path is tested for known import-resolution failures"
+      ]
+    },
+    {
+      "id": "CJ-110",
+      "title": "Expose cognitive complexity as a first-class metric and profile option",
+      "status": "done",
+      "priority": "P1",
+      "priority_rank": 12,
+      "estimate": "M",
+      "type": "feature",
+      "theme": "complexity",
+      "phase": "phase-3",
+      "target_release": "0.1.11",
+      "depends_on": [],
+      "problem": "Cyclomatic complexity alone underweights deeply nested control flow that humans experience as hard to maintain.",
+      "evidence": [
+        "checkRelation measured cyclomatic 15 but cognitive 26 in user feedback"
+      ],
+      "deliverables": [
+        "Add a complexity-metric selector or equivalent config surface",
+        "Support cognitive complexity in thresholding and reporting",
+        "Decide whether the security profile should remain cyclomatic-based, become cognitive-based, or support both"
+      ],
+      "acceptance_criteria": [
+        "Users can choose cyclomatic or cognitive complexity for gating",
+        "Reports clearly state which metric drove a violation",
+        "Docs explain tradeoffs and default behavior"
+      ]
+    },
+    {
+      "id": "CJ-111",
+      "title": "Classify wide-type parameter crashes separately from likely runtime bugs",
+      "status": "done",
+      "priority": "P1",
+      "priority_rank": 13,
+      "estimate": "L",
+      "type": "feature",
+      "theme": "signal_quality",
+      "phase": "phase-3",
+      "target_release": "0.1.11",
+      "depends_on": [],
+      "problem": "Some fuzz crashes only happen on values allowed by the type signature but never passed by any observed static call site.",
+      "evidence": [
+        "hotel-cache.ts jsonResponse crashed on status: 0 even though real call sites only pass literals in a safe range"
+      ],
+      "deliverables": [
+        "Prototype a finding class like type_signature_wider_than_usage",
+        "Use observed static call-site values as an advisory signal, not as proof of safety",
+        "Generate remediation suggestions that prefer narrowing the type when appropriate"
+      ],
+      "acceptance_criteria": [
+        "The tool can distinguish at least one wide-type-only crash case from a general crash finding",
+        "The finding text makes clear that the classification is inferred from observed usage",
+        "A regression test covers the hotel-cache-style pattern"
+      ]
+    },
+    {
+      "id": "CJ-112",
+      "title": "Auto-seed fuzz inputs from existing tests and literal call sites",
+      "status": "done",
+      "priority": "P1",
+      "priority_rank": 14,
+      "estimate": "L",
+      "type": "feature",
+      "theme": "coverage_growth",
+      "phase": "phase-4",
+      "target_release": "0.1.11",
+      "depends_on": [],
+      "problem": "Generic generation misses valid boundary-shaping inputs that already exist in repo tests.",
+      "evidence": [
+        "Requested examples included scrape-url.ts, where generators could not reach valid base URLs without help"
+      ],
+      "deliverables": [
+        "Search conventional nearby test paths automatically when not explicitly provided",
+        "Extract literal argument seeds from simple expect(fn(...)) or call-site patterns",
+        "Blend discovered seeds into fuzz generation without hiding purely generated cases"
+      ],
+      "acceptance_criteria": [
+        "CJ can discover and use argument seeds from at least one conventional test file layout",
+        "Reports indicate when seeded inputs contributed to coverage",
+        "Auto-seeding can be disabled for deterministic debugging"
+      ]
+    },
+    {
+      "id": "CJ-113",
+      "title": "Add a no_fuzzable_surface classification for vacuous zero-arg coverage",
+      "status": "done",
+      "priority": "P1",
+      "priority_rank": 11,
+      "estimate": "M",
+      "type": "feature",
+      "theme": "signal_quality",
+      "phase": "phase-3",
+      "target_release": "0.1.11",
+      "depends_on": [],
+      "problem": "Some zero-arg, impure, env-gated functions currently count as fuzzed even when the run provided little or no real signal.",
+      "evidence": [
+        "ensure-scraper.ts had two zero-arg exports that both passed 30x while coverage still reported fuzzed: 2"
+      ],
+      "deliverables": [
+        "Define a no_fuzzable_surface or equivalent coverage outcome",
+        "Detect vacuous zero-arg cases that only touch globals, env, or clocks without meaningful parameter exploration",
+        "Reflect the new classification in coverage summaries"
+      ],
+      "acceptance_criteria": [
+        "Vacuous zero-arg cases no longer overstate fuzz coverage",
+        "Legitimate zero-arg deterministic functions can still be marked as covered when appropriate",
+        "A regression test covers the ensure-scraper-style pattern"
+      ]
+    },
+    {
+      "id": "CJ-114",
+      "title": "Ship a court-jester ci subcommand for first-party PR workflows",
+      "status": "planned",
+      "priority": "P1",
+      "priority_rank": 16,
+      "estimate": "XL",
+      "type": "feature",
+      "theme": "ci_workflow",
+      "phase": "phase-4",
+      "target_release": "0.2.0",
+      "depends_on": [
+        "CJ-102",
+        "CJ-103",
+        "CJ-105",
+        "CJ-106"
+      ],
+      "problem": "Every adopter otherwise has to reinvent diff extraction, fan-out, aggregation, baseline comparison, and reporter formatting.",
+      "evidence": [
+        "Requested UX: court-jester ci --base=origin/main --gate=complexity,portability --report=github"
+      ],
+      "deliverables": [
+        "Design a ci subcommand that scopes to changed files",
+        "Aggregate per-file JSON into a single gate result",
+        "Support at least one reporter format for PR annotations"
+      ],
+      "acceptance_criteria": [
+        "A user can point CJ at a base revision and get a single CI-oriented result",
+        "The command supports minimal output suitable for GitHub or similar CI surfaces",
+        "The implementation reuses stable report schema and gating primitives instead of inventing a second reporting path"
+      ]
+    },
+    {
+      "id": "CJ-115",
+      "title": "Publish cost-curve guidance for PR-sized runs",
+      "status": "done",
+      "priority": "P1",
+      "priority_rank": 8,
+      "estimate": "S",
+      "type": "docs",
+      "theme": "adoption_docs",
+      "phase": "phase-2",
+      "target_release": "0.1.10",
+      "depends_on": [],
+      "problem": "Potential adopters need an honest expectation for latency and artifact cost on real PRs.",
+      "evidence": [
+        "Observed local run: 10 files in parallel in about 30 seconds, with an expected 30-file PR around 90 seconds"
+      ],
+      "deliverables": [
+        "Measure median and p95 run times for representative TypeScript and Python files",
+        "Document which stages dominate runtime",
+        "Add guidance for parallelism and report-level choice in CI"
+      ],
+      "acceptance_criteria": [
+        "Docs include at least median and p95 timing guidance",
+        "Users can estimate the cost of a 10-file and 30-file PR from the published guidance",
+        "The note calls out when execute-stage work dominates total runtime"
+      ]
+    },
+    {
+      "id": "CJ-116",
+      "title": "Promote real repo wins and auditable-green examples in release and site copy",
+      "status": "done",
+      "priority": "P2",
+      "priority_rank": 15,
+      "estimate": "S",
+      "type": "docs",
+      "theme": "proof_points",
+      "phase": "phase-4",
+      "target_release": "0.1.10",
+      "depends_on": [
+        "CJ-107"
+      ],
+      "problem": "The repo has strong concrete proof points, but they are not packaged into a durable user-facing adoption narrative.",
+      "evidence": [
+        "CRLF-injected X-Correlation-Id crash in correlation.ts",
+        "nil-deref in authz/check.ts:buildCacheKey found through factory-to-nested fuzzing",
+        "3+ Node-strict ESM portability issues",
+        "Zero crashes across ~575 fuzz executions in security-boundary code with auditable coverage"
+      ],
+      "deliverables": [
+        "Add a short wins section to release notes, README, or site copy",
+        "Pair concrete bug finds with auditable-green examples",
+        "Make the examples easy to cite in future release notes"
+      ],
+      "acceptance_criteria": [
+        "At least one user-facing doc includes both bug-finding wins and auditable-green examples",
+        "The examples are specific enough to be credible without exposing sensitive repo details",
+        "Future releases have a place to carry forward similar proof points"
+      ]
+    }
+  ]
+}

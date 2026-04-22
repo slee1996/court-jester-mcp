@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+pub const REPORT_SCHEMA_VERSION: u32 = 2;
+
 fn is_zero(value: &usize) -> bool {
     *value == 0
 }
@@ -18,6 +20,62 @@ impl Language {
         match s.to_lowercase().as_str() {
             "python" | "py" => Some(Language::Python),
             "typescript" | "ts" => Some(Language::TypeScript),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportLevel {
+    #[default]
+    Full,
+    Minimal,
+}
+
+impl ReportLevel {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "full" => Some(Self::Full),
+            "minimal" => Some(Self::Minimal),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecuteGate {
+    #[default]
+    All,
+    Crash,
+    None,
+}
+
+impl ExecuteGate {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "all" => Some(Self::All),
+            "crash" => Some(Self::Crash),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ComplexityMetric {
+    #[default]
+    Cyclomatic,
+    Cognitive,
+}
+
+impl ComplexityMetric {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "cyclomatic" => Some(Self::Cyclomatic),
+            "cognitive" => Some(Self::Cognitive),
             _ => None,
         }
     }
@@ -151,12 +209,17 @@ pub struct FuzzFailure {
     pub error_type: String,
     pub message: String,
     pub severity: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classification: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggestion: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FuzzFunctionStatus {
     Fuzzed,
+    SkippedNoFuzzableSurface,
     SkippedUnsupportedType,
     SkippedInternalHelper,
     SkippedMethod,
@@ -211,8 +274,10 @@ pub struct VerificationStage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerificationReport {
+    pub schema_version: u32,
     pub stages: Vec<VerificationStage>,
     pub overall_ok: bool,
+    pub summary: ReportSummary,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub report_path: Option<String>,
 }
@@ -234,12 +299,18 @@ pub struct ReportSummary {
     pub functions_blocked_module_load: usize,
     pub fuzz_pass: usize,
     pub fuzz_crash: usize,
+    pub fuzz_property_violation: usize,
+    pub fuzz_no_inputs_reached: usize,
+    pub suppressed_fuzz_findings: usize,
+    pub suppressed_complexity_violations: usize,
+    pub suppressed_portability_warnings: usize,
     pub lint_issues: usize,
     pub complexity_violations: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedReport {
+    pub schema_version: u32,
     pub meta: ReportMeta,
     pub stages: Vec<VerificationStage>,
     pub overall_ok: bool,

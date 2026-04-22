@@ -12,11 +12,7 @@ const FUZZ_ITERATIONS: usize = 30;
 /// 3. Idempotency where applicable (string→string, etc.)
 /// 4. Consistency (same input → same output)
 pub fn synthesize_calls(analysis: &AnalysisResult, language: &Language) -> String {
-    synthesize_plan(
-        analysis,
-        language,
-    )
-    .code
+    synthesize_plan(analysis, language).code
 }
 
 pub fn synthesize_plan(analysis: &AnalysisResult, language: &Language) -> FuzzPlan {
@@ -59,6 +55,16 @@ pub fn synthesize_plan_for(
     aliases: &[TypeAliasInfo],
     language: &Language,
 ) -> FuzzPlan {
+    synthesize_plan_for_with_seeds(functions, classes, aliases, language, &HashMap::new())
+}
+
+pub fn synthesize_plan_for_with_seeds(
+    functions: &[FunctionInfo],
+    classes: &[ClassInfo],
+    aliases: &[TypeAliasInfo],
+    language: &Language,
+    seed_inputs: &HashMap<String, Vec<Vec<String>>>,
+) -> FuzzPlan {
     let class_defs: HashMap<&str, &ClassInfo> =
         classes.iter().map(|c| (c.name.as_str(), c)).collect();
 
@@ -75,10 +81,10 @@ pub fn synthesize_plan_for(
     };
 
     match language {
-        Language::Python => synthesize_python(&pseudo_analysis, &class_defs),
+        Language::Python => synthesize_python(&pseudo_analysis, &class_defs, seed_inputs),
         Language::TypeScript => {
             let named_types = build_ts_named_types(classes, aliases);
-            synthesize_typescript(&pseudo_analysis, &named_types)
+            synthesize_typescript(&pseudo_analysis, &named_types, seed_inputs)
         }
     }
 }
@@ -223,6 +229,46 @@ fn coverage_entry(
     }
 }
 
+fn python_seed_setup(
+    func: &FunctionInfo,
+    seed_inputs: &HashMap<String, Vec<Vec<String>>>,
+) -> String {
+    let Some(rows) = seed_inputs.get(&func.name) else {
+        return String::new();
+    };
+    rows.iter()
+        .map(|row| format!("_all_inputs.append([{}])", row.join(", ")))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn ts_seed_rows(func: &FunctionInfo, seed_inputs: &HashMap<String, Vec<Vec<String>>>) -> String {
+    let Some(rows) = seed_inputs.get(&func.name) else {
+        return String::new();
+    };
+    rows.iter()
+        .map(|row| format!("[{}]", row.join(", ")))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn has_noncheckable_python_zero_arg_return_contract(func: &FunctionInfo) -> bool {
+    let return_type = func.return_type.as_deref().unwrap_or("").trim();
+    !return_type.is_empty()
+        && !matches!(return_type, "str" | "int" | "float" | "bool" | "bytes")
+}
+
+fn has_noncheckable_ts_zero_arg_return_contract(func: &FunctionInfo) -> bool {
+    let return_type = func.return_type.as_deref().unwrap_or("").trim();
+    !return_type.is_empty() && !matches!(return_type, "string" | "number" | "boolean")
+}
+
+fn has_nested_children(func: &FunctionInfo, all_functions: &[FunctionInfo]) -> bool {
+    all_functions.iter().any(|candidate| {
+        candidate.is_nested && candidate.line >= func.line && candidate.end_line <= func.end_line
+    })
+}
+
 fn python_type_is_simple_helper_input(
     type_ann: Option<&str>,
     type_defs: &HashMap<&str, &ClassInfo>,
@@ -320,6 +366,7 @@ fn should_fuzz_ts_helper(
 fn synthesize_python(
     analysis: &AnalysisResult,
     type_defs: &HashMap<&str, &ClassInfo>,
+    seed_inputs: &HashMap<String, Vec<Vec<String>>>,
 ) -> FuzzPlan {
     let mut code = String::new();
     let mut coverage = Vec::new();
@@ -337,6 +384,21 @@ fn synthesize_python(
             .iter()
             .filter(|p| !p.name.starts_with('*'))
             .collect();
+        let has_nested = has_nested_children(func, &analysis.functions);
+
+        if callable_params.is_empty()
+            && !has_nested
+            && has_noncheckable_python_zero_arg_return_contract(func)
+        {
+            coverage.push(coverage_entry(
+                func,
+                FuzzFunctionStatus::SkippedNoFuzzableSurface,
+                Some(
+                    "zero-argument function has no meaningful parameter surface or stable return contract to fuzz".into(),
+                ),
+            ));
+            continue;
+        }
 
         // Check if we can generate values for all params
         let generators: Vec<String> = callable_params
@@ -401,6 +463,7 @@ fn synthesize_python(
             r#"
 _all_inputs = []
 {edge_case_setup}
+{seed_setup}
 for _ in range({FUZZ_ITERATIONS}):
     _all_inputs.append([{gen_list}])
 _pass = 0
@@ -441,6 +504,7 @@ else:
 "#,
             name = func.name,
             edge_case_setup = edge_case_setup,
+            seed_setup = python_seed_setup(func, seed_inputs),
             type_check = python_type_check(ret_type, type_defs),
             idempotency_check = python_idempotency_check(func, &callable_params, type_defs),
             consistency_check = python_consistency_check(func, &call_args),
@@ -466,10 +530,7 @@ else:
     // Factory exercise: for functions containing nested functions,
     // call the factory and exercise the returned object's callables
     for func in selected_functions {
-        let has_nested = analysis
-            .functions
-            .iter()
-            .any(|f| f.is_nested && f.line >= func.line && f.end_line <= func.end_line);
+        let has_nested = has_nested_children(func, &analysis.functions);
         if !has_nested {
             continue;
         }
@@ -1369,7 +1430,11 @@ else:
 
 // ── TypeScript fuzz harness ─────────────────────────────────────────────────
 
-fn synthesize_typescript(analysis: &AnalysisResult, type_defs: &TsNamedTypes<'_>) -> FuzzPlan {
+fn synthesize_typescript(
+    analysis: &AnalysisResult,
+    type_defs: &TsNamedTypes<'_>,
+    seed_inputs: &HashMap<String, Vec<Vec<String>>>,
+) -> FuzzPlan {
     let mut code = String::new();
     let mut coverage = Vec::new();
     let has_exported = has_exported_surface(&analysis.functions);
@@ -1385,12 +1450,29 @@ fn synthesize_typescript(analysis: &AnalysisResult, type_defs: &TsNamedTypes<'_>
             .iter()
             .filter(|p| !p.name.starts_with('*'))
             .collect();
+        let has_nested = has_nested_children(func, &analysis.functions);
+
+        if callable_params.is_empty()
+            && !has_nested
+            && has_noncheckable_ts_zero_arg_return_contract(func)
+        {
+            coverage.push(coverage_entry(
+                func,
+                FuzzFunctionStatus::SkippedNoFuzzableSurface,
+                Some(
+                    "zero-argument function has no meaningful parameter surface or stable return contract to fuzz".into(),
+                ),
+            ));
+            continue;
+        }
 
         if !ts_params_are_fuzzable(func, &callable_params, type_defs) {
             coverage.push(coverage_entry(
                 func,
                 FuzzFunctionStatus::SkippedUnsupportedType,
-                Some("one or more parameters use unsupported or unresolved TypeScript types".into()),
+                Some(
+                    "one or more parameters use unsupported or unresolved TypeScript types".into(),
+                ),
             ));
             continue;
         }
@@ -1535,7 +1617,7 @@ fn synthesize_typescript(analysis: &AnalysisResult, type_defs: &TsNamedTypes<'_>
         code.push_str(&format!(
             r#"
 {{
-  const _fuzzOk = _fuzzOne("{name}", {iters}, () => [{gen_list}], (args: unknown[]) => ({name} as Function)(...args), {typecheck}, [{param_type_list}], [{properties_list}]);
+  const _fuzzOk = _fuzzOne("{name}", {iters}, () => [{gen_list}], (args: unknown[]) => ({name} as Function)(...args), {typecheck}, [{param_type_list}], [{properties_list}], [{seed_rows}]);
 {query_string_semantic_check}
 {defaults_semantic_check}
 {feature_flag_override_check}
@@ -1546,6 +1628,7 @@ fn synthesize_typescript(analysis: &AnalysisResult, type_defs: &TsNamedTypes<'_>
             name = func.name,
             iters = FUZZ_ITERATIONS,
             typecheck = ts_type_check_fn(ret_type),
+            seed_rows = ts_seed_rows(func, seed_inputs),
             query_string_semantic_check = query_string_semantic_check,
             defaults_semantic_check = defaults_semantic_check,
             feature_flag_override_check = feature_flag_override_check,
@@ -2602,10 +2685,14 @@ function _fuzzOne(
   expectedType: string | null,
   paramTypes: string[] = [],
   properties: string[] = [],
+  seedRows: unknown[][] = [],
 ): boolean {
   let pass = 0, reject = 0, crash = 0;
   let firstCrash = "";
   const allInputs: unknown[][] = [];
+  for (const seed of seedRows) {
+    allInputs.push(seed);
+  }
   for (let pi = 0; pi < paramTypes.length; pi++) {
     for (const ev of _edgeCasesFor(paramTypes[pi])) {
       const row = genArgs(); row[pi] = ev; allInputs.push(row);

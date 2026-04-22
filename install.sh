@@ -80,6 +80,16 @@ case ":${PATH}:" in
     ;;
 esac
 
+if [ ! -x "${INSTALL_DIR}/biome" ] && ! command -v biome >/dev/null 2>&1; then
+  echo ""
+  echo "Optional follow-up for TypeScript lint:"
+  echo "  Court Jester uses a project-local Biome from node_modules/.bin/biome when present."
+  echo "  If your repo does not already install Biome, add it with:"
+  echo "    npm install --save-dev --save-exact @biomejs/biome"
+  echo "  or"
+  echo "    bun add -d --exact @biomejs/biome"
+fi
+
 # Agent setup note
 BINARY_PATH="${INSTALL_DIR}/${BINARY_NAME}"
 

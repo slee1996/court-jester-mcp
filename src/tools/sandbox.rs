@@ -968,76 +968,129 @@ async fn execute_with_typescript_mode(
 
     let (path_env, extra_envs, interpreter, extra_args, loader_fallback, repo_fallback) =
         match language {
-        Language::Python => {
-            let mut python = "python3".to_string();
-            let mut path = base_path.to_string();
-            let mut envs: Vec<(String, String)> = vec![];
+            Language::Python => {
+                let mut python = "python3".to_string();
+                let mut path = base_path.to_string();
+                let mut envs: Vec<(String, String)> = vec![];
 
-            if let Some(dir) = project_dir {
-                let venv_python = format!("{dir}/.venv/bin/python3");
-                if std::path::Path::new(&venv_python).exists() {
-                    python = venv_python;
-                    path = format!("{dir}/.venv/bin:{base_path}");
-                } else {
-                    path = format!("{dir}/.venv/bin:{base_path}");
+                if let Some(dir) = project_dir {
+                    let venv_python = format!("{dir}/.venv/bin/python3");
+                    if std::path::Path::new(&venv_python).exists() {
+                        python = venv_python;
+                        path = format!("{dir}/.venv/bin:{base_path}");
+                    } else {
+                        path = format!("{dir}/.venv/bin:{base_path}");
+                    }
+                    envs.push(("PYTHONPATH".into(), dir.to_string()));
                 }
-                envs.push(("PYTHONPATH".into(), dir.to_string()));
+
+                (path, envs, python, vec![], None, None)
             }
+            Language::TypeScript => {
+                let inherited_path = std::env::var("PATH").unwrap_or_default();
+                let mut path = if inherited_path.is_empty() {
+                    base_path.to_string()
+                } else {
+                    format!("{inherited_path}:{base_path}")
+                };
+                let mut envs: Vec<(String, String)> = vec![];
 
-            (path, envs, python, vec![], None, None)
-        }
-        Language::TypeScript => {
-            let inherited_path = std::env::var("PATH").unwrap_or_default();
-            let mut path = if inherited_path.is_empty() {
-                base_path.to_string()
-            } else {
-                format!("{inherited_path}:{base_path}")
-            };
-            let mut envs: Vec<(String, String)> = vec![];
+                if let Some(dir) = project_dir {
+                    path = format!("{dir}/node_modules/.bin:{path}");
+                    envs.push(("NODE_PATH".into(), format!("{dir}/node_modules")));
+                }
 
-            if let Some(dir) = project_dir {
-                path = format!("{dir}/node_modules/.bin:{path}");
-                envs.push(("NODE_PATH".into(), format!("{dir}/node_modules")));
-            }
+                let node_path = which_binary(&path, "node");
+                let bun_path = which_binary(&path, "bun");
+                let tsx_path = which_binary(&path, "tsx");
+                let tsx_loader_path = tsx_path.as_deref().and_then(tsx_loader_path);
+                let has_relative_imports = has_typescript_relative_imports(code);
+                let requires_node_loader = has_relative_imports
+                    && tsx_loader_path.is_some()
+                    && has_typescript_type_only_relative_imports(code, source_file);
+                let repo_runner = detect_repo_typescript_runner(project_dir, source_file);
+                let bun_repo = repo_runner.as_deref() == Some("bun");
+                let repo_fallback = if bun_repo {
+                    bun_path
+                        .clone()
+                        .map(|bun_path| (bun_path, vec!["run".to_string()]))
+                } else {
+                    None
+                };
+                let prefer_repo_native = matches!(ts_mode, TypeScriptRuntimeMode::ForceRepoNative)
+                    || (matches!(ts_mode, TypeScriptRuntimeMode::Auto)
+                        && bun_repo
+                        && code_requires_bun_runtime(code));
 
-            let node_path = which_binary(&path, "node");
-            let bun_path = which_binary(&path, "bun");
-            let tsx_path = which_binary(&path, "tsx");
-            let tsx_loader_path = tsx_path.as_deref().and_then(tsx_loader_path);
-            let has_relative_imports = has_typescript_relative_imports(code);
-            let requires_node_loader = has_relative_imports
-                && tsx_loader_path.is_some()
-                && has_typescript_type_only_relative_imports(code, source_file);
-            let repo_runner = detect_repo_typescript_runner(project_dir, source_file);
-            let bun_repo = repo_runner.as_deref() == Some("bun");
-            let repo_fallback = if bun_repo {
-                bun_path
-                    .clone()
-                    .map(|bun_path| (bun_path, vec!["run".to_string()]))
-            } else {
-                None
-            };
-            let prefer_repo_native = matches!(ts_mode, TypeScriptRuntimeMode::ForceRepoNative)
-                || (matches!(ts_mode, TypeScriptRuntimeMode::Auto)
-                    && bun_repo
-                    && code_requires_bun_runtime(code));
-
-            if prefer_repo_native {
-                if let Some((bun_path, bun_args)) = repo_fallback.clone() {
-                    (path, envs, bun_path, bun_args, None, None)
+                if prefer_repo_native {
+                    if let Some((bun_path, bun_args)) = repo_fallback.clone() {
+                        (path, envs, bun_path, bun_args, None, None)
+                    } else if let Some(node_path) = node_path {
+                        (
+                            path,
+                            envs,
+                            node_path,
+                            vec![
+                                "--no-warnings".to_string(),
+                                "--experimental-transform-types".to_string(),
+                            ],
+                            None,
+                            None,
+                        )
+                    } else if let Some(tsx_path) = tsx_path {
+                        (path, envs, tsx_path, vec![], None, None)
+                    } else {
+                        (
+                            path,
+                            envs,
+                            "npx".to_string(),
+                            vec!["tsx".to_string()],
+                            None,
+                            None,
+                        )
+                    }
                 } else if let Some(node_path) = node_path {
+                    let transform_args = vec![
+                        "--no-warnings".to_string(),
+                        "--experimental-transform-types".to_string(),
+                    ];
+                    let loader_fallback = if has_relative_imports && !requires_node_loader {
+                        tsx_loader_path
+                            .clone()
+                            .map(|loader| (node_path.clone(), vec!["--import".to_string(), loader]))
+                    } else {
+                        None
+                    };
+
+                    // Prefer Node's built-in TypeScript transform path for
+                    // standalone snippets. For relative-import TypeScript we still
+                    // try the transform path first, then retry with tsx's loader
+                    // only for the module/type-only export failure it fixes.
                     (
                         path,
                         envs,
                         node_path,
-                        vec![
-                            "--no-warnings".to_string(),
-                            "--experimental-transform-types".to_string(),
-                        ],
-                        None,
-                        None,
+                        if requires_node_loader {
+                            vec![
+                                "--import".to_string(),
+                                tsx_loader_path.clone().unwrap_or_default(),
+                            ]
+                        } else {
+                            transform_args
+                        },
+                        loader_fallback,
+                        if matches!(ts_mode, TypeScriptRuntimeMode::ForceNode) {
+                            None
+                        } else {
+                            repo_fallback
+                        },
                     )
+                } else if let Some(bun_path) = bun_path {
+                    (path, envs, bun_path, vec!["run".to_string()], None, None)
                 } else if let Some(tsx_path) = tsx_path {
+                    // Last resort: tsx CLI can bootstrap TypeScript execution,
+                    // but it opens an IPC server that stricter sandboxes may
+                    // reject.
                     (path, envs, tsx_path, vec![], None, None)
                 } else {
                     (
@@ -1049,61 +1102,8 @@ async fn execute_with_typescript_mode(
                         None,
                     )
                 }
-            } else if let Some(node_path) = node_path {
-                let transform_args = vec![
-                    "--no-warnings".to_string(),
-                    "--experimental-transform-types".to_string(),
-                ];
-                let loader_fallback = if has_relative_imports && !requires_node_loader {
-                    tsx_loader_path
-                        .clone()
-                        .map(|loader| (node_path.clone(), vec!["--import".to_string(), loader]))
-                } else {
-                    None
-                };
-
-                // Prefer Node's built-in TypeScript transform path for
-                // standalone snippets. For relative-import TypeScript we still
-                // try the transform path first, then retry with tsx's loader
-                // only for the module/type-only export failure it fixes.
-                (
-                    path,
-                    envs,
-                    node_path,
-                    if requires_node_loader {
-                        vec![
-                            "--import".to_string(),
-                            tsx_loader_path.clone().unwrap_or_default(),
-                        ]
-                    } else {
-                        transform_args
-                    },
-                    loader_fallback,
-                    if matches!(ts_mode, TypeScriptRuntimeMode::ForceNode) {
-                        None
-                    } else {
-                        repo_fallback
-                    },
-                )
-            } else if let Some(bun_path) = bun_path {
-                (path, envs, bun_path, vec!["run".to_string()], None, None)
-            } else if let Some(tsx_path) = tsx_path {
-                // Last resort: tsx CLI can bootstrap TypeScript execution,
-                // but it opens an IPC server that stricter sandboxes may
-                // reject.
-                (path, envs, tsx_path, vec![], None, None)
-            } else {
-                (
-                    path,
-                    envs,
-                    "npx".to_string(),
-                    vec!["tsx".to_string()],
-                    None,
-                    None,
-                )
             }
-        }
-    };
+        };
 
     let python_module_run = python_module_run
         .as_ref()
