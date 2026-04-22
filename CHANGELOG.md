@@ -4,6 +4,13 @@ This changelog tracks user-visible verifier semantics, report-shape changes, and
 
 ## Unreleased
 
+## 0.1.13 - 2026-04-22
+
+### Authoritative Test Runners
+
+- Fixed Bun-backed authoritative TypeScript tests to invoke `bun test <file>` instead of Bun script mode.
+- `--test-runner bun` and `--test-runner auto` now correctly run `bun:test` suites under Bun's test runner once Bun is selected.
+
 ## 0.1.12 - 2026-04-22
 
 ### Packaging
@@ -37,7 +44,7 @@ This changelog tracks user-visible verifier semantics, report-shape changes, and
 - Execute failures can now carry `classification: "type_signature_wider_than_usage"` when static literal call sites suggest the type surface is wider than observed usage.
 - Verify can auto-seed fuzzing from simple literal call sites in the source file and nearby conventional test files. Use `--no-auto-seed` to disable that path.
 - Fused flag/value CLI mistakes now get a split-argument hint instead of a bare unknown-flag error.
-- TypeScript authoritative `--test-file` runs remain Node-only; Bun-native `bun:test` files are not yet supported directly.
+- TypeScript authoritative `--test-file` runs remained Node-only in `0.1.10`; this was addressed in `0.1.11` and corrected for Bun test-runner invocation in `0.1.13`.
 
 ## 0.1.9 - 2026-04-22
 

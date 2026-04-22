@@ -791,6 +791,7 @@ pub async fn execute(
         project_dir,
         source_file,
         TypeScriptRuntimeMode::Auto,
+        "run",
     )
     .await
 }
@@ -810,6 +811,7 @@ pub async fn execute_typescript_node(
         project_dir,
         source_file,
         TypeScriptRuntimeMode::ForceNode,
+        "run",
     )
     .await
 }
@@ -829,6 +831,27 @@ pub async fn execute_typescript_bun(
         project_dir,
         source_file,
         TypeScriptRuntimeMode::ForceBun,
+        "run",
+    )
+    .await
+}
+
+pub async fn execute_typescript_bun_test(
+    code: &str,
+    timeout_seconds: f64,
+    memory_mb: u64,
+    project_dir: Option<&str>,
+    source_file: Option<&str>,
+) -> ExecutionResult {
+    execute_with_typescript_mode(
+        code,
+        &Language::TypeScript,
+        timeout_seconds,
+        memory_mb,
+        project_dir,
+        source_file,
+        TypeScriptRuntimeMode::ForceBun,
+        "test",
     )
     .await
 }
@@ -850,6 +873,30 @@ pub async fn execute_typescript_repo_native(
             project_dir,
             source_file,
             TypeScriptRuntimeMode::ForceRepoNative,
+            "run",
+        )
+        .await,
+    )
+}
+
+pub async fn execute_typescript_repo_native_test(
+    code: &str,
+    timeout_seconds: f64,
+    memory_mb: u64,
+    project_dir: Option<&str>,
+    source_file: Option<&str>,
+) -> Option<ExecutionResult> {
+    detect_repo_typescript_runner(project_dir, source_file)?;
+    Some(
+        execute_with_typescript_mode(
+            code,
+            &Language::TypeScript,
+            timeout_seconds,
+            memory_mb,
+            project_dir,
+            source_file,
+            TypeScriptRuntimeMode::ForceRepoNative,
+            "test",
         )
         .await,
     )
@@ -863,6 +910,7 @@ async fn execute_with_typescript_mode(
     project_dir: Option<&str>,
     source_file: Option<&str>,
     ts_mode: TypeScriptRuntimeMode,
+    bun_subcommand: &str,
 ) -> ExecutionResult {
     // Decide where to write the code file:
     // - If source_file is set for Python, write as a sibling so same-directory imports resolve.
@@ -1033,7 +1081,7 @@ async fn execute_with_typescript_mode(
                 let repo_fallback = if bun_repo {
                     bun_path
                         .clone()
-                        .map(|bun_path| (bun_path, vec!["run".to_string()]))
+                        .map(|bun_path| (bun_path, vec![bun_subcommand.to_string()]))
                 } else {
                     None
                 };
@@ -1044,7 +1092,14 @@ async fn execute_with_typescript_mode(
 
                 if matches!(ts_mode, TypeScriptRuntimeMode::ForceBun) {
                     if let Some(bun_path) = bun_path {
-                        (path, envs, bun_path, vec!["run".to_string()], None, None)
+                        (
+                            path,
+                            envs,
+                            bun_path,
+                            vec![bun_subcommand.to_string()],
+                            None,
+                            None,
+                        )
                     } else {
                         return err_result(
                             "bun runtime requested for TypeScript execution, but `bun` was not found on PATH or next to court-jester",

@@ -1489,7 +1489,7 @@ pub async fn verify(
                     .await
                 }
                 TestRunner::Bun => {
-                    sandbox::execute_typescript_bun(
+                    sandbox::execute_typescript_bun_test(
                         &test_input,
                         test_timeout(),
                         512,
@@ -1498,7 +1498,7 @@ pub async fn verify(
                     )
                     .await
                 }
-                TestRunner::RepoNative => sandbox::execute_typescript_repo_native(
+                TestRunner::RepoNative => sandbox::execute_typescript_repo_native_test(
                     &test_input,
                     test_timeout(),
                     512,

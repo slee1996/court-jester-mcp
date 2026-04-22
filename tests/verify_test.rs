@@ -2325,6 +2325,10 @@ test("add", () => {
         "expected bun runner log, got: {bun_log_text}"
     );
     assert!(
+        bun_log_text.contains("arg=test"),
+        "expected bun test subcommand, got: {bun_log_text}"
+    );
+    assert!(
         !node_log.exists(),
         "node should not have been invoked for bun:test authoritative tests"
     );
