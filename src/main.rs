@@ -1,7 +1,7 @@
 use std::env;
 use std::process::ExitCode;
 
-use court_jester_mcp::types::{ComplexityMetric, ExecuteGate, Language, ReportLevel};
+use court_jester_mcp::types::{ComplexityMetric, ExecuteGate, Language, ReportLevel, TestRunner};
 use court_jester_mcp::{detect_project_dir, parse_language, tools};
 
 const USAGE: &str = "\
@@ -24,6 +24,7 @@ COMMON OPTIONS:
 
 VERIFY OPTIONS:
   --test-file <PATH>         Test file to include as an authoritative stage
+  --test-runner <MODE>       auto | node | bun | repo-native (default auto)
   --tests-only               Skip fuzz-execute and run only the authoritative test stage
   --output-dir <PATH>        Directory to write persistent JSON reports
   --report-level <LEVEL>     full | minimal (default full)
@@ -94,6 +95,7 @@ struct CliArgs {
     config_path: Option<String>,
     virtual_file_path: Option<String>,
     test_file: Option<String>,
+    test_runner: TestRunner,
     tests_only: bool,
     output_dir: Option<String>,
     report_level: ReportLevel,
@@ -127,6 +129,15 @@ fn parse_flags(rest: &[String]) -> Result<CliArgs, String> {
             "--config-path" => out.config_path = Some(take_value(&mut i)?),
             "--virtual-file-path" => out.virtual_file_path = Some(take_value(&mut i)?),
             "--test-file" => out.test_file = Some(take_value(&mut i)?),
+            "--test-runner" => {
+                let raw = take_value(&mut i)?;
+                out.test_runner = TestRunner::parse(&raw).ok_or_else(|| {
+                    format!(
+                        "--test-runner must be one of: auto, node, bun, repo-native (got '{}')",
+                        raw
+                    )
+                })?;
+            }
             "--tests-only" => out.tests_only = true,
             "--output-dir" => out.output_dir = Some(take_value(&mut i)?),
             "--report-level" => {
@@ -277,6 +288,7 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
             let opts = tools::verify::VerifyOptions {
                 test_code: test_code.as_deref(),
                 test_source_file: args.test_file.as_deref(),
+                test_runner: args.test_runner,
                 complexity_threshold,
                 complexity_metric: args.complexity_metric,
                 project_dir: project_dir.as_deref(),
@@ -379,7 +391,7 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{parse_flags, resolve_complexity_threshold};
-    use court_jester_mcp::types::{ComplexityMetric, ExecuteGate, ReportLevel};
+    use court_jester_mcp::types::{ComplexityMetric, ExecuteGate, ReportLevel, TestRunner};
 
     #[test]
     fn security_profile_maps_to_complexity_threshold_20() {
@@ -431,5 +443,11 @@ mod tests {
     fn no_auto_seed_flag_parses() {
         let args = parse_flags(&["--no-auto-seed".into()]).unwrap();
         assert!(args.no_auto_seed);
+    }
+
+    #[test]
+    fn test_runner_flag_parses() {
+        let args = parse_flags(&["--test-runner".into(), "bun".into()]).unwrap();
+        assert_eq!(args.test_runner, TestRunner::Bun);
     }
 }

@@ -1,34 +1,9 @@
 use court_jester_mcp::tools::verify::{
     parse_fuzz_failures, report_json_value, verify, VerifyOptions,
 };
-use court_jester_mcp::types::{ComplexityMetric, ExecuteGate, Language, ReportLevel};
+use court_jester_mcp::types::{ComplexityMetric, ExecuteGate, Language, ReportLevel, TestRunner};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-use tokio::sync::Mutex;
-
-fn path_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
-struct PathGuard {
-    old_path: String,
-}
-
-impl PathGuard {
-    fn install(prefix: &std::path::Path) -> Self {
-        let old_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", format!("{}:{}", prefix.display(), old_path));
-        Self { old_path }
-    }
-}
-
-impl Drop for PathGuard {
-    fn drop(&mut self) {
-        std::env::set_var("PATH", &self.old_path);
-    }
-}
 
 #[cfg(unix)]
 fn make_executable(path: &std::path::Path) {
@@ -37,12 +12,6 @@ fn make_executable(path: &std::path::Path) {
     let mut perms = fs::metadata(path).unwrap().permissions();
     perms.set_mode(0o755);
     fs::set_permissions(path, perms).unwrap();
-}
-
-fn install_fake_tool(name: &str, body: &str) -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    install_fake_tool_at(dir.path(), name, body);
-    dir
 }
 
 fn install_fake_tool_at(dir: &Path, name: &str, body: &str) -> PathBuf {
@@ -80,6 +49,7 @@ fn default_opts(test_code: Option<&str>) -> VerifyOptions<'_> {
     VerifyOptions {
         test_code,
         test_source_file: None,
+        test_runner: TestRunner::Auto,
         tests_only: false,
         complexity_threshold: None,
         complexity_metric: ComplexityMetric::Cyclomatic,
@@ -140,6 +110,7 @@ async fn tests_only_verify_skips_execute_stage() {
     let opts = VerifyOptions {
         test_code: Some(tests),
         test_source_file: None,
+        test_runner: TestRunner::Auto,
         tests_only: true,
         complexity_threshold: None,
         complexity_metric: ComplexityMetric::Cyclomatic,
@@ -168,6 +139,7 @@ async fn tests_only_verify_requires_authoritative_test() {
     let opts = VerifyOptions {
         test_code: None,
         test_source_file: None,
+        test_runner: TestRunner::Auto,
         tests_only: true,
         complexity_threshold: None,
         complexity_metric: ComplexityMetric::Cyclomatic,
@@ -211,19 +183,22 @@ async fn with_failing_tests() {
 
 #[tokio::test]
 async fn lint_warnings_are_informational() {
-    let _guard = path_lock().lock().await;
-    let tool_dir = install_fake_tool(
+    let project_dir = tempfile::tempdir().unwrap();
+    let tool_dir = project_dir.path().join("node_modules").join(".bin");
+    install_fake_tool_at(
+        &tool_dir,
         "biome",
         "#!/bin/sh\ncat <<'EOF'\n{\"diagnostics\":[{\"category\":\"lint/style/noNonNullAssertion\",\"description\":\"Avoid non-null assertions.\",\"severity\":\"warning\",\"location\":{\"start\":{\"line\":3,\"column\":12}}}]}\nEOF\nexit 1\n",
     );
-    let _path = PathGuard::install(tool_dir.path());
 
     let code = r#"
 function normalizeName(name: string): string {
     return name!.trim();
 }
 "#;
-    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+    let mut opts = default_opts(None);
+    opts.project_dir = Some(project_dir.path().to_str().unwrap());
+    let report = verify(code, &Language::TypeScript, opts).await;
 
     assert!(report.overall_ok, "report: {:#?}", report.stages);
 
@@ -283,6 +258,7 @@ exit 1
         VerifyOptions {
             test_code: None,
             test_source_file: None,
+            test_runner: TestRunner::Auto,
             tests_only: false,
             complexity_threshold: None,
             complexity_metric: ComplexityMetric::Cyclomatic,
@@ -334,15 +310,18 @@ exit 1
 
 #[tokio::test]
 async fn verify_filters_unused_variable_diagnostics_for_anonymous_inline_snippets() {
-    let _guard = path_lock().lock().await;
-    let tool_dir = install_fake_tool(
+    let project_dir = tempfile::tempdir().unwrap();
+    let tool_dir = project_dir.path().join(".venv").join("bin");
+    install_fake_tool_at(
+        &tool_dir,
         "ruff",
         "#!/bin/sh\ncat <<'EOF'\n[{\"code\":\"F841\",\"message\":\"assigned but unused\",\"location\":{\"row\":1,\"column\":1}}]\nEOF\nexit 1\n",
     );
-    let _path = PathGuard::install(tool_dir.path());
 
     let code = "def add(a: int, b: int) -> int:\n    return a + b\n";
-    let report = verify(code, &Language::Python, default_opts(None)).await;
+    let mut opts = default_opts(None);
+    opts.project_dir = Some(project_dir.path().to_str().unwrap());
+    let report = verify(code, &Language::Python, opts).await;
 
     assert!(
         report.overall_ok,
@@ -1098,6 +1077,7 @@ async fn python_test_stage_can_import_source_module_from_sibling_path() {
     let opts = VerifyOptions {
         test_code: Some(tests),
         test_source_file: None,
+        test_runner: TestRunner::Auto,
         tests_only: false,
         complexity_threshold: None,
         complexity_metric: ComplexityMetric::Cyclomatic,
@@ -1125,6 +1105,7 @@ async fn verify_with_threshold_adds_stage() {
     let opts = VerifyOptions {
         test_code: None,
         test_source_file: None,
+        test_runner: TestRunner::Auto,
         tests_only: false,
         complexity_threshold: Some(3),
         complexity_metric: ComplexityMetric::Cyclomatic,
@@ -1167,6 +1148,7 @@ def changed(x: int) -> int:
         VerifyOptions {
             test_code: None,
             test_source_file: None,
+            test_runner: TestRunner::Auto,
             tests_only: false,
             complexity_threshold: Some(3),
             complexity_metric: ComplexityMetric::Cyclomatic,
@@ -1217,6 +1199,7 @@ def classify(x: int) -> str:
         VerifyOptions {
             test_code: None,
             test_source_file: None,
+            test_runner: TestRunner::Auto,
             tests_only: false,
             complexity_threshold: Some(2),
             complexity_metric: ComplexityMetric::Cyclomatic,
@@ -1275,6 +1258,7 @@ def check_access(a: bool, b: bool, c: bool) -> int:
         VerifyOptions {
             test_code: None,
             test_source_file: None,
+            test_runner: TestRunner::Auto,
             tests_only: false,
             complexity_threshold: Some(5),
             complexity_metric: ComplexityMetric::Cognitive,
@@ -1354,6 +1338,7 @@ def changed(x: int) -> int:
     let opts = VerifyOptions {
         test_code: None,
         test_source_file: None,
+        test_runner: TestRunner::Auto,
         tests_only: false,
         complexity_threshold: None,
         complexity_metric: ComplexityMetric::Cyclomatic,
@@ -1397,6 +1382,7 @@ async fn writes_report_to_output_dir() {
     let opts = VerifyOptions {
         test_code: None,
         test_source_file: None,
+        test_runner: TestRunner::Auto,
         tests_only: false,
         complexity_threshold: None,
         complexity_metric: ComplexityMetric::Cyclomatic,
@@ -1478,6 +1464,7 @@ async fn rejected_only_fuzz_run_is_not_counted_as_pass_in_report_summary() {
     let opts = VerifyOptions {
         test_code: None,
         test_source_file: None,
+        test_runner: TestRunner::Auto,
         tests_only: false,
         complexity_threshold: None,
         complexity_metric: ComplexityMetric::Cyclomatic,
@@ -1596,6 +1583,7 @@ async fn execute_findings_can_be_suppressed_without_failing_verify() {
         VerifyOptions {
             test_code: None,
             test_source_file: None,
+            test_runner: TestRunner::Auto,
             tests_only: false,
             complexity_threshold: None,
             complexity_metric: ComplexityMetric::Cyclomatic,
@@ -1676,6 +1664,7 @@ def check_access(a: bool, b: bool, c: bool) -> int:
         VerifyOptions {
             test_code: None,
             test_source_file: None,
+            test_runner: TestRunner::Auto,
             tests_only: false,
             complexity_threshold: Some(2),
             complexity_metric: ComplexityMetric::Cyclomatic,
@@ -1973,6 +1962,7 @@ export function add(input: number): number {
     let opts = VerifyOptions {
         test_code: None,
         test_source_file: None,
+        test_runner: TestRunner::Auto,
         tests_only: false,
         complexity_threshold: None,
         complexity_metric: ComplexityMetric::Cyclomatic,
@@ -2082,6 +2072,7 @@ hostLabel("https://example.com");
         VerifyOptions {
             test_code: None,
             test_source_file: None,
+            test_runner: TestRunner::Auto,
             tests_only: false,
             complexity_threshold: None,
             complexity_metric: ComplexityMetric::Cyclomatic,
@@ -2125,6 +2116,7 @@ hostLabel("https://example.com");
         VerifyOptions {
             test_code: None,
             test_source_file: None,
+            test_runner: TestRunner::Auto,
             tests_only: false,
             complexity_threshold: None,
             complexity_metric: ComplexityMetric::Cyclomatic,
@@ -2223,6 +2215,7 @@ assert.equal(displayHandle({ profile: { handle: " Admin " }, username: "root" })
     let opts = VerifyOptions {
         test_code: Some(tests),
         test_source_file: Some(test_path.to_str().unwrap()),
+        test_runner: TestRunner::Auto,
         tests_only: false,
         complexity_threshold: None,
         complexity_metric: ComplexityMetric::Cyclomatic,
@@ -2242,6 +2235,99 @@ assert.equal(displayHandle({ profile: { handle: " Admin " }, username: "root" })
 
     assert!(report.overall_ok, "report: {:#?}", report.stages);
     assert!(report.stages.iter().any(|s| s.name == "test" && s.ok));
+}
+
+#[tokio::test]
+async fn typescript_test_stage_auto_prefers_bun_for_bun_test_imports() {
+    let dir = tempfile::tempdir().unwrap();
+    let tool_dir = dir.path().join("node_modules").join(".bin");
+    let bun_log = dir.path().join("bun.log");
+    let node_log = dir.path().join("node.log");
+    install_fake_tool_at(
+        &tool_dir,
+        "bun",
+        &format!(
+            "#!/bin/sh\nprintf 'runner=bun\\n' > \"{}\"\nfor arg in \"$@\"; do printf 'arg=%s\\n' \"$arg\" >> \"{}\"; done\nexit 0\n",
+            bun_log.display(),
+            bun_log.display(),
+        ),
+    );
+    install_fake_tool_at(
+        &tool_dir,
+        "node",
+        &format!(
+            "#!/bin/sh\nprintf 'runner=node\\n' > \"{}\"\nexit 1\n",
+            node_log.display(),
+        ),
+    );
+    let src_dir = dir.path().join("src");
+    let tests_dir = dir.path().join("tests");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::create_dir_all(&tests_dir).unwrap();
+
+    let source_path = src_dir.join("math.ts");
+    let test_path = tests_dir.join("unit.test.ts");
+    let code = "export function add(a: number, b: number): number { return a + b; }\n";
+    let tests = r#"
+import { test, expect } from "bun:test";
+import { add } from "../src/math.ts";
+
+test("add", () => {
+  expect(add(2, 3)).toBe(5);
+});
+"#;
+    std::fs::write(&source_path, code).unwrap();
+    std::fs::write(&test_path, tests).unwrap();
+
+    let report = verify(
+        code,
+        &Language::TypeScript,
+        VerifyOptions {
+            test_code: Some(tests),
+            test_source_file: Some(test_path.to_str().unwrap()),
+            test_runner: TestRunner::Auto,
+            tests_only: true,
+            complexity_threshold: None,
+            complexity_metric: ComplexityMetric::Cyclomatic,
+            project_dir: Some(dir.path().to_str().unwrap()),
+            lint_config_path: None,
+            lint_virtual_file_path: None,
+            diff: None,
+            suppressions: None,
+            suppression_source: None,
+            auto_seed: true,
+            source_file: Some(source_path.to_str().unwrap()),
+            output_dir: None,
+            report_level: ReportLevel::Full,
+            execute_gate: ExecuteGate::All,
+        },
+    )
+    .await;
+
+    assert!(report.overall_ok, "report: {:#?}", report.stages);
+    let test_stage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "test")
+        .expect("test stage should be present");
+    assert!(
+        test_stage.ok,
+        "test stage should pass: {:?}",
+        test_stage.error
+    );
+    let detail = test_stage.detail.as_ref().unwrap();
+    assert_eq!(detail["test_runner_requested"].as_str(), Some("auto"));
+    assert_eq!(detail["test_runner_selected"].as_str(), Some("bun"));
+
+    let bun_log_text = std::fs::read_to_string(&bun_log).unwrap();
+    assert!(
+        bun_log_text.contains("runner=bun"),
+        "expected bun runner log, got: {bun_log_text}"
+    );
+    assert!(
+        !node_log.exists(),
+        "node should not have been invoked for bun:test authoritative tests"
+    );
 }
 
 #[tokio::test]
@@ -2272,6 +2358,7 @@ assert Path(__file__).name == "test_app.py"
     let opts = VerifyOptions {
         test_code: Some(tests),
         test_source_file: Some(test_path.to_str().unwrap()),
+        test_runner: TestRunner::Auto,
         tests_only: true,
         complexity_threshold: None,
         complexity_metric: ComplexityMetric::Cyclomatic,
@@ -2321,6 +2408,7 @@ assert Path(__file__).name == "test_app.py"
     let opts = VerifyOptions {
         test_code: Some(tests),
         test_source_file: Some(test_path.to_str().unwrap()),
+        test_runner: TestRunner::Auto,
         tests_only: true,
         complexity_threshold: None,
         complexity_metric: ComplexityMetric::Cyclomatic,
@@ -2394,6 +2482,7 @@ assert.equal(primaryPlanCode({ plans: [null, ""] }), "FREE");
     let opts = VerifyOptions {
         test_code: Some(tests),
         test_source_file: Some(test_path.to_str().unwrap()),
+        test_runner: TestRunner::Auto,
         tests_only: false,
         complexity_threshold: None,
         complexity_metric: ComplexityMetric::Cyclomatic,
@@ -2444,6 +2533,7 @@ if (displayInitials("Spencer Lee") !== "SL") {
     let opts = VerifyOptions {
         test_code: Some(tests),
         test_source_file: Some(tests_path.to_str().unwrap()),
+        test_runner: TestRunner::Auto,
         tests_only: false,
         complexity_threshold: None,
         complexity_metric: ComplexityMetric::Cyclomatic,

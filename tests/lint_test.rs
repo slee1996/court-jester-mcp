@@ -1,6 +1,6 @@
 use court_jester_mcp::tools::lint::{lint, lint_with_options, LintOptions};
 use court_jester_mcp::tools::verify::{verify, VerifyOptions};
-use court_jester_mcp::types::{ComplexityMetric, ExecuteGate, Language, ReportLevel};
+use court_jester_mcp::types::{ComplexityMetric, ExecuteGate, Language, ReportLevel, TestRunner};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -145,6 +145,7 @@ fn verify_keeps_python_lint_runner_errors_advisory() {
         VerifyOptions {
             test_code: None,
             test_source_file: None,
+            test_runner: TestRunner::Auto,
             tests_only: false,
             complexity_threshold: None,
             complexity_metric: ComplexityMetric::Cyclomatic,

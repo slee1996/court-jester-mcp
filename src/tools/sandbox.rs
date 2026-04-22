@@ -213,7 +213,7 @@ fn has_typescript_module_dependencies(code: &str) -> bool {
     })
 }
 
-fn code_requires_bun_runtime(code: &str) -> bool {
+pub fn typescript_code_requires_bun_runtime(code: &str) -> bool {
     code.lines().any(|line| {
         let trimmed = line.trim();
         trimmed.contains("Bun.")
@@ -545,6 +545,7 @@ fn should_retry_typescript_with_repo_runtime(result: &ExecutionResult) -> bool {
 enum TypeScriptRuntimeMode {
     Auto,
     ForceNode,
+    ForceBun,
     ForceRepoNative,
 }
 
@@ -813,6 +814,25 @@ pub async fn execute_typescript_node(
     .await
 }
 
+pub async fn execute_typescript_bun(
+    code: &str,
+    timeout_seconds: f64,
+    memory_mb: u64,
+    project_dir: Option<&str>,
+    source_file: Option<&str>,
+) -> ExecutionResult {
+    execute_with_typescript_mode(
+        code,
+        &Language::TypeScript,
+        timeout_seconds,
+        memory_mb,
+        project_dir,
+        source_file,
+        TypeScriptRuntimeMode::ForceBun,
+    )
+    .await
+}
+
 pub async fn execute_typescript_repo_native(
     code: &str,
     timeout_seconds: f64,
@@ -1020,9 +1040,17 @@ async fn execute_with_typescript_mode(
                 let prefer_repo_native = matches!(ts_mode, TypeScriptRuntimeMode::ForceRepoNative)
                     || (matches!(ts_mode, TypeScriptRuntimeMode::Auto)
                         && bun_repo
-                        && code_requires_bun_runtime(code));
+                        && typescript_code_requires_bun_runtime(code));
 
-                if prefer_repo_native {
+                if matches!(ts_mode, TypeScriptRuntimeMode::ForceBun) {
+                    if let Some(bun_path) = bun_path {
+                        (path, envs, bun_path, vec!["run".to_string()], None, None)
+                    } else {
+                        return err_result(
+                            "bun runtime requested for TypeScript execution, but `bun` was not found on PATH or next to court-jester",
+                        );
+                    }
+                } else if prefer_repo_native {
                     if let Some((bun_path, bun_args)) = repo_fallback.clone() {
                         (path, envs, bun_path, bun_args, None, None)
                     } else if let Some(node_path) = node_path {

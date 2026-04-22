@@ -2,12 +2,13 @@
 //! Each test writes a buggy function, runs verify, and asserts the fuzz stage fails.
 
 use court_jester_mcp::tools::verify::{verify, VerifyOptions};
-use court_jester_mcp::types::{ComplexityMetric, ExecuteGate, Language, ReportLevel};
+use court_jester_mcp::types::{ComplexityMetric, ExecuteGate, Language, ReportLevel, TestRunner};
 
 fn opts() -> VerifyOptions<'static> {
     VerifyOptions {
         test_code: None,
         test_source_file: None,
+        test_runner: TestRunner::Auto,
         tests_only: false,
         complexity_threshold: None,
         complexity_metric: ComplexityMetric::Cyclomatic,

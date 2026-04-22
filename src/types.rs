@@ -65,6 +65,28 @@ impl ExecuteGate {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
+pub enum TestRunner {
+    #[default]
+    Auto,
+    Node,
+    Bun,
+    RepoNative,
+}
+
+impl TestRunner {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "auto" => Some(Self::Auto),
+            "node" => Some(Self::Node),
+            "bun" => Some(Self::Bun),
+            "repo-native" | "repo_native" => Some(Self::RepoNative),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum ComplexityMetric {
     #[default]
     Cyclomatic,

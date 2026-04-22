@@ -12,6 +12,7 @@ use crate::types::*;
 pub struct VerifyOptions<'a> {
     pub test_code: Option<&'a str>,
     pub test_source_file: Option<&'a str>,
+    pub test_runner: TestRunner,
     pub tests_only: bool,
     pub complexity_threshold: Option<usize>,
     pub complexity_metric: ComplexityMetric,
@@ -88,6 +89,17 @@ fn test_code_has_imports(code: &str, language: &Language) -> bool {
             }
         }
     })
+}
+
+fn err_execution_result(message: &str) -> ExecutionResult {
+    ExecutionResult {
+        stdout: String::new(),
+        stderr: message.to_string(),
+        exit_code: None,
+        duration_ms: 0,
+        timed_out: false,
+        memory_error: false,
+    }
 }
 
 fn function_key(func: &FunctionInfo) -> (String, usize) {
@@ -1433,15 +1445,74 @@ pub async fn verify(
         };
 
         let start = Instant::now();
-        let test_result = sandbox::execute(
-            &test_input,
-            language,
-            test_timeout(),
-            512,
-            opts.project_dir,
-            test_file_for_execution,
-        )
-        .await;
+        let selected_test_runner = match language {
+            Language::TypeScript => match opts.test_runner {
+                TestRunner::Auto if sandbox::typescript_code_requires_bun_runtime(&test_input) => {
+                    TestRunner::Bun
+                }
+                other => other,
+            },
+            Language::Python => TestRunner::Auto,
+        };
+        let test_result = match language {
+            Language::Python => {
+                sandbox::execute(
+                    &test_input,
+                    language,
+                    test_timeout(),
+                    512,
+                    opts.project_dir,
+                    test_file_for_execution,
+                )
+                .await
+            }
+            Language::TypeScript => match selected_test_runner {
+                TestRunner::Auto => {
+                    sandbox::execute(
+                        &test_input,
+                        language,
+                        test_timeout(),
+                        512,
+                        opts.project_dir,
+                        test_file_for_execution,
+                    )
+                    .await
+                }
+                TestRunner::Node => {
+                    sandbox::execute_typescript_node(
+                        &test_input,
+                        test_timeout(),
+                        512,
+                        opts.project_dir,
+                        test_file_for_execution,
+                    )
+                    .await
+                }
+                TestRunner::Bun => {
+                    sandbox::execute_typescript_bun(
+                        &test_input,
+                        test_timeout(),
+                        512,
+                        opts.project_dir,
+                        test_file_for_execution,
+                    )
+                    .await
+                }
+                TestRunner::RepoNative => sandbox::execute_typescript_repo_native(
+                    &test_input,
+                    test_timeout(),
+                    512,
+                    opts.project_dir,
+                    test_file_for_execution,
+                )
+                .await
+                .unwrap_or_else(|| {
+                    err_execution_result(
+                        "repo-native TypeScript test runner requested, but no repo runtime was detected",
+                    )
+                }),
+            },
+        };
         let test_ms = start.elapsed().as_millis() as u64;
 
         let has_assertion_failure = test_result.stderr.contains("Assertion failed")
@@ -1452,11 +1523,15 @@ pub async fn verify(
             overall_ok = false;
         }
 
+        let mut test_detail = serde_json::to_value(&test_result).unwrap();
+        test_detail["test_runner_requested"] = serde_json::to_value(opts.test_runner).unwrap();
+        test_detail["test_runner_selected"] = serde_json::to_value(selected_test_runner).unwrap();
+
         stages.push(VerificationStage {
             name: "test".into(),
             ok: test_ok,
             duration_ms: test_ms,
-            detail: Some(serde_json::to_value(&test_result).unwrap()),
+            detail: Some(test_detail),
             error: if test_ok {
                 None
             } else {

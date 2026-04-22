@@ -149,7 +149,7 @@ court-jester verify \
   --test-file tests/semver.test.ts
 ```
 
-TypeScript `--test-file` runs under Node. Test files that import `bun:test` are not currently supported as authoritative tests; use a Node-runnable test file instead, or omit `--test-file`.
+TypeScript `--test-file` uses `--test-runner auto` by default. That path now prefers Bun when the authoritative test imports `bun:test`; otherwise it uses the Node path. Use `--test-runner node|bun|repo-native` to override.
 
 Write JSON reports to disk:
 
@@ -201,6 +201,7 @@ Core flags:
 Useful `verify` flags:
 
 - `--test-file <PATH>`: add an authoritative test stage
+- `--test-runner auto|node|bun|repo-native`: choose how TypeScript authoritative tests execute
 - `--tests-only`: skip fuzz execute and run only the authoritative test stage
 - `--output-dir <PATH>`: persist JSON reports
 - `--report-level full|minimal`: choose full debug output or CI-sized reports

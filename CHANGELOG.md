@@ -4,6 +4,13 @@ This changelog tracks user-visible verifier semantics, report-shape changes, and
 
 ## Unreleased
 
+## 0.1.11 - 2026-04-22
+
+### Authoritative Test Runners
+
+- Added `--test-runner auto|node|bun|repo-native` for authoritative test execution.
+- TypeScript authoritative tests in `auto` mode now prefer Bun whenever the test imports `bun:test`, even if the repo is not otherwise marked Bun-native.
+
 ## 0.1.10 - 2026-04-22
 
 ### Report And CI Contract
