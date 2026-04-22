@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and upload (e.g. v0.1.8). Used to backfill a release.'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build-${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            runner: macos-latest
+          - platform: darwin-amd64
+            runner: macos-13
+          - platform: linux-amd64
+            runner: ubuntu-latest
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package tarball
+        shell: bash
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          asset="court-jester-${tag}-${{ matrix.platform }}.tar.gz"
+          tar -czf "${asset}" -C target/release court-jester
+          echo "ASSET=${asset}" >> "$GITHUB_ENV"
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          if ! gh release view "${tag}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release create "${tag}" --repo "${{ github.repository }}" --title "${tag}" --notes "Automated release build."
+          fi
+          gh release upload "${tag}" "${ASSET}" --clobber --repo "${{ github.repository }}"
