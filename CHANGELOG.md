@@ -4,6 +4,13 @@ This changelog tracks user-visible verifier semantics, report-shape changes, and
 
 ## Unreleased
 
+## 0.1.12 - 2026-04-22
+
+### Packaging
+
+- Added the missing `Cargo.lock` update for the `0.1.11` package version.
+- `cargo build --release --locked` now succeeds again for release builds.
+
 ## 0.1.11 - 2026-04-22
 
 ### Authoritative Test Runners
