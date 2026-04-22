@@ -12,7 +12,15 @@ const FUZZ_ITERATIONS: usize = 30;
 /// 3. Idempotency where applicable (string→string, etc.)
 /// 4. Consistency (same input → same output)
 pub fn synthesize_calls(analysis: &AnalysisResult, language: &Language) -> String {
-    synthesize_calls_for(
+    synthesize_plan(
+        analysis,
+        language,
+    )
+    .code
+}
+
+pub fn synthesize_plan(analysis: &AnalysisResult, language: &Language) -> FuzzPlan {
+    synthesize_plan_for(
         &analysis.functions,
         &analysis.classes,
         &analysis.aliases,
@@ -42,6 +50,15 @@ pub fn synthesize_calls_for(
     aliases: &[TypeAliasInfo],
     language: &Language,
 ) -> String {
+    synthesize_plan_for(functions, classes, aliases, language).code
+}
+
+pub fn synthesize_plan_for(
+    functions: &[FunctionInfo],
+    classes: &[ClassInfo],
+    aliases: &[TypeAliasInfo],
+    language: &Language,
+) -> FuzzPlan {
     let class_defs: HashMap<&str, &ClassInfo> =
         classes.iter().map(|c| (c.name.as_str(), c)).collect();
 
@@ -116,31 +133,203 @@ fn is_synth_top_level_candidate(func: &FunctionInfo) -> bool {
     !func.name.starts_with('_') && !func.is_method && !func.is_nested
 }
 
+fn has_exported_surface(functions: &[FunctionInfo]) -> bool {
+    functions
+        .iter()
+        .any(|func| is_synth_top_level_candidate(func) && func.is_exported)
+}
+
+fn callable_param_count(func: &FunctionInfo) -> usize {
+    func.params
+        .iter()
+        .filter(|param| !param.name.starts_with('*'))
+        .count()
+}
+
+fn likely_intentionally_nondeterministic(func: &FunctionInfo) -> bool {
+    if callable_param_count(func) != 0 {
+        return false;
+    }
+
+    let lower = func
+        .name
+        .chars()
+        .filter(|ch| *ch != '_' && *ch != '-')
+        .collect::<String>()
+        .to_lowercase();
+
+    lower == "now"
+        || lower.ends_with("now")
+        || [
+            "random",
+            "uuid",
+            "guid",
+            "nonce",
+            "token",
+            "timestamp",
+            "correlationid",
+            "requestid",
+            "traceid",
+            "spanid",
+            "sessionid",
+            "messageid",
+            "clock",
+        ]
+        .iter()
+        .any(|cue| lower.contains(cue))
+}
+
+const SIMPLE_HELPER_NAME_CUES: &[&str] = &[
+    "parse",
+    "read",
+    "decode",
+    "normalize",
+    "trim",
+    "split",
+    "token",
+    "header",
+    "query",
+    "param",
+    "path",
+    "slug",
+];
+
+fn likely_simple_helper(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    SIMPLE_HELPER_NAME_CUES
+        .iter()
+        .any(|cue| lower.contains(cue))
+}
+
 fn synth_candidate_functions<'a>(functions: &'a [FunctionInfo]) -> Vec<&'a FunctionInfo> {
-    let top_level: Vec<&FunctionInfo> = functions
+    functions
         .iter()
         .filter(|func| is_synth_top_level_candidate(func))
-        .collect();
+        .collect()
+}
 
-    if top_level.iter().any(|func| func.is_exported) {
-        top_level
-            .into_iter()
-            .filter(|func| func.is_exported)
-            .collect()
-    } else {
-        top_level
+fn coverage_entry(
+    func: &FunctionInfo,
+    status: FuzzFunctionStatus,
+    reason: Option<String>,
+) -> FuzzFunctionCoverage {
+    FuzzFunctionCoverage {
+        function: func.name.clone(),
+        line: func.line,
+        end_line: func.end_line,
+        status,
+        is_exported: func.is_exported,
+        reason,
     }
+}
+
+fn python_type_is_simple_helper_input(
+    type_ann: Option<&str>,
+    type_defs: &HashMap<&str, &ClassInfo>,
+) -> bool {
+    let t = match type_ann {
+        Some(t) => t.trim(),
+        None => return true,
+    };
+
+    match t {
+        "int" | "float" | "str" | "bool" | "bytes" | "Any" | "dict" | "Dict" | "datetime"
+        | "date" => true,
+        _ if starts_with_any(t, &["dict[", "Dict["]) => true,
+        _ if starts_with_any(t, &["Optional["]) => {
+            let inner = extract_generic_arg(t);
+            python_type_is_simple_helper_input(Some(&inner), type_defs)
+        }
+        _ if t.contains(" | ") => t
+            .split('|')
+            .map(str::trim)
+            .filter(|branch| *branch != "None")
+            .all(|branch| python_type_is_simple_helper_input(Some(branch), type_defs)),
+        _ if starts_with_any(t, &["list[str", "List[str", "tuple[str", "Tuple[str"]) => true,
+        _ if type_defs.contains_key(t) => false,
+        _ => false,
+    }
+}
+
+fn should_fuzz_python_helper(
+    func: &FunctionInfo,
+    params: &[&ParamInfo],
+    type_defs: &HashMap<&str, &ClassInfo>,
+    has_exported: bool,
+) -> bool {
+    if func.is_exported || !has_exported {
+        return true;
+    }
+
+    params.len() == 1
+        && likely_simple_helper(&func.name)
+        && python_type_is_simple_helper_input(params[0].type_annotation.as_deref(), type_defs)
+}
+
+fn ts_type_is_simple_helper_input(type_ann: Option<&str>, type_defs: &TsNamedTypes<'_>) -> bool {
+    let t = match type_ann {
+        Some(t) => ts_effective_type(t.trim(), type_defs),
+        None => return true,
+    };
+    let trimmed = t.trim();
+
+    let union_branches = split_ts_top_level(trimmed, '|');
+    if union_branches.len() > 1 {
+        return union_branches
+            .iter()
+            .map(|branch| branch.trim())
+            .filter(|branch| !matches!(*branch, "null" | "undefined"))
+            .all(|branch| ts_type_is_simple_helper_input(Some(branch), type_defs));
+    }
+
+    match trimmed {
+        "number" | "string" | "boolean" | "URL" | "URLSearchParams" | "Headers" | "Request"
+        | "Response" => true,
+        _ if trimmed.ends_with("[]") => {
+            let inner = trimmed.trim_end_matches("[]").trim();
+            matches!(inner, "string" | "number" | "boolean")
+        }
+        _ if trimmed.starts_with("Array<") => {
+            let inner = extract_generic_arg(trimmed);
+            matches!(inner.trim(), "string" | "number" | "boolean")
+        }
+        _ if trimmed.starts_with("Record<") => true,
+        _ if looks_like_ts_object_type(trimmed) => true,
+        _ if ts_class_def(trimmed, type_defs).is_some() => true,
+        _ => false,
+    }
+}
+
+fn should_fuzz_ts_helper(
+    func: &FunctionInfo,
+    params: &[&ParamInfo],
+    type_defs: &TsNamedTypes<'_>,
+    has_exported: bool,
+) -> bool {
+    if func.is_exported || !has_exported {
+        return true;
+    }
+
+    params.len() == 1
+        && likely_simple_helper(&func.name)
+        && ts_type_is_simple_helper_input(params[0].type_annotation.as_deref(), type_defs)
 }
 
 // ── Python fuzz harness ─────────────────────────────────────────────────────
 
-fn synthesize_python(analysis: &AnalysisResult, type_defs: &HashMap<&str, &ClassInfo>) -> String {
+fn synthesize_python(
+    analysis: &AnalysisResult,
+    type_defs: &HashMap<&str, &ClassInfo>,
+) -> FuzzPlan {
     let mut code = String::new();
+    let mut coverage = Vec::new();
+    let has_exported = has_exported_surface(&analysis.functions);
 
     // Embed a tiny random generator (no imports needed)
     code.push_str(PYTHON_FUZZ_PRELUDE);
 
     let mut any_synthesized = false;
+    let mut selected_functions = Vec::new();
 
     for func in synth_candidate_functions(&analysis.functions) {
         let callable_params: Vec<&ParamInfo> = func
@@ -154,6 +343,25 @@ fn synthesize_python(analysis: &AnalysisResult, type_defs: &HashMap<&str, &Class
             .iter()
             .map(|p| python_generator(p.type_annotation.as_deref(), type_defs))
             .collect();
+        if generators.iter().any(|gen| gen == "_fuzz_none()") {
+            coverage.push(coverage_entry(
+                func,
+                FuzzFunctionStatus::SkippedUnsupportedType,
+                Some("one or more parameters use unsupported Python types".into()),
+            ));
+            continue;
+        }
+
+        if !should_fuzz_python_helper(func, &callable_params, type_defs, has_exported) {
+            coverage.push(coverage_entry(
+                func,
+                FuzzFunctionStatus::SkippedInternalHelper,
+                Some("non-exported helper is deferred to the exported API surface".into()),
+            ));
+            continue;
+        }
+        coverage.push(coverage_entry(func, FuzzFunctionStatus::Fuzzed, None));
+        selected_functions.push(func);
 
         // Build the call with keyword args where needed
         let call_args: Vec<String> = callable_params
@@ -249,12 +457,15 @@ else:
     }
 
     if !any_synthesized {
-        return String::new();
+        return FuzzPlan {
+            code: String::new(),
+            coverage,
+        };
     }
 
     // Factory exercise: for functions containing nested functions,
     // call the factory and exercise the returned object's callables
-    for func in synth_candidate_functions(&analysis.functions) {
+    for func in selected_functions {
         let has_nested = analysis
             .functions
             .iter()
@@ -324,7 +535,7 @@ else:
     code.push_str(&synthesize_python_involution_checks(analysis, type_defs));
 
     code.push_str(PYTHON_FUZZ_EPILOGUE);
-    code
+    FuzzPlan { code, coverage }
 }
 
 fn python_generator(type_ann: Option<&str>, type_defs: &HashMap<&str, &ClassInfo>) -> String {
@@ -857,6 +1068,10 @@ fn python_idempotency_check(
 }
 
 fn python_consistency_check(func: &FunctionInfo, call_args: &[String]) -> String {
+    if likely_intentionally_nondeterministic(func) {
+        return String::new();
+    }
+
     // Run the same input twice, verify same output
     let call = call_args.join(", ");
     format!(
@@ -1154,12 +1369,15 @@ else:
 
 // ── TypeScript fuzz harness ─────────────────────────────────────────────────
 
-fn synthesize_typescript(analysis: &AnalysisResult, type_defs: &TsNamedTypes<'_>) -> String {
+fn synthesize_typescript(analysis: &AnalysisResult, type_defs: &TsNamedTypes<'_>) -> FuzzPlan {
     let mut code = String::new();
+    let mut coverage = Vec::new();
+    let has_exported = has_exported_surface(&analysis.functions);
 
     code.push_str(TYPESCRIPT_FUZZ_PRELUDE);
 
     let mut any_synthesized = false;
+    let mut selected_functions = Vec::new();
 
     for func in synth_candidate_functions(&analysis.functions) {
         let callable_params: Vec<&ParamInfo> = func
@@ -1167,9 +1385,26 @@ fn synthesize_typescript(analysis: &AnalysisResult, type_defs: &TsNamedTypes<'_>
             .iter()
             .filter(|p| !p.name.starts_with('*'))
             .collect();
+
         if !ts_params_are_fuzzable(func, &callable_params, type_defs) {
+            coverage.push(coverage_entry(
+                func,
+                FuzzFunctionStatus::SkippedUnsupportedType,
+                Some("one or more parameters use unsupported or unresolved TypeScript types".into()),
+            ));
             continue;
         }
+
+        if !should_fuzz_ts_helper(func, &callable_params, type_defs, has_exported) {
+            coverage.push(coverage_entry(
+                func,
+                FuzzFunctionStatus::SkippedInternalHelper,
+                Some("non-exported helper is deferred to the exported API surface".into()),
+            ));
+            continue;
+        }
+        coverage.push(coverage_entry(func, FuzzFunctionStatus::Fuzzed, None));
+        selected_functions.push(func);
         let ret_type = func.return_type.as_deref().unwrap_or("");
         let param_types: Vec<String> = callable_params
             .iter()
@@ -1193,6 +1428,9 @@ fn synthesize_typescript(analysis: &AnalysisResult, type_defs: &TsNamedTypes<'_>
         let gen_list = generators.join(", ");
 
         let mut properties: Vec<&str> = vec![];
+        if !likely_intentionally_nondeterministic(func) {
+            properties.push("consistent");
+        }
 
         // Idempotency: single-arg, same in/out type, name suggests it
         if callable_params.len() == 1
@@ -1319,20 +1557,29 @@ fn synthesize_typescript(analysis: &AnalysisResult, type_defs: &TsNamedTypes<'_>
     }
 
     if !any_synthesized {
-        return String::new();
+        return FuzzPlan {
+            code: String::new(),
+            coverage,
+        };
     }
 
     // Factory exercise: for functions that contain nested functions,
     // call the factory and fuzz the returned object's methods
-    code.push_str(&synthesize_typescript_factory_exercise(analysis, type_defs));
+    code.push_str(&synthesize_typescript_factory_exercise(
+        analysis,
+        &selected_functions,
+        type_defs,
+    ));
 
     // Involution roundtrip checks
     code.push_str(&synthesize_typescript_involution_checks(
-        analysis, type_defs,
+        analysis,
+        &selected_functions,
+        type_defs,
     ));
 
     code.push_str(TYPESCRIPT_FUZZ_EPILOGUE);
-    code
+    FuzzPlan { code, coverage }
 }
 
 /// For factory functions (functions containing nested function definitions),
@@ -1340,11 +1587,12 @@ fn synthesize_typescript(analysis: &AnalysisResult, type_defs: &TsNamedTypes<'_>
 /// on the returned object.
 fn synthesize_typescript_factory_exercise(
     analysis: &AnalysisResult,
+    selected_functions: &[&FunctionInfo],
     type_defs: &TsNamedTypes<'_>,
 ) -> String {
     let mut code = String::new();
 
-    for func in synth_candidate_functions(&analysis.functions) {
+    for func in selected_functions {
         // Check if this function contains nested functions
         let has_nested = analysis
             .functions
@@ -1517,12 +1765,14 @@ fn ts_generator(type_ann: Option<&str>, type_defs: &TsNamedTypes<'_>) -> String 
                 "new ArrayBuffer(0)".into()
             } else if t == "URL" {
                 "new URL('https://example.com/' + _fuzzStr().replace(/[^a-z0-9]/gi, ''))".into()
+            } else if t == "URLSearchParams" {
+                "_fuzzUrlSearchParams()".into()
             } else if t == "Request" {
-                "new Request('https://example.com', {headers: {'content-type': 'application/json'}})".into()
+                "_fuzzRequest()".into()
             } else if t == "Response" {
-                "new Response('ok')".into()
+                "_fuzzResponse()".into()
             } else if t == "Headers" {
-                "new Headers({'content-type': 'text/plain'})".into()
+                "_fuzzHeaders()".into()
             } else if t == "FormData" {
                 "new FormData()".into()
             } else if t == "AbortController" {
@@ -1603,7 +1853,8 @@ fn ts_type_is_fuzzable(type_ann: Option<&str>, type_defs: &TsNamedTypes<'_>) -> 
     match t {
         "number" | "string" | "boolean" | "any" | "unknown" | "null" | "undefined" | "Date"
         | "RegExp" | "Map" | "Set" | "Error" | "Buffer" | "Uint8Array" | "ArrayBuffer" | "URL"
-        | "Request" | "Response" | "Headers" | "FormData" | "AbortController" | "Promise" => true,
+        | "URLSearchParams" | "Request" | "Response" | "Headers" | "FormData"
+        | "AbortController" | "Promise" => true,
         _ if t.ends_with("[]") => {
             let inner = &t[..t.len() - 2];
             ts_type_is_fuzzable(Some(inner), type_defs)
@@ -2173,6 +2424,52 @@ function _fuzzObject(): unknown {
   return pools[_fuzzIntRange(0, pools.length - 1)];
 }
 
+function _fuzzHeaders(): Headers {
+  const headerSets: Array<Record<string, string>> = [
+    {},
+    { authorization: "Bearer token-123" },
+    { authorization: "bearer token-123" },
+    { authorization: "Bearer   token-123   " },
+    { authorization: "Bearer " },
+    { authorization: "Basic Zm9vOmJhcg==" },
+    { authorization: "Bearer token-123, Bearer token-456" },
+    { "content-type": "application/json", authorization: "Bearer token-123" },
+  ];
+  return new Headers(headerSets[_fuzzIntRange(0, headerSets.length - 1)]);
+}
+
+function _fuzzUrlSearchParams(): URLSearchParams {
+  const pairs: Array<Array<[string, string]>> = [
+    [],
+    [["token", "abc123"]],
+    [["tag", "pro"], ["tag", "beta"]],
+    [["q", "naïve café"]],
+    [["authorization", "Bearer token-123"]],
+  ];
+  return new URLSearchParams(pairs[_fuzzIntRange(0, pairs.length - 1)]);
+}
+
+function _fuzzRequest(): Request {
+  const methods = ["GET", "POST", "PUT"];
+  const headers = _fuzzHeaders();
+  const body = [_fuzzStr(), JSON.stringify({ token: _fuzzStr() }), ""][_fuzzIntRange(0, 2)];
+  const url = `https://example.com/${_fuzzStr().replace(/[^a-z0-9]/gi, "").slice(0, 12)}`;
+  const method = methods[_fuzzIntRange(0, methods.length - 1)];
+  return new Request(url || "https://example.com", {
+    method,
+    headers,
+    body: method === "GET" ? undefined : body,
+  });
+}
+
+function _fuzzResponse(): Response {
+  const statuses = [200, 201, 400, 401, 403, 500];
+  return new Response(_fuzzStr(), {
+    status: statuses[_fuzzIntRange(0, statuses.length - 1)],
+    headers: _fuzzHeaders(),
+  });
+}
+
 const _EDGE_NUMS = [0, -0, Infinity, -Infinity, NaN, Number.MAX_SAFE_INTEGER, -Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER + 1, 1e-300, 1e300];
 const _EDGE_STRS = ["", "   ", "\0", "\uFFFF", "a".repeat(10000), "true", "null", "0", "-1", "\r\n", "\u200F", "\u200D", "${...}", "<script>"];
 const _EDGE_STR_ARRAYS = [
@@ -2326,9 +2623,11 @@ function _fuzzOne(
         throw new Error(`Return type mismatch: expected ${expectedType}, got ${typeof result}`);
       }
       // Consistency: same input → same output
-      const result2 = fn(args);
-      if (!_nanSafeEq(result, result2)) {
-        throw new Error(`Inconsistent: ${JSON.stringify(result)} !== ${JSON.stringify(result2)}`);
+      if (properties.includes("consistent")) {
+        const result2 = fn(args);
+        if (!_nanSafeEq(result, result2)) {
+          throw new Error(`Inconsistent: ${JSON.stringify(result)} !== ${JSON.stringify(result2)}`);
+        }
       }
       // Idempotency: f(f(x)) === f(x)
       if (properties.includes("idempotent")) {
@@ -2656,6 +2955,7 @@ for _i in range(30):
 
 fn synthesize_typescript_involution_checks(
     analysis: &AnalysisResult,
+    _selected_functions: &[&FunctionInfo],
     type_defs: &TsNamedTypes<'_>,
 ) -> String {
     let pairs = find_involution_pairs(analysis);

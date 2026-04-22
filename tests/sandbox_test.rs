@@ -434,3 +434,72 @@ console.log(process.argv[1]);
         result.stdout
     );
 }
+
+#[tokio::test]
+async fn typescript_source_file_resolves_repo_local_package_imports() {
+    let dir = tempfile::tempdir().unwrap();
+    let node_modules = dir.path().join("node_modules").join("demo-pkg");
+    std::fs::create_dir_all(&node_modules).unwrap();
+    std::fs::write(
+        node_modules.join("package.json"),
+        r#"{"name":"demo-pkg","type":"module","exports":"./index.js"}"#,
+    )
+    .unwrap();
+    std::fs::write(node_modules.join("index.js"), "export const value = 42;\n").unwrap();
+
+    let src_dir = dir.path().join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    let source_path = src_dir.join("main.ts");
+    let code = r#"
+import { value } from "demo-pkg";
+console.log(value);
+"#;
+    std::fs::write(&source_path, code).unwrap();
+
+    let result = execute(
+        code,
+        &Language::TypeScript,
+        10.0,
+        128,
+        Some(dir.path().to_str().unwrap()),
+        Some(source_path.to_str().unwrap()),
+    )
+    .await;
+
+    assert_eq!(result.exit_code, Some(0), "stderr: {}", result.stderr);
+    assert_eq!(result.stdout.trim(), "42");
+}
+
+#[tokio::test]
+async fn typescript_bun_repo_falls_back_from_node_for_extensionless_relative_imports() {
+    let bun_ok = std::process::Command::new("bun")
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    assert!(bun_ok, "bun must be available for this regression test");
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("bun.lock"), "").unwrap();
+    let helper_path = dir.path().join("helper.ts");
+    let source_path = dir.path().join("main.ts");
+    std::fs::write(&helper_path, "export const value = 9;\n").unwrap();
+    let code = r#"
+import { value } from "./helper";
+console.log(`${typeof process.versions.bun === "string" ? "bun" : "node"}:${value}`);
+"#;
+    std::fs::write(&source_path, code).unwrap();
+
+    let result = execute(
+        code,
+        &Language::TypeScript,
+        10.0,
+        128,
+        Some(dir.path().to_str().unwrap()),
+        Some(source_path.to_str().unwrap()),
+    )
+    .await;
+
+    assert_eq!(result.exit_code, Some(0), "stderr: {}", result.stderr);
+    assert_eq!(result.stdout.trim(), "bun:9");
+}

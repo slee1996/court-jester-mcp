@@ -1414,6 +1414,135 @@ export function decodeSegment(value: string): string {
 }
 
 #[tokio::test]
+async fn verify_reports_per_function_fuzz_coverage_honestly() {
+    let code = r#"
+export function verifyRequest(request: Request): boolean {
+  return request.headers.has("authorization");
+}
+
+function parseSignatureHeader(header: string): Record<string, string> {
+  return Object.fromEntries(
+    header
+      .split(",")
+      .filter(Boolean)
+      .map((part, index) => [`v${index}`, part.trim()]),
+  );
+}
+
+function encodePair(left: string, right: string): string {
+  return `${left}:${right}`;
+}
+
+function unresolved(value: MissingThing): string {
+  return String(value);
+}
+
+function _privateToken(): string {
+  return "token";
+}
+
+class Reader {
+  read(headers: Headers): string {
+    return headers.get("authorization") ?? "";
+  }
+}
+"#;
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+
+    let coverage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "coverage")
+        .and_then(|stage| stage.detail.as_ref())
+        .and_then(|detail| detail.get("functions"))
+        .and_then(|value| value.as_array())
+        .expect("coverage stage should contain per-function entries");
+
+    let status_for = |name: &str| {
+        coverage
+            .iter()
+            .find(|entry| entry.get("function").and_then(|value| value.as_str()) == Some(name))
+            .and_then(|entry| entry.get("status"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+    };
+
+    assert_eq!(status_for("verifyRequest"), "fuzzed");
+    assert_eq!(status_for("parseSignatureHeader"), "fuzzed");
+    assert_eq!(status_for("encodePair"), "skipped_internal_helper");
+    assert_eq!(status_for("unresolved"), "skipped_unsupported_type");
+    assert_eq!(status_for("_privateToken"), "skipped_private_name");
+    assert_eq!(status_for("read"), "skipped_method");
+}
+
+#[tokio::test]
+async fn verify_separates_portability_warning_from_execute_success() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("bun.lock"), "").unwrap();
+    std::fs::write(dir.path().join("helper.ts"), "export const value = 7;\n").unwrap();
+
+    let source_path = dir.path().join("main.ts");
+    let code = r#"
+import { value } from "./helper";
+
+export function add(input: number): number {
+  return input + value;
+}
+"#;
+    std::fs::write(&source_path, code).unwrap();
+
+    let opts = VerifyOptions {
+        test_code: None,
+        test_source_file: None,
+        tests_only: false,
+        complexity_threshold: None,
+        project_dir: Some(dir.path().to_str().unwrap()),
+        lint_config_path: None,
+        lint_virtual_file_path: None,
+        diff: None,
+        source_file: Some(source_path.to_str().unwrap()),
+        output_dir: None,
+    };
+    let report = verify(code, &Language::TypeScript, opts).await;
+
+    assert!(report.overall_ok, "report: {:#?}", report.stages);
+
+    let portability_stage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "portability")
+        .expect("portability stage should be present");
+    assert!(
+        !portability_stage.ok,
+        "portability stage should record the Node warning"
+    );
+    let portability_detail = portability_stage
+        .detail
+        .as_ref()
+        .expect("portability stage should include details");
+    let node_stderr = portability_detail["node_result"]["stderr"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        node_stderr.contains("ERR_MODULE_NOT_FOUND"),
+        "expected Node module resolution warning, got: {node_stderr}"
+    );
+
+    let execute_stage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("execute stage should be present");
+    assert!(execute_stage.ok, "execute stage should succeed: {:?}", execute_stage.error);
+    let runtime = execute_stage
+        .detail
+        .as_ref()
+        .and_then(|detail| detail.get("runtime"))
+        .and_then(|value| value.as_str());
+    assert_eq!(runtime, Some("bun"));
+}
+
+#[tokio::test]
 async fn fuzz_failures_truncate_large_inputs_and_messages() {
     let code =
         "def explode(name: str) -> str:\n    if len(name) < 1000:\n        return name\n    raise TypeError('x' * 500)";

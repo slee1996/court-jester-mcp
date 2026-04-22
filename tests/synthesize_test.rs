@@ -313,6 +313,23 @@ fn typescript_generates_fuzz_harness() {
 }
 
 #[test]
+fn typescript_zero_arg_entropy_helper_skips_consistency_property() {
+    let a = make_analysis(
+        vec![func("generateCorrelationId", vec![], Some("string"))],
+        vec![],
+    );
+    let code = synthesize_calls(&a, &Language::TypeScript);
+    let fuzz_call = code
+        .lines()
+        .find(|line| line.contains("_fuzzOne(\"generateCorrelationId\""))
+        .expect("generateCorrelationId fuzz call should exist");
+    assert!(
+        !fuzz_call.contains("\"consistent\""),
+        "entropy helper should not get consistency checks, got: {fuzz_call}"
+    );
+}
+
+#[test]
 fn typescript_idempotency_for_normalize() {
     let a = make_analysis(
         vec![func(
@@ -388,7 +405,7 @@ fn typescript_upper_bound_helper_is_not_treated_as_idempotent() {
         .find(|line| line.contains("_fuzzOne(\"caretUpperBound\""))
         .unwrap_or("");
     assert!(
-        fuzz_call.ends_with(", [\"object\"], []);"),
+        !fuzz_call.contains("\"idempotent\""),
         "caretUpperBound should not get idempotency checks, got: {fuzz_call}"
     );
 }
@@ -679,6 +696,31 @@ fn typescript_prefers_exported_surface_over_internal_helpers() {
     assert!(
         !code.contains("_fuzzOne(\"encode\""),
         "internal helper should be skipped when exported surface exists, got: {code}"
+    );
+}
+
+#[test]
+fn typescript_fuzzes_non_exported_parser_helper_with_simple_input() {
+    let mut helper = func(
+        "parseSignatureHeader",
+        vec![("header", Some("string"))],
+        Some("Record<string, string>"),
+    );
+    helper.is_exported = false;
+    let api = func(
+        "verifyRequest",
+        vec![("request", Some("Request"))],
+        Some("boolean"),
+    );
+    let a = make_analysis(vec![helper, api], vec![]);
+    let code = synthesize_calls(&a, &Language::TypeScript);
+    assert!(
+        code.contains("_fuzzOne(\"parseSignatureHeader\""),
+        "simple parser helper should now be fuzzed, got: {code}"
+    );
+    assert!(
+        code.contains("_fuzzOne(\"verifyRequest\""),
+        "exported surface should remain fuzzed, got: {code}"
     );
 }
 
@@ -1130,7 +1172,7 @@ fn typescript_normalize_plan_code_not_nonempty_string() {
         .find(|line| line.contains("_fuzzOne(\"normalizePlanCode\""))
         .expect("normalizePlanCode fuzz call should exist");
     assert!(
-        fuzz_call.ends_with(", []);"),
+        !fuzz_call.contains("\"nonempty_string\""),
         "normalize helper should not force nonempty_string, got: {fuzz_call}"
     );
 }
@@ -1327,6 +1369,30 @@ fn typescript_promise_generator() {
     assert!(
         code.contains("Promise.resolve("),
         "Promise<string> should generate Promise.resolve(), got: {code}"
+    );
+}
+
+#[test]
+fn typescript_web_platform_generators() {
+    let a = make_analysis(
+        vec![
+            func("readHeaders", vec![("headers", Some("Headers"))], Some("string")),
+            func("readRequest", vec![("request", Some("Request"))], Some("boolean")),
+            func("rewriteParams", vec![("params", Some("URLSearchParams"))], Some("string")),
+            func("inspectResponse", vec![("response", Some("Response"))], Some("number")),
+        ],
+        vec![],
+    );
+    let code = synthesize_calls(&a, &Language::TypeScript);
+    assert!(code.contains("_fuzzHeaders()"), "Headers should use _fuzzHeaders(), got: {code}");
+    assert!(code.contains("_fuzzRequest()"), "Request should use _fuzzRequest(), got: {code}");
+    assert!(
+        code.contains("_fuzzUrlSearchParams()"),
+        "URLSearchParams should use _fuzzUrlSearchParams(), got: {code}"
+    );
+    assert!(
+        code.contains("_fuzzResponse()"),
+        "Response should use _fuzzResponse(), got: {code}"
     );
 }
 

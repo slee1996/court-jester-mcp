@@ -153,6 +153,37 @@ pub struct FuzzFailure {
     pub severity: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FuzzFunctionStatus {
+    Fuzzed,
+    SkippedUnsupportedType,
+    SkippedInternalHelper,
+    SkippedMethod,
+    SkippedNested,
+    SkippedPrivateName,
+    SkippedDiffFiltered,
+    BlockedModuleLoad,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FuzzFunctionCoverage {
+    pub function: String,
+    pub line: usize,
+    pub end_line: usize,
+    pub status: FuzzFunctionStatus,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_exported: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FuzzPlan {
+    pub code: String,
+    pub coverage: Vec<FuzzFunctionCoverage>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComplexityViolation {
     pub function: String,
@@ -199,6 +230,8 @@ pub struct ReportMeta {
 pub struct ReportSummary {
     pub functions_analyzed: usize,
     pub functions_fuzzed: usize,
+    pub functions_skipped: usize,
+    pub functions_blocked_module_load: usize,
     pub fuzz_pass: usize,
     pub fuzz_crash: usize,
     pub lint_issues: usize,

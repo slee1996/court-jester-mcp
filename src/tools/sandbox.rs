@@ -203,6 +203,73 @@ fn has_typescript_relative_imports(code: &str) -> bool {
     })
 }
 
+fn has_typescript_module_dependencies(code: &str) -> bool {
+    code.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.starts_with("import ")
+            || trimmed.contains("require(")
+            || trimmed.starts_with("export * from ")
+            || (trimmed.starts_with("export {") && trimmed.contains(" from "))
+    })
+}
+
+fn code_requires_bun_runtime(code: &str) -> bool {
+    code.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.contains("Bun.")
+            || trimmed.contains("typeof Bun")
+            || trimmed.contains("instanceof Bun")
+            || trimmed.contains("from \"bun\"")
+            || trimmed.contains("from 'bun'")
+            || trimmed.contains("from \"bun:")
+            || trimmed.contains("from 'bun:")
+            || trimmed.contains("import \"bun\"")
+            || trimmed.contains("import 'bun'")
+            || trimmed.contains("require(\"bun\")")
+            || trimmed.contains("require('bun')")
+    })
+}
+
+fn dir_declares_bun_package_manager(dir: &std::path::Path) -> bool {
+    let package_json = dir.join("package.json");
+    std::fs::read_to_string(package_json)
+        .map(|text| text.contains("\"packageManager\"") && text.contains("bun@"))
+        .unwrap_or(false)
+}
+
+pub fn detect_repo_typescript_runner(
+    project_dir: Option<&str>,
+    source_file: Option<&str>,
+) -> Option<String> {
+    let mut starts = Vec::new();
+    if let Some(dir) = project_dir {
+        starts.push(std::path::PathBuf::from(dir));
+    }
+    if let Some(source_file) = source_file {
+        if let Some(parent) = std::path::Path::new(source_file).parent() {
+            starts.push(parent.to_path_buf());
+        }
+    }
+
+    for start in starts {
+        let mut dir = start.as_path();
+        loop {
+            if dir.join("bun.lock").exists()
+                || dir.join("bun.lockb").exists()
+                || dir_declares_bun_package_manager(dir)
+            {
+                return Some("bun".into());
+            }
+            match dir.parent() {
+                Some(parent) if parent != dir => dir = parent,
+                _ => break,
+            }
+        }
+    }
+
+    None
+}
+
 fn parse_quoted_path(input: &str) -> Option<String> {
     let quote = input.chars().find(|c| *c == '"' || *c == '\'')?;
     let start = input.find(quote)? + 1;
@@ -460,6 +527,27 @@ fn should_retry_typescript_with_loader(result: &ExecutionResult) -> bool {
         && result.stderr.contains("does not provide an export named")
 }
 
+fn should_retry_typescript_with_repo_runtime(result: &ExecutionResult) -> bool {
+    !result.timed_out
+        && !result.memory_error
+        && result.exit_code != Some(0)
+        && (result.stderr.contains("Bun is not defined")
+            || result.stderr.contains("Cannot find package 'bun'")
+            || result.stderr.contains("Cannot find module 'bun'")
+            || result.stderr.contains("ERR_MODULE_NOT_FOUND")
+            || result.stderr.contains("ERR_IMPORT_ATTRIBUTE_MISSING")
+            || result
+                .stderr
+                .contains("needs an import attribute of \"type: json\""))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TypeScriptRuntimeMode {
+    Auto,
+    ForceNode,
+    ForceRepoNative,
+}
+
 fn source_matches_disk(code: &str, source_file: Option<&str>) -> Option<std::path::PathBuf> {
     let source_file = source_file?;
     let disk_code = std::fs::read_to_string(source_file).ok()?;
@@ -694,9 +782,71 @@ pub async fn execute(
     project_dir: Option<&str>,
     source_file: Option<&str>,
 ) -> ExecutionResult {
+    execute_with_typescript_mode(
+        code,
+        language,
+        timeout_seconds,
+        memory_mb,
+        project_dir,
+        source_file,
+        TypeScriptRuntimeMode::Auto,
+    )
+    .await
+}
+
+pub async fn execute_typescript_node(
+    code: &str,
+    timeout_seconds: f64,
+    memory_mb: u64,
+    project_dir: Option<&str>,
+    source_file: Option<&str>,
+) -> ExecutionResult {
+    execute_with_typescript_mode(
+        code,
+        &Language::TypeScript,
+        timeout_seconds,
+        memory_mb,
+        project_dir,
+        source_file,
+        TypeScriptRuntimeMode::ForceNode,
+    )
+    .await
+}
+
+pub async fn execute_typescript_repo_native(
+    code: &str,
+    timeout_seconds: f64,
+    memory_mb: u64,
+    project_dir: Option<&str>,
+    source_file: Option<&str>,
+) -> Option<ExecutionResult> {
+    detect_repo_typescript_runner(project_dir, source_file)?;
+    Some(
+        execute_with_typescript_mode(
+            code,
+            &Language::TypeScript,
+            timeout_seconds,
+            memory_mb,
+            project_dir,
+            source_file,
+            TypeScriptRuntimeMode::ForceRepoNative,
+        )
+        .await,
+    )
+}
+
+async fn execute_with_typescript_mode(
+    code: &str,
+    language: &Language,
+    timeout_seconds: f64,
+    memory_mb: u64,
+    project_dir: Option<&str>,
+    source_file: Option<&str>,
+    ts_mode: TypeScriptRuntimeMode,
+) -> ExecutionResult {
     // Decide where to write the code file:
     // - If source_file is set for Python, write as a sibling so same-directory imports resolve.
-    // - If source_file is set for TypeScript and code has relative imports, write as a sibling.
+    // - If source_file is set for TypeScript and code has module dependencies, write as a sibling.
     // - Otherwise, write to a temp directory (isolated, avoids polluting stdlib dirs etc.)
     let has_relative_imports = match language {
         Language::Python => has_python_relative_imports(code),
@@ -704,7 +854,7 @@ pub async fn execute(
     };
     let use_sibling = match language {
         Language::Python => source_file.is_some(),
-        Language::TypeScript => source_file.is_some() && has_relative_imports,
+        Language::TypeScript => source_file.is_some() && has_typescript_module_dependencies(code),
     };
     let tmpdir_holder;
     let rand_id: u64 = std::time::SystemTime::now()
@@ -816,7 +966,8 @@ pub async fn execute(
         home
     );
 
-    let (path_env, extra_envs, interpreter, extra_args, loader_fallback) = match language {
+    let (path_env, extra_envs, interpreter, extra_args, loader_fallback, repo_fallback) =
+        match language {
         Language::Python => {
             let mut python = "python3".to_string();
             let mut path = base_path.to_string();
@@ -833,7 +984,7 @@ pub async fn execute(
                 envs.push(("PYTHONPATH".into(), dir.to_string()));
             }
 
-            (path, envs, python, vec![], None)
+            (path, envs, python, vec![], None, None)
         }
         Language::TypeScript => {
             let inherited_path = std::env::var("PATH").unwrap_or_default();
@@ -857,8 +1008,48 @@ pub async fn execute(
             let requires_node_loader = has_relative_imports
                 && tsx_loader_path.is_some()
                 && has_typescript_type_only_relative_imports(code, source_file);
+            let repo_runner = detect_repo_typescript_runner(project_dir, source_file);
+            let bun_repo = repo_runner.as_deref() == Some("bun");
+            let repo_fallback = if bun_repo {
+                bun_path
+                    .clone()
+                    .map(|bun_path| (bun_path, vec!["run".to_string()]))
+            } else {
+                None
+            };
+            let prefer_repo_native = matches!(ts_mode, TypeScriptRuntimeMode::ForceRepoNative)
+                || (matches!(ts_mode, TypeScriptRuntimeMode::Auto)
+                    && bun_repo
+                    && code_requires_bun_runtime(code));
 
-            if let Some(node_path) = node_path {
+            if prefer_repo_native {
+                if let Some((bun_path, bun_args)) = repo_fallback.clone() {
+                    (path, envs, bun_path, bun_args, None, None)
+                } else if let Some(node_path) = node_path {
+                    (
+                        path,
+                        envs,
+                        node_path,
+                        vec![
+                            "--no-warnings".to_string(),
+                            "--experimental-transform-types".to_string(),
+                        ],
+                        None,
+                        None,
+                    )
+                } else if let Some(tsx_path) = tsx_path {
+                    (path, envs, tsx_path, vec![], None, None)
+                } else {
+                    (
+                        path,
+                        envs,
+                        "npx".to_string(),
+                        vec!["tsx".to_string()],
+                        None,
+                        None,
+                    )
+                }
+            } else if let Some(node_path) = node_path {
                 let transform_args = vec![
                     "--no-warnings".to_string(),
                     "--experimental-transform-types".to_string(),
@@ -888,16 +1079,28 @@ pub async fn execute(
                         transform_args
                     },
                     loader_fallback,
+                    if matches!(ts_mode, TypeScriptRuntimeMode::ForceNode) {
+                        None
+                    } else {
+                        repo_fallback
+                    },
                 )
             } else if let Some(bun_path) = bun_path {
-                (path, envs, bun_path, vec!["run".to_string()], None)
+                (path, envs, bun_path, vec!["run".to_string()], None, None)
             } else if let Some(tsx_path) = tsx_path {
                 // Last resort: tsx CLI can bootstrap TypeScript execution,
                 // but it opens an IPC server that stricter sandboxes may
                 // reject.
-                (path, envs, tsx_path, vec![], None)
+                (path, envs, tsx_path, vec![], None, None)
             } else {
-                (path, envs, "npx".to_string(), vec!["tsx".to_string()], None)
+                (
+                    path,
+                    envs,
+                    "npx".to_string(),
+                    vec!["tsx".to_string()],
+                    None,
+                    None,
+                )
             }
         }
     };
@@ -925,6 +1128,25 @@ pub async fn execute(
             return run_sandbox_process(
                 &loader_interpreter,
                 &loader_args,
+                &file_path,
+                python_module_run,
+                source_file,
+                project_dir,
+                &path_env,
+                &extra_envs,
+                timeout_seconds,
+                memory_mb,
+                language,
+            )
+            .await;
+        }
+    }
+
+    if let Some((repo_interpreter, repo_args)) = repo_fallback {
+        if should_retry_typescript_with_repo_runtime(&result) {
+            return run_sandbox_process(
+                &repo_interpreter,
+                &repo_args,
                 &file_path,
                 python_module_run,
                 source_file,

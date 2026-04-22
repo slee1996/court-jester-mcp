@@ -27,6 +27,7 @@ VERIFY OPTIONS:
   --tests-only               Skip fuzz-execute and run only the authoritative test stage
   --output-dir <PATH>        Directory to write persistent JSON reports
   --diff-file <PATH>         Unified-diff file — only inspect changed functions
+  --profile <NAME>           Verification profile preset (currently: security => complexity 20)
   --complexity-threshold <N> Fail if any function exceeds this complexity (changed functions only when --diff-file is set)
 
 EXECUTE OPTIONS:
@@ -91,6 +92,7 @@ struct CliArgs {
     tests_only: bool,
     output_dir: Option<String>,
     diff_file: Option<String>,
+    profile: Option<String>,
     complexity_threshold: Option<usize>,
     timeout_seconds: Option<f64>,
     memory_mb: Option<u64>,
@@ -118,6 +120,7 @@ fn parse_flags(rest: &[String]) -> Result<CliArgs, String> {
             "--tests-only" => out.tests_only = true,
             "--output-dir" => out.output_dir = Some(take_value(&mut i)?),
             "--diff-file" => out.diff_file = Some(take_value(&mut i)?),
+            "--profile" => out.profile = Some(take_value(&mut i)?),
             "--complexity-threshold" => {
                 let raw = take_value(&mut i)?;
                 out.complexity_threshold = Some(raw.parse::<usize>().map_err(|_| {
@@ -181,11 +184,27 @@ fn read_optional_file(path: Option<&str>) -> Result<Option<String>, String> {
     }
 }
 
+fn resolve_complexity_threshold(args: &CliArgs) -> Result<Option<usize>, String> {
+    if let Some(threshold) = args.complexity_threshold {
+        return Ok(Some(threshold));
+    }
+
+    match args.profile.as_deref() {
+        None => Ok(None),
+        Some("security") => Ok(Some(20)),
+        Some(other) => Err(format!(
+            "unknown profile '{}'; supported profiles: security",
+            other
+        )),
+    }
+}
+
 async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
     let args = parse_flags(rest)?;
     let file = require_file(&args)?.to_string();
     let language = require_language(&args)?;
     let code = read_file(&file)?;
+    let complexity_threshold = resolve_complexity_threshold(&args)?;
     let project_dir = args
         .project_dir
         .clone()
@@ -198,7 +217,7 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
             let opts = tools::verify::VerifyOptions {
                 test_code: test_code.as_deref(),
                 test_source_file: args.test_file.as_deref(),
-                complexity_threshold: args.complexity_threshold,
+                complexity_threshold,
                 project_dir: project_dir.as_deref(),
                 lint_config_path: args.config_path.as_deref(),
                 lint_virtual_file_path: args.virtual_file_path.as_deref(),
@@ -226,7 +245,7 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
                     tools::analyze::filter_changed_functions(&analysis, &changed_ranges);
                 value["changed_functions"] = serde_json::to_value(&changed_fns).unwrap();
             }
-            if let Some(threshold) = args.complexity_threshold {
+            if let Some(threshold) = complexity_threshold {
                 let violations = tools::analyze::check_complexity_threshold(&analysis, threshold);
                 value["complexity_violations"] = serde_json::to_value(&violations).unwrap();
                 value["complexity_ok"] = serde_json::Value::Bool(violations.is_empty());
@@ -279,5 +298,28 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
             Ok(())
         }
         _ => unreachable!("unhandled subcommand '{}'", cmd),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_flags, resolve_complexity_threshold};
+
+    #[test]
+    fn security_profile_maps_to_complexity_threshold_20() {
+        let args = parse_flags(&["--profile".into(), "security".into()]).unwrap();
+        assert_eq!(resolve_complexity_threshold(&args).unwrap(), Some(20));
+    }
+
+    #[test]
+    fn explicit_threshold_overrides_profile() {
+        let args = parse_flags(&[
+            "--profile".into(),
+            "security".into(),
+            "--complexity-threshold".into(),
+            "12".into(),
+        ])
+        .unwrap();
+        assert_eq!(resolve_complexity_threshold(&args).unwrap(), Some(12));
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crate::tools::{analyze, diff, lint, sandbox, synthesize};
@@ -76,6 +77,122 @@ fn test_code_has_imports(code: &str, language: &Language) -> bool {
             }
         }
     })
+}
+
+fn function_key(func: &FunctionInfo) -> (String, usize) {
+    (func.name.clone(), func.line)
+}
+
+fn coverage_counts(entries: &[FuzzFunctionCoverage]) -> serde_json::Value {
+    let mut counts = serde_json::Map::new();
+    for status in [
+        FuzzFunctionStatus::Fuzzed,
+        FuzzFunctionStatus::SkippedUnsupportedType,
+        FuzzFunctionStatus::SkippedInternalHelper,
+        FuzzFunctionStatus::SkippedMethod,
+        FuzzFunctionStatus::SkippedNested,
+        FuzzFunctionStatus::SkippedPrivateName,
+        FuzzFunctionStatus::SkippedDiffFiltered,
+        FuzzFunctionStatus::BlockedModuleLoad,
+    ] {
+        let key = serde_json::to_value(&status)
+            .ok()
+            .and_then(|value| value.as_str().map(ToOwned::to_owned))
+            .unwrap_or_else(|| "unknown".into());
+        let count = entries.iter().filter(|entry| entry.status == status).count();
+        counts.insert(key, serde_json::Value::from(count));
+    }
+    serde_json::Value::Object(counts)
+}
+
+fn finalize_fuzz_coverage(
+    analysis_functions: &[FunctionInfo],
+    allowed_functions: &[FunctionInfo],
+    planned_coverage: &[FuzzFunctionCoverage],
+    module_load_blocked: bool,
+) -> Vec<FuzzFunctionCoverage> {
+    let allowed: HashSet<(String, usize)> = allowed_functions.iter().map(function_key).collect();
+    let mut planned: HashMap<(String, usize), FuzzFunctionCoverage> = planned_coverage
+        .iter()
+        .cloned()
+        .map(|entry| ((entry.function.clone(), entry.line), entry))
+        .collect();
+
+    let mut coverage = Vec::with_capacity(analysis_functions.len());
+    for func in analysis_functions {
+        let key = function_key(func);
+        let entry = if !allowed.contains(&key) {
+            coverage_entry_for_verify(
+                func,
+                FuzzFunctionStatus::SkippedDiffFiltered,
+                Some("excluded by diff scoping".into()),
+            )
+        } else if func.is_method {
+            coverage_entry_for_verify(
+                func,
+                FuzzFunctionStatus::SkippedMethod,
+                Some("methods are not fuzzed directly".into()),
+            )
+        } else if func.is_nested {
+            coverage_entry_for_verify(
+                func,
+                FuzzFunctionStatus::SkippedNested,
+                Some("nested functions are exercised via their parent factory when possible".into()),
+            )
+        } else if func.name.starts_with('_') {
+            coverage_entry_for_verify(
+                func,
+                FuzzFunctionStatus::SkippedPrivateName,
+                Some("underscore-prefixed helpers are skipped".into()),
+            )
+        } else if let Some(mut planned_entry) = planned.remove(&key) {
+            if module_load_blocked && planned_entry.status == FuzzFunctionStatus::Fuzzed {
+                planned_entry.status = FuzzFunctionStatus::BlockedModuleLoad;
+                planned_entry.reason = Some("module load failed before the fuzz harness ran".into());
+            }
+            planned_entry
+        } else {
+            coverage_entry_for_verify(
+                func,
+                FuzzFunctionStatus::SkippedUnsupportedType,
+                Some("function was not selected for fuzzing".into()),
+            )
+        };
+        coverage.push(entry);
+    }
+
+    coverage
+}
+
+fn coverage_entry_for_verify(
+    func: &FunctionInfo,
+    status: FuzzFunctionStatus,
+    reason: Option<String>,
+) -> FuzzFunctionCoverage {
+    FuzzFunctionCoverage {
+        function: func.name.clone(),
+        line: func.line,
+        end_line: func.end_line,
+        status,
+        is_exported: func.is_exported,
+        reason,
+    }
+}
+
+fn is_typescript_portability_error(stderr: &str) -> bool {
+    stderr.contains("ERR_MODULE_NOT_FOUND")
+        || stderr.contains("ERR_IMPORT_ATTRIBUTE_MISSING")
+        || stderr.contains("Cannot find module 'bun'")
+        || stderr.contains("Cannot find package 'bun'")
+        || stderr.contains("Bun is not defined")
+        || stderr.contains("needs an import attribute of \"type: json\"")
+}
+
+fn is_typescript_module_load_error(stderr: &str) -> bool {
+    is_typescript_portability_error(stderr)
+        || stderr.contains("Cannot find module")
+        || stderr.contains("Cannot find package")
+        || stderr.contains("The requested module")
 }
 
 /// Run the full verification pipeline: parse → complexity → lint → synthesize+execute → test.
@@ -257,27 +374,85 @@ pub async fn verify(
             all_aliases.extend(imported.aliases);
         }
 
-        let synth_code = synthesize::synthesize_calls_for(
+        let synth_start = Instant::now();
+        let fuzz_plan = synthesize::synthesize_plan_for(
             &functions_to_fuzz,
             &all_classes,
             &all_aliases,
             language,
         );
+        let coverage_ms = synth_start.elapsed().as_millis() as u64;
+        let mut module_load_blocked = false;
 
-        if !synth_code.is_empty() {
-            let full_code = format!("{code}\n{synth_code}");
+        if !fuzz_plan.code.is_empty() {
+            let full_code = format!("{code}\n{}", fuzz_plan.code);
             let execute_timeout = execute_timeout_for(language);
 
             let start = Instant::now();
-            let exec_result = sandbox::execute(
-                &full_code,
-                language,
-                execute_timeout,
-                512,
-                opts.project_dir,
-                opts.source_file,
-            )
-            .await;
+            let mut exec_runtime: Option<String> = None;
+            let mut portability_detail: Option<serde_json::Value> = None;
+            let exec_result = if matches!(language, Language::TypeScript) {
+                if let Some(repo_runtime) =
+                    sandbox::detect_repo_typescript_runner(opts.project_dir, opts.source_file)
+                {
+                    let node_result = sandbox::execute_typescript_node(
+                        &full_code,
+                        execute_timeout,
+                        512,
+                        opts.project_dir,
+                        opts.source_file,
+                    )
+                    .await;
+                    let node_ok = node_result.exit_code == Some(0)
+                        && !node_result.timed_out
+                        && !node_result.memory_error;
+                    if !node_ok && is_typescript_portability_error(&node_result.stderr) {
+                        if let Some(repo_result) = sandbox::execute_typescript_repo_native(
+                            &full_code,
+                            execute_timeout,
+                            512,
+                            opts.project_dir,
+                            opts.source_file,
+                        )
+                        .await
+                        {
+                            exec_runtime = Some(repo_runtime.clone());
+                            portability_detail = Some(serde_json::json!({
+                                "repo_runtime": repo_runtime,
+                                "node_result": serde_json::to_value(&node_result).unwrap(),
+                                "repo_result": serde_json::to_value(&repo_result).unwrap(),
+                            }));
+                            repo_result
+                        } else {
+                            exec_runtime = Some("node".into());
+                            node_result
+                        }
+                    } else {
+                        exec_runtime = Some("node".into());
+                        node_result
+                    }
+                } else {
+                    sandbox::execute(
+                        &full_code,
+                        language,
+                        execute_timeout,
+                        512,
+                        opts.project_dir,
+                        opts.source_file,
+                    )
+                    .await
+                }
+            } else {
+                sandbox::execute(
+                    &full_code,
+                    language,
+                    execute_timeout,
+                    512,
+                    opts.project_dir,
+                    opts.source_file,
+                )
+                .await
+            };
             let exec_ms = start.elapsed().as_millis() as u64;
 
             let exec_ok = exec_result.exit_code == Some(0)
@@ -286,8 +461,41 @@ pub async fn verify(
             if !exec_ok {
                 overall_ok = false;
             }
+            module_load_blocked = matches!(language, Language::TypeScript)
+                && is_typescript_module_load_error(&exec_result.stderr)
+                && !exec_result.stdout.lines().any(|line| line.starts_with("FUZZ "));
+
+            let coverage = finalize_fuzz_coverage(
+                &analysis.functions,
+                &functions_to_fuzz,
+                &fuzz_plan.coverage,
+                module_load_blocked,
+            );
+            stages.push(VerificationStage {
+                name: "coverage".into(),
+                ok: true,
+                duration_ms: coverage_ms,
+                detail: Some(serde_json::json!({
+                    "functions": serde_json::to_value(&coverage).unwrap(),
+                    "counts": coverage_counts(&coverage),
+                })),
+                error: None,
+            });
+
+            if let Some(detail) = portability_detail {
+                stages.push(VerificationStage {
+                    name: "portability".into(),
+                    ok: false,
+                    duration_ms: 0,
+                    detail: Some(detail),
+                    error: Some("Node compatibility failed; repo-native runtime was used for fuzz execution".into()),
+                });
+            }
 
             let mut detail = serde_json::to_value(&exec_result).unwrap();
+            if let Some(runtime) = exec_runtime {
+                detail["runtime"] = serde_json::Value::String(runtime);
+            }
             if let Some(failures) = parse_fuzz_failures(&exec_result.stdout) {
                 detail["fuzz_failures"] = serde_json::to_value(&failures).unwrap();
             }
@@ -302,6 +510,23 @@ pub async fn verify(
                 } else {
                     Some(exec_result.stderr.clone())
                 },
+            });
+        } else {
+            let coverage = finalize_fuzz_coverage(
+                &analysis.functions,
+                &functions_to_fuzz,
+                &fuzz_plan.coverage,
+                module_load_blocked,
+            );
+            stages.push(VerificationStage {
+                name: "coverage".into(),
+                ok: true,
+                duration_ms: coverage_ms,
+                detail: Some(serde_json::json!({
+                    "functions": serde_json::to_value(&coverage).unwrap(),
+                    "counts": coverage_counts(&coverage),
+                })),
+                error: None,
             });
         }
     }
@@ -388,6 +613,8 @@ fn write_report(
     let mut summary = ReportSummary {
         functions_analyzed: 0,
         functions_fuzzed: 0,
+        functions_skipped: 0,
+        functions_blocked_module_load: 0,
         fuzz_pass: 0,
         fuzz_crash: 0,
         lint_issues: 0,
@@ -407,12 +634,25 @@ fn write_report(
                         }
                     }
                 }
+                "coverage" => {
+                    if let Some(funcs) = detail.get("functions").and_then(|value| value.as_array()) {
+                        for func in funcs {
+                            match func.get("status").and_then(|value| value.as_str()) {
+                                Some("fuzzed") => summary.functions_fuzzed += 1,
+                                Some("blocked_module_load") => {
+                                    summary.functions_blocked_module_load += 1;
+                                }
+                                Some(_) => summary.functions_skipped += 1,
+                                None => {}
+                            }
+                        }
+                    }
+                }
                 "execute" => {
                     // Count fuzz results from stdout
                     if let Some(stdout) = detail.get("stdout").and_then(|v| v.as_str()) {
                         for line in stdout.lines() {
                             if line.starts_with("FUZZ ") {
-                                summary.functions_fuzzed += 1;
                                 if line.contains("CRASHED") {
                                     summary.fuzz_crash += 1;
                                 } else if line.contains("nothing tested") {
