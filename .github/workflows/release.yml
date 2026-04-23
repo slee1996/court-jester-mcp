@@ -22,9 +22,9 @@ jobs:
       matrix:
         include:
           - platform: darwin-arm64
-            runner: macos-latest
+            runner: macos-15
           - platform: darwin-amd64
-            runner: macos-13
+            runner: macos-15-intel
           - platform: linux-amd64
             runner: ubuntu-latest
           - platform: linux-arm64
