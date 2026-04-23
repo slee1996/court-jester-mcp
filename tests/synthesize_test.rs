@@ -1,4 +1,4 @@
-use court_jester_mcp::tools::synthesize::synthesize_calls;
+use court_jester_mcp::tools::synthesize::{synthesize_calls, synthesize_plan};
 use court_jester_mcp::types::*;
 use std::collections::BTreeMap;
 
@@ -1454,6 +1454,75 @@ fn typescript_map_set_generator() {
         code.contains("new Set()"),
         "Set should generate new Set(), got: {code}"
     );
+}
+
+#[test]
+fn typescript_generic_collection_generators() {
+    let a = make_analysis(
+        vec![func(
+            "process",
+            vec![
+                ("taken", Some("Set<string>")),
+                ("lookup", Some("Map<string, number>")),
+            ],
+            None,
+        )],
+        vec![],
+    );
+    let code = synthesize_calls(&a, &Language::TypeScript);
+    assert!(
+        code.contains("new Set(Array.from"),
+        "Set<string> should generate a populated Set, got: {code}"
+    );
+    assert!(
+        code.contains("new Map(Array.from"),
+        "Map<string, number> should generate a populated Map, got: {code}"
+    );
+}
+
+#[test]
+fn typescript_readonly_array_generator() {
+    let a = make_analysis(
+        vec![func(
+            "joinLabels",
+            vec![("labels", Some("ReadonlyArray<string>"))],
+            Some("string"),
+        )],
+        vec![],
+    );
+    let code = synthesize_calls(&a, &Language::TypeScript);
+    assert!(
+        code.contains("_fuzzOne(\"joinLabels\""),
+        "ReadonlyArray<string> params should remain fuzzable, got: {code}"
+    );
+    assert!(
+        code.contains("Array.from({length: _fuzzIntRange(0,5)}, () => _fuzzStr())"),
+        "ReadonlyArray<string> should use array generation, got: {code}"
+    );
+}
+
+#[test]
+fn typescript_set_param_is_no_longer_skipped_as_unsupported() {
+    let analysis = make_analysis(
+        vec![func(
+            "uniqueName",
+            vec![("base", Some("string")), ("taken", Some("Set<string>"))],
+            Some("string"),
+        )],
+        vec![],
+    );
+    let plan = synthesize_plan(&analysis, &Language::TypeScript);
+    assert!(
+        plan.code.contains("_fuzzOne(\"uniqueName\""),
+        "Set<string> params should remain fuzzable, got: {}",
+        plan.code
+    );
+    let coverage = plan
+        .coverage
+        .iter()
+        .find(|entry| entry.function == "uniqueName")
+        .expect("coverage entry for uniqueName");
+    assert_eq!(coverage.status, FuzzFunctionStatus::Fuzzed);
 }
 
 #[test]

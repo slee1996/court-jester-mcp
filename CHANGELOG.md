@@ -4,6 +4,13 @@ This changelog tracks user-visible verifier semantics, report-shape changes, and
 
 ## Unreleased
 
+## 0.1.14 - 2026-04-22
+
+### TypeScript Fuzz Coverage
+
+- Added TypeScript fuzz-generator support for generic collection types including `Set<T>`, `ReadonlySet<T>`, `Map<K, V>`, `ReadonlyMap<K, V>`, and `ReadonlyArray<T>`.
+- Functions that use supported collection generics such as `Set<string>` are no longer skipped as `unsupported or unresolved TypeScript types`.
+
 ## 0.1.13 - 2026-04-22
 
 ### Authoritative Test Runners

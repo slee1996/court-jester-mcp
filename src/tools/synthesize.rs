@@ -254,8 +254,7 @@ fn ts_seed_rows(func: &FunctionInfo, seed_inputs: &HashMap<String, Vec<Vec<Strin
 
 fn has_noncheckable_python_zero_arg_return_contract(func: &FunctionInfo) -> bool {
     let return_type = func.return_type.as_deref().unwrap_or("").trim();
-    !return_type.is_empty()
-        && !matches!(return_type, "str" | "int" | "float" | "bool" | "bytes")
+    !return_type.is_empty() && !matches!(return_type, "str" | "int" | "float" | "bool" | "bytes")
 }
 
 fn has_noncheckable_ts_zero_arg_return_contract(func: &FunctionInfo) -> bool {
@@ -338,6 +337,19 @@ fn ts_type_is_simple_helper_input(type_ann: Option<&str>, type_defs: &TsNamedTyp
         _ if trimmed.starts_with("Array<") => {
             let inner = extract_generic_arg(trimmed);
             matches!(inner.trim(), "string" | "number" | "boolean")
+        }
+        _ if trimmed.starts_with("ReadonlyArray<") => {
+            let inner = extract_generic_arg(trimmed);
+            matches!(inner.trim(), "string" | "number" | "boolean")
+        }
+        _ if trimmed.starts_with("Set<") || trimmed.starts_with("ReadonlySet<") => {
+            let inner = extract_generic_arg(trimmed);
+            matches!(inner.trim(), "string" | "number" | "boolean")
+        }
+        _ if trimmed.starts_with("Map<") || trimmed.starts_with("ReadonlyMap<") => {
+            let (key, value) = extract_two_generic_args(trimmed);
+            matches!(key.trim(), "string" | "number" | "boolean")
+                && matches!(value.trim(), "string" | "number" | "boolean")
         }
         _ if trimmed.starts_with("Record<") => true,
         _ if looks_like_ts_object_type(trimmed) => true,
@@ -1785,6 +1797,24 @@ fn ts_generator(type_ann: Option<&str>, type_defs: &TsNamedTypes<'_>) -> String 
             let gen = ts_generator(Some(&inner), type_defs);
             format!("Array.from({{length: _fuzzIntRange(0,5)}}, () => {gen})")
         }
+        _ if t.starts_with("ReadonlyArray<") => {
+            let inner = extract_generic_arg(t);
+            let gen = ts_generator(Some(&inner), type_defs);
+            format!("Array.from({{length: _fuzzIntRange(0,5)}}, () => {gen})")
+        }
+        _ if t.starts_with("Set<") || t.starts_with("ReadonlySet<") => {
+            let inner = extract_generic_arg(t);
+            let gen = ts_generator(Some(&inner), type_defs);
+            format!("new Set(Array.from({{length: _fuzzIntRange(0,5)}}, () => {gen}))")
+        }
+        _ if t.starts_with("Map<") || t.starts_with("ReadonlyMap<") => {
+            let (key, value) = extract_two_generic_args(t);
+            let key_gen = ts_generator(Some(&key), type_defs);
+            let value_gen = ts_generator(Some(&value), type_defs);
+            format!(
+                "new Map(Array.from({{length: _fuzzIntRange(0,3)}}, () => [{key_gen}, {value_gen}]))"
+            )
+        }
         _ if t.starts_with("Record<") => {
             let (_k, v) = extract_two_generic_args(t);
             let vg = ts_generator(Some(&v), type_defs);
@@ -1945,6 +1975,19 @@ fn ts_type_is_fuzzable(type_ann: Option<&str>, type_defs: &TsNamedTypes<'_>) -> 
         _ if t.starts_with("Array<") => {
             let inner = extract_generic_arg(t);
             ts_type_is_fuzzable(Some(&inner), type_defs)
+        }
+        _ if t.starts_with("ReadonlyArray<") => {
+            let inner = extract_generic_arg(t);
+            ts_type_is_fuzzable(Some(&inner), type_defs)
+        }
+        _ if t.starts_with("Set<") || t.starts_with("ReadonlySet<") => {
+            let inner = extract_generic_arg(t);
+            ts_type_is_fuzzable(Some(&inner), type_defs)
+        }
+        _ if t.starts_with("Map<") || t.starts_with("ReadonlyMap<") => {
+            let (key, value) = extract_two_generic_args(t);
+            ts_type_is_fuzzable(Some(&key), type_defs)
+                && ts_type_is_fuzzable(Some(&value), type_defs)
         }
         _ if t.starts_with("Record<") => {
             let (k, v) = extract_two_generic_args(t);
@@ -2914,7 +2957,7 @@ fn is_string_array_like_type(type_ann: &str) -> bool {
         let inner = trimmed.trim_end_matches("[]").trim();
         return is_string_like_union(inner);
     }
-    if trimmed.starts_with("Array<") {
+    if trimmed.starts_with("Array<") || trimmed.starts_with("ReadonlyArray<") {
         let inner = extract_generic_arg(trimmed);
         return is_string_like_union(inner.trim());
     }
