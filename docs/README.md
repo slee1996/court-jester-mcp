@@ -6,6 +6,7 @@ This folder now has a small canonical set at the top level, with older planning 
 
 - [court-jester-overview.md](court-jester-overview.md): what Court Jester is, why it exists, and how the benchmark is meant to answer product questions
 - [release-readiness-private-beta.md](release-readiness-private-beta.md): current release bar and honest status read
+- [release-notes-0.1.15.md](release-notes-0.1.15.md): release summary and validation for version `0.1.15`
 - [release-notes-0.1.14.md](release-notes-0.1.14.md): release summary and validation for version `0.1.14`
 - [release-notes-0.1.13.md](release-notes-0.1.13.md): release summary and validation for version `0.1.13`
 - [release-notes-0.1.12.md](release-notes-0.1.12.md): release summary and validation for version `0.1.12`

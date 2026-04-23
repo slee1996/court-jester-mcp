@@ -1,11 +1,11 @@
 {
   "schema_version": 2,
   "created_at": "2026-04-22",
-  "last_updated": "2026-04-22",
+  "last_updated": "2026-04-23",
   "source": {
-    "type": "structured_user_feedback",
-    "summary": "Feedback from running Court Jester across ~15 files from 0.1.x through 0.1.9.",
-    "headline": "0.1.9 is close to CI-worthy; remaining blockers are suppression, output stability, and a few categorization bugs."
+    "type": "merged_user_feedback",
+    "summary": "Merged backlog from structured CI-adoption feedback and a later repo-fit assessment across utility files, store code, portability cases, and planted bugs through 0.1.14.",
+    "headline": "CJ is strong on utility modules and crash detection, but needs better operator ergonomics and broader callable-surface visibility for modern TypeScript app code."
   },
   "status_summary": {
     "done": [
@@ -23,14 +23,20 @@
       "CJ-112",
       "CJ-113",
       "CJ-115",
-      "CJ-116"
-    ],
-    "planned": [
+      "CJ-116",
+      "CJ-117",
+      "CJ-118",
+      "CJ-119",
+      "CJ-120",
+      "CJ-121",
+      "CJ-122",
+      "CJ-123",
       "CJ-114"
-    ]
+    ],
+    "planned": []
   },
   "prioritization": {
-    "strategy": "Prioritize trust and CI adoption first: fix incorrect accounting, separate diagnostics from failures, stabilize report contracts, reduce artifact size, then add suppression and gating. Defer capability-expansion and workflow packaging until the machine interface is stable.",
+    "strategy": "The current backlog is cleared. The next planning pass should be driven by fresh user feedback, benchmark evidence, or product goals rather than the prior CI-adoption and callable-surface gaps.",
     "execution_order": [
       "CJ-101",
       "CJ-104",
@@ -47,11 +53,16 @@
       "CJ-111",
       "CJ-112",
       "CJ-116",
+      "CJ-117",
+      "CJ-118",
+      "CJ-119",
+      "CJ-120",
+      "CJ-121",
+      "CJ-122",
+      "CJ-123",
       "CJ-114"
     ],
-    "remaining_execution_order": [
-      "CJ-114"
-    ],
+    "remaining_execution_order": [],
     "phases": [
       {
         "id": "phase-1",
@@ -93,7 +104,42 @@
         "goal": "Expand reach and package the experience once the core CI contract is stable.",
         "task_ids": [
           "CJ-112",
-          "CJ-116",
+          "CJ-116"
+        ]
+      },
+      {
+        "id": "phase-5",
+        "name": "Operator Ergonomics",
+        "goal": "Reduce misleading output and make local triage usable without custom jq or Python.",
+        "task_ids": [
+          "CJ-117",
+          "CJ-118",
+          "CJ-119"
+        ]
+      },
+      {
+        "id": "phase-6",
+        "name": "Declarative Semantics",
+        "goal": "Let users teach CJ about expected behavior instead of relying only on name-based heuristics.",
+        "task_ids": [
+          "CJ-120"
+        ]
+      },
+      {
+        "id": "phase-7",
+        "name": "Callable Surface Expansion",
+        "goal": "Make CJ see meaningful logic in modern TypeScript code that lives behind classes, object literals, factories, and framework containers.",
+        "task_ids": [
+          "CJ-121",
+          "CJ-122",
+          "CJ-123"
+        ]
+      },
+      {
+        "id": "phase-8",
+        "name": "Workflow Packaging",
+        "goal": "Package the stabilized gates and broader callable surface into a first-party CI workflow command.",
+        "task_ids": [
           "CJ-114"
         ]
       }
@@ -464,7 +510,7 @@
     {
       "id": "CJ-114",
       "title": "Ship a court-jester ci subcommand for first-party PR workflows",
-      "status": "planned",
+      "status": "done",
       "priority": "P1",
       "priority_rank": 16,
       "estimate": "XL",
@@ -550,6 +596,212 @@
         "At least one user-facing doc includes both bug-finding wins and auditable-green examples",
         "The examples are specific enough to be credible without exposing sensitive repo details",
         "Future releases have a place to carry forward similar proof points"
+      ]
+    },
+    {
+      "id": "CJ-117",
+      "title": "Separate lint runner failures from actual lint issue counts",
+      "status": "done",
+      "priority": "P0",
+      "priority_rank": 17,
+      "estimate": "S",
+      "type": "bug",
+      "theme": "operator_ergonomics",
+      "phase": "phase-5",
+      "target_release": "0.1.15",
+      "depends_on": [],
+      "problem": "Biome or Ruff runner failures can corrupt the top-line lint issue count and make the summary misleading.",
+      "evidence": [
+        "User report: Biome returned internalError/io on a known existing file",
+        "The same run counted the failure as a lint_issue in the summary, corrupting the headline number"
+      ],
+      "deliverables": [
+        "Define a distinct runner-failure path for lint infrastructure errors",
+        "Keep summary.lint_issues scoped to actual diagnostics only",
+        "Add regression coverage for a Biome or Ruff execution failure that still leaves issue counts at zero"
+      ],
+      "acceptance_criteria": [
+        "Lint infrastructure failures appear as stage errors, not ordinary lint issue counts",
+        "summary.lint_issues reflects only diagnostics emitted by the linter",
+        "A regression test covers the failure-accounting split"
+      ]
+    },
+    {
+      "id": "CJ-118",
+      "title": "Add a human-readable summary view for interactive triage",
+      "status": "done",
+      "priority": "P0",
+      "priority_rank": 18,
+      "estimate": "M",
+      "type": "feature",
+      "theme": "operator_ergonomics",
+      "phase": "phase-5",
+      "target_release": "0.1.15",
+      "depends_on": [
+        "CJ-102",
+        "CJ-103"
+      ],
+      "problem": "The JSON report is good for CI plumbing but too cumbersome for interactive use without extra jq or Python.",
+      "evidence": [
+        "User report: the report is comprehensive but not scannable for questions like top-5 complexity offenders"
+      ],
+      "deliverables": [
+        "Add either verify --summary human or a summarize subcommand for an existing report",
+        "Surface stage outcomes, top complexity offenders, top execute findings, and skipped-function counts",
+        "Document how the human summary relates to the stable JSON report contract"
+      ],
+      "acceptance_criteria": [
+        "A user can answer what failed and what to inspect first without custom scripting",
+        "The summary output is deterministic enough for local use but does not replace the JSON contract",
+        "Tests cover at least one mixed-failure report rendered through the summary path"
+      ]
+    },
+    {
+      "id": "CJ-119",
+      "title": "Support source-level complexity suppressions",
+      "status": "done",
+      "priority": "P0",
+      "priority_rank": 19,
+      "estimate": "M",
+      "type": "feature",
+      "theme": "operator_ergonomics",
+      "phase": "phase-5",
+      "target_release": "0.1.15",
+      "depends_on": [
+        "CJ-102",
+        "CJ-105"
+      ],
+      "problem": "Users can suppress complexity findings in a JSON file, but not at the source location that actually carries the noise.",
+      "evidence": [
+        "User report: room.ts::webSocketMessage is noisy complexity signal and there is no way to add a suppression comment at source"
+      ],
+      "deliverables": [
+        "Choose a source-level directive syntax for complexity ignores",
+        "Associate directives with the following function or callable declaration",
+        "Keep suppressed findings visible in report detail and summary counts"
+      ],
+      "acceptance_criteria": [
+        "A complexity finding can be suppressed in source without muting the whole file or stage",
+        "Suppressed complexity findings remain auditable in the report",
+        "Regression tests cover both direct and adjacent comment-placement cases"
+      ]
+    },
+    {
+      "id": "CJ-120",
+      "title": "Add declarative user-supplied property checks v1",
+      "status": "done",
+      "priority": "P1",
+      "priority_rank": 20,
+      "estimate": "L",
+      "type": "feature",
+      "theme": "semantic_signal",
+      "phase": "phase-6",
+      "target_release": "0.1.16",
+      "depends_on": [
+        "CJ-102",
+        "CJ-103"
+      ],
+      "problem": "Property inference is currently hardcoded and name-driven, so silent wrong answers are invisible unless a built-in heuristic happens to match.",
+      "evidence": [
+        "User report: absBroken was caught by a name-triggered non-negative check, while clampBroken, sortBroken, idempotentBroken, and reverseBroken sailed through"
+      ],
+      "deliverables": [
+        "Define a controlled vocabulary for declarative properties such as idempotent, sorted, permutation, nonnegative, clamped, nonempty_string, symmetric, and comparator",
+        "Support specifying those properties either inline or via a sidecar configuration path",
+        "Integrate declarative properties into the fuzz harness and report shape without breaking existing heuristic checks"
+      ],
+      "acceptance_criteria": [
+        "A user can mark a function with at least one declarative property without renaming the function",
+        "The generated harness enforces the requested property and reports failures through the existing execute-stage taxonomy",
+        "Docs explain the supported property vocabulary and precedence versus built-in heuristics"
+      ]
+    },
+    {
+      "id": "CJ-121",
+      "title": "Expand callable discovery to exported object-literal methods and class methods",
+      "status": "done",
+      "priority": "P1",
+      "priority_rank": 21,
+      "estimate": "L",
+      "type": "feature",
+      "theme": "callable_visibility",
+      "phase": "phase-7",
+      "target_release": "0.2.0",
+      "depends_on": [],
+      "problem": "CJ currently focuses on top-level named functions, missing a large amount of real logic in modern TypeScript modules.",
+      "evidence": [
+        "User report: gameStore.ts is 343 lines of zustand store logic but CJ analyzed only 3 functions",
+        "The synthesizer currently filters to !is_method && !is_nested top-level candidates"
+      ],
+      "deliverables": [
+        "Extend analysis to emit stable qualified names for exported object-literal methods and class methods",
+        "Teach the synthesizer to build harness calls for those methods without treating every nested helper as public API",
+        "Update coverage reporting so the newly visible callables are counted explicitly"
+      ],
+      "acceptance_criteria": [
+        "At least exported object-literal methods and class methods can appear as first-class callable surfaces in parse and coverage output",
+        "The execute harness can invoke those callables with stable names and source locations",
+        "Regression tests cover at least one object-literal export and one class-method example"
+      ]
+    },
+    {
+      "id": "CJ-122",
+      "title": "Promote factory-returned object methods into explicit callable coverage",
+      "status": "done",
+      "priority": "P1",
+      "priority_rank": 22,
+      "estimate": "L",
+      "type": "feature",
+      "theme": "callable_visibility",
+      "phase": "phase-7",
+      "target_release": "0.2.0",
+      "depends_on": [
+        "CJ-121"
+      ],
+      "problem": "CJ already exercises some factory-returned methods indirectly, but they are not modeled as named callable surfaces with their own coverage and reporting identity.",
+      "evidence": [
+        "Factory-to-nested fuzzing found buildCacheKey via createAuthzChecker, but the path is still implicit rather than a first-class callable surface"
+      ],
+      "deliverables": [
+        "Represent factory-returned callables with stable synthetic identities in coverage and execute output",
+        "Reuse the existing factory exercise machinery where possible instead of inventing a second harness model",
+        "Make it obvious when a finding came from a returned method versus the factory constructor itself"
+      ],
+      "acceptance_criteria": [
+        "Returned object methods show up as explicit callable coverage entries rather than only an aggregate factory note",
+        "Findings can identify the returned method that crashed or violated a property",
+        "Regression tests cover a factory that returns multiple callable methods"
+      ]
+    },
+    {
+      "id": "CJ-123",
+      "title": "Handle framework and container closures such as zustand stores and hook bodies",
+      "status": "done",
+      "priority": "P2",
+      "priority_rank": 23,
+      "estimate": "XL",
+      "type": "feature",
+      "theme": "callable_visibility",
+      "phase": "phase-7",
+      "target_release": "0.2.x",
+      "depends_on": [
+        "CJ-121",
+        "CJ-122"
+      ],
+      "problem": "A large share of modern app logic lives inside closures passed to framework or container APIs rather than at top level.",
+      "evidence": [
+        "User report: zustand create(set => ({...})) logic was effectively invisible",
+        "The same blind spot is expected for hook bodies, RxJS pipelines, and other factory-wrapped logic"
+      ],
+      "deliverables": [
+        "Design a container-aware callable-discovery model for common wrapper patterns instead of treating all nested closures as internal helpers",
+        "Start with at least one concrete container family such as zustand-style stores",
+        "Define how those discovered callables will be named, fuzzed, and reported without exploding into every incidental nested closure"
+      ],
+      "acceptance_criteria": [
+        "At least one real container pattern yields meaningful callable coverage beyond top-level functions",
+        "The report distinguishes intentional surfaced callables from incidental nested helpers",
+        "The implementation is framed as an explicit supported pattern, not a brittle generic AST hack"
       ]
     }
   ]

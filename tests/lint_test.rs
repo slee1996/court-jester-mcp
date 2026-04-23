@@ -194,6 +194,37 @@ fn lint_reports_typescript_runner_failure() {
     );
 }
 
+#[test]
+fn lint_reports_typescript_internal_error_as_runner_failure() {
+    let _guard = path_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tool_dir = install_fake_tool(
+        "biome",
+        "#!/bin/sh\ncat <<'EOF'\n{\"diagnostics\":[{\"category\":\"internalError/io\",\"description\":\"No such file or directory (os error 2)\",\"severity\":\"fatal\",\"location\":{\"start\":{\"line\":0,\"column\":0}}}]}\nEOF\nexit 1\n",
+    );
+    let _path = EnvVarGuard::prepend_path(tool_dir.path());
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let result = runtime.block_on(lint(
+        "export function add(a: number, b: number): number { return a + b; }",
+        &Language::TypeScript,
+    ));
+
+    assert!(
+        result.runner_failed,
+        "expected runner failure classification"
+    );
+    assert!(result.error.is_some(), "runner failure should surface");
+    assert!(
+        result.diagnostics.is_empty(),
+        "runner failure should not count as a lint finding"
+    );
+    assert_eq!(
+        result.runner_diagnostics.len(),
+        1,
+        "expected one captured runner diagnostic"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn lint_reports_signal_kill_with_actionable_hint() {

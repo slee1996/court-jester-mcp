@@ -45,6 +45,24 @@ impl ReportLevel {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
+pub enum SummaryFormat {
+    #[default]
+    Json,
+    Human,
+}
+
+impl SummaryFormat {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "json" => Some(Self::Json),
+            "human" => Some(Self::Human),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum ExecuteGate {
     #[default]
     All,
@@ -136,6 +154,12 @@ pub struct FunctionInfo {
     pub is_nested: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_exported: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared_properties: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invocation_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub returned_callables: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,10 +242,14 @@ pub struct LintDiagnostic {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LintResult {
     pub diagnostics: Vec<LintDiagnostic>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runner_diagnostics: Vec<LintDiagnostic>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unavailable: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub runner_failed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,6 +269,7 @@ pub struct FuzzFailure {
 #[serde(rename_all = "snake_case")]
 pub enum FuzzFunctionStatus {
     Fuzzed,
+    FuzzedViaFactory,
     SkippedNoFuzzableSurface,
     SkippedUnsupportedType,
     SkippedInternalHelper,
@@ -327,6 +356,7 @@ pub struct ReportSummary {
     pub suppressed_complexity_violations: usize,
     pub suppressed_portability_warnings: usize,
     pub lint_issues: usize,
+    pub lint_runner_failures: usize,
     pub complexity_violations: usize,
 }
 

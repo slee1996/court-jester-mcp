@@ -79,6 +79,7 @@ The selected gate is recorded in the execute stage detail.
 Coverage detail reports per-function statuses such as:
 
 - `fuzzed`
+- `fuzzed_via_factory`
 - `skipped_no_fuzzable_surface`
 - `skipped_unsupported_type`
 - `skipped_internal_helper`
@@ -89,6 +90,10 @@ Coverage detail reports per-function statuses such as:
 - `blocked_module_load`
 
 `skipped_no_fuzzable_surface` is used for zero-argument functions where Court Jester cannot derive a meaningful parameter surface or stable return contract to exercise.
+
+`fuzzed_via_factory` is used for callable methods discovered on a returned factory object surface. Those entries are reported explicitly even when the callable itself is not a top-level function.
+
+Supported container-backed callables, such as Zustand-style `create(... => ({ ... }))` stores, are reported as normal `fuzzed` entries with explicit surfaced names like `useStore.method`. That keeps them distinct from incidental nested helpers, which remain `skipped_nested`.
 
 ## Complexity Contract
 

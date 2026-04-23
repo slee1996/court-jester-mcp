@@ -40,6 +40,7 @@ Release and CI wiring docs:
 - Spec-like behavior where small semantic mistakes matter a lot
 - Hidden semantic bugs that slip past obvious happy-path checks
 - Nullish, fallback, defaulting, canonicalization, and cross-file behavior that looks plausible but is still wrong
+- Exported object/class methods, factory-returned callables, and supported container patterns such as Zustand-style `create(... => ({ ... }))` stores
 - Repair loops where the model benefits from a concrete failing repro instead of generic feedback
 - Projects that already have local tool context such as `.venv`, `node_modules`, Ruff, Biome, or authoritative test files
 
@@ -151,6 +152,39 @@ court-jester verify \
 
 TypeScript `--test-file` uses `--test-runner auto` by default. That path now prefers Bun when the authoritative test imports `bun:test`; otherwise it uses the Node path. Use `--test-runner node|bun|repo-native` to override.
 
+Source directives:
+
+- `court-jester-ignore complexity` on the same line or immediately above a callable suppresses only that complexity finding while keeping it visible in the report.
+- `court-jester-properties ...` on the same line or immediately above a callable adds explicit execute-stage properties without renaming the function.
+
+Example:
+
+```ts
+// court-jester-properties sorted permutation
+export function reorder(values: string[]): string[] {
+  return [...values].reverse();
+}
+```
+
+Supported declarative properties today:
+
+- `idempotent`
+- `sorted`
+- `permutation`
+- `nonnegative`
+- `clamped`
+- `nonempty_string`
+- `symmetric`
+- `antisymmetric`
+- `bounded`
+- `no_nullish_string`
+
+Precedence:
+
+- explicit properties are additive: they turn checks on even when the function name would not have triggered a built-in heuristic
+- built-in heuristics still run unless separately suppressed
+- `antisymmetric` maps to the existing comparator-style contract checks
+
 Write JSON reports to disk:
 
 ```bash
@@ -163,10 +197,21 @@ court-jester verify \
 Other commands:
 
 ```text
+court-jester ci       [OPTIONS]
 court-jester analyze  [OPTIONS]
 court-jester lint     [OPTIONS]
 court-jester execute  [OPTIONS]
 court-jester --help
+```
+
+Changed-files CI wrapper:
+
+```bash
+court-jester ci \
+  --base origin/main \
+  --gate complexity,portability,execute \
+  --report github \
+  --report-level minimal
 ```
 
 ## What `verify` Does

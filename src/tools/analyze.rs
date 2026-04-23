@@ -64,6 +64,8 @@ pub fn analyze(code: &str, language: &Language) -> AnalysisResult {
         }
     }
 
+    annotate_function_source_directives(code, language, &mut functions);
+
     AnalysisResult {
         functions,
         classes,
@@ -79,6 +81,132 @@ pub fn analyze(code: &str, language: &Language) -> AnalysisResult {
 
 fn text<'a>(node: &tree_sitter::Node, source: &'a [u8]) -> &'a str {
     node.utf8_text(source).unwrap_or("")
+}
+
+const SOURCE_IGNORE_DIRECTIVE_MARKERS: [&str; 2] = ["@court-jester-ignore", "court-jester-ignore"];
+const SOURCE_PROPERTY_DIRECTIVE_MARKERS: [&str; 2] =
+    ["@court-jester-properties", "court-jester-properties"];
+const TS_SUPPORTED_CONTAINER_CALLEES: [&str; 2] = ["create", "createStore"];
+
+fn directive_targets_stage(line: &str, stage: &str) -> bool {
+    let lower = line.to_lowercase();
+    let stage = stage.to_lowercase();
+    SOURCE_IGNORE_DIRECTIVE_MARKERS.iter().any(|marker| {
+        lower.find(marker).is_some_and(|idx| {
+            lower[idx + marker.len()..]
+                .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-')
+                .any(|token| token == stage || token == "all")
+        })
+    })
+}
+
+fn normalize_declared_property(token: &str) -> Option<&'static str> {
+    match token {
+        "idempotent" => Some("idempotent"),
+        "sorted" => Some("sorted"),
+        "permutation" => Some("permutation"),
+        "nonnegative" | "nonneg" => Some("nonneg"),
+        "clamped" => Some("clamped"),
+        "nonempty" | "nonempty_string" => Some("nonempty_string"),
+        "symmetric" => Some("symmetric"),
+        "antisymmetric" | "comparator" => Some("antisymmetric"),
+        "bounded" => Some("bounded"),
+        "no_nullish_string" => Some("no_nullish_string"),
+        _ => None,
+    }
+}
+
+fn extract_declared_properties_from_line(line: &str) -> Vec<String> {
+    let lower = line.to_lowercase();
+    SOURCE_PROPERTY_DIRECTIVE_MARKERS
+        .iter()
+        .find_map(|marker| {
+            lower.find(marker).map(|idx| {
+                lower[idx + marker.len()..]
+                    .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-')
+                    .filter_map(normalize_declared_property)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+        })
+        .unwrap_or_default()
+}
+
+fn is_comment_only_line(trimmed: &str, language: &Language) -> bool {
+    match language {
+        Language::Python => trimmed.starts_with('#'),
+        Language::TypeScript => {
+            trimmed.starts_with("//")
+                || trimmed.starts_with("/*")
+                || trimmed.starts_with('*')
+                || trimmed.starts_with("*/")
+        }
+    }
+}
+
+fn source_context_lines<'a>(code: &'a str, language: &Language, line: usize) -> Vec<&'a str> {
+    if line == 0 {
+        return Vec::new();
+    }
+
+    let lines: Vec<&str> = code.lines().collect();
+    if line > lines.len() {
+        return Vec::new();
+    }
+
+    let mut context = vec![lines[line - 1]];
+
+    let mut idx = line.saturating_sub(2);
+    let mut have_prior_line = line >= 2;
+    while have_prior_line {
+        let trimmed = lines[idx].trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        context.push(lines[idx]);
+        if !is_comment_only_line(trimmed, language) {
+            break;
+        }
+        if idx == 0 {
+            break;
+        }
+        idx -= 1;
+        have_prior_line = true;
+    }
+
+    context
+}
+
+pub fn source_directive_suppresses_complexity(
+    code: &str,
+    language: &Language,
+    line: usize,
+) -> bool {
+    source_context_lines(code, language, line)
+        .into_iter()
+        .any(|candidate| directive_targets_stage(candidate, "complexity"))
+}
+
+pub fn source_declared_properties(code: &str, language: &Language, line: usize) -> Vec<String> {
+    let mut properties = Vec::new();
+    for candidate in source_context_lines(code, language, line) {
+        for property in extract_declared_properties_from_line(candidate) {
+            if !properties.iter().any(|existing| existing == &property) {
+                properties.push(property);
+            }
+        }
+    }
+    properties
+}
+
+fn annotate_function_source_directives(
+    code: &str,
+    language: &Language,
+    functions: &mut [FunctionInfo],
+) {
+    for function in functions {
+        function.declared_properties = source_declared_properties(code, language, function.line);
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -400,6 +528,9 @@ fn visit_python(
                 is_method,
                 is_nested: func_depth > 0,
                 is_exported,
+                declared_properties: vec![],
+                invocation_target: None,
+                returned_callables: vec![],
             });
             child_depth = func_depth + 1;
         }
@@ -629,6 +760,7 @@ fn visit_typescript(
                 .child_by_field_name("return_type")
                 .map(|n| type_text(&n, source));
             let metrics = callable_complexity(node, &Language::TypeScript, source);
+            let returned_callables = extract_ts_returned_object_callables(node, source);
             functions.push(FunctionInfo {
                 name,
                 params,
@@ -642,19 +774,48 @@ fn visit_typescript(
                 is_method: false,
                 is_nested: func_depth > 0,
                 is_exported: ts_is_exported(node),
+                declared_properties: vec![],
+                invocation_target: None,
+                returned_callables,
             });
             child_depth = func_depth + 1;
         }
         "method_definition" => {
-            let name = node
+            let method_name = node
                 .child_by_field_name("name")
                 .map(|n| text(&n, source).to_string())
                 .unwrap_or_default();
+            let (name, is_exported, invocation_target) =
+                if let Some((qualified_name, call_target)) =
+                    ts_exported_class_method_surface(node, source)
+                {
+                    (qualified_name, true, Some(call_target))
+                } else if node
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "object")
+                {
+                    let mut cursor = node.walk();
+                    for child in node.named_children(&mut cursor) {
+                        visit_typescript(
+                            &child,
+                            source,
+                            functions,
+                            classes,
+                            aliases,
+                            imports,
+                            child_depth,
+                        );
+                    }
+                    return;
+                } else {
+                    (method_name.clone(), false, None)
+                };
             let params = extract_ts_params(node, source);
             let return_type = node
                 .child_by_field_name("return_type")
                 .map(|n| type_text(&n, source));
             let metrics = callable_complexity(node, &Language::TypeScript, source);
+            let returned_callables = extract_ts_returned_object_callables(node, source);
             functions.push(FunctionInfo {
                 name,
                 params,
@@ -667,7 +828,10 @@ fn visit_typescript(
                 complexity_breakdown: metrics.breakdown,
                 is_method: true,
                 is_nested: func_depth > 0,
-                is_exported: false,
+                is_exported,
+                declared_properties: vec![],
+                invocation_target,
+                returned_callables,
             });
             child_depth = func_depth + 1;
         }
@@ -684,6 +848,7 @@ fn visit_typescript(
                         .child_by_field_name("return_type")
                         .map(|n| type_text(&n, source));
                     let metrics = callable_complexity(&value, &Language::TypeScript, source);
+                    let returned_callables = extract_ts_returned_object_callables(&value, source);
                     functions.push(FunctionInfo {
                         name,
                         params,
@@ -697,8 +862,34 @@ fn visit_typescript(
                         is_method: false,
                         is_nested: func_depth > 0,
                         is_exported: ts_is_exported(node),
+                        declared_properties: vec![],
+                        invocation_target: None,
+                        returned_callables,
                     });
                     child_depth = func_depth + 1;
+                } else if value.kind() == "object" && ts_is_exported(node) {
+                    let base_name = node
+                        .child_by_field_name("name")
+                        .map(|n| text(&n, source).to_string())
+                        .unwrap_or_default();
+                    if !base_name.is_empty() {
+                        collect_exported_object_callables(
+                            &base_name, &value, source, functions, func_depth,
+                        );
+                    }
+                } else if value.kind() == "call_expression" && ts_is_exported(node) {
+                    let base_name = node
+                        .child_by_field_name("name")
+                        .map(|n| text(&n, source).to_string())
+                        .unwrap_or_default();
+                    if !base_name.is_empty() {
+                        collect_exported_container_callables(
+                            &base_name,
+                            &value,
+                            source,
+                            functions,
+                        );
+                    }
                 }
             }
         }
@@ -777,6 +968,377 @@ fn visit_typescript(
             child_depth,
         );
     }
+}
+
+fn ts_exported_class_method_surface(
+    node: &tree_sitter::Node,
+    source: &[u8],
+) -> Option<(String, String)> {
+    let parent = node.parent()?;
+    if parent.kind() != "class_body" {
+        return None;
+    }
+    let class_node = parent.parent()?;
+    if class_node.kind() != "class_declaration" || !ts_is_exported(&class_node) {
+        return None;
+    }
+    if !ts_class_has_zero_arg_constructor(&class_node, source) {
+        return None;
+    }
+
+    let class_name = class_node
+        .child_by_field_name("name")
+        .map(|n| text(&n, source))?;
+    let method_name = node.child_by_field_name("name").map(|n| text(&n, source))?;
+    if method_name.is_empty() || method_name == "constructor" || method_name.starts_with('#') {
+        return None;
+    }
+
+    Some((
+        format!("{class_name}#{method_name}"),
+        format!("(new {class_name}()).{method_name}"),
+    ))
+}
+
+fn ts_class_has_zero_arg_constructor(class_node: &tree_sitter::Node, source: &[u8]) -> bool {
+    let Some(body) = class_node.child_by_field_name("body") else {
+        return true;
+    };
+    let mut cursor = body.walk();
+    for child in body.named_children(&mut cursor) {
+        if child.kind() != "method_definition" {
+            continue;
+        }
+        let name = child
+            .child_by_field_name("name")
+            .map(|n| text(&n, source))
+            .unwrap_or_default();
+        if name != "constructor" {
+            continue;
+        }
+        let params = extract_ts_params(&child, source);
+        return params.is_empty();
+    }
+    true
+}
+
+fn collect_exported_object_callables(
+    base_name: &str,
+    object: &tree_sitter::Node,
+    source: &[u8],
+    functions: &mut Vec<FunctionInfo>,
+    func_depth: usize,
+) {
+    collect_ts_surfaced_object_callables(
+        base_name,
+        base_name,
+        object,
+        source,
+        functions,
+        func_depth > 0,
+    );
+}
+
+fn collect_exported_container_callables(
+    base_name: &str,
+    value: &tree_sitter::Node,
+    source: &[u8],
+    functions: &mut Vec<FunctionInfo>,
+) {
+    let Some(object) = ts_supported_container_return_object(*value, source) else {
+        return;
+    };
+    let invocation_root = format!("{base_name}.getState()");
+    collect_ts_surfaced_object_callables(
+        base_name,
+        &invocation_root,
+        &object,
+        source,
+        functions,
+        false,
+    );
+}
+
+fn collect_ts_surfaced_object_callables(
+    base_name: &str,
+    invocation_root: &str,
+    object: &tree_sitter::Node,
+    source: &[u8],
+    functions: &mut Vec<FunctionInfo>,
+    is_nested: bool,
+) {
+    let mut cursor = object.walk();
+    for child in object.named_children(&mut cursor) {
+        match child.kind() {
+            "method_definition" => {
+                let Some(method_name) =
+                    child.child_by_field_name("name").and_then(|n| ts_property_name(&n, source))
+                else {
+                    continue;
+                };
+                push_ts_surfaced_callable(
+                    functions,
+                    base_name,
+                    invocation_root,
+                    &method_name,
+                    &child,
+                    &child,
+                    source,
+                    is_nested,
+                );
+            }
+            "pair" => {
+                let Some(key_node) = child.child_by_field_name("key") else {
+                    continue;
+                };
+                let Some(value_node) = child.child_by_field_name("value") else {
+                    continue;
+                };
+                if !matches!(value_node.kind(), "arrow_function" | "function_expression") {
+                    continue;
+                }
+                let Some(method_name) = ts_property_name(&key_node, source) else {
+                    continue;
+                };
+                push_ts_surfaced_callable(
+                    functions,
+                    base_name,
+                    invocation_root,
+                    &method_name,
+                    &child,
+                    &value_node,
+                    source,
+                    is_nested,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+fn push_ts_surfaced_callable(
+    functions: &mut Vec<FunctionInfo>,
+    base_name: &str,
+    invocation_root: &str,
+    method_name: &str,
+    property_node: &tree_sitter::Node,
+    callable_node: &tree_sitter::Node,
+    source: &[u8],
+    is_nested: bool,
+) {
+    if method_name.is_empty() || method_name.starts_with('#') {
+        return;
+    }
+    let params = extract_ts_params(callable_node, source);
+    let return_type = callable_node
+        .child_by_field_name("return_type")
+        .map(|n| type_text(&n, source));
+    let metrics = callable_complexity(callable_node, &Language::TypeScript, source);
+    functions.push(FunctionInfo {
+        name: format!("{base_name}.{method_name}"),
+        params,
+        return_type,
+        line: property_node.start_position().row + 1,
+        end_line: property_node.end_position().row + 1,
+        complexity: metrics.cyclomatic,
+        cognitive_complexity: metrics.cognitive,
+        max_nesting_depth: metrics.max_nesting_depth,
+        complexity_breakdown: metrics.breakdown,
+        is_method: true,
+        is_nested,
+        is_exported: true,
+        declared_properties: vec![],
+        invocation_target: Some(format!("{invocation_root}.{method_name}")),
+        returned_callables: vec![],
+    });
+}
+
+fn ts_property_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let name = text(node, source)
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_string();
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$')
+    {
+        return None;
+    }
+    Some(name)
+}
+
+fn ts_supported_container_return_object<'a>(
+    value: tree_sitter::Node<'a>,
+    source: &[u8],
+) -> Option<tree_sitter::Node<'a>> {
+    if value.kind() != "call_expression" || !ts_call_has_supported_container_callee(value, source) {
+        return None;
+    }
+    ts_find_object_returning_callback_in_call(value)
+}
+
+fn ts_call_has_supported_container_callee(
+    call: tree_sitter::Node,
+    source: &[u8],
+) -> bool {
+    call.child_by_field_name("function")
+        .is_some_and(|function| ts_expr_contains_supported_container_callee(function, source))
+}
+
+fn ts_expr_contains_supported_container_callee(
+    expr: tree_sitter::Node,
+    source: &[u8],
+) -> bool {
+    match expr.kind() {
+        "identifier" | "property_identifier" => TS_SUPPORTED_CONTAINER_CALLEES
+            .iter()
+            .any(|candidate| text(&expr, source).trim() == *candidate),
+        "member_expression" => {
+            expr.child_by_field_name("property")
+                .is_some_and(|property| {
+                    TS_SUPPORTED_CONTAINER_CALLEES
+                        .iter()
+                        .any(|candidate| text(&property, source).trim() == *candidate)
+                })
+                || expr
+                    .child_by_field_name("object")
+                    .is_some_and(|object| ts_expr_contains_supported_container_callee(object, source))
+        }
+        _ => {
+            if let Some(function) = expr.child_by_field_name("function") {
+                return ts_expr_contains_supported_container_callee(function, source);
+            }
+            let mut cursor = expr.walk();
+            let has_supported_name = expr
+                .named_children(&mut cursor)
+                .any(|child| ts_expr_contains_supported_container_callee(child, source));
+            has_supported_name
+        }
+    }
+}
+
+fn ts_find_object_returning_callback_in_call<'a>(
+    call: tree_sitter::Node<'a>,
+) -> Option<tree_sitter::Node<'a>> {
+    let args = call.child_by_field_name("arguments")?;
+    let mut cursor = args.walk();
+    for arg in args.named_children(&mut cursor) {
+        if let Some(object) = ts_find_object_returning_callback_in_expression(arg) {
+            return Some(object);
+        }
+    }
+    None
+}
+
+fn ts_find_object_returning_callback_in_expression<'a>(
+    expr: tree_sitter::Node<'a>,
+) -> Option<tree_sitter::Node<'a>> {
+    match expr.kind() {
+        "arrow_function" | "function_expression" => ts_returned_object_node(expr),
+        "call_expression" => ts_find_object_returning_callback_in_call(expr),
+        _ => {
+            let mut cursor = expr.walk();
+            for child in expr.named_children(&mut cursor) {
+                if let Some(object) = ts_find_object_returning_callback_in_expression(child) {
+                    return Some(object);
+                }
+            }
+            None
+        }
+    }
+}
+
+fn ts_returned_object_node<'a>(
+    callable: tree_sitter::Node<'a>,
+) -> Option<tree_sitter::Node<'a>> {
+    let body = callable.child_by_field_name("body")?;
+    if body.kind() == "statement_block" {
+        let mut cursor = body.walk();
+        for child in body.named_children(&mut cursor) {
+            if child.kind() != "return_statement" {
+                continue;
+            }
+            let mut stmt_cursor = child.walk();
+            for stmt_child in child.named_children(&mut stmt_cursor) {
+                if let Some(object) = ts_expression_object_node(stmt_child) {
+                    return Some(object);
+                }
+            }
+        }
+        None
+    } else {
+        ts_expression_object_node(body)
+    }
+}
+
+fn ts_expression_object_node<'a>(
+    expr: tree_sitter::Node<'a>,
+) -> Option<tree_sitter::Node<'a>> {
+    if expr.kind() == "object" {
+        return Some(expr);
+    }
+
+    let mut cursor = expr.walk();
+    for child in expr.named_children(&mut cursor) {
+        if let Some(object) = ts_expression_object_node(child) {
+            return Some(object);
+        }
+    }
+    None
+}
+
+fn extract_ts_returned_object_callables(
+    callable: &tree_sitter::Node,
+    source: &[u8],
+) -> Vec<String> {
+    let Some(object) = ts_returned_object_node(*callable) else {
+        return Vec::new();
+    };
+
+    let mut callables = Vec::new();
+    let mut cursor = object.walk();
+    for child in object.named_children(&mut cursor) {
+        match child.kind() {
+            "method_definition" => {
+                let name = child
+                    .child_by_field_name("name")
+                    .map(|n| text(&n, source).to_string())
+                    .unwrap_or_default();
+                if !name.is_empty() && !callables.iter().any(|existing| existing == &name) {
+                    callables.push(name);
+                }
+            }
+            "pair" => {
+                let Some(key) = child.child_by_field_name("key") else {
+                    continue;
+                };
+                let Some(value) = child.child_by_field_name("value") else {
+                    continue;
+                };
+                if !matches!(value.kind(), "arrow_function" | "function_expression") {
+                    continue;
+                }
+                let name = text(&key, source)
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .to_string();
+                if !name.is_empty() && !callables.iter().any(|existing| existing == &name) {
+                    callables.push(name);
+                }
+            }
+            "shorthand_property_identifier" | "property_identifier" => {
+                let name = text(&child, source).trim().to_string();
+                if !name.is_empty() && !callables.iter().any(|existing| existing == &name) {
+                    callables.push(name);
+                }
+            }
+            _ => {}
+        }
+    }
+    callables
 }
 
 fn ts_is_exported(node: &tree_sitter::Node) -> bool {

@@ -38,6 +38,9 @@ fn func(name: &str, params: Vec<(&str, Option<&str>)>, ret: Option<&str>) -> Fun
         is_method: false,
         is_nested: false,
         is_exported: true,
+        declared_properties: vec![],
+        invocation_target: None,
+        returned_callables: vec![],
     }
 }
 
@@ -75,6 +78,9 @@ fn kwonly_func(
         is_method: false,
         is_nested: false,
         is_exported: true,
+        declared_properties: vec![],
+        invocation_target: None,
+        returned_callables: vec![],
     }
 }
 
@@ -1140,6 +1146,42 @@ fn typescript_nonneg_for_count() {
 }
 
 #[test]
+fn typescript_declared_sorted_and_permutation_properties_are_emitted() {
+    let mut reorder = func(
+        "reorder",
+        vec![("values", Some("string[]"))],
+        Some("string[]"),
+    );
+    reorder.declared_properties = vec!["sorted".into(), "permutation".into()];
+    let a = make_analysis(vec![reorder], vec![]);
+    let code = synthesize_calls(&a, &Language::TypeScript);
+    assert!(
+        code.contains("\"sorted\"") && code.contains("\"permutation\""),
+        "declared properties should be emitted into the TS harness, got: {code}"
+    );
+}
+
+#[test]
+fn python_declared_clamped_property_is_emitted() {
+    let mut clamp_like = func(
+        "choose_range",
+        vec![
+            ("value", Some("int")),
+            ("lower", Some("int")),
+            ("upper", Some("int")),
+        ],
+        Some("int"),
+    );
+    clamp_like.declared_properties = vec!["clamped".into()];
+    let a = make_analysis(vec![clamp_like], vec![]);
+    let code = synthesize_calls(&a, &Language::Python);
+    assert!(
+        code.contains("Clamp bounds violated") && code.contains("Clamp passthrough violated"),
+        "declared clamped property should emit clamp assertions, got: {code}"
+    );
+}
+
+#[test]
 fn typescript_nonempty_string_for_label() {
     let a = make_analysis(
         vec![func(
@@ -1280,6 +1322,9 @@ fn python_skips_methods_in_fuzz() {
                 is_method: true,
                 is_nested: false,
                 is_exported: false,
+                declared_properties: vec![],
+                invocation_target: None,
+                returned_callables: vec![],
             },
             func("standalone", vec![("x", Some("int"))], Some("int")),
         ],

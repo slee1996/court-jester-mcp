@@ -4,6 +4,26 @@ This changelog tracks user-visible verifier semantics, report-shape changes, and
 
 ## Unreleased
 
+## 0.1.15 - 2026-04-23
+
+### Operator Ergonomics
+
+- Added `verify --summary human` for a fast CLI summary over the structured report.
+- Lint runner and infrastructure failures are now separated from ordinary Ruff/Biome findings instead of inflating `lint_issues`.
+- Added source-level `court-jester-ignore complexity` support so complexity suppressions can live next to the code they justify.
+- Added explicit declarative execute properties with `court-jester-properties ...`, including checks such as `sorted`, `permutation`, `nonnegative`, `clamped`, `nonempty_string`, `symmetric`, and `antisymmetric`.
+
+### Callable Surface Expansion
+
+- Exported object-literal methods and zero-argument exported class methods can now be surfaced and invoked as first-class callable APIs.
+- Factory-returned methods are now explicit in coverage output via `fuzzed_via_factory` instead of remaining an implicit side effect of factory exercise.
+- Added explicit support for Zustand-style container surfaces such as `create(... => ({ ... }))` and curried `create<T>()(... )` patterns. Surfaced methods are reported with stable names like `useStore.method`.
+
+### CI Workflow
+
+- Added a first-party `court-jester ci` subcommand for changed-file PR workflows.
+- `court-jester ci` reuses the existing verify report schema and gate semantics, scopes to changed Python/TypeScript files from `git diff`, and supports `human`, `github`, and `json` output.
+
 ## 0.1.14 - 2026-04-22
 
 ### TypeScript Fuzz Coverage

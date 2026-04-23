@@ -4,7 +4,17 @@ This is the shortest path to running Court Jester in CI without drowning in nois
 
 ## Recommended Starting Point
 
-For changed files in a PR:
+For changed files in a PR, the shortest path is now the first-party wrapper:
+
+```bash
+court-jester ci \
+  --base origin/main \
+  --gate complexity,portability,execute \
+  --report github \
+  --report-level minimal
+```
+
+If you need the lower-level building blocks directly, the equivalent manual shape is:
 
 ```bash
 court-jester verify \
@@ -20,6 +30,7 @@ court-jester verify \
 
 Why this shape:
 
+- `court-jester ci` shells out to git, scopes to changed Python/TypeScript files, and aggregates the result into one CI-oriented exit code
 - `--diff-file` limits work to changed functions
 - `--report-level minimal` keeps artifacts small
 - `--execute-gate crash` is the safest first gate for noisy repos

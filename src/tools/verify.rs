@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -110,6 +111,7 @@ fn coverage_counts(entries: &[FuzzFunctionCoverage]) -> serde_json::Value {
     let mut counts = serde_json::Map::new();
     for status in [
         FuzzFunctionStatus::Fuzzed,
+        FuzzFunctionStatus::FuzzedViaFactory,
         FuzzFunctionStatus::SkippedNoFuzzableSurface,
         FuzzFunctionStatus::SkippedUnsupportedType,
         FuzzFunctionStatus::SkippedInternalHelper,
@@ -154,13 +156,13 @@ fn finalize_fuzz_coverage(
                 FuzzFunctionStatus::SkippedDiffFiltered,
                 Some("excluded by diff scoping".into()),
             )
-        } else if func.is_method {
+        } else if func.is_method && func.invocation_target.is_none() {
             coverage_entry_for_verify(
                 func,
                 FuzzFunctionStatus::SkippedMethod,
                 Some("methods are not fuzzed directly".into()),
             )
-        } else if func.is_nested {
+        } else if func.is_nested && func.invocation_target.is_none() {
             coverage_entry_for_verify(
                 func,
                 FuzzFunctionStatus::SkippedNested,
@@ -190,6 +192,14 @@ fn finalize_fuzz_coverage(
         };
         coverage.push(entry);
     }
+
+    let mut synthetic_entries: Vec<_> = planned.into_values().collect();
+    synthetic_entries.sort_by(|left, right| {
+        left.line
+            .cmp(&right.line)
+            .then_with(|| left.function.cmp(&right.function))
+    });
+    coverage.extend(synthetic_entries);
 
     coverage
 }
@@ -346,11 +356,24 @@ fn split_complexity_violations(
     violations: Vec<ComplexityViolation>,
     suppressions: &SuppressionsFile,
     source_file: Option<&str>,
-) -> (Vec<ComplexityViolation>, Vec<ComplexityViolation>) {
+    code: &str,
+    language: &Language,
+) -> (
+    Vec<ComplexityViolation>,
+    Vec<ComplexityViolation>,
+    Vec<String>,
+) {
     let mut active = Vec::new();
     let mut suppressed = Vec::new();
+    let mut source_directive_functions = Vec::new();
 
     for violation in violations {
+        if analyze::source_directive_suppresses_complexity(code, language, violation.line) {
+            source_directive_functions.push(violation.function.clone());
+            suppressed.push(violation);
+            continue;
+        }
+
         let ctx = SuppressionContext {
             source_file,
             stage: "complexity",
@@ -370,7 +393,10 @@ fn split_complexity_violations(
         }
     }
 
-    (active, suppressed)
+    source_directive_functions.sort();
+    source_directive_functions.dedup();
+
+    (active, suppressed, source_directive_functions)
 }
 
 fn portability_reason(stderr: &str) -> &'static str {
@@ -1064,15 +1090,18 @@ pub async fn verify(
         } else {
             (analysis.functions.clone(), false)
         };
-        let (violations, suppressed_violations) = split_complexity_violations(
-            analyze::check_complexity_threshold_for_functions_with_metric(
-                &functions_checked,
-                threshold,
-                opts.complexity_metric,
-            ),
-            &suppressions,
-            opts.source_file,
-        );
+        let (violations, suppressed_violations, source_directive_functions) =
+            split_complexity_violations(
+                analyze::check_complexity_threshold_for_functions_with_metric(
+                    &functions_checked,
+                    threshold,
+                    opts.complexity_metric,
+                ),
+                &suppressions,
+                opts.source_file,
+                code,
+                language,
+            );
         let complexity_ms = start.elapsed().as_millis() as u64;
         let complexity_ok = violations.is_empty();
         if !complexity_ok {
@@ -1091,6 +1120,8 @@ pub async fn verify(
                 "diff_scoped": diff_scoped,
                 "complexity_ok": complexity_ok,
                 "suppression_source": opts.suppression_source,
+                "source_directive_functions": serde_json::to_value(&source_directive_functions).unwrap(),
+                "source_directive_suppression_count": source_directive_functions.len(),
             })),
             error: if complexity_ok {
                 None
@@ -1129,7 +1160,7 @@ pub async fn verify(
         });
     }
 
-    let lint_runner_failed = lint_result.error.is_some() && !lint_result.unavailable;
+    let lint_runner_failed = lint_result.runner_failed;
     let lint_ok = !lint_runner_failed;
 
     stages.push(VerificationStage {
@@ -1591,6 +1622,8 @@ fn minimal_stage_view(stage: &VerificationStage) -> serde_json::Value {
                 "diff_scoped": detail.get("diff_scoped").cloned().unwrap_or(serde_json::Value::Null),
                 "violations": detail.get("violations").cloned().unwrap_or_else(|| serde_json::json!([])),
                 "suppressed_violations": detail.get("suppressed_violations").cloned().unwrap_or_else(|| serde_json::json!([])),
+                "source_directive_functions": detail.get("source_directive_functions").cloned().unwrap_or_else(|| serde_json::json!([])),
+                "source_directive_suppression_count": detail.get("source_directive_suppression_count").cloned().unwrap_or_else(|| serde_json::Value::from(0)),
             })),
             "coverage" => Some(serde_json::json!({
                 "counts": detail.get("counts").cloned().unwrap_or(serde_json::json!({})),
@@ -1611,6 +1644,12 @@ fn minimal_stage_view(stage: &VerificationStage) -> serde_json::Value {
                 "seed_input_count": detail.get("seed_input_count").cloned().unwrap_or_else(|| serde_json::Value::from(0)),
                 "seeded_functions": detail.get("seeded_functions").cloned().unwrap_or_else(|| serde_json::Value::from(0)),
                 "seed_sources": detail.get("seed_sources").cloned().unwrap_or_else(|| serde_json::json!([])),
+            })),
+            "lint" => Some(serde_json::json!({
+                "diagnostics": detail.get("diagnostics").cloned().unwrap_or_else(|| serde_json::json!([])),
+                "runner_diagnostics": detail.get("runner_diagnostics").cloned().unwrap_or_else(|| serde_json::json!([])),
+                "runner_failed": detail.get("runner_failed").cloned().unwrap_or(serde_json::Value::Bool(false)),
+                "unavailable": detail.get("unavailable").cloned().unwrap_or(serde_json::Value::Bool(false)),
             })),
             "portability" => Some(serde_json::json!({
                 "reason": detail.get("reason").cloned().unwrap_or(serde_json::Value::Null),
@@ -1655,6 +1694,251 @@ pub fn report_json_value(
     }
 }
 
+fn human_status(ok: bool) -> &'static str {
+    if ok {
+        "OK"
+    } else {
+        "FAIL"
+    }
+}
+
+fn clip_human(text: &str, limit: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= limit {
+        return trimmed.to_string();
+    }
+    let clipped: String = trimmed.chars().take(limit).collect();
+    format!("{clipped}...")
+}
+
+fn human_number(detail: &serde_json::Value, key: &str) -> usize {
+    detail
+        .get(key)
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0) as usize
+}
+
+pub fn report_human_summary(report: &VerificationReport) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Overall: {}",
+        if report.overall_ok { "PASS" } else { "FAIL" }
+    );
+    if let Some(path) = &report.report_path {
+        let _ = writeln!(out, "Report Path: {path}");
+    }
+
+    let summary = &report.summary;
+    let _ = writeln!(
+        out,
+        "Coverage: {} analyzed, {} fuzzed, {} skipped, {} module-load blocked",
+        summary.functions_analyzed,
+        summary.functions_fuzzed,
+        summary.functions_skipped,
+        summary.functions_blocked_module_load
+    );
+    let _ = writeln!(
+        out,
+        "Execute: {} passed, {} crashed, {} property violations, {} no-inputs-reached",
+        summary.fuzz_pass,
+        summary.fuzz_crash,
+        summary.fuzz_property_violation,
+        summary.fuzz_no_inputs_reached
+    );
+    let _ = writeln!(
+        out,
+        "Lint: {} issues, {} runner failures",
+        summary.lint_issues, summary.lint_runner_failures
+    );
+    let _ = writeln!(
+        out,
+        "Complexity: {} violations, {} suppressed",
+        summary.complexity_violations, summary.suppressed_complexity_violations
+    );
+
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Stages:");
+    for stage in &report.stages {
+        let mut extra = String::new();
+        if let Some(detail) = &stage.detail {
+            match stage.name.as_str() {
+                "execute" => {
+                    let crash = detail
+                        .get("finding_counts")
+                        .and_then(|counts| counts.get("crash"))
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(0);
+                    let property = detail
+                        .get("finding_counts")
+                        .and_then(|counts| counts.get("property_violation"))
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(0);
+                    let no_inputs = human_number(detail, "no_inputs_reached");
+                    extra = format!("crash={crash}, property={property}, no_inputs={no_inputs}");
+                }
+                "coverage" => {
+                    let counts = detail.get("counts").cloned().unwrap_or_default();
+                    let fuzzed = counts
+                        .get("fuzzed")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(0);
+                    let skipped: u64 = counts
+                        .as_object()
+                        .map(|obj| {
+                            obj.iter()
+                                .filter(|(key, _)| {
+                                    let key = key.as_str();
+                                    key != "fuzzed" && key != "fuzzed_via_factory"
+                                })
+                                .map(|(_, value)| value.as_u64().unwrap_or(0))
+                                .sum()
+                        })
+                        .unwrap_or(0);
+                    let factory = counts
+                        .get("fuzzed_via_factory")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(0);
+                    extra = format!("fuzzed={fuzzed}, factory={factory}, skipped={skipped}");
+                }
+                "lint" => {
+                    let issues = detail
+                        .get("diagnostics")
+                        .and_then(|value| value.as_array())
+                        .map(|arr| arr.len())
+                        .unwrap_or(0);
+                    let runner_failures = detail
+                        .get("runner_diagnostics")
+                        .and_then(|value| value.as_array())
+                        .map(|arr| arr.len())
+                        .unwrap_or(0);
+                    let unavailable = detail
+                        .get("unavailable")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false);
+                    extra = format!(
+                        "issues={issues}, runner_failures={runner_failures}, unavailable={unavailable}"
+                    );
+                }
+                "complexity" => {
+                    let violations = detail
+                        .get("violations")
+                        .and_then(|value| value.as_array())
+                        .map(|arr| arr.len())
+                        .unwrap_or(0);
+                    let threshold = human_number(detail, "threshold");
+                    extra = format!("violations={violations}, threshold={threshold}");
+                }
+                _ => {}
+            }
+        }
+        let _ = if extra.is_empty() {
+            writeln!(
+                out,
+                "  {:<12} {:<4} {:>5} ms",
+                stage.name,
+                human_status(stage.ok),
+                stage.duration_ms
+            )
+        } else {
+            writeln!(
+                out,
+                "  {:<12} {:<4} {:>5} ms  {}",
+                stage.name,
+                human_status(stage.ok),
+                stage.duration_ms,
+                extra
+            )
+        };
+        if let Some(error) = &stage.error {
+            let _ = writeln!(out, "    {}", clip_human(error, 160));
+        }
+    }
+
+    if let Some(complexity_stage) = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "complexity")
+    {
+        if let Some(violations) = complexity_stage
+            .detail
+            .as_ref()
+            .and_then(|detail| detail.get("violations"))
+            .and_then(|value| value.as_array())
+        {
+            if !violations.is_empty() {
+                let _ = writeln!(out);
+                let _ = writeln!(out, "Top Complexity Offenders:");
+                for (idx, violation) in violations.iter().take(5).enumerate() {
+                    let function = violation
+                        .get("function")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("<unknown>");
+                    let line = violation
+                        .get("line")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(0);
+                    let cyclomatic = violation
+                        .get("complexity")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(0);
+                    let cognitive = violation
+                        .get("cognitive_complexity")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(0);
+                    let _ = writeln!(
+                        out,
+                        "  {}. {} (line {}) cyclomatic={} cognitive={}",
+                        idx + 1,
+                        function,
+                        line,
+                        cyclomatic,
+                        cognitive
+                    );
+                }
+            }
+        }
+    }
+
+    if let Some(execute_stage) = report.stages.iter().find(|stage| stage.name == "execute") {
+        if let Some(failures) = execute_stage
+            .detail
+            .as_ref()
+            .and_then(|detail| detail.get("fuzz_failures"))
+            .and_then(|value| value.as_array())
+        {
+            if !failures.is_empty() {
+                let _ = writeln!(out);
+                let _ = writeln!(out, "Top Execute Findings:");
+                for (idx, failure) in failures.iter().take(5).enumerate() {
+                    let function = failure
+                        .get("function")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("<unknown>");
+                    let severity = failure
+                        .get("severity")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unknown");
+                    let message = failure
+                        .get("message")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("");
+                    let _ = writeln!(
+                        out,
+                        "  {}. {} [{}] {}",
+                        idx + 1,
+                        function,
+                        severity,
+                        clip_human(message, 140)
+                    );
+                }
+            }
+        }
+    }
+
+    out.trim_end().to_string()
+}
+
 fn compute_report_summary(stages: &[VerificationStage]) -> ReportSummary {
     let mut summary = ReportSummary {
         functions_analyzed: 0,
@@ -1669,6 +1953,7 @@ fn compute_report_summary(stages: &[VerificationStage]) -> ReportSummary {
         suppressed_complexity_violations: 0,
         suppressed_portability_warnings: 0,
         lint_issues: 0,
+        lint_runner_failures: 0,
         complexity_violations: 0,
     };
 
@@ -1685,7 +1970,9 @@ fn compute_report_summary(stages: &[VerificationStage]) -> ReportSummary {
                     {
                         for func in funcs {
                             match func.get("status").and_then(|value| value.as_str()) {
-                                Some("fuzzed") => summary.functions_fuzzed += 1,
+                                Some("fuzzed" | "fuzzed_via_factory") => {
+                                    summary.functions_fuzzed += 1
+                                }
                                 Some("blocked_module_load") => {
                                     summary.functions_blocked_module_load += 1;
                                 }
@@ -1732,6 +2019,13 @@ fn compute_report_summary(stages: &[VerificationStage]) -> ReportSummary {
                     if let Some(arr) = detail.get("diagnostics").and_then(|diags| diags.as_array())
                     {
                         summary.lint_issues = arr.len();
+                    }
+                    if detail
+                        .get("runner_failed")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false)
+                    {
+                        summary.lint_runner_failures += 1;
                     }
                 }
                 "complexity" => {

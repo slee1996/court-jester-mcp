@@ -1,6 +1,7 @@
 use court_jester_mcp::tools::analyze;
 use court_jester_mcp::tools::analyze::{
-    analyze, check_complexity_threshold, filter_changed_functions,
+    analyze, check_complexity_threshold, filter_changed_functions, source_declared_properties,
+    source_directive_suppresses_complexity,
 };
 use court_jester_mcp::tools::diff::parse_changed_lines;
 use court_jester_mcp::types::Language;
@@ -100,6 +101,206 @@ fn typescript_imports() {
 
     assert_eq!(r.imports.len(), 1);
     assert!(r.imports[0].statement.contains("fs"));
+}
+
+#[test]
+fn python_complexity_directive_on_previous_comment_line_is_detected() {
+    let code = "\
+# court-jester-ignore complexity
+def check_access(a: bool, b: bool, c: bool) -> int:
+    if a:
+        if b:
+            if c:
+                return 1
+    return 0
+";
+
+    assert!(source_directive_suppresses_complexity(
+        code,
+        &Language::Python,
+        2
+    ));
+}
+
+#[test]
+fn typescript_complexity_directive_in_block_comment_is_detected() {
+    let code = "\
+/**
+ * @court-jester-ignore complexity
+ */
+export function route(kind: string): number {
+  switch (kind) {
+    case 'a':
+      return 1;
+    case 'b':
+      return 2;
+    default:
+      return 0;
+  }
+}
+";
+
+    assert!(source_directive_suppresses_complexity(
+        code,
+        &Language::TypeScript,
+        4
+    ));
+}
+
+#[test]
+fn typescript_declared_properties_are_parsed_from_source_comment() {
+    let code = "\
+// court-jester-properties sorted permutation
+export function reorder(values: string[]): string[] {
+  return [...values];
+}
+";
+    let analysis = analyze(code, &Language::TypeScript);
+    assert_eq!(
+        analysis.functions[0].declared_properties,
+        vec!["sorted".to_string(), "permutation".to_string()]
+    );
+    assert_eq!(
+        source_declared_properties(code, &Language::TypeScript, 2),
+        vec!["sorted".to_string(), "permutation".to_string()]
+    );
+}
+
+#[test]
+fn python_declared_properties_normalize_aliases() {
+    let code = "\
+# @court-jester-properties nonnegative antisymmetric nonempty
+def check_metric(a: int, b: int) -> int:
+    return a - b
+";
+    assert_eq!(
+        source_declared_properties(code, &Language::Python, 2),
+        vec![
+            "nonneg".to_string(),
+            "antisymmetric".to_string(),
+            "nonempty_string".to_string()
+        ]
+    );
+}
+
+#[test]
+fn typescript_exported_object_literal_methods_are_callable_surfaces() {
+    let code = "\
+export const reorderer = {
+  reorder(values: string[]): string[] {
+    return [...values].reverse();
+  },
+};
+";
+    let analysis = analyze(code, &Language::TypeScript);
+    let reorder = analysis
+        .functions
+        .iter()
+        .find(|function| function.name == "reorderer.reorder")
+        .expect("exported object literal method should be analyzed");
+    assert!(reorder.is_exported);
+    assert!(reorder.is_method);
+    assert_eq!(
+        reorder.invocation_target.as_deref(),
+        Some("reorderer.reorder")
+    );
+}
+
+#[test]
+fn typescript_exported_zero_arg_class_methods_are_callable_surfaces() {
+    let code = "\
+export class Reorderer {
+  reorder(values: string[]): string[] {
+    return [...values].reverse();
+  }
+}
+";
+    let analysis = analyze(code, &Language::TypeScript);
+    let reorder = analysis
+        .functions
+        .iter()
+        .find(|function| function.name == "Reorderer#reorder")
+        .expect("exported zero-arg class method should be analyzed");
+    assert!(reorder.is_exported);
+    assert!(reorder.is_method);
+    assert_eq!(
+        reorder.invocation_target.as_deref(),
+        Some("(new Reorderer()).reorder")
+    );
+}
+
+#[test]
+fn typescript_factory_functions_record_returned_callables() {
+    let code = "\
+export function createReorderer() {
+  function reorder(values: string[]): string[] {
+    return [...values].reverse();
+  }
+  return { reorder };
+}
+";
+    let analysis = analyze(code, &Language::TypeScript);
+    let factory = analysis
+        .functions
+        .iter()
+        .find(|function| function.name == "createReorderer")
+        .expect("factory should be analyzed");
+    assert_eq!(factory.returned_callables, vec!["reorder".to_string()]);
+}
+
+#[test]
+fn typescript_zustand_style_container_methods_are_callable_surfaces() {
+    let code = "\
+declare function create<T>(initializer: (set: unknown, get: unknown) => T): {
+  getState(): T;
+};
+
+export const useReorderer = create(() => ({
+  reorder(values: string[]): string[] {
+    return [...values].reverse();
+  },
+}));
+";
+    let analysis = analyze(code, &Language::TypeScript);
+    let reorder = analysis
+        .functions
+        .iter()
+        .find(|function| function.name == "useReorderer.reorder")
+        .expect("container method should be analyzed");
+    assert!(reorder.is_exported);
+    assert!(reorder.is_method);
+    assert!(!reorder.is_nested, "surfaced container method should not be treated as nested");
+    assert_eq!(
+        reorder.invocation_target.as_deref(),
+        Some("useReorderer.getState().reorder")
+    );
+}
+
+#[test]
+fn typescript_curried_container_methods_are_callable_surfaces() {
+    let code = "\
+declare function create<T>(): (initializer: (set: unknown, get: unknown) => T) => {
+  getState(): T;
+};
+
+export const useReorderer = create<{ reorder(values: string[]): string[] }>()(() => ({
+  reorder(values: string[]): string[] {
+    return [...values].reverse();
+  },
+}));
+";
+    let analysis = analyze(code, &Language::TypeScript);
+    let reorder = analysis
+        .functions
+        .iter()
+        .find(|function| function.name == "useReorderer.reorder")
+        .expect("curried container method should be analyzed");
+    assert!(reorder.is_exported);
+    assert!(reorder.is_method);
+    assert_eq!(
+        reorder.invocation_target.as_deref(),
+        Some("useReorderer.getState().reorder")
+    );
 }
 
 // ── Arrow function detection ────────────────────────────────────────────────

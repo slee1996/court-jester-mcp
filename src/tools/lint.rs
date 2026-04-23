@@ -351,8 +351,10 @@ async fn lint_python(code: &str, opts: &LintOptions<'_>) -> LintResult {
     let Some(ruff) = resolve_binary(&path, "ruff", exe_dir.as_deref(), opts.project_dir) else {
         return LintResult {
             diagnostics: vec![],
+            runner_diagnostics: vec![],
             error: Some(tool_unavailable_message("ruff")),
             unavailable: true,
+            runner_failed: false,
         };
     };
 
@@ -387,18 +389,22 @@ async fn lint_python(code: &str, opts: &LintOptions<'_>) -> LintResult {
                 {
                     result.error = Some(message);
                     result.unavailable = true;
+                    result.runner_failed = false;
                 } else {
                     result.error = Some(tool_failure_message(
                         "ruff", &ruff, out.status, &stdout, &stderr,
                     ));
+                    result.runner_failed = true;
                 }
             }
             result
         }
         Err(e) => LintResult {
             diagnostics: vec![],
+            runner_diagnostics: vec![],
             error: Some(format!("ruff not available: {e}")),
             unavailable: true,
+            runner_failed: false,
         },
     }
 }
@@ -407,8 +413,10 @@ fn parse_ruff_output(output: &str) -> LintResult {
     if output.trim().is_empty() {
         return LintResult {
             diagnostics: vec![],
+            runner_diagnostics: vec![],
             error: None,
             unavailable: false,
+            runner_failed: false,
         };
     }
 
@@ -434,14 +442,18 @@ fn parse_ruff_output(output: &str) -> LintResult {
                 .collect();
             LintResult {
                 diagnostics,
+                runner_diagnostics: vec![],
                 error: None,
                 unavailable: false,
+                runner_failed: false,
             }
         }
         Err(e) => LintResult {
             diagnostics: vec![],
+            runner_diagnostics: vec![],
             error: Some(format!("Failed to parse ruff output: {e}")),
             unavailable: false,
+            runner_failed: true,
         },
     }
 }
@@ -452,8 +464,10 @@ async fn lint_typescript(code: &str, opts: &LintOptions<'_>) -> LintResult {
     let Some(biome) = resolve_binary(&path, "biome", exe_dir.as_deref(), opts.project_dir) else {
         return LintResult {
             diagnostics: vec![],
+            runner_diagnostics: vec![],
             error: Some(tool_unavailable_message("biome")),
             unavailable: true,
+            runner_failed: false,
         };
     };
 
@@ -469,8 +483,10 @@ async fn lint_typescript(code: &str, opts: &LintOptions<'_>) -> LintResult {
             Err(e) => {
                 return LintResult {
                     diagnostics: vec![],
+                    runner_diagnostics: vec![],
                     error: Some(e),
                     unavailable: false,
+                    runner_failed: false,
                 }
             }
         },
@@ -500,24 +516,33 @@ async fn lint_typescript(code: &str, opts: &LintOptions<'_>) -> LintResult {
                 stderr.to_string()
             };
             let mut result = parse_biome_output(&text);
-            if result.error.is_some() || (!out.status.success() && result.diagnostics.is_empty()) {
+            if !result.runner_failed
+                && (result.error.is_some()
+                    || (!out.status.success()
+                        && result.diagnostics.is_empty()
+                        && result.runner_diagnostics.is_empty()))
+            {
                 if let Some(message) =
                     signal_only_unavailable_message("biome", &biome, out.status, &stdout, &stderr)
                 {
                     result.error = Some(message);
                     result.unavailable = true;
+                    result.runner_failed = false;
                 } else {
                     result.error = Some(tool_failure_message(
                         "biome", &biome, out.status, &stdout, &stderr,
                     ));
+                    result.runner_failed = true;
                 }
             }
             result
         }
         Err(e) => LintResult {
             diagnostics: vec![],
+            runner_diagnostics: vec![],
             error: Some(format!("biome not available: {e}")),
             unavailable: true,
+            runner_failed: false,
         },
     }
 }
@@ -549,8 +574,10 @@ fn parse_biome_output(output: &str) -> LintResult {
     if output.trim().is_empty() {
         return LintResult {
             diagnostics: vec![],
+            runner_diagnostics: vec![],
             error: None,
             unavailable: false,
+            runner_failed: false,
         };
     }
 
@@ -560,7 +587,7 @@ fn parse_biome_output(output: &str) -> LintResult {
     let parsed: Result<serde_json::Value, _> = serde_json::from_str(json_str);
     match parsed {
         Ok(val) => {
-            let diagnostics = val
+            let diagnostics: Vec<LintDiagnostic> = val
                 .get("diagnostics")
                 .and_then(|d| d.as_array())
                 .map(|diags| {
@@ -599,17 +626,54 @@ fn parse_biome_output(output: &str) -> LintResult {
                         .collect()
                 })
                 .unwrap_or_default();
+            let (runner_diagnostics, diagnostics): (Vec<_>, Vec<_>) = diagnostics
+                .into_iter()
+                .partition(|diagnostic| biome_runner_failure_diagnostic(diagnostic));
+            let error = if runner_diagnostics.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "biome runner failure: {}",
+                    runner_diagnostics
+                        .iter()
+                        .map(format_lint_diagnostic_summary)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ))
+            };
+            let runner_failed = error.is_some();
             LintResult {
                 diagnostics,
-                error: None,
+                runner_diagnostics,
+                error,
                 unavailable: false,
+                runner_failed,
             }
         }
         Err(_) => LintResult {
             diagnostics: vec![],
+            runner_diagnostics: vec![],
             error: Some("Failed to parse biome output".to_string()),
             unavailable: false,
+            runner_failed: true,
         },
+    }
+}
+
+fn biome_runner_failure_diagnostic(diagnostic: &LintDiagnostic) -> bool {
+    let rule = diagnostic.rule.trim().to_ascii_lowercase();
+    let severity = diagnostic.severity.trim().to_ascii_lowercase();
+    rule.starts_with("internalerror/")
+        || rule == "internalerror"
+        || (severity == "fatal" && rule.starts_with("internal"))
+}
+
+fn format_lint_diagnostic_summary(diagnostic: &LintDiagnostic) -> String {
+    let message = diagnostic.message.trim();
+    if message.is_empty() {
+        diagnostic.rule.clone()
+    } else {
+        format!("{}: {}", diagnostic.rule, message)
     }
 }
 

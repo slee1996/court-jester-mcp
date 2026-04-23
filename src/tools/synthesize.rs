@@ -136,7 +136,9 @@ fn ts_effective_type(type_name: &str, defs: &TsNamedTypes<'_>) -> String {
 }
 
 fn is_synth_top_level_candidate(func: &FunctionInfo) -> bool {
-    !func.name.starts_with('_') && !func.is_method && !func.is_nested
+    !func.name.starts_with('_')
+        && !func.is_nested
+        && (!func.is_method || func.invocation_target.is_some())
 }
 
 fn has_exported_surface(functions: &[FunctionInfo]) -> bool {
@@ -227,6 +229,37 @@ fn coverage_entry(
         is_exported: func.is_exported,
         reason,
     }
+}
+
+fn factory_callable_coverage(
+    analysis: &AnalysisResult,
+    selected_functions: &[&FunctionInfo],
+) -> Vec<FuzzFunctionCoverage> {
+    let mut coverage = Vec::new();
+    for func in selected_functions {
+        if func.returned_callables.is_empty() {
+            continue;
+        }
+        for callable in &func.returned_callables {
+            let nested = analysis.functions.iter().find(|candidate| {
+                candidate.name == *callable
+                    && candidate.line >= func.line
+                    && candidate.end_line <= func.end_line
+            });
+            coverage.push(FuzzFunctionCoverage {
+                function: format!("{}().{}", func.name, callable),
+                line: nested.map(|entry| entry.line).unwrap_or(func.line),
+                end_line: nested.map(|entry| entry.end_line).unwrap_or(func.end_line),
+                status: FuzzFunctionStatus::FuzzedViaFactory,
+                is_exported: true,
+                reason: Some(format!(
+                    "exercised through factory return surface of {}",
+                    func.name
+                )),
+            });
+        }
+    }
+    coverage
 }
 
 fn python_seed_setup(
@@ -490,6 +523,9 @@ for _args in _all_inputs:
 {consistency_check}
 {boundedness_check}
 {nonneg_check}
+{clamped_check}
+{sorted_check}
+{permutation_check}
 {nullish_string_leak_check}
 {comparator_check}
 {symmetry_check}
@@ -522,6 +558,9 @@ else:
             consistency_check = python_consistency_check(func, &call_args),
             boundedness_check = python_boundedness_check(func, &callable_params),
             nonneg_check = python_nonneg_check(func),
+            clamped_check = python_clamped_check(func, &callable_params),
+            sorted_check = python_sorted_check(func, &callable_params),
+            permutation_check = python_permutation_check(func, &callable_params),
             nullish_string_leak_check = python_nullish_string_leak_check(func, &callable_params),
             query_string_semantic_check =
                 python_query_string_semantic_check(func, &callable_params),
@@ -556,12 +595,16 @@ else:
             .map(|p| python_generator(p.type_annotation.as_deref(), type_defs))
             .collect();
         let gen_list = generators.join(", ");
-        let nested_names: Vec<&str> = analysis
-            .functions
-            .iter()
-            .filter(|f| f.is_nested && f.line >= func.line && f.end_line <= func.end_line)
-            .map(|f| f.name.as_str())
-            .collect();
+        let nested_names: Vec<&str> = if func.returned_callables.is_empty() {
+            analysis
+                .functions
+                .iter()
+                .filter(|f| f.is_nested && f.line >= func.line && f.end_line <= func.end_line)
+                .map(|f| f.name.as_str())
+                .collect()
+        } else {
+            func.returned_callables.iter().map(String::as_str).collect()
+        };
         code.push_str(&format!(
             r#"
 # Factory exercise: {name} -> test returned callables
@@ -865,8 +908,31 @@ fn likely_symmetric(name: &str) -> bool {
     SYMMETRIC_NAME_CUES.iter().any(|cue| lower.contains(cue))
 }
 
+fn has_declared_property(func: &FunctionInfo, property: &str) -> bool {
+    func.declared_properties
+        .iter()
+        .any(|declared| declared == property)
+}
+
 fn is_api_surface(func: &FunctionInfo) -> bool {
-    !func.is_method && !func.is_nested && func.is_exported
+    !func.is_nested && func.is_exported && (!func.is_method || func.invocation_target.is_some())
+}
+
+fn ts_call_with_args(func: &FunctionInfo, args: &[&str]) -> String {
+    let joined = args.join(", ");
+    if let Some(target) = func.invocation_target.as_deref() {
+        format!("{target}({joined})")
+    } else {
+        format!("({} as Function)({joined})", func.name)
+    }
+}
+
+fn ts_call_with_spread(func: &FunctionInfo, spread_args: &str) -> String {
+    if let Some(target) = func.invocation_target.as_deref() {
+        format!("{target}({spread_args})")
+    } else {
+        format!("({} as Function)({spread_args})", func.name)
+    }
 }
 
 fn is_ts_type_param_like(type_name: &str) -> bool {
@@ -939,6 +1005,9 @@ fn should_require_ts_nonempty_string(
     param_types: &[String],
     type_defs: &TsNamedTypes<'_>,
 ) -> bool {
+    if has_declared_property(func, "nonempty_string") {
+        return true;
+    }
     if !likely_nonempty_string(&func.name) {
         return false;
     }
@@ -1128,8 +1197,8 @@ fn python_idempotency_check(
         && !param_type.is_empty()
         && !param_type.contains("None")
         && is_idempotent_candidate_type(param_type)
-        && is_api_surface(func)
-        && likely_idempotent(&func.name)
+        && (has_declared_property(func, "idempotent")
+            || (is_api_surface(func) && likely_idempotent(&func.name)))
     {
         format!(
             "        _result2 = {name}(_result)\n        assert _nan_eq(_result, _result2), f\"Not idempotent: {{repr(_result)}} -> {{repr(_result2)}}\"",
@@ -1162,7 +1231,10 @@ fn python_boundedness_check(func: &FunctionInfo, params: &[&ParamInfo]) -> Strin
     let types_match = (param_type == "str" && ret_type == "str")
         || (starts_with_any(param_type, &["list", "List"])
             && starts_with_any(ret_type, &["list", "List"]));
-    if types_match && is_api_surface(func) && likely_bounded(&func.name) {
+    if types_match
+        && (has_declared_property(func, "bounded")
+            || (is_api_surface(func) && likely_bounded(&func.name)))
+    {
         "        assert len(_result) <= len(_args[0]), f\"Not bounded: len({repr(_result)}) > len({repr(_args[0])})\"".to_string()
     } else {
         String::new()
@@ -1172,13 +1244,37 @@ fn python_boundedness_check(func: &FunctionInfo, params: &[&ParamInfo]) -> Strin
 fn python_nonneg_check(func: &FunctionInfo) -> String {
     let ret_type = func.return_type.as_deref().unwrap_or("");
     if (ret_type == "int" || ret_type == "float")
-        && is_api_surface(func)
-        && likely_nonneg(&func.name)
+        && (has_declared_property(func, "nonneg")
+            || (is_api_surface(func) && likely_nonneg(&func.name)))
     {
         "        assert _result >= 0, f\"Non-negative violation: {repr(_result)} < 0\"".to_string()
     } else {
         String::new()
     }
+}
+
+fn python_clamped_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
+    if !has_declared_property(func, "clamped") || params.len() < 3 {
+        return String::new();
+    }
+
+    "        if all(isinstance(_value, (int, float)) and not isinstance(_value, bool) for _value in (_args[0], _args[1], _args[2], _result)):\n            _lo = min(_args[1], _args[2])\n            _hi = max(_args[1], _args[2])\n            assert _lo <= _result <= _hi, f\"Clamp bounds violated: {repr(_result)} not in [{repr(_lo)}, {repr(_hi)}]\"\n            if _lo <= _args[0] <= _hi:\n                assert _result == _args[0], f\"Clamp passthrough violated: {repr(_result)} != {repr(_args[0])}\"".to_string()
+}
+
+fn python_sorted_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
+    if !has_declared_property(func, "sorted") || params.is_empty() {
+        return String::new();
+    }
+
+    "        if isinstance(_result, (list, tuple)) and all(isinstance(_item, (int, float, str)) for _item in _result):\n            assert list(_result) == sorted(_result), f\"Not sorted: {repr(_result)}\"".to_string()
+}
+
+fn python_permutation_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
+    if !has_declared_property(func, "permutation") || params.len() != 1 {
+        return String::new();
+    }
+
+    "        if isinstance(_args[0], (list, tuple)) and isinstance(_result, (list, tuple)):\n            assert _multiset_counts(_result) == _multiset_counts(_args[0]), f\"Permutation violated: {repr(_result)} vs {repr(_args[0])}\"".to_string()
 }
 
 fn python_nullish_string_leak_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
@@ -1192,9 +1288,10 @@ fn python_nullish_string_leak_check(func: &FunctionInfo, params: &[&ParamInfo]) 
         || starts_with_any(param_type, &["dict[", "Dict["]);
     if ret_type == "str"
         && accepts_mapping
-        && (is_api_surface(func)
-            || infer_python_contract(func, params) == Some(ContractKind::MappingSerializer))
-        && likely_nullish_string_leak(&func.name)
+        && (has_declared_property(func, "no_nullish_string")
+            || ((is_api_surface(func)
+                || infer_python_contract(func, params) == Some(ContractKind::MappingSerializer))
+                && likely_nullish_string_leak(&func.name)))
     {
         "        if _contains_nullish(_args[0]) and _string_leaks_nullish(_result):\n            raise AssertionError(f\"Nullish string leak: {repr(_result)}\")".to_string()
     } else {
@@ -1234,7 +1331,9 @@ except Exception as _e:
 }
 
 fn python_comparator_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
-    if infer_python_contract(func, params) == Some(ContractKind::Comparator) {
+    if infer_python_contract(func, params) == Some(ContractKind::Comparator)
+        || has_declared_property(func, "antisymmetric")
+    {
         format!(
             "        _self_cmp = {name}(_args[0], _args[0])\n        assert _cmp_sign(_self_cmp) == 0, f\"Comparator self-compare should be zero: {{repr(_self_cmp)}}\"\n        _rev_cmp = {name}(_args[1], _args[0])\n        assert _cmp_sign(_result) == -_cmp_sign(_rev_cmp), f\"Comparator antisymmetry violated: {{repr(_result)}} vs {{repr(_rev_cmp)}}\"",
             name = func.name,
@@ -1250,7 +1349,11 @@ fn python_symmetry_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
     }
     let t0 = params[0].type_annotation.as_deref().unwrap_or("");
     let t1 = params[1].type_annotation.as_deref().unwrap_or("");
-    if t0 == t1 && !t0.is_empty() && is_api_surface(func) && likely_symmetric(&func.name) {
+    if t0 == t1
+        && !t0.is_empty()
+        && (has_declared_property(func, "symmetric")
+            || (is_api_surface(func) && likely_symmetric(&func.name)))
+    {
         format!(
             "        _result_sym = {name}(_args[1], _args[0])\n        assert _nan_eq(_result, _result_sym), f\"Not symmetric: {{repr(_result)}} != {{repr(_result_sym)}}\"",
             name = func.name,
@@ -1428,6 +1531,13 @@ def _cmp_sign(value):
             return 1
         return 0
     raise AssertionError(f"Comparator returned non-numeric value: {repr(value)}")
+
+def _multiset_counts(values):
+    counts = {}
+    for value in values:
+        key = _json.dumps(value, sort_keys=True, ensure_ascii=False, default=repr)
+        counts[key] = counts.get(key, 0) + 1
+    return counts
 "#;
 
 const PYTHON_FUZZ_EPILOGUE: &str = r#"
@@ -1522,8 +1632,13 @@ fn synthesize_typescript(
         let gen_list = generators.join(", ");
 
         let mut properties: Vec<&str> = vec![];
+        let mut push_property = |property: &'static str| {
+            if !properties.contains(&property) {
+                properties.push(property);
+            }
+        };
         if !likely_intentionally_nondeterministic(func) {
-            properties.push("consistent");
+            push_property("consistent");
         }
 
         // Idempotency: single-arg, same in/out type, name suggests it
@@ -1533,55 +1648,69 @@ fn synthesize_typescript(
             && !ret_type.contains("null")
             && !ret_type.contains("undefined")
             && is_idempotent_candidate_type(ret_type)
-            && is_api_surface(func)
-            && likely_idempotent(&func.name)
+            && (has_declared_property(func, "idempotent")
+                || (is_api_surface(func) && likely_idempotent(&func.name)))
         {
-            properties.push("idempotent");
+            push_property("idempotent");
         }
         // Boundedness: single-arg, str→str or array→array, name suggests it
         if callable_params.len() == 1
             && ((param_types[0].as_str() == "string" && ret_type == "string")
                 || (param_types[0].ends_with("[]") && ret_type.ends_with("[]")))
-            && is_api_surface(func)
-            && likely_bounded(&func.name)
+            && (has_declared_property(func, "bounded")
+                || (is_api_surface(func) && likely_bounded(&func.name)))
         {
-            properties.push("bounded");
+            push_property("bounded");
         }
         // Non-negativity: returns number, name suggests it
-        if ret_type == "number" && is_api_surface(func) && likely_nonneg(&func.name) {
-            properties.push("nonneg");
+        if ret_type == "number"
+            && (has_declared_property(func, "nonneg")
+                || (is_api_surface(func) && likely_nonneg(&func.name)))
+        {
+            push_property("nonneg");
         }
         // Non-empty strings: string-returning identifier/display helpers should
         // not silently return blank output.
         if ret_type == "string" && should_require_ts_nonempty_string(func, &param_types, type_defs)
         {
-            properties.push("nonempty_string");
+            push_property("nonempty_string");
         }
         // Serialized/canonical string helpers should not leak nullish sentinel
         // text into the output when the input contains null/undefined values.
         if callable_params.len() == 1
             && ret_type == "string"
             && is_ts_mapping_type(&param_types[0], type_defs)
-            && (is_api_surface(func)
-                || infer_ts_contract(func, &param_types, ret_type, type_defs)
-                    == Some(ContractKind::MappingSerializer))
-            && likely_nullish_string_leak(&func.name)
+            && (has_declared_property(func, "no_nullish_string")
+                || ((is_api_surface(func)
+                    || infer_ts_contract(func, &param_types, ret_type, type_defs)
+                        == Some(ContractKind::MappingSerializer))
+                    && likely_nullish_string_leak(&func.name)))
         {
-            properties.push("no_nullish_string");
+            push_property("no_nullish_string");
         }
         if infer_ts_contract(func, &param_types, ret_type, type_defs)
             == Some(ContractKind::Comparator)
+            || has_declared_property(func, "antisymmetric")
         {
-            properties.push("comparator");
+            push_property("comparator");
         }
         // Symmetry: two params same type, name suggests it
         if callable_params.len() == 2
             && !param_types[0].is_empty()
             && param_types[0] == param_types[1]
-            && is_api_surface(func)
-            && likely_symmetric(&func.name)
+            && (has_declared_property(func, "symmetric")
+                || (is_api_surface(func) && likely_symmetric(&func.name)))
         {
-            properties.push("symmetric");
+            push_property("symmetric");
+        }
+        if has_declared_property(func, "sorted") {
+            push_property("sorted");
+        }
+        if has_declared_property(func, "permutation") {
+            push_property("permutation");
+        }
+        if has_declared_property(func, "clamped") {
+            push_property("clamped");
         }
 
         let properties_list: String = properties
@@ -1629,7 +1758,7 @@ fn synthesize_typescript(
         code.push_str(&format!(
             r#"
 {{
-  const _fuzzOk = _fuzzOne("{name}", {iters}, () => [{gen_list}], (args: unknown[]) => ({name} as Function)(...args), {typecheck}, [{param_type_list}], [{properties_list}], [{seed_rows}]);
+  const _fuzzOk = _fuzzOne("{name}", {iters}, () => [{gen_list}], (args: unknown[]) => {call_expr}, {typecheck}, [{param_type_list}], [{properties_list}], [{seed_rows}]);
 {query_string_semantic_check}
 {defaults_semantic_check}
 {feature_flag_override_check}
@@ -1639,6 +1768,7 @@ fn synthesize_typescript(
 "#,
             name = func.name,
             iters = FUZZ_ITERATIONS,
+            call_expr = ts_call_with_spread(func, "...args"),
             typecheck = ts_type_check_fn(ret_type),
             seed_rows = ts_seed_rows(func, seed_inputs),
             query_string_semantic_check = query_string_semantic_check,
@@ -1660,6 +1790,7 @@ fn synthesize_typescript(
 
     // Factory exercise: for functions that contain nested functions,
     // call the factory and fuzz the returned object's methods
+    coverage.extend(factory_callable_coverage(analysis, &selected_functions));
     code.push_str(&synthesize_typescript_factory_exercise(
         analysis,
         &selected_functions,
@@ -2069,6 +2200,7 @@ fn ts_query_string_semantic_check(
     {
         return String::new();
     }
+    let query_call = ts_call_with_args(func, &["_queryInput"]);
 
     format!(
         r#"  if (_fuzzOk) {{
@@ -2081,7 +2213,7 @@ fn ts_query_string_semantic_check(
       ];
       for (const [_label, _queryInput, _expectedPairs] of _queryCases) {{
         _queryLabel = _label;
-        const _queryResult = String(({name} as Function)(_queryInput));
+        const _queryResult = String({query_call});
         const _queryPairs = Array.from(new URLSearchParams(_queryResult).entries());
         if (!_nanSafeEq(_queryPairs, _expectedPairs)) {{
           throw new Error(`Query semantics (${{_label}}): ${{JSON.stringify(_queryPairs)}} !== ${{JSON.stringify(_expectedPairs)}} from ${{_queryResult}}`);
@@ -2098,6 +2230,7 @@ fn ts_query_string_semantic_check(
   }}
 "#,
         name = func.name,
+        query_call = query_call,
     )
 }
 
@@ -2110,24 +2243,27 @@ fn ts_defaults_semantic_check(
     if !is_ts_defaults_semantic_target(func, param_types, ret_type, type_defs) {
         return String::new();
     }
+    let null_target_call = ts_call_with_args(func, &["{ a: null }", "{ a: 1 }"]);
+    let undefined_target_call = ts_call_with_args(func, &["{ a: undefined }", "{ a: 1 }"]);
+    let inherited_target_call = ts_call_with_args(func, &["{}", "_defaultsSource"]);
 
     format!(
         r#"  if (_fuzzOk) {{
     let _defaultsLabel = "null target preserves value";
     try {{
-      const _nullTarget = ({name} as Function)({{ a: null }}, {{ a: 1 }}) as Record<string, unknown>;
+      const _nullTarget = {null_target_call} as Record<string, unknown>;
       if (_nullTarget.a !== null) {{
         throw new Error(`Defaults semantics (${{_defaultsLabel}}): ${{JSON.stringify(_nullTarget.a)}} !== null`);
       }}
       _defaultsLabel = "undefined target accepts source";
-      const _undefinedTarget = ({name} as Function)({{ a: undefined }}, {{ a: 1 }}) as Record<string, unknown>;
+      const _undefinedTarget = {undefined_target_call} as Record<string, unknown>;
       if (_undefinedTarget.a !== 1) {{
         throw new Error(`Defaults semantics (${{_defaultsLabel}}): ${{JSON.stringify(_undefinedTarget.a)}} !== 1`);
       }}
       _defaultsLabel = "inherited source keys";
       const _defaultsProto = {{ inherited: 7 }};
       const _defaultsSource = Object.create(_defaultsProto) as Record<string, unknown>;
-      const _inheritedTarget = ({name} as Function)({{}}, _defaultsSource) as Record<string, unknown>;
+      const _inheritedTarget = {inherited_target_call} as Record<string, unknown>;
       if (_inheritedTarget.inherited !== 7) {{
         throw new Error(`Defaults semantics (${{_defaultsLabel}}): ${{JSON.stringify(_inheritedTarget.inherited)}} !== 7`);
       }}
@@ -2142,6 +2278,9 @@ fn ts_defaults_semantic_check(
   }}
 "#,
         name = func.name,
+        null_target_call = null_target_call,
+        undefined_target_call = undefined_target_call,
+        inherited_target_call = inherited_target_call,
     )
 }
 
@@ -2169,22 +2308,26 @@ fn ts_feature_flag_override_check(
     if !is_boolean_like_ts_type(&flag_value_type) {
         return String::new();
     }
+    let fallback_call = ts_call_with_args(func, &["{}"]);
+    let null_flags_call = ts_call_with_args(func, &["{ flags: null }"]);
+    let null_flag_value_call = ts_call_with_args(func, &["{ flags: { [_flagKey]: null } }"]);
+    let explicit_false_call = ts_call_with_args(func, &["{ flags: { [_flagKey]: false } }"]);
 
     format!(
         r#"  if (_fuzzOk) {{
     let _flagLabel = "explicit false override";
     try {{
       const _flagKey = "{flag_key}";
-      const _flagFallback = Boolean(({name} as Function)({{}}));
-      const _nullFlags = Boolean(({name} as Function)({{ flags: null }}));
+      const _flagFallback = Boolean({fallback_call});
+      const _nullFlags = Boolean({null_flags_call});
       if (_nullFlags !== _flagFallback) {{
         throw new Error(`Feature flag semantics (flags null): ${{JSON.stringify(_nullFlags)}} !== ${{JSON.stringify(_flagFallback)}}`);
       }}
-      const _nullFlagValue = Boolean(({name} as Function)({{ flags: {{ [_flagKey]: null }} }}));
+      const _nullFlagValue = Boolean({null_flag_value_call});
       if (_nullFlagValue !== _flagFallback) {{
         throw new Error(`Feature flag semantics (flag null): ${{JSON.stringify(_nullFlagValue)}} !== ${{JSON.stringify(_flagFallback)}}`);
       }}
-      const _explicitFalse = Boolean(({name} as Function)({{ flags: {{ [_flagKey]: false }} }}));
+      const _explicitFalse = Boolean({explicit_false_call});
       if (_explicitFalse !== false) {{
         throw new Error(`Feature flag semantics (explicit false): ${{JSON.stringify(_explicitFalse)}} !== false`);
       }}
@@ -2200,6 +2343,10 @@ fn ts_feature_flag_override_check(
 "#,
         name = func.name,
         flag_key = flag_key,
+        fallback_call = fallback_call,
+        null_flags_call = null_flags_call,
+        null_flag_value_call = null_flag_value_call,
+        explicit_false_call = explicit_false_call,
     )
 }
 
@@ -2221,6 +2368,8 @@ fn ts_semver_compare_semantic_check(
     {
         return String::new();
     }
+    let compare_call = ts_call_with_args(func, &["_left", "_right"]);
+    let reverse_compare_call = ts_call_with_args(func, &["_right", "_left"]);
 
     format!(
         r#"  if (_fuzzOk) {{
@@ -2234,11 +2383,11 @@ fn ts_semver_compare_semantic_check(
       ];
       for (const [_left, _right, _expected] of _semverCases) {{
         _semverLabel = `${{_left}} vs ${{_right}}`;
-        const _cmp = ({name} as Function)(_left, _right);
+        const _cmp = {compare_call};
         if (_cmpSign(_cmp) !== _cmpSign(_expected)) {{
           throw new Error(`Semver compare semantics (${{_semverLabel}}): ${{JSON.stringify(_cmp)}} !== ${{_expected}}`);
         }}
-        const _rev = ({name} as Function)(_right, _left);
+        const _rev = {reverse_compare_call};
         if (_cmpSign(_rev) !== -_cmpSign(_expected)) {{
           throw new Error(`Semver compare antisymmetry (${{_semverLabel}}): ${{JSON.stringify(_rev)}} !== ${{-_cmpSign(_expected)}}`);
         }}
@@ -2254,6 +2403,8 @@ fn ts_semver_compare_semantic_check(
   }}
 "#,
         name = func.name,
+        compare_call = compare_call,
+        reverse_compare_call = reverse_compare_call,
     )
 }
 
@@ -2272,6 +2423,7 @@ fn ts_semver_caret_semantic_check(
     {
         return String::new();
     }
+    let caret_call = ts_call_with_args(func, &["_version", "_range"]);
 
     format!(
         r#"  if (_fuzzOk) {{
@@ -2286,7 +2438,7 @@ fn ts_semver_caret_semantic_check(
       ];
       for (const [_version, _range, _expected] of _caretCases) {{
         _caretLabel = `${{_version}} in ${{_range}}`;
-        const _actual = Boolean(({name} as Function)(_version, _range));
+        const _actual = Boolean({caret_call});
         if (_actual !== _expected) {{
           throw new Error(`Semver caret semantics (${{_caretLabel}}): ${{JSON.stringify(_actual)}} !== ${{JSON.stringify(_expected)}}`);
         }}
@@ -2302,6 +2454,7 @@ fn ts_semver_caret_semantic_check(
   }}
 "#,
         name = func.name,
+        caret_call = caret_call,
     )
 }
 
@@ -2674,6 +2827,30 @@ function _cmpSign(value: unknown): number {
   return 0;
 }
 
+function _isPrimitiveSortableArray(value: unknown): value is Array<number | string> {
+  return Array.isArray(value) && value.every((item) => typeof item === "number" || typeof item === "string");
+}
+
+function _samePrimitiveMultiset(a: unknown[], b: unknown[]): boolean {
+  const counts = new Map<string, number>();
+  const keyFor = (value: unknown): string => `${typeof value}:${JSON.stringify(value)}`;
+  for (const item of a) {
+    const key = keyFor(item);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  for (const item of b) {
+    const key = keyFor(item);
+    const next = (counts.get(key) ?? 0) - 1;
+    if (next < 0) return false;
+    if (next === 0) {
+      counts.delete(key);
+    } else {
+      counts.set(key, next);
+    }
+  }
+  return counts.size === 0;
+}
+
 const _FUZZ_TEXT_LIMIT = 240;
 function _clipText(value: unknown, limit = _FUZZ_TEXT_LIMIT): string {
   const text = typeof value === "string" ? value : String(value);
@@ -2710,6 +2887,10 @@ function _isCrash(e: unknown): boolean {
     e.message.startsWith("Blank string output") ||
     e.message.startsWith("Nullish string leak") ||
     e.message.startsWith("Not symmetric") ||
+    e.message.startsWith("Not sorted") ||
+    e.message.startsWith("Permutation violated") ||
+    e.message.startsWith("Clamp bounds violated") ||
+    e.message.startsWith("Clamp passthrough violated") ||
     e.message.startsWith("Comparator") ||
     e.message.startsWith("Roundtrip")
   )) return true;
@@ -2781,6 +2962,28 @@ function _fuzzOne(
       // Non-empty string: identifier/display helpers should not emit blanks.
       if (properties.includes("nonempty_string") && typeof result === "string" && result.trim().length === 0) {
         throw new Error(`Blank string output: ${JSON.stringify(result)}`);
+      }
+      if (properties.includes("sorted") && _isPrimitiveSortableArray(result)) {
+        for (let i = 1; i < result.length; i++) {
+          if (result[i - 1] > result[i]) {
+            throw new Error(`Not sorted: ${JSON.stringify(result)}`);
+          }
+        }
+      }
+      if (properties.includes("permutation") && args.length >= 1 && Array.isArray(args[0]) && Array.isArray(result)) {
+        if (!_samePrimitiveMultiset(args[0] as unknown[], result)) {
+          throw new Error(`Permutation violated: ${JSON.stringify(result)} vs ${JSON.stringify(args[0])}`);
+        }
+      }
+      if (properties.includes("clamped") && args.length >= 3 && typeof args[0] === "number" && typeof args[1] === "number" && typeof args[2] === "number" && typeof result === "number") {
+        const lo = Math.min(args[1], args[2]);
+        const hi = Math.max(args[1], args[2]);
+        if (result < lo || result > hi) {
+          throw new Error(`Clamp bounds violated: ${JSON.stringify(result)} not in [${JSON.stringify(lo)}, ${JSON.stringify(hi)}]`);
+        }
+        if (args[0] >= lo && args[0] <= hi && result !== args[0]) {
+          throw new Error(`Clamp passthrough violated: ${JSON.stringify(result)} != ${JSON.stringify(args[0])}`);
+        }
       }
       // Serialized/canonical string helpers should not emit nullish sentinel
       // text when the input structure contains null or undefined values.
@@ -3110,12 +3313,12 @@ fn synthesize_typescript_involution_checks(
         code.push_str("    const input = ");
         code.push_str(&gen);
         code.push_str(";\n    try {\n");
-        code.push_str("      const encoded = (");
-        code.push_str(&enc.name);
-        code.push_str(" as Function)(input);\n");
-        code.push_str("      const decoded = (");
-        code.push_str(&dec.name);
-        code.push_str(" as Function)(encoded);\n");
+        code.push_str("      const encoded = ");
+        code.push_str(&ts_call_with_args(enc, &["input"]));
+        code.push_str(";\n");
+        code.push_str("      const decoded = ");
+        code.push_str(&ts_call_with_args(dec, &["encoded"]));
+        code.push_str(";\n");
         code.push_str("      if (!_nanSafeEq(input, decoded)) {\n");
         code.push_str("        console.log(`  ROUNDTRIP FAIL ");
         code.push_str(&enc.name);

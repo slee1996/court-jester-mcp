@@ -1,5 +1,5 @@
 use court_jester_mcp::tools::verify::{
-    parse_fuzz_failures, report_json_value, verify, VerifyOptions,
+    parse_fuzz_failures, report_human_summary, report_json_value, verify, VerifyOptions,
 };
 use court_jester_mcp::types::{ComplexityMetric, ExecuteGate, Language, ReportLevel, TestRunner};
 use std::fs;
@@ -219,6 +219,92 @@ function normalizeName(name: string): string {
         !diagnostics.is_empty(),
         "expected lint diagnostics to remain in the report"
     );
+}
+
+#[tokio::test]
+async fn lint_runner_failures_do_not_count_as_lint_issues_in_summary() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let tool_dir = project_dir.path().join("node_modules").join(".bin");
+    install_fake_tool_at(
+        &tool_dir,
+        "biome",
+        "#!/bin/sh\ncat <<'EOF'\n{\"diagnostics\":[{\"category\":\"internalError/io\",\"description\":\"No such file or directory (os error 2)\",\"severity\":\"fatal\",\"location\":{\"start\":{\"line\":0,\"column\":0}}}]}\nEOF\nexit 1\n",
+    );
+
+    let code = "export function add(a: number, b: number): number { return a + b; }\n";
+    let mut opts = default_opts(None);
+    opts.project_dir = Some(project_dir.path().to_str().unwrap());
+    let report = verify(code, &Language::TypeScript, opts).await;
+
+    assert!(
+        report.overall_ok,
+        "lint runner failures should remain advisory: {:#?}",
+        report.stages
+    );
+    assert_eq!(report.summary.lint_issues, 0);
+    assert_eq!(report.summary.lint_runner_failures, 1);
+
+    let lint_stage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "lint")
+        .expect("lint stage should exist");
+    assert!(
+        !lint_stage.ok,
+        "runner failure should fail the lint stage itself"
+    );
+    let detail = lint_stage
+        .detail
+        .as_ref()
+        .expect("lint detail should exist");
+    assert_eq!(
+        detail
+            .get("runner_failed")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        detail
+            .get("runner_diagnostics")
+            .and_then(|value| value.as_array())
+            .map(|arr| arr.len()),
+        Some(1)
+    );
+    assert_eq!(
+        detail
+            .get("diagnostics")
+            .and_then(|value| value.as_array())
+            .map(|arr| arr.len()),
+        Some(0)
+    );
+}
+
+#[tokio::test]
+async fn human_summary_highlights_offenders_and_findings() {
+    let code = r#"
+function deepGet(input: { value: { name: string } | null } | null): string {
+    return input!.value!.name.toLowerCase();
+}
+"#;
+    let mut opts = default_opts(None);
+    opts.complexity_threshold = Some(0);
+    let report = verify(code, &Language::TypeScript, opts).await;
+
+    assert!(
+        !report.overall_ok,
+        "report should fail: {:#?}",
+        report.stages
+    );
+
+    let summary = report_human_summary(&report);
+    assert!(summary.contains("Overall: FAIL"), "got:\n{summary}");
+    assert!(summary.contains("Stages:"), "got:\n{summary}");
+    assert!(
+        summary.contains("Top Complexity Offenders:"),
+        "got:\n{summary}"
+    );
+    assert!(summary.contains("Top Execute Findings:"), "got:\n{summary}");
+    assert!(summary.contains("deepGet"), "got:\n{summary}");
 }
 
 #[tokio::test]
@@ -1700,6 +1786,68 @@ def check_access(a: bool, b: bool, c: bool) -> int:
 }
 
 #[tokio::test]
+async fn complexity_violations_can_be_suppressed_by_source_directive() {
+    let code = r#"
+# court-jester-ignore complexity
+def check_access(a: bool, b: bool, c: bool) -> int:
+    if a:
+        if b:
+            if c:
+                return 1
+    return 0
+"#;
+    let report = verify(
+        code,
+        &Language::Python,
+        VerifyOptions {
+            test_code: None,
+            test_source_file: None,
+            test_runner: TestRunner::Auto,
+            tests_only: false,
+            complexity_threshold: Some(2),
+            complexity_metric: ComplexityMetric::Cyclomatic,
+            project_dir: None,
+            lint_config_path: None,
+            lint_virtual_file_path: None,
+            diff: None,
+            suppressions: None,
+            suppression_source: None,
+            auto_seed: true,
+            source_file: None,
+            output_dir: None,
+            report_level: ReportLevel::Full,
+            execute_gate: ExecuteGate::All,
+        },
+    )
+    .await;
+
+    assert!(
+        report.overall_ok,
+        "source directive suppression should not fail verify"
+    );
+    let complexity_stage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "complexity")
+        .expect("complexity stage should be present");
+    assert!(complexity_stage.ok);
+    let detail = complexity_stage.detail.as_ref().unwrap();
+    assert_eq!(detail["violations"].as_array().unwrap().len(), 0);
+    assert_eq!(detail["suppressed_violations"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        detail["source_directive_suppression_count"].as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        detail["source_directive_functions"].as_array().unwrap()[0]
+            .as_str()
+            .unwrap(),
+        "check_access"
+    );
+    assert_eq!(report.summary.suppressed_complexity_violations, 1);
+}
+
+#[tokio::test]
 async fn value_error_is_treated_as_a_crash() {
     let code = "def normalize_timezone(value: str) -> str:\n    raise ValueError('invalid timezone offset')";
     let report = verify(code, &Language::Python, default_opts(None)).await;
@@ -1725,6 +1873,212 @@ async fn value_error_is_treated_as_a_crash() {
                 == Some("ValueError")
         ),
         "expected ValueError fuzz failure, got: {failures:?}"
+    );
+}
+
+#[tokio::test]
+async fn declared_properties_can_trigger_typescript_property_failures() {
+    let code = r#"
+// court-jester-properties sorted permutation
+export function reorder(values: string[]): string[] {
+    return [...values].reverse();
+}
+"#;
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+
+    assert!(
+        !report.overall_ok,
+        "declared sorted property should fail on non-sorted output"
+    );
+
+    let execute_stage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("execute stage should exist");
+    let failures = execute_stage
+        .detail
+        .as_ref()
+        .and_then(|detail| detail.get("fuzz_failures"))
+        .and_then(|value| value.as_array())
+        .expect("fuzz failures should be present");
+    assert!(
+        failures.iter().any(|failure| {
+            failure["function"].as_str() == Some("reorder")
+                && failure["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("Not sorted"))
+        }),
+        "declared sorted property should surface a property violation"
+    );
+}
+
+#[tokio::test]
+async fn exported_object_literal_methods_can_fail_verify() {
+    let code = r#"
+export const reorderer = {
+    // court-jester-properties sorted permutation
+    reorder(values: string[]): string[] {
+        return [...values].reverse();
+    },
+};
+"#;
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+
+    assert!(
+        !report.overall_ok,
+        "exported object literal method should be invoked by verify"
+    );
+    let failures = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .and_then(|stage| stage.detail.as_ref())
+        .and_then(|detail| detail.get("fuzz_failures"))
+        .and_then(|value| value.as_array())
+        .expect("fuzz failures should be present");
+    assert!(
+        failures.iter().any(|failure| {
+            failure["function"].as_str() == Some("reorderer.reorder")
+                && failure["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("Not sorted"))
+        }),
+        "exported object literal method should produce a property violation"
+    );
+}
+
+#[tokio::test]
+async fn exported_zero_arg_class_methods_can_fail_verify() {
+    let code = r#"
+export class Reorderer {
+    // court-jester-properties sorted permutation
+    reorder(values: string[]): string[] {
+        return [...values].reverse();
+    }
+}
+"#;
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+
+    assert!(
+        !report.overall_ok,
+        "exported zero-arg class method should be invoked by verify"
+    );
+    let failures = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .and_then(|stage| stage.detail.as_ref())
+        .and_then(|detail| detail.get("fuzz_failures"))
+        .and_then(|value| value.as_array())
+        .expect("fuzz failures should be present");
+    assert!(
+        failures.iter().any(|failure| {
+            failure["function"].as_str() == Some("Reorderer#reorder")
+                && failure["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("Not sorted"))
+        }),
+        "exported zero-arg class method should produce a property violation"
+    );
+}
+
+#[tokio::test]
+async fn factory_returned_methods_appear_in_coverage() {
+    let code = r#"
+export function createReorderer() {
+    function reorder(values: string[]): string[] {
+        return [...values].reverse();
+    }
+    return { reorder };
+}
+"#;
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+
+    let coverage_stage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "coverage")
+        .expect("coverage stage should exist");
+    let functions = coverage_stage
+        .detail
+        .as_ref()
+        .and_then(|detail| detail.get("functions"))
+        .and_then(|value| value.as_array())
+        .expect("coverage functions should be present");
+    assert!(
+        functions.iter().any(|function| {
+            function["function"].as_str() == Some("createReorderer().reorder")
+                && function["status"].as_str() == Some("fuzzed_via_factory")
+        }),
+        "factory-returned callables should be explicit in coverage output"
+    );
+}
+
+#[tokio::test]
+async fn zustand_style_container_methods_can_fail_verify() {
+    let code = r#"
+function create<T>(initializer: (set: unknown, get: unknown) => T) {
+    let state!: T;
+    const get = () => state;
+    const set = (_value: unknown) => {};
+    state = initializer(set, get);
+    return {
+        getState(): T {
+            return state;
+        },
+    };
+}
+
+export const useReorderer = create(() => ({
+    // court-jester-properties sorted permutation
+    reorder(values: string[]): string[] {
+        return [...values].reverse();
+    },
+}));
+"#;
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+
+    assert!(
+        !report.overall_ok,
+        "container surfaced method should be invoked by verify"
+    );
+
+    let coverage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "coverage")
+        .and_then(|stage| stage.detail.as_ref())
+        .and_then(|detail| detail.get("functions"))
+        .and_then(|value| value.as_array())
+        .expect("coverage stage should contain per-function entries");
+    let surfaced = coverage
+        .iter()
+        .find(|entry| {
+            entry.get("function").and_then(|value| value.as_str()) == Some("useReorderer.reorder")
+        })
+        .expect("container surfaced method coverage should be present");
+    assert_eq!(
+        surfaced.get("status").and_then(|value| value.as_str()),
+        Some("fuzzed")
+    );
+
+    let failures = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .and_then(|stage| stage.detail.as_ref())
+        .and_then(|detail| detail.get("fuzz_failures"))
+        .and_then(|value| value.as_array())
+        .expect("fuzz failures should be present");
+    assert!(
+        failures.iter().any(|failure| {
+            failure["function"].as_str() == Some("useReorderer.reorder")
+                && failure["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("Not sorted"))
+        }),
+        "container surfaced method should produce a property violation"
     );
 }
 
