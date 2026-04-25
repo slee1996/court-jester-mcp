@@ -1,0 +1,11 @@
+--- a/status.py
++++ b/status.py
+@@ -4,5 +4,7 @@
+ def status_label(status: Literal["draft", "published"]) -> str:
+     if status == "draft":
+         return "Draft"
+-
++    if status == "published":
++        return "Published"
++
+     raise ValueError(f"unsupported status: {status}")

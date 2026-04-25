@@ -4,6 +4,21 @@ This changelog tracks user-visible verifier semantics, report-shape changes, and
 
 ## Unreleased
 
+## 0.1.16 - 2026-04-25
+
+### Domain-Aware Synthesis
+
+- TypeScript and Python fuzz synthesis now derives closed input domains from literal type surfaces instead of falling back to arbitrary values.
+- Python `typing.Literal[...]` annotations, including nested literal collection elements, now generate only declared values.
+- TypeScript literal unions and object fields with literal domains now generate declared branch values.
+- TypeScript enum declarations are recorded as literal-union aliases, including imported enum type context.
+- TypeScript `typeof CONST_TUPLE[number]` aliases are rewritten from `as const` arrays, including imported type context.
+
+### False-Positive Control
+
+- Closed literal-domain object inputs no longer receive broad `{}` object edge cases that are outside the declared shape.
+- Fresh external guardrails `v3` and `v4` both reach full buggy recall with zero fixed-code false positives, while saturated `v1` and `v2` remain clean.
+
 ## 0.1.15 - 2026-04-23
 
 ### Operator Ergonomics

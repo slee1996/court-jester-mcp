@@ -1,0 +1,42 @@
+{
+  "id": "ts-imported-enum-param-billing-v4",
+  "title": "TypeScript enum parameter branch is exercised from imported source context",
+  "repo_fixture": "mini_ts_closed_domain_service",
+  "prompt": "Fix cycleDays so every imported BillingCycle enum value is handled.",
+  "language": "typescript",
+  "bucket": "signature_domain_fresh_v4",
+  "verify_paths": [
+    "billing.ts"
+  ],
+  "gold_patch_path": "gold/billing_imported_enum_domain_fix.patch",
+  "gold_changed_files": [
+    "billing.ts"
+  ],
+  "expected_files": [
+    "billing.ts"
+  ],
+  "family": "signature_domain",
+  "bug_class": "missing_closed_domain_branch",
+  "bug_surface": "imported_enum_signature",
+  "difficulty": "medium",
+  "golden_patch_description": "Handle the Annual branch declared by the imported enum.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": true,
+  "uses_relative_imports": true,
+  "cross_file": true,
+  "upstream_benchmark": "synthetic_external_guardrail",
+  "upstream_instance_id": "ts-imported-enum-param-billing-v4",
+  "instance_notes": "Fresh v4 guardrail task for imported enum-derived input domains.",
+  "tags": [
+    "typescript",
+    "signature_domain",
+    "enum",
+    "cross_file",
+    "fresh_guardrail"
+  ]
+}

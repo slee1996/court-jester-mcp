@@ -432,7 +432,7 @@ async fn verify_filters_unused_variable_diagnostics_for_anonymous_inline_snippet
 }
 
 #[tokio::test]
-async fn blank_label_output_fails_verify() {
+async fn blank_label_output_is_not_failed_by_name_only() {
     let code = r#"
 function secondaryLabel(labels: string[]): string {
     if (labels.length < 2) return "general";
@@ -441,14 +441,17 @@ function secondaryLabel(labels: string[]): string {
 "#;
     let report = verify(code, &Language::TypeScript, default_opts(None)).await;
 
-    assert!(!report.overall_ok, "report: {:#?}", report.stages);
+    assert!(report.overall_ok, "report: {:#?}", report.stages);
 
     let exec_stage = report
         .stages
         .iter()
         .find(|s| s.name == "execute")
         .expect("execute stage should be present");
-    assert!(!exec_stage.ok, "blank string output should fail verify");
+    assert!(
+        exec_stage.ok,
+        "array label helper should not fail from name-only nonempty-string inference"
+    );
 }
 
 #[tokio::test]
@@ -1150,6 +1153,504 @@ export function canonicalQuery(params: Record<string, unknown>): string {
 
     assert!(report.overall_ok, "report: {:#?}", report.stages);
     assert!(report.stages.iter().any(|s| s.name == "execute" && s.ok));
+}
+
+#[tokio::test]
+async fn typescript_context_notes_can_enable_nested_query_bracket_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("stringify.ts");
+    let code = r#"
+function appendScalar(entries: string[], key: string, value: unknown): void {
+  if (value === undefined || value === null) {
+    return;
+  }
+  entries.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
+}
+
+export function stringifyQuery(input: Record<string, unknown>): string {
+  const entries: string[] = [];
+  for (const key of Object.keys(input).sort()) {
+    const value = input[key];
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      for (const childKey of Object.keys(value as Record<string, unknown>).sort()) {
+        appendScalar(entries, `${key}[${childKey}]`, (value as Record<string, unknown>)[childKey]);
+      }
+      continue;
+    }
+    appendScalar(entries, key, value);
+  }
+  return entries.join("&");
+}
+"#;
+    std::fs::write(&source_path, code).unwrap();
+    std::fs::write(
+        dir.path().join("UPSTREAM_NOTES.md"),
+        "stringifyQuery(input) -> string uses query bracket notation: nested object arrays use [] suffixes.",
+    )
+    .unwrap();
+
+    let source_path_string = source_path.to_string_lossy().to_string();
+    let project_dir_string = dir.path().to_string_lossy().to_string();
+    let mut opts = default_opts(None);
+    opts.source_file = Some(source_path_string.as_str());
+    opts.project_dir = Some(project_dir_string.as_str());
+    let report = verify(code, &Language::TypeScript, opts).await;
+
+    assert!(!report.overall_ok, "report: {:#?}", report.stages);
+    let coverage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "coverage")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("coverage detail should be present");
+    assert_eq!(
+        coverage["inferred_context_properties"]["stringifyQuery"][0].as_str(),
+        Some("query_nested_brackets")
+    );
+}
+
+#[tokio::test]
+async fn typescript_urlencoded_context_targets_parser_not_setting_normalizer() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("query.ts");
+    let code = r#"
+type QueryParserSetting = "simple" | "extended" | true | false | ((input: string) => unknown);
+
+export function normalizeQueryParserSetting(input: unknown): QueryParserSetting {
+  if (input === undefined || input === true) {
+    return "simple";
+  }
+  if (input === false) {
+    return false;
+  }
+  if (typeof input === "function") {
+    return input;
+  }
+  if (input === "simple" || input === "extended") {
+    return input;
+  }
+  throw new Error(`unknown value for query parser: ${String(input)}`);
+}
+
+export function parseQueryString(input: string, setting: QueryParserSetting): unknown {
+  const result: Record<string, unknown> = {};
+  if (!input.trim() || setting === false) {
+    return result;
+  }
+  for (const segment of input.split("&")) {
+    const [rawKey, rawValue = ""] = segment.split("=", 2);
+    result[decodeURIComponent(rawKey)] = decodeURIComponent(rawValue);
+  }
+  return result;
+}
+"#;
+    std::fs::write(&source_path, code).unwrap();
+    std::fs::write(
+        dir.path().join("WORKMAP.md"),
+        "Build extended urlencoded parsing for nested form bodies. lib/query.ts owns query-string parsing for the urlencoded body parser.",
+    )
+    .unwrap();
+
+    let source_path_string = source_path.to_string_lossy().to_string();
+    let project_dir_string = dir.path().to_string_lossy().to_string();
+    let mut opts = default_opts(None);
+    opts.source_file = Some(source_path_string.as_str());
+    opts.project_dir = Some(project_dir_string.as_str());
+    let report = verify(code, &Language::TypeScript, opts).await;
+
+    assert!(!report.overall_ok, "report: {:#?}", report.stages);
+    let coverage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "coverage")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("coverage detail should be present");
+    assert_eq!(
+        coverage["inferred_context_properties"]["parseQueryString"][0].as_str(),
+        Some("query_nested_brackets")
+    );
+    assert!(
+        coverage["inferred_context_properties"]
+            .get("normalizeQueryParserSetting")
+            .is_none(),
+        "setting normalizer should not inherit parser-specific nested-input semantics"
+    );
+}
+
+#[tokio::test]
+async fn typescript_request_metadata_context_enables_side_effect_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("http.ts");
+    let code = r#"
+type RequestLike = {
+  method?: string;
+  url?: string;
+  headers?: Record<string, string | undefined>;
+  encrypted?: boolean;
+  app?: { __settings: Map<string, unknown> };
+  [key: string]: unknown;
+};
+
+function requestHeader(request: RequestLike, name: string): string | undefined {
+  const target = name.toLowerCase();
+  for (const [headerName, headerValue] of Object.entries(request.headers || {})) {
+    if (headerName.toLowerCase() === target) {
+      return headerValue;
+    }
+  }
+  return undefined;
+}
+
+export function decorateRequest(request: RequestLike): void {
+  if (typeof request.get !== "function") {
+    request.get = (name: string) => requestHeader(request, name);
+  }
+  if (typeof request.header !== "function") {
+    request.header = request.get;
+  }
+  if (typeof request.protocol !== "string") {
+    request.protocol = request.encrypted === true ? "https" : "http";
+  }
+  if (typeof request.secure !== "boolean") {
+    request.secure = request.protocol === "https";
+  }
+  if (typeof request.xhr !== "boolean") {
+    request.xhr = requestHeader(request, "x-requested-with")?.toLowerCase() === "xmlhttprequest";
+  }
+  request.query = {};
+}
+"#;
+    std::fs::write(&source_path, code).unwrap();
+    std::fs::write(
+        dir.path().join("WORKMAP.md"),
+        "Build request introspection behavior: header lookup, trust proxy protocol, XHR detection, and request decoration.",
+    )
+    .unwrap();
+
+    let source_path_string = source_path.to_string_lossy().to_string();
+    let project_dir_string = dir.path().to_string_lossy().to_string();
+    let mut opts = default_opts(None);
+    opts.source_file = Some(source_path_string.as_str());
+    opts.project_dir = Some(project_dir_string.as_str());
+    let report = verify(code, &Language::TypeScript, opts).await;
+
+    assert!(!report.overall_ok, "report: {:#?}", report.stages);
+    let coverage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "coverage")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("coverage detail should be present");
+    assert_eq!(
+        coverage["inferred_context_properties"]["decorateRequest"][0].as_str(),
+        Some("http_request_metadata")
+    );
+}
+
+#[tokio::test]
+async fn typescript_response_helpers_context_enables_side_effect_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("http.ts");
+    let code = r#"
+type RequestLike = {
+  method?: string;
+  headers?: Record<string, string | undefined>;
+  [key: string]: unknown;
+};
+
+type ResponseLike = {
+  statusCode?: number;
+  statusMessage?: string;
+  headersSent?: boolean;
+  setHeader?: (name: string, value: string) => void;
+  getHeader?: (name: string) => string | undefined;
+  end?: (body?: unknown) => void;
+  [key: string]: unknown;
+};
+
+const STATUS_TEXT: Record<number, string> = { 200: "OK", 204: "No Content" };
+
+function normalizeHeaderName(name: string): string {
+  return name.toLowerCase();
+}
+
+function ensureResponseInfrastructure(response: ResponseLike): void {
+  if (!response.__headers) {
+    response.__headers = new Map<string, string>();
+  }
+  if (typeof response.setHeader !== "function") {
+    response.setHeader = (name: string, value: string) => {
+      (response.__headers as Map<string, string>).set(normalizeHeaderName(name), value);
+    };
+  }
+  if (typeof response.getHeader !== "function") {
+    response.getHeader = (name: string) =>
+      (response.__headers as Map<string, string>).get(normalizeHeaderName(name));
+  }
+  if (typeof response.end !== "function") {
+    response.end = (body?: unknown) => {
+      response.headersSent = true;
+      response.__body = body ?? "";
+    };
+  }
+  if (typeof response.statusCode !== "number") {
+    response.statusCode = 200;
+  }
+}
+
+export function decorateResponse(response: ResponseLike, request: RequestLike): void {
+  ensureResponseInfrastructure(response);
+  if (typeof response.status !== "function") {
+    response.status = (code: number) => {
+      response.statusCode = code;
+      response.statusMessage = STATUS_TEXT[code] || String(code);
+      return response;
+    };
+  }
+  if (typeof response.send !== "function") {
+    response.send = (body: unknown) => {
+      response.end?.(body ?? "");
+      return response;
+    };
+  }
+  if (typeof response.sendStatus !== "function") {
+    response.sendStatus = (code: number) => {
+      response.status?.(code);
+      return response.send?.(String(code));
+    };
+  }
+  if (typeof response.location !== "function") {
+    response.location = (value: string) => {
+      response.setHeader?.("Location", value);
+      return response;
+    };
+  }
+  if (typeof response.vary !== "function") {
+    response.vary = (field: string) => {
+      response.setHeader?.("Vary", field);
+      return response;
+    };
+  }
+}
+"#;
+    std::fs::write(&source_path, code).unwrap();
+    std::fs::write(
+        dir.path().join("WORKMAP.md"),
+        "Build response header and status helpers: location, vary, sendStatus, and empty response body behavior.",
+    )
+    .unwrap();
+
+    let source_path_string = source_path.to_string_lossy().to_string();
+    let project_dir_string = dir.path().to_string_lossy().to_string();
+    let mut opts = default_opts(None);
+    opts.source_file = Some(source_path_string.as_str());
+    opts.project_dir = Some(project_dir_string.as_str());
+    let report = verify(code, &Language::TypeScript, opts).await;
+
+    assert!(!report.overall_ok, "report: {:#?}", report.stages);
+    let coverage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "coverage")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("coverage detail should be present");
+    assert_eq!(
+        coverage["inferred_context_properties"]["decorateResponse"][0].as_str(),
+        Some("http_response_helpers")
+    );
+}
+
+#[tokio::test]
+async fn typescript_static_file_context_promotes_internal_middleware_factory() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("index.ts");
+    std::fs::create_dir(dir.path().join("static")).unwrap();
+    std::fs::write(dir.path().join("static").join("hello.txt"), "hello world\n").unwrap();
+    let code = r#"
+type Handler = (req: any, res: any, next: () => void) => void;
+type StaticMiddlewareOptions = {
+  index?: string | false;
+};
+
+function createStaticMiddleware(root: string, options?: StaticMiddlewareOptions): Handler {
+  void root;
+  void options;
+  return (_req, _res, next) => {
+    next();
+  };
+}
+
+export function express(): unknown {
+  return {};
+}
+"#;
+    std::fs::write(&source_path, code).unwrap();
+    std::fs::write(
+        dir.path().join("WORKMAP.md"),
+        "Build the static-file wrapper from the visible public spec. Focus on serving a known static file correctly. Suggested build order: serve known files from static/.",
+    )
+    .unwrap();
+
+    let source_path_string = source_path.to_string_lossy().to_string();
+    let project_dir_string = dir.path().to_string_lossy().to_string();
+    let mut opts = default_opts(None);
+    opts.source_file = Some(source_path_string.as_str());
+    opts.project_dir = Some(project_dir_string.as_str());
+    let report = verify(code, &Language::TypeScript, opts).await;
+
+    assert!(!report.overall_ok, "report: {:#?}", report.stages);
+    let coverage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "coverage")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("coverage detail should be present");
+    assert_eq!(
+        coverage["inferred_context_properties"]["createStaticMiddleware"][0].as_str(),
+        Some("http_static_file_middleware")
+    );
+    assert!(
+        coverage["counts"]["fuzzed"].as_u64().unwrap_or(0) >= 1,
+        "context should promote the internal static middleware factory into fuzzing"
+    );
+}
+
+#[tokio::test]
+async fn typescript_context_notes_can_enable_same_value_zero_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("internals.ts");
+    let code = r#"
+export function sameValueZero(left: unknown, right: unknown): boolean {
+  return left === right;
+}
+"#;
+    std::fs::write(&source_path, code).unwrap();
+    std::fs::write(
+        dir.path().join("UPSTREAM_NOTES.md"),
+        "This lodash-derived shard uses SameValueZero equality for uniq.",
+    )
+    .unwrap();
+
+    let source_path_string = source_path.to_string_lossy().to_string();
+    let project_dir_string = dir.path().to_string_lossy().to_string();
+    let mut opts = default_opts(None);
+    opts.source_file = Some(source_path_string.as_str());
+    opts.project_dir = Some(project_dir_string.as_str());
+    let report = verify(code, &Language::TypeScript, opts).await;
+
+    assert!(!report.overall_ok, "report: {:#?}", report.stages);
+    let execute = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("execute detail should be present");
+    assert_eq!(
+        execute["inferred_context_properties"]["sameValueZero"][0].as_str(),
+        Some("same_value_zero")
+    );
+}
+
+#[tokio::test]
+async fn context_notes_can_enable_pep440_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("packaging_slice.py");
+    let code = r#"
+def compare_versions(left: str, right: str) -> int:
+    return 0
+
+
+def allows(version: str, specifier: str) -> bool:
+    return True
+
+
+def filter_versions(candidates: list[str], specifier: str) -> list[str]:
+    return []
+"#;
+    std::fs::write(&source_path, code).unwrap();
+    std::fs::write(
+        dir.path().join("UPSTREAM_NOTES.md"),
+        "This pypa/packaging PEP 440 slice covers version-ordering behavior, \
+         specifier behavior including compatible release ~= semantics, and \
+         filter_versions prerelease fallback when prereleases are the only matching candidates.",
+    )
+    .unwrap();
+
+    let source_path_string = source_path.to_string_lossy().to_string();
+    let project_dir_string = dir.path().to_string_lossy().to_string();
+    let mut opts = default_opts(None);
+    opts.source_file = Some(source_path_string.as_str());
+    opts.project_dir = Some(project_dir_string.as_str());
+    let report = verify(code, &Language::Python, opts).await;
+
+    assert!(!report.overall_ok, "report: {:#?}", report.stages);
+    let execute = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("execute detail should be present");
+    assert_eq!(
+        execute["inferred_context_properties"]["compare_versions"][0].as_str(),
+        Some("pep440_version_ordering")
+    );
+    assert_eq!(
+        execute["inferred_context_properties"]["allows"][0].as_str(),
+        Some("pep440_specifier_membership")
+    );
+    assert_eq!(
+        execute["inferred_context_properties"]["filter_versions"][0].as_str(),
+        Some("pep440_filter_prerelease")
+    );
+}
+
+#[tokio::test]
+async fn cookie_file_context_can_enable_cookie_quote_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("cookies.py");
+    let code = r#"
+from collections.abc import Mapping
+
+
+def format_cookie_value(value: str) -> str:
+    normalized = value.strip()
+    if len(normalized) >= 2 and normalized[0] == normalized[-1] == '"':
+        return normalized[1:-1]
+    return normalized
+
+
+def build_cookie_header(cookies: Mapping[str, str | None]) -> str:
+    parts: list[str] = []
+    for name, value in cookies.items():
+        if value is None:
+            continue
+        parts.append(f"{name}={format_cookie_value(value)}")
+    return "; ".join(parts)
+"#;
+    std::fs::write(&source_path, code).unwrap();
+
+    let source_path_string = source_path.to_string_lossy().to_string();
+    let project_dir_string = dir.path().to_string_lossy().to_string();
+    let mut opts = default_opts(None);
+    opts.source_file = Some(source_path_string.as_str());
+    opts.project_dir = Some(project_dir_string.as_str());
+    let report = verify(code, &Language::Python, opts).await;
+
+    assert!(!report.overall_ok, "report: {:#?}", report.stages);
+    let execute = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("execute detail should be present");
+    assert_eq!(
+        execute["inferred_context_properties"]["format_cookie_value"][0].as_str(),
+        Some("cookie_value_quote")
+    );
+    assert_eq!(
+        execute["inferred_context_properties"]["build_cookie_header"][0].as_str(),
+        Some("cookie_header_quote")
+    );
 }
 
 #[tokio::test]
@@ -2496,6 +2997,340 @@ hostLabel("https://example.com");
         .expect("execute stage should be present");
     assert_eq!(unseeded_execute["no_inputs_reached"].as_u64(), Some(1));
     assert_eq!(unseeded_execute["seed_input_count"].as_u64(), Some(0));
+}
+
+#[tokio::test]
+async fn auto_seed_uses_project_production_calls_for_execute_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_dir = dir.path().join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+
+    let source_path = src_dir.join("host_label.ts");
+    let route_path = src_dir.join("routes.ts");
+    let code = r#"
+export function hostLabel(url: string): string {
+  if (!url.startsWith("https://")) {
+    throw new Error("invalid base url");
+  }
+  return new URL(url).host;
+}
+"#;
+    let route_code = r#"
+import * as labels from "./host_label";
+
+export const defaultHost = labels.hostLabel("https://example.com");
+"#;
+    std::fs::write(&source_path, code).unwrap();
+    std::fs::write(&route_path, route_code).unwrap();
+
+    let report = verify(
+        code,
+        &Language::TypeScript,
+        VerifyOptions {
+            test_code: None,
+            test_source_file: None,
+            test_runner: TestRunner::Auto,
+            tests_only: false,
+            complexity_threshold: None,
+            complexity_metric: ComplexityMetric::Cyclomatic,
+            project_dir: Some(dir.path().to_str().unwrap()),
+            lint_config_path: None,
+            lint_virtual_file_path: None,
+            diff: None,
+            suppressions: None,
+            suppression_source: None,
+            auto_seed: true,
+            source_file: Some(source_path.to_str().unwrap()),
+            output_dir: None,
+            report_level: ReportLevel::Full,
+            execute_gate: ExecuteGate::All,
+        },
+    )
+    .await;
+
+    let execute = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("execute stage should be present");
+    assert_eq!(execute["no_inputs_reached"].as_u64(), Some(0));
+    assert!(
+        execute["seed_sources"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .any(|value| value.as_str() == Some(route_path.to_string_lossy().as_ref())),
+        "expected production project file in seed sources"
+    );
+}
+
+#[tokio::test]
+async fn auto_seed_accepts_project_object_literal_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_dir = dir.path().join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+
+    let source_path = src_dir.join("location.ts");
+    let caller_path = src_dir.join("profile_view.ts");
+    let code = r#"
+export interface Profile {
+  address?: { city?: string };
+}
+
+export function primaryCity(profile: Profile): string {
+  if (!profile.address?.city) {
+    return "Unknown";
+  }
+  return profile.address.city;
+}
+"#;
+    let caller_code = r#"
+import { primaryCity } from "./location";
+
+export const previewCity = primaryCity({ address: { city: "Boise" } });
+"#;
+    std::fs::write(&source_path, code).unwrap();
+    std::fs::write(&caller_path, caller_code).unwrap();
+
+    let report = verify(
+        code,
+        &Language::TypeScript,
+        VerifyOptions {
+            test_code: None,
+            test_source_file: None,
+            test_runner: TestRunner::Auto,
+            tests_only: false,
+            complexity_threshold: None,
+            complexity_metric: ComplexityMetric::Cyclomatic,
+            project_dir: Some(dir.path().to_str().unwrap()),
+            lint_config_path: None,
+            lint_virtual_file_path: None,
+            diff: None,
+            suppressions: None,
+            suppression_source: None,
+            auto_seed: true,
+            source_file: Some(source_path.to_str().unwrap()),
+            output_dir: None,
+            report_level: ReportLevel::Full,
+            execute_gate: ExecuteGate::All,
+        },
+    )
+    .await;
+
+    let execute = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("execute stage should be present");
+    assert!(
+        execute["seed_input_count"].as_u64().unwrap_or(0) > 0,
+        "expected object literal call to become a seed row"
+    );
+    assert!(
+        execute["seed_sources"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .any(|value| value.as_str() == Some(caller_path.to_string_lossy().as_ref())),
+        "expected object literal caller in seed sources"
+    );
+}
+
+#[tokio::test]
+async fn auto_seed_uses_json_fixture_inputs_as_domain_examples() {
+    let dir = tempfile::tempdir().unwrap();
+    let tests_dir = dir.path().join("tests");
+    std::fs::create_dir_all(&tests_dir).unwrap();
+
+    let source_path = dir.path().join("first_item.py");
+    let fixture_path = tests_dir.join("first_item.json");
+    let code = r#"
+def first_item(items):
+    return items[0]
+"#;
+    std::fs::write(&source_path, code).unwrap();
+    std::fs::write(&fixture_path, "[[[1, 2, 3]], 1]\n").unwrap();
+
+    let report = verify(
+        code,
+        &Language::Python,
+        VerifyOptions {
+            test_code: None,
+            test_source_file: None,
+            test_runner: TestRunner::Auto,
+            tests_only: false,
+            complexity_threshold: None,
+            complexity_metric: ComplexityMetric::Cyclomatic,
+            project_dir: Some(dir.path().to_str().unwrap()),
+            lint_config_path: None,
+            lint_virtual_file_path: None,
+            diff: None,
+            suppressions: None,
+            suppression_source: None,
+            auto_seed: true,
+            source_file: Some(source_path.to_str().unwrap()),
+            output_dir: None,
+            report_level: ReportLevel::Full,
+            execute_gate: ExecuteGate::All,
+        },
+    )
+    .await;
+
+    let execute_stage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("execute stage should be present");
+    assert!(
+        execute_stage.ok,
+        "fixture-shaped fuzz inputs should avoid arbitrary non-list crashes: {:#?}",
+        execute_stage
+    );
+    let detail = execute_stage
+        .detail
+        .as_ref()
+        .expect("execute detail should be present");
+    assert!(
+        detail["seed_input_count"].as_u64().unwrap_or(0) > 0,
+        "expected JSON fixture inputs to seed fuzzing"
+    );
+    assert!(
+        detail["seed_sources"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .any(|value| value.as_str() == Some(fixture_path.to_string_lossy().as_ref())),
+        "expected JSON fixture path in seed sources"
+    );
+}
+
+#[tokio::test]
+async fn json_fixture_outputs_infer_structural_properties_not_exact_oracles() {
+    let dir = tempfile::tempdir().unwrap();
+    let tests_dir = dir.path().join("tests");
+    std::fs::create_dir_all(&tests_dir).unwrap();
+
+    let source_path = dir.path().join("sort_items.py");
+    let fixture_path = tests_dir.join("sort_items.json");
+    let code = r#"
+def sort_items(items):
+    return items
+"#;
+    std::fs::write(&source_path, code).unwrap();
+    std::fs::write(
+        &fixture_path,
+        "[[[3, 1, 2]], [1, 2, 3]]\n[[[4, 2, 3, 1]], [1, 2, 3, 4]]\n",
+    )
+    .unwrap();
+
+    let report = verify(
+        code,
+        &Language::Python,
+        VerifyOptions {
+            test_code: None,
+            test_source_file: None,
+            test_runner: TestRunner::Auto,
+            tests_only: false,
+            complexity_threshold: None,
+            complexity_metric: ComplexityMetric::Cyclomatic,
+            project_dir: Some(dir.path().to_str().unwrap()),
+            lint_config_path: None,
+            lint_virtual_file_path: None,
+            diff: None,
+            suppressions: None,
+            suppression_source: None,
+            auto_seed: true,
+            source_file: Some(source_path.to_str().unwrap()),
+            output_dir: None,
+            report_level: ReportLevel::Full,
+            execute_gate: ExecuteGate::All,
+        },
+    )
+    .await;
+
+    let execute_stage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("execute stage should be present");
+    assert!(
+        !execute_stage.ok,
+        "fixture-derived sorted/permutation properties should catch unsorted output"
+    );
+    let detail = execute_stage
+        .detail
+        .as_ref()
+        .expect("execute detail should be present");
+    assert_eq!(
+        detail["inferred_fixture_properties"]["sort_items"]
+            .as_array()
+            .map(|values| values
+                .iter()
+                .filter_map(|value| value.as_str())
+                .collect::<Vec<_>>()),
+        Some(vec!["sorted", "permutation"])
+    );
+}
+
+#[tokio::test]
+async fn json_fixture_single_row_does_not_infer_structural_properties() {
+    let dir = tempfile::tempdir().unwrap();
+    let tests_dir = dir.path().join("tests");
+    std::fs::create_dir_all(&tests_dir).unwrap();
+
+    let source_path = dir.path().join("sort_items.py");
+    let fixture_path = tests_dir.join("sort_items.json");
+    let code = r#"
+def sort_items(items):
+    return items
+"#;
+    std::fs::write(&source_path, code).unwrap();
+    std::fs::write(&fixture_path, "[[[3, 1, 2]], [1, 2, 3]]\n").unwrap();
+
+    let report = verify(
+        code,
+        &Language::Python,
+        VerifyOptions {
+            test_code: None,
+            test_source_file: None,
+            test_runner: TestRunner::Auto,
+            tests_only: false,
+            complexity_threshold: None,
+            complexity_metric: ComplexityMetric::Cyclomatic,
+            project_dir: Some(dir.path().to_str().unwrap()),
+            lint_config_path: None,
+            lint_virtual_file_path: None,
+            diff: None,
+            suppressions: None,
+            suppression_source: None,
+            auto_seed: true,
+            source_file: Some(source_path.to_str().unwrap()),
+            output_dir: None,
+            report_level: ReportLevel::Full,
+            execute_gate: ExecuteGate::All,
+        },
+    )
+    .await;
+
+    let execute_stage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("execute stage should be present");
+    assert!(
+        execute_stage.ok,
+        "one fixture row should shape inputs but should not create a hard sorted oracle"
+    );
+    let detail = execute_stage
+        .detail
+        .as_ref()
+        .expect("execute detail should be present");
+    assert!(
+        detail["inferred_fixture_properties"]["sort_items"].is_null(),
+        "single fixture row should not infer structural properties"
+    );
 }
 
 #[tokio::test]

@@ -1,0 +1,7 @@
+--- a/transport.ts
++++ b/transport.ts
+@@ -6,3 +6,4 @@
+ const ROUTES: Partial<Record<DeliveryChannel, string>> = {
+   [DeliveryChannel.Email]: "mailer",
++  [DeliveryChannel.Sms]: "sms-gateway",
+ };

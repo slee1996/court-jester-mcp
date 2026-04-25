@@ -1,0 +1,7 @@
+--- a/notify.ts
++++ b/notify.ts
+@@ -3,3 +3,4 @@
+ const LABELS: Partial<Record<AlertChannel, string>> = {
+   email: "Email",
++  sms: "SMS",
+ };

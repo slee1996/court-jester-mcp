@@ -4,6 +4,7 @@ use crate::types::*;
 
 /// Number of random inputs to generate per function.
 const FUZZ_ITERATIONS: usize = 30;
+const TS_TYPE_RECURSION_LIMIT: usize = 8;
 
 /// Generate a property-based fuzz harness that tests each function with
 /// many random inputs and checks:
@@ -29,6 +30,7 @@ enum ContractKind {
     StringTransform,
     MappingSerializer,
     QueryStringSerializer,
+    QueryStringParser,
     Comparator,
 }
 
@@ -262,17 +264,20 @@ fn factory_callable_coverage(
     coverage
 }
 
-fn python_seed_setup(
+fn python_seed_rows_expr(
     func: &FunctionInfo,
     seed_inputs: &HashMap<String, Vec<Vec<String>>>,
 ) -> String {
     let Some(rows) = seed_inputs.get(&func.name) else {
-        return String::new();
+        return "[]".to_string();
     };
-    rows.iter()
-        .map(|row| format!("_all_inputs.append([{}])", row.join(", ")))
-        .collect::<Vec<_>>()
-        .join("\n")
+    format!(
+        "[{}]",
+        rows.iter()
+            .map(|row| format!("[{}]", row.join(", ")))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 fn ts_seed_rows(func: &FunctionInfo, seed_inputs: &HashMap<String, Vec<Vec<String>>>) -> String {
@@ -311,9 +316,9 @@ fn python_type_is_simple_helper_input(
     };
 
     match t {
-        "int" | "float" | "str" | "bool" | "bytes" | "Any" | "dict" | "Dict" | "datetime"
-        | "date" => true,
-        _ if starts_with_any(t, &["dict[", "Dict["]) => true,
+        "int" | "float" | "str" | "bool" | "bytes" | "Any" | "datetime" | "date" => true,
+        _ if python_literal_choice_exprs(t).is_some() => true,
+        _ if is_python_mapping_type(t) => true,
         _ if starts_with_any(t, &["Optional["]) => {
             let inner = extract_generic_arg(t);
             python_type_is_simple_helper_input(Some(&inner), type_defs)
@@ -323,7 +328,10 @@ fn python_type_is_simple_helper_input(
             .map(str::trim)
             .filter(|branch| *branch != "None")
             .all(|branch| python_type_is_simple_helper_input(Some(branch), type_defs)),
-        _ if starts_with_any(t, &["list[str", "List[str", "tuple[str", "Tuple[str"]) => true,
+        _ if starts_with_any(t, &["list[", "List[", "tuple[", "Tuple["]) => {
+            let inner = extract_generic_arg(t);
+            python_type_is_simple_helper_input(Some(&inner), type_defs)
+        }
         _ if type_defs.contains_key(t) => false,
         _ => false,
     }
@@ -336,6 +344,10 @@ fn should_fuzz_python_helper(
     has_exported: bool,
 ) -> bool {
     if func.is_exported || !has_exported {
+        return true;
+    }
+
+    if has_http_static_file_middleware_contract(func) {
         return true;
     }
 
@@ -401,6 +413,10 @@ fn should_fuzz_ts_helper(
         return true;
     }
 
+    if has_http_static_file_middleware_contract(func) {
+        return true;
+    }
+
     params.len() == 1
         && likely_simple_helper(&func.name)
         && ts_type_is_simple_helper_input(params[0].type_annotation.as_deref(), type_defs)
@@ -430,6 +446,9 @@ fn synthesize_python(
             .filter(|p| !p.name.starts_with('*'))
             .collect();
         let has_nested = has_nested_children(func, &analysis.functions);
+        let has_seed_rows = seed_inputs
+            .get(&func.name)
+            .is_some_and(|rows| !rows.is_empty());
 
         if callable_params.is_empty()
             && !has_nested
@@ -440,6 +459,22 @@ fn synthesize_python(
                 FuzzFunctionStatus::SkippedNoFuzzableSurface,
                 Some(
                     "zero-argument function has no meaningful parameter surface or stable return contract to fuzz".into(),
+                ),
+            ));
+            continue;
+        }
+
+        if callable_params
+            .iter()
+            .any(|param| param.type_annotation.is_none())
+            && !has_seed_rows
+        {
+            coverage.push(coverage_entry(
+                func,
+                FuzzFunctionStatus::SkippedUnsupportedType,
+                Some(
+                    "one or more Python parameters are untyped and no seed/domain examples were found"
+                        .into(),
                 ),
             ));
             continue;
@@ -476,9 +511,20 @@ fn synthesize_python(
             .enumerate()
             .map(|(i, p)| {
                 if p.keyword_only {
-                    format!("{}=_args[{}]", p.name, i)
+                    format!("{}=_call_args[{}]", p.name, i)
                 } else {
-                    format!("_args[{}]", i)
+                    format!("_call_args[{}]", i)
+                }
+            })
+            .collect();
+        let repeat_call_args: Vec<String> = callable_params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                if p.keyword_only {
+                    format!("{}=_repeat_args[{}]", p.name, i)
+                } else {
+                    format!("_repeat_args[{}]", i)
                 }
             })
             .collect();
@@ -507,16 +553,21 @@ fn synthesize_python(
         code.push_str(&format!(
             r#"
 _all_inputs = []
+_seed_rows = {seed_rows}
 {edge_case_setup}
-{seed_setup}
+_all_inputs.extend(_seed_rows)
 for _ in range({FUZZ_ITERATIONS}):
-    _all_inputs.append([{gen_list}])
+    if _seed_rows:
+        _all_inputs.append(_fuzz_seed_row(_seed_rows))
+    else:
+        _all_inputs.append([{gen_list}])
 _pass = 0
 _reject = 0
 _crash = 0
 for _args in _all_inputs:
     try:
-        _result = {name}({call})
+        _call_args = _copy.deepcopy(_args)
+        _result = _materialize_if_iterator({name}({call}))
         _pass += 1
 {type_check}
 {idempotency_check}
@@ -526,6 +577,7 @@ for _args in _all_inputs:
 {clamped_check}
 {sorted_check}
 {permutation_check}
+{palindrome_check}
 {nullish_string_leak_check}
 {comparator_check}
 {symmetry_check}
@@ -540,6 +592,11 @@ for _args in _all_inputs:
         else:
             _reject += 1
 {query_string_semantic_check}
+{pep440_version_ordering_check}
+{pep440_specifier_membership_check}
+{pep440_filter_prerelease_check}
+{cookie_value_quote_check}
+{cookie_header_quote_check}
 _total = _pass + _reject + _crash
 if _crash > 0:
     print(f"FUZZ {name}: {{_pass}} passed, {{_reject}} rejected, {{_crash}} CRASHED (of {{_total}})")
@@ -552,18 +609,27 @@ else:
 "#,
             name = func.name,
             edge_case_setup = edge_case_setup,
-            seed_setup = python_seed_setup(func, seed_inputs),
+            seed_rows = python_seed_rows_expr(func, seed_inputs),
             type_check = python_type_check(ret_type, type_defs),
             idempotency_check = python_idempotency_check(func, &callable_params, type_defs),
-            consistency_check = python_consistency_check(func, &call_args),
+            consistency_check = python_consistency_check(func, &repeat_call_args),
             boundedness_check = python_boundedness_check(func, &callable_params),
             nonneg_check = python_nonneg_check(func),
             clamped_check = python_clamped_check(func, &callable_params),
             sorted_check = python_sorted_check(func, &callable_params),
             permutation_check = python_permutation_check(func, &callable_params),
+            palindrome_check = python_palindrome_check(func),
             nullish_string_leak_check = python_nullish_string_leak_check(func, &callable_params),
             query_string_semantic_check =
                 python_query_string_semantic_check(func, &callable_params),
+            pep440_version_ordering_check =
+                python_pep440_version_ordering_check(func, &callable_params),
+            pep440_specifier_membership_check =
+                python_pep440_specifier_membership_check(func, &callable_params),
+            pep440_filter_prerelease_check =
+                python_pep440_filter_prerelease_check(func, &callable_params),
+            cookie_value_quote_check = python_cookie_value_quote_check(func, &callable_params),
+            cookie_header_quote_check = python_cookie_header_quote_check(func, &callable_params),
             comparator_check = python_comparator_check(func, &callable_params),
             symmetry_check = python_symmetry_check(func, &callable_params),
         ));
@@ -581,8 +647,7 @@ else:
     // Factory exercise: for functions containing nested functions,
     // call the factory and exercise the returned object's callables
     for func in selected_functions {
-        let has_nested = has_nested_children(func, &analysis.functions);
-        if !has_nested {
+        if func.returned_callables.is_empty() {
             continue;
         }
         let callable_params: Vec<&ParamInfo> = func
@@ -595,16 +660,7 @@ else:
             .map(|p| python_generator(p.type_annotation.as_deref(), type_defs))
             .collect();
         let gen_list = generators.join(", ");
-        let nested_names: Vec<&str> = if func.returned_callables.is_empty() {
-            analysis
-                .functions
-                .iter()
-                .filter(|f| f.is_nested && f.line >= func.line && f.end_line <= func.end_line)
-                .map(|f| f.name.as_str())
-                .collect()
-        } else {
-            func.returned_callables.iter().map(String::as_str).collect()
-        };
+        let nested_names: Vec<&str> = func.returned_callables.iter().map(String::as_str).collect();
         code.push_str(&format!(
             r#"
 # Factory exercise: {name} -> test returned callables
@@ -661,6 +717,10 @@ fn python_generator(type_ann: Option<&str>, type_defs: &HashMap<&str, &ClassInfo
         None => return "_fuzz_any()".to_string(),
     };
 
+    if let Some(choices) = python_literal_choice_exprs(t) {
+        return literal_choice_expr(&choices, "_fuzz_int_range");
+    }
+
     match t {
         "int" => "_fuzz_int()".into(),
         "float" => "_fuzz_float()".into(),
@@ -668,13 +728,13 @@ fn python_generator(type_ann: Option<&str>, type_defs: &HashMap<&str, &ClassInfo
         "bool" => "_fuzz_bool()".into(),
         "bytes" => "_fuzz_bytes()".into(),
         "Any" => "_fuzz_any()".into(),
-        "dict" | "Dict" => "_fuzz_dict()".into(),
+        _ if is_python_mapping_type(t) && !t.contains('[') => "_fuzz_dict()".into(),
         _ if starts_with_any(t, &["list[", "List["]) => {
             let inner = extract_generic_arg(t);
             let gen = python_generator(Some(&inner), type_defs);
             format!("[{gen} for _ in range(_fuzz_int_range(0, 5))]")
         }
-        _ if starts_with_any(t, &["dict[", "Dict["]) => {
+        _ if is_python_mapping_type(t) => {
             let (k, v) = extract_two_generic_args(t);
             let kg = python_generator(Some(&k), type_defs);
             let vg = python_generator(Some(&v), type_defs);
@@ -760,34 +820,6 @@ fn python_type_check(ret_type: &str, _type_defs: &HashMap<&str, &ClassInfo>) -> 
     format!("        assert {check}, f\"Return type mismatch: got {{type(_result).__name__}}\"")
 }
 
-/// Names that suggest idempotent behavior (f(f(x)) == f(x)).
-const IDEMPOTENT_NAME_CUES: &[&str] = &[
-    "clean",
-    "normalize",
-    "strip",
-    "trim",
-    "lower",
-    "upper",
-    "casefold",
-    "dedupe",
-    "dedup",
-    "unique",
-    "sort",
-    "flatten",
-    "compact",
-    "squeeze",
-    "canonicalize",
-    "simplify",
-    "collapse",
-    "sanitize",
-    "format",
-];
-
-fn likely_idempotent(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    IDEMPOTENT_NAME_CUES.iter().any(|cue| lower.contains(cue))
-}
-
 fn is_idempotent_candidate_type(type_name: &str) -> bool {
     let trimmed = type_name.trim();
     trimmed == "str"
@@ -815,16 +847,6 @@ const BOUNDED_NAME_CUES: &[&str] = &[
 fn likely_bounded(name: &str) -> bool {
     let lower = name.to_lowercase();
     BOUNDED_NAME_CUES.iter().any(|cue| lower.contains(cue))
-}
-
-/// Names that suggest non-negative return values.
-const NONNEG_NAME_CUES: &[&str] = &[
-    "len", "count", "size", "distance", "abs", "norm", "score", "total",
-];
-
-fn likely_nonneg(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    NONNEG_NAME_CUES.iter().any(|cue| lower.contains(cue))
 }
 
 /// Names that suggest a returned string should not be blank after trimming.
@@ -871,6 +893,9 @@ fn likely_query_string_semantics(name: &str) -> bool {
             "serialize",
             "serialise",
             "encode",
+            "stringify",
+            "parse",
+            "decode",
         ]
         .iter()
         .any(|cue| lower.contains(cue))
@@ -889,29 +914,38 @@ fn likely_defaults_semantics(name: &str) -> bool {
     name.trim().eq_ignore_ascii_case("defaults")
 }
 
-/// Names that suggest symmetric behavior (f(a,b) == f(b,a)).
-const SYMMETRIC_NAME_CUES: &[&str] = &["distance", "similarity", "hamming", "gcd"];
-
 /// Names that suggest comparator-style ordering (antisymmetric, NOT symmetric).
 /// Keep this list narrow: generic words like "order" create false positives for
 /// ordinary business functions such as average_order_value(total, count).
 const ANTISYMMETRIC_NAME_CUES: &[&str] = &["compare", "cmp", "sort", "asc", "desc"];
 
-fn likely_symmetric(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    if ANTISYMMETRIC_NAME_CUES
-        .iter()
-        .any(|cue| lower.contains(cue))
-    {
-        return false;
-    }
-    SYMMETRIC_NAME_CUES.iter().any(|cue| lower.contains(cue))
-}
-
 fn has_declared_property(func: &FunctionInfo, property: &str) -> bool {
     func.declared_properties
         .iter()
         .any(|declared| declared == property)
+}
+
+fn has_query_nested_brackets_contract(func: &FunctionInfo) -> bool {
+    has_declared_property(func, "query_nested_brackets")
+}
+
+fn has_same_value_zero_contract(func: &FunctionInfo) -> bool {
+    if has_declared_property(func, "same_value_zero") {
+        return true;
+    }
+    func.name.to_lowercase().replace('_', "").replace('-', "") == "samevaluezero"
+}
+
+fn has_http_request_metadata_contract(func: &FunctionInfo) -> bool {
+    has_declared_property(func, "http_request_metadata")
+}
+
+fn has_http_response_helpers_contract(func: &FunctionInfo) -> bool {
+    has_declared_property(func, "http_response_helpers")
+}
+
+fn has_http_static_file_middleware_contract(func: &FunctionInfo) -> bool {
+    has_declared_property(func, "http_static_file_middleware")
 }
 
 fn is_api_surface(func: &FunctionInfo) -> bool {
@@ -967,7 +1001,7 @@ fn is_ts_defaults_semantic_target(
             || ts_class_def(target_type, type_defs).is_some())
 }
 
-fn ts_has_structured_input_type(type_name: &str, type_defs: &TsNamedTypes<'_>) -> bool {
+fn ts_has_object_like_input_type(type_name: &str, type_defs: &TsNamedTypes<'_>) -> bool {
     let trimmed = type_name.trim();
     if trimmed.is_empty() {
         return false;
@@ -978,7 +1012,7 @@ fn ts_has_structured_input_type(type_name: &str, type_defs: &TsNamedTypes<'_>) -
         return union_branches.iter().any(|branch| {
             let branch = branch.trim();
             !matches!(branch, "null" | "undefined")
-                && ts_has_structured_input_type(branch, type_defs)
+                && ts_has_object_like_input_type(branch, type_defs)
         });
     }
 
@@ -986,18 +1020,12 @@ fn ts_has_structured_input_type(type_name: &str, type_defs: &TsNamedTypes<'_>) -
     if intersection_branches.len() > 1 {
         return intersection_branches
             .iter()
-            .any(|branch| ts_has_structured_input_type(branch.trim(), type_defs));
+            .any(|branch| ts_has_object_like_input_type(branch.trim(), type_defs));
     }
 
     let effective = ts_effective_type(trimmed, type_defs);
     let effective = effective.trim();
-
-    is_ts_mapping_type(effective, type_defs)
-        || effective.ends_with("[]")
-        || effective.starts_with("Array<")
-        || effective.starts_with("ReadonlyArray<")
-        || effective.starts_with('[')
-        || ts_class_def(effective, type_defs).is_some()
+    is_ts_mapping_type(effective, type_defs) || ts_class_def(effective, type_defs).is_some()
 }
 
 fn should_require_ts_nonempty_string(
@@ -1012,23 +1040,52 @@ fn should_require_ts_nonempty_string(
         return false;
     }
 
-    is_api_surface(func)
-        || (!func.is_method
-            && !func.is_nested
-            && param_types
-                .iter()
-                .any(|param_type| ts_has_structured_input_type(param_type, type_defs)))
+    !func.is_method
+        && !func.is_nested
+        && param_types
+            .iter()
+            .any(|param_type| ts_has_object_like_input_type(param_type, type_defs))
 }
 
 fn is_python_mapping_type(type_name: &str) -> bool {
-    matches!(type_name.trim(), "dict" | "Dict")
-        || starts_with_any(type_name.trim(), &["dict[", "Dict["])
+    let trimmed = type_name.trim();
+    matches!(
+        trimmed,
+        "dict"
+            | "Dict"
+            | "Mapping"
+            | "MutableMapping"
+            | "typing.Mapping"
+            | "typing.MutableMapping"
+            | "collections.abc.Mapping"
+            | "collections.abc.MutableMapping"
+    ) || starts_with_any(
+        trimmed,
+        &[
+            "dict[",
+            "Dict[",
+            "Mapping[",
+            "MutableMapping[",
+            "typing.Mapping[",
+            "typing.MutableMapping[",
+            "collections.abc.Mapping[",
+            "collections.abc.MutableMapping[",
+        ],
+    )
 }
 
 fn is_ts_mapping_type(type_name: &str, type_defs: &TsNamedTypes<'_>) -> bool {
     let effective = ts_effective_type(type_name, type_defs);
     let trimmed = effective.trim();
     trimmed.starts_with("Record<") || looks_like_ts_object_type(trimmed)
+}
+
+fn is_ts_query_parser_return_type(type_name: &str, type_defs: &TsNamedTypes<'_>) -> bool {
+    let effective = ts_effective_type(type_name, type_defs);
+    let trimmed = effective.trim();
+    matches!(trimmed, "unknown" | "any" | "object")
+        || trimmed.starts_with("Record<")
+        || looks_like_ts_object_type(trimmed)
 }
 
 fn is_boolean_like_ts_type(type_name: &str) -> bool {
@@ -1130,6 +1187,13 @@ fn infer_ts_contract(
     ret_type: &str,
     type_defs: &TsNamedTypes<'_>,
 ) -> Option<ContractKind> {
+    if !param_types.is_empty()
+        && param_types[0].trim() == "string"
+        && is_ts_query_parser_return_type(ret_type, type_defs)
+        && likely_query_string_semantics(&func.name)
+    {
+        return Some(ContractKind::QueryStringParser);
+    }
     if param_types.len() == 1 {
         let param_type = param_types[0].trim();
         let ret_type = ret_type.trim();
@@ -1197,8 +1261,7 @@ fn python_idempotency_check(
         && !param_type.is_empty()
         && !param_type.contains("None")
         && is_idempotent_candidate_type(param_type)
-        && (has_declared_property(func, "idempotent")
-            || (is_api_surface(func) && likely_idempotent(&func.name)))
+        && has_declared_property(func, "idempotent")
     {
         format!(
             "        _result2 = {name}(_result)\n        assert _nan_eq(_result, _result2), f\"Not idempotent: {{repr(_result)}} -> {{repr(_result2)}}\"",
@@ -1217,7 +1280,7 @@ fn python_consistency_check(func: &FunctionInfo, call_args: &[String]) -> String
     // Run the same input twice, verify same output
     let call = call_args.join(", ");
     format!(
-        "        _result_b = {name}({call})\n        assert _nan_eq(_result, _result_b), f\"Inconsistent: {{repr(_result)}} != {{repr(_result_b)}}\"",
+        "        _repeat_args = _copy.deepcopy(_args)\n        _result_b = _materialize_if_iterator({name}({call}))\n        assert _nan_eq(_result, _result_b), f\"Inconsistent: {{repr(_result)}} != {{repr(_result_b)}}\"",
         name = func.name,
     )
 }
@@ -1231,10 +1294,7 @@ fn python_boundedness_check(func: &FunctionInfo, params: &[&ParamInfo]) -> Strin
     let types_match = (param_type == "str" && ret_type == "str")
         || (starts_with_any(param_type, &["list", "List"])
             && starts_with_any(ret_type, &["list", "List"]));
-    if types_match
-        && (has_declared_property(func, "bounded")
-            || (is_api_surface(func) && likely_bounded(&func.name)))
-    {
+    if types_match && has_declared_property(func, "bounded") {
         "        assert len(_result) <= len(_args[0]), f\"Not bounded: len({repr(_result)}) > len({repr(_args[0])})\"".to_string()
     } else {
         String::new()
@@ -1243,10 +1303,7 @@ fn python_boundedness_check(func: &FunctionInfo, params: &[&ParamInfo]) -> Strin
 
 fn python_nonneg_check(func: &FunctionInfo) -> String {
     let ret_type = func.return_type.as_deref().unwrap_or("");
-    if (ret_type == "int" || ret_type == "float")
-        && (has_declared_property(func, "nonneg")
-            || (is_api_surface(func) && likely_nonneg(&func.name)))
-    {
+    if (ret_type == "int" || ret_type == "float") && has_declared_property(func, "nonneg") {
         "        assert _result >= 0, f\"Non-negative violation: {repr(_result)} < 0\"".to_string()
     } else {
         String::new()
@@ -1270,11 +1327,19 @@ fn python_sorted_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
 }
 
 fn python_permutation_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
-    if !has_declared_property(func, "permutation") || params.len() != 1 {
+    if !has_declared_property(func, "permutation") || params.is_empty() {
         return String::new();
     }
 
     "        if isinstance(_args[0], (list, tuple)) and isinstance(_result, (list, tuple)):\n            assert _multiset_counts(_result) == _multiset_counts(_args[0]), f\"Permutation violated: {repr(_result)} vs {repr(_args[0])}\"".to_string()
+}
+
+fn python_palindrome_check(func: &FunctionInfo) -> String {
+    if !has_declared_property(func, "palindrome") {
+        return String::new();
+    }
+
+    "        if isinstance(_result, (list, tuple, str)):\n            assert _is_palindrome_sequence(_result), f\"Palindrome violated: {repr(_result)}\"".to_string()
 }
 
 fn python_nullish_string_leak_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
@@ -1330,6 +1395,201 @@ except Exception as _e:
     )
 }
 
+fn python_pep440_version_ordering_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
+    if !has_declared_property(func, "pep440_version_ordering") || params.len() != 2 {
+        return String::new();
+    }
+    if !matches!(
+        func.return_type.as_deref().map(str::trim),
+        Some("int" | "float")
+    ) {
+        return String::new();
+    }
+    if !params
+        .iter()
+        .all(|param| matches!(param.type_annotation.as_deref().map(str::trim), Some("str")))
+    {
+        return String::new();
+    }
+
+    format!(
+        r#"try:
+    _pep440_label = "rc before final"
+    _pep440_cases = [
+        ("dev before alpha", "1.0.dev1", "1.0a1", -1),
+        ("alpha before beta", "1.0a1", "1.0b1", -1),
+        ("beta before rc", "1.0b1", "1.0rc1", -1),
+        ("rc before final", "1.0rc1", "1.0", -1),
+        ("final before post", "1.0", "1.0.post1", -1),
+        ("release segment numeric ordering", "1.2", "1.10", -1),
+        ("equivalent release forms", "1.0", "1.0.0", 0),
+    ]
+    for _pep440_label, _left, _right, _expected in _pep440_cases:
+        _actual = {name}(_left, _right)
+        assert _cmp_sign(_actual) == _cmp_sign(_expected), f"PEP 440 version ordering ({{_pep440_label}}): {{_actual!r}} != {{_expected!r}}"
+        _reverse = {name}(_right, _left)
+        assert _cmp_sign(_reverse) == -_cmp_sign(_expected), f"PEP 440 version ordering reverse ({{_pep440_label}}): {{_reverse!r}} != {{-_cmp_sign(_expected)!r}}"
+except Exception as _e:
+    if _is_crash(_e):
+        _crash += 1
+        _FUZZ_RESULTS.append({{"function": "{name}", "input": f"pep440 version ordering:{{_pep440_label}}",
+            "error_type": type(_e).__name__, "message": _clip_text(str(_e)),
+            "severity": "crash" if isinstance(_e, _CRASH_TYPES) else "property_violation"}})
+        if _crash == 1:
+            print(f"  CRASH {name}(pep440 version ordering): {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
+"#,
+        name = func.name,
+    )
+}
+
+fn python_pep440_specifier_membership_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
+    if !has_declared_property(func, "pep440_specifier_membership") || params.len() != 2 {
+        return String::new();
+    }
+    if !matches!(func.return_type.as_deref().map(str::trim), Some("bool")) {
+        return String::new();
+    }
+    if !params
+        .iter()
+        .all(|param| matches!(param.type_annotation.as_deref().map(str::trim), Some("str")))
+    {
+        return String::new();
+    }
+
+    format!(
+        r#"try:
+    _specifier_label = "prerelease excluded by default"
+    _specifier_cases = [
+        ("inclusive lower bound", "1.0", ">=1.0", True),
+        ("exclusive upper bound", "2.0.0", "<2.0", False),
+        ("compatible includes patch", "1.4.5", "~=1.4", True),
+        ("compatible excludes next minor", "1.5.0", "~=1.4.5", False),
+        ("prerelease excluded by default", "1.0a1", ">=1.0", False),
+    ]
+    for _specifier_label, _version, _specifier, _expected in _specifier_cases:
+        _actual = bool({name}(_version, _specifier))
+        assert _actual is _expected, f"PEP 440 specifier membership ({{_specifier_label}}): {{_actual!r}} != {{_expected!r}}"
+except Exception as _e:
+    if _is_crash(_e):
+        _crash += 1
+        _FUZZ_RESULTS.append({{"function": "{name}", "input": f"pep440 specifier membership:{{_specifier_label}}",
+            "error_type": type(_e).__name__, "message": _clip_text(str(_e)),
+            "severity": "crash" if isinstance(_e, _CRASH_TYPES) else "property_violation"}})
+        if _crash == 1:
+            print(f"  CRASH {name}(pep440 specifier membership): {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
+"#,
+        name = func.name,
+    )
+}
+
+fn python_pep440_filter_prerelease_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
+    if !has_declared_property(func, "pep440_filter_prerelease") || params.len() != 2 {
+        return String::new();
+    }
+    if !matches!(
+        func.return_type.as_deref().map(str::trim),
+        Some("list[str]" | "List[str]")
+    ) {
+        return String::new();
+    }
+    let first_type = params[0].type_annotation.as_deref().unwrap_or("").trim();
+    let second_type = params[1].type_annotation.as_deref().unwrap_or("").trim();
+    if !matches!(first_type, "list[str]" | "List[str]") || second_type != "str" {
+        return String::new();
+    }
+
+    format!(
+        r#"try:
+    _filter_label = "prerelease-only fallback"
+    _filter_cases = [
+        ("stable lower bound", ["1.2", "1.3"], ">=1.3", ["1.3"]),
+        ("prerelease-only fallback", ["1.2", "1.5a1"], ">=1.5", ["1.5a1"]),
+        ("empty specifier preserves prerelease-only input", ["1.0a1"], "", ["1.0a1"]),
+        ("stable match suppresses prerelease fallback", ["1.5a1", "1.5"], ">=1.5", ["1.5"]),
+    ]
+    for _filter_label, _candidates, _specifier, _expected in _filter_cases:
+        _actual = _materialize_if_iterator({name}(_copy.deepcopy(_candidates), _specifier))
+        assert _actual == _expected, f"PEP 440 prerelease filter ({{_filter_label}}): {{_actual!r}} != {{_expected!r}}"
+except Exception as _e:
+    if _is_crash(_e):
+        _crash += 1
+        _FUZZ_RESULTS.append({{"function": "{name}", "input": f"pep440 filter prerelease:{{_filter_label}}",
+            "error_type": type(_e).__name__, "message": _clip_text(str(_e)),
+            "severity": "crash" if isinstance(_e, _CRASH_TYPES) else "property_violation"}})
+        if _crash == 1:
+            print(f"  CRASH {name}(pep440 filter prerelease): {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
+"#,
+        name = func.name,
+    )
+}
+
+fn python_cookie_value_quote_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
+    if !has_declared_property(func, "cookie_value_quote") || params.len() != 1 {
+        return String::new();
+    }
+    let param_type = params[0].type_annotation.as_deref().unwrap_or("").trim();
+    if param_type != "str" || !matches!(func.return_type.as_deref().map(str::trim), Some("str")) {
+        return String::new();
+    }
+
+    format!(
+        r#"try:
+    _cookie_value_label = "already quoted value round-trips"
+    _cookie_value_cases = [
+        ("already quoted value round-trips", '"two words"', '"two words"'),
+        ("unquoted value is trimmed", "  dark  ", "dark"),
+    ]
+    for _cookie_value_label, _cookie_value, _expected in _cookie_value_cases:
+        _actual = {name}(_cookie_value)
+        assert _actual == _expected, f"Cookie value quoting ({{_cookie_value_label}}): {{_actual!r}} != {{_expected!r}}"
+except Exception as _e:
+    if _is_crash(_e):
+        _crash += 1
+        _FUZZ_RESULTS.append({{"function": "{name}", "input": f"cookie value quote:{{_cookie_value_label}}",
+            "error_type": type(_e).__name__, "message": _clip_text(str(_e)),
+            "severity": "crash" if isinstance(_e, _CRASH_TYPES) else "property_violation"}})
+        if _crash == 1:
+            print(f"  CRASH {name}(cookie value quote): {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
+"#,
+        name = func.name,
+    )
+}
+
+fn python_cookie_header_quote_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
+    if !has_declared_property(func, "cookie_header_quote") || params.len() != 1 {
+        return String::new();
+    }
+    let param_type = params[0].type_annotation.as_deref().unwrap_or("").trim();
+    if !is_python_mapping_type(param_type)
+        || !matches!(func.return_type.as_deref().map(str::trim), Some("str"))
+    {
+        return String::new();
+    }
+
+    format!(
+        r#"try:
+    _cookie_header_label = "quoted value round-trips"
+    _cookie_header_cases = [
+        ("quoted value round-trips", {{"session": '"two words"'}}, 'session="two words"'),
+        ("separator value is quoted", {{"token": "a,b"}}, 'token="a,b"'),
+        ("none values are skipped", {{"theme": "dark", "empty": None}}, "theme=dark"),
+    ]
+    for _cookie_header_label, _cookies, _expected in _cookie_header_cases:
+        _actual = {name}(_copy.deepcopy(_cookies))
+        assert _actual == _expected, f"Cookie header quoting ({{_cookie_header_label}}): {{_actual!r}} != {{_expected!r}}"
+except Exception as _e:
+    if _is_crash(_e):
+        _crash += 1
+        _FUZZ_RESULTS.append({{"function": "{name}", "input": f"cookie header quote:{{_cookie_header_label}}",
+            "error_type": type(_e).__name__, "message": _clip_text(str(_e)),
+            "severity": "crash" if isinstance(_e, _CRASH_TYPES) else "property_violation"}})
+        if _crash == 1:
+            print(f"  CRASH {name}(cookie header quote): {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
+"#,
+        name = func.name,
+    )
+}
+
 fn python_comparator_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
     if infer_python_contract(func, params) == Some(ContractKind::Comparator)
         || has_declared_property(func, "antisymmetric")
@@ -1349,11 +1609,7 @@ fn python_symmetry_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
     }
     let t0 = params[0].type_annotation.as_deref().unwrap_or("");
     let t1 = params[1].type_annotation.as_deref().unwrap_or("");
-    if t0 == t1
-        && !t0.is_empty()
-        && (has_declared_property(func, "symmetric")
-            || (is_api_surface(func) && likely_symmetric(&func.name)))
-    {
+    if t0 == t1 && !t0.is_empty() && has_declared_property(func, "symmetric") {
         format!(
             "        _result_sym = {name}(_args[1], _args[0])\n        assert _nan_eq(_result, _result_sym), f\"Not symmetric: {{repr(_result)}} != {{repr(_result_sym)}}\"",
             name = func.name,
@@ -1366,6 +1622,7 @@ fn python_symmetry_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
 const PYTHON_FUZZ_PRELUDE: &str = r#"
 import random as _rng
 import json as _json
+import copy as _copy
 import unicodedata as _unicodedata
 from urllib.parse import parse_qsl as _parse_qsl
 _rng.seed(42)
@@ -1384,6 +1641,11 @@ def _clip_text(value, limit=_FUZZ_TEXT_LIMIT):
 
 def _short_repr(value, limit=_FUZZ_TEXT_LIMIT):
     return _clip_text(repr(value), limit)
+
+def _materialize_if_iterator(value):
+    if hasattr(value, "__next__"):
+        return list(value)
+    return value
 
 def _is_crash(e):
     """Distinguish intentional validation errors from real bugs."""
@@ -1425,6 +1687,40 @@ def _fuzz_str():
     return _rng.choice(pools)
 def _fuzz_any():
     return _rng.choice([_fuzz_int(), _fuzz_float(), _fuzz_str(), _fuzz_bool(), None, [], _fuzz_dict()])
+
+def _is_sorted_numeric_list(value):
+    return isinstance(value, list) and all(isinstance(item, (int, float)) and not isinstance(item, bool) for item in value) and value == sorted(value)
+
+def _fuzz_like_seed(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        return value
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return None
+    if isinstance(value, list):
+        if not value:
+            return []
+        if _is_sorted_numeric_list(value):
+            delta = _rng.choice([-1, 0, 1])
+            return [item + delta for item in value]
+        return [_fuzz_like_seed(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_fuzz_like_seed(item) for item in value)
+    if isinstance(value, dict):
+        return {key: _fuzz_like_seed(item) for key, item in value.items()}
+    return _copy.deepcopy(value)
+
+def _fuzz_seed_row(seed_rows):
+    row = _copy.deepcopy(_rng.choice(seed_rows))
+    if _rng.random() < 0.65:
+        return row
+    return [_fuzz_like_seed(item) for item in row]
+
 def _fuzz_dict():
     return _rng.choice([
         {},
@@ -1497,6 +1793,8 @@ def _edge_cases_for(type_name):
     return m.get(type_name, [])
 
 def _nan_eq(a, b):
+    a = _materialize_if_iterator(a)
+    b = _materialize_if_iterator(b)
     if isinstance(a, float) and isinstance(b, float):
         import math
         if math.isnan(a) and math.isnan(b): return True
@@ -1538,6 +1836,9 @@ def _multiset_counts(values):
         key = _json.dumps(value, sort_keys=True, ensure_ascii=False, default=repr)
         counts[key] = counts.get(key, 0) + 1
     return counts
+
+def _is_palindrome_sequence(value):
+    return isinstance(value, (list, tuple, str)) and list(value) == list(reversed(value))
 "#;
 
 const PYTHON_FUZZ_EPILOGUE: &str = r#"
@@ -1573,6 +1874,9 @@ fn synthesize_typescript(
             .filter(|p| !p.name.starts_with('*'))
             .collect();
         let has_nested = has_nested_children(func, &analysis.functions);
+        let has_seed_rows = seed_inputs
+            .get(&func.name)
+            .is_some_and(|rows| !rows.is_empty());
 
         if callable_params.is_empty()
             && !has_nested
@@ -1583,6 +1887,22 @@ fn synthesize_typescript(
                 FuzzFunctionStatus::SkippedNoFuzzableSurface,
                 Some(
                     "zero-argument function has no meaningful parameter surface or stable return contract to fuzz".into(),
+                ),
+            ));
+            continue;
+        }
+
+        if callable_params
+            .iter()
+            .any(|param| param.type_annotation.is_none())
+            && !has_seed_rows
+        {
+            coverage.push(coverage_entry(
+                func,
+                FuzzFunctionStatus::SkippedUnsupportedType,
+                Some(
+                    "one or more TypeScript parameters are untyped and no seed/domain examples were found"
+                        .into(),
                 ),
             ));
             continue;
@@ -1648,8 +1968,7 @@ fn synthesize_typescript(
             && !ret_type.contains("null")
             && !ret_type.contains("undefined")
             && is_idempotent_candidate_type(ret_type)
-            && (has_declared_property(func, "idempotent")
-                || (is_api_surface(func) && likely_idempotent(&func.name)))
+            && has_declared_property(func, "idempotent")
         {
             push_property("idempotent");
         }
@@ -1657,16 +1976,12 @@ fn synthesize_typescript(
         if callable_params.len() == 1
             && ((param_types[0].as_str() == "string" && ret_type == "string")
                 || (param_types[0].ends_with("[]") && ret_type.ends_with("[]")))
-            && (has_declared_property(func, "bounded")
-                || (is_api_surface(func) && likely_bounded(&func.name)))
+            && has_declared_property(func, "bounded")
         {
             push_property("bounded");
         }
         // Non-negativity: returns number, name suggests it
-        if ret_type == "number"
-            && (has_declared_property(func, "nonneg")
-                || (is_api_surface(func) && likely_nonneg(&func.name)))
-        {
+        if ret_type == "number" && has_declared_property(func, "nonneg") {
             push_property("nonneg");
         }
         // Non-empty strings: string-returning identifier/display helpers should
@@ -1698,8 +2013,7 @@ fn synthesize_typescript(
         if callable_params.len() == 2
             && !param_types[0].is_empty()
             && param_types[0] == param_types[1]
-            && (has_declared_property(func, "symmetric")
-                || (is_api_surface(func) && likely_symmetric(&func.name)))
+            && has_declared_property(func, "symmetric")
         {
             push_property("symmetric");
         }
@@ -1746,6 +2060,8 @@ fn synthesize_typescript(
 
         let query_string_semantic_check =
             ts_query_string_semantic_check(func, &param_types, ret_type, type_defs);
+        let query_string_parser_semantic_check =
+            ts_query_string_parser_semantic_check(func, &param_types, ret_type, type_defs);
         let defaults_semantic_check =
             ts_defaults_semantic_check(func, &param_types, ret_type, type_defs);
         let feature_flag_override_check =
@@ -1754,16 +2070,28 @@ fn synthesize_typescript(
             ts_semver_compare_semantic_check(func, &param_types, ret_type);
         let semver_caret_semantic_check =
             ts_semver_caret_semantic_check(func, &param_types, ret_type);
+        let same_value_zero_semantic_check =
+            ts_same_value_zero_semantic_check(func, &param_types, ret_type);
+        let request_metadata_semantic_check =
+            ts_http_request_metadata_semantic_check(func, &param_types);
+        let response_helpers_semantic_check =
+            ts_http_response_helpers_semantic_check(func, &param_types);
+        let static_file_semantic_check = ts_http_static_file_semantic_check(func, &param_types);
 
         code.push_str(&format!(
             r#"
 {{
   const _fuzzOk = _fuzzOne("{name}", {iters}, () => [{gen_list}], (args: unknown[]) => {call_expr}, {typecheck}, [{param_type_list}], [{properties_list}], [{seed_rows}]);
 {query_string_semantic_check}
+{query_string_parser_semantic_check}
 {defaults_semantic_check}
 {feature_flag_override_check}
 {semver_compare_semantic_check}
 {semver_caret_semantic_check}
+{same_value_zero_semantic_check}
+{request_metadata_semantic_check}
+{response_helpers_semantic_check}
+{static_file_semantic_check}
 }}
 "#,
             name = func.name,
@@ -1772,10 +2100,15 @@ fn synthesize_typescript(
             typecheck = ts_type_check_fn(ret_type),
             seed_rows = ts_seed_rows(func, seed_inputs),
             query_string_semantic_check = query_string_semantic_check,
+            query_string_parser_semantic_check = query_string_parser_semantic_check,
             defaults_semantic_check = defaults_semantic_check,
             feature_flag_override_check = feature_flag_override_check,
             semver_compare_semantic_check = semver_compare_semantic_check,
             semver_caret_semantic_check = semver_caret_semantic_check,
+            same_value_zero_semantic_check = same_value_zero_semantic_check,
+            request_metadata_semantic_check = request_metadata_semantic_check,
+            response_helpers_semantic_check = response_helpers_semantic_check,
+            static_file_semantic_check = static_file_semantic_check,
         ));
 
         any_synthesized = true;
@@ -1903,16 +2236,42 @@ fn synthesize_typescript_factory_exercise(
     code
 }
 
+fn ts_type_seen(stack: &[String], type_name: &str) -> bool {
+    stack.iter().any(|item| item == type_name)
+}
+
 fn ts_generator(type_ann: Option<&str>, type_defs: &TsNamedTypes<'_>) -> String {
+    ts_generator_with_stack(type_ann, type_defs, &mut Vec::new(), 0)
+}
+
+fn ts_generator_with_stack(
+    type_ann: Option<&str>,
+    type_defs: &TsNamedTypes<'_>,
+    stack: &mut Vec<String>,
+    depth: usize,
+) -> String {
     let t = match type_ann {
         Some(t) => t.trim(),
         // No type annotation: generate a mix of types instead of just undefined
         None => return "_fuzzAny()".to_string(),
     };
-    if let Some(resolved) = ts_resolve_alias_text(t, type_defs) {
-        return ts_generator(Some(&resolved), type_defs);
+    if depth >= TS_TYPE_RECURSION_LIMIT {
+        return "({})".into();
     }
-
+    if let Some(TsNamedTypeRef::Alias(alias)) = type_defs.get(t) {
+        if ts_type_seen(stack, t) {
+            return "({})".into();
+        }
+        stack.push(t.to_string());
+        let generated = ts_generator_with_stack(
+            Some(alias.type_annotation.as_str()),
+            type_defs,
+            stack,
+            depth + 1,
+        );
+        stack.pop();
+        return generated;
+    }
     match t {
         "number" => "_fuzzNum()".into(),
         "string" => "_fuzzStr()".into(),
@@ -1920,38 +2279,40 @@ fn ts_generator(type_ann: Option<&str>, type_defs: &TsNamedTypes<'_>) -> String 
         "any" | "unknown" => "_fuzzAny()".into(),
         _ if t.ends_with("[]") => {
             let inner = &t[..t.len() - 2];
-            let gen = ts_generator(Some(inner), type_defs);
+            let gen = ts_generator_with_stack(Some(inner), type_defs, stack, depth + 1);
             format!("Array.from({{length: _fuzzIntRange(0,5)}}, () => {gen})")
         }
         _ if t.starts_with("Array<") => {
             let inner = extract_generic_arg(t);
-            let gen = ts_generator(Some(&inner), type_defs);
+            let gen = ts_generator_with_stack(Some(&inner), type_defs, stack, depth + 1);
             format!("Array.from({{length: _fuzzIntRange(0,5)}}, () => {gen})")
         }
         _ if t.starts_with("ReadonlyArray<") => {
             let inner = extract_generic_arg(t);
-            let gen = ts_generator(Some(&inner), type_defs);
+            let gen = ts_generator_with_stack(Some(&inner), type_defs, stack, depth + 1);
             format!("Array.from({{length: _fuzzIntRange(0,5)}}, () => {gen})")
         }
         _ if t.starts_with("Set<") || t.starts_with("ReadonlySet<") => {
             let inner = extract_generic_arg(t);
-            let gen = ts_generator(Some(&inner), type_defs);
+            let gen = ts_generator_with_stack(Some(&inner), type_defs, stack, depth + 1);
             format!("new Set(Array.from({{length: _fuzzIntRange(0,5)}}, () => {gen}))")
         }
         _ if t.starts_with("Map<") || t.starts_with("ReadonlyMap<") => {
             let (key, value) = extract_two_generic_args(t);
-            let key_gen = ts_generator(Some(&key), type_defs);
-            let value_gen = ts_generator(Some(&value), type_defs);
+            let key_gen = ts_generator_with_stack(Some(&key), type_defs, stack, depth + 1);
+            let value_gen = ts_generator_with_stack(Some(&value), type_defs, stack, depth + 1);
             format!(
                 "new Map(Array.from({{length: _fuzzIntRange(0,3)}}, () => [{key_gen}, {value_gen}]))"
             )
         }
         _ if t.starts_with("Record<") => {
             let (_k, v) = extract_two_generic_args(t);
-            let vg = ts_generator(Some(&v), type_defs);
+            let vg = ts_generator_with_stack(Some(&v), type_defs, stack, depth + 1);
             format!("Object.fromEntries(Array.from({{length: _fuzzIntRange(0,3)}}, (_, i) => [`k${{i}}`, {vg}]))")
         }
-        _ if looks_like_ts_object_type(t) => ts_inline_object_generator(t, type_defs),
+        _ if looks_like_ts_object_type(t) => {
+            ts_inline_object_generator_with_stack(t, type_defs, stack, depth + 1)
+        }
         _ => {
             let union_branches = split_ts_top_level(t, '|');
             if union_branches.len() > 1 {
@@ -1969,7 +2330,7 @@ fn ts_generator(type_ann: Option<&str>, type_defs: &TsNamedTypes<'_>) -> String 
                 } else {
                     let mut gens: Vec<String> = branches
                         .iter()
-                        .map(|b| ts_generator(Some(b), type_defs))
+                        .map(|b| ts_generator_with_stack(Some(b), type_defs, stack, depth + 1))
                         .collect();
                     // Include null/undefined as a fuzzable branch if the type allows it
                     if has_null {
@@ -1985,10 +2346,12 @@ fn ts_generator(type_ann: Option<&str>, type_defs: &TsNamedTypes<'_>) -> String 
                         )
                     }
                 }
+            } else if let Some(literal) = ts_literal_expr(t) {
+                literal
             } else if t.contains(" & ") {
                 let intersection = split_ts_top_level(t, '&');
                 let first = intersection.first().map(|s| s.trim()).unwrap_or(t);
-                ts_generator(Some(first), type_defs)
+                ts_generator_with_stack(Some(first), type_defs, stack, depth + 1)
             } else if t.contains("=>") {
                 "(() => undefined)".into()
             } else if t == "Date" {
@@ -2023,22 +2386,28 @@ fn ts_generator(type_ann: Option<&str>, type_defs: &TsNamedTypes<'_>) -> String 
                 "new AbortController()".into()
             } else if t.starts_with("Promise<") {
                 let inner = extract_generic_arg(t);
-                let gen = ts_generator(Some(&inner), type_defs);
+                let gen = ts_generator_with_stack(Some(&inner), type_defs, stack, depth + 1);
                 format!("Promise.resolve({gen})")
             } else if t == "Promise" {
                 "Promise.resolve(_fuzzAny())".into()
             } else if let Some(class) = ts_class_def(t, type_defs) {
+                if ts_type_seen(stack, t) {
+                    return "({})".into();
+                }
                 if class.fields.is_empty() {
                     "({})".into()
                 } else {
+                    stack.push(t.to_string());
                     let props: Vec<String> = class
                         .fields
                         .iter()
                         .map(|f| {
-                            let field_gen = ts_field_generator(
+                            let field_gen = ts_field_generator_with_stack(
                                 f.name.as_str(),
                                 f.type_annotation.as_deref(),
                                 type_defs,
+                                stack,
+                                depth + 1,
                             );
                             let val = if f.optional {
                                 format!("_fuzzBool() ? null : {}", field_gen)
@@ -2048,6 +2417,7 @@ fn ts_generator(type_ann: Option<&str>, type_defs: &TsNamedTypes<'_>) -> String 
                             format!("{}: {}", f.name, val)
                         })
                         .collect();
+                    stack.pop();
                     format!("({{ {} }})", props.join(", "))
                 }
             } else if t.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
@@ -2071,6 +2441,10 @@ fn ts_params_are_fuzzable(
         return true;
     }
 
+    if ts_query_parser_params_are_fuzzable(func, params, type_defs) {
+        return true;
+    }
+
     if !is_api_surface(func) || !likely_defaults_semantics(&func.name) || params.is_empty() {
         return false;
     }
@@ -2085,13 +2459,66 @@ fn ts_params_are_fuzzable(
             .all(|param| ts_type_is_fuzzable(param.type_annotation.as_deref(), type_defs))
 }
 
+fn ts_query_parser_params_are_fuzzable(
+    func: &FunctionInfo,
+    params: &[&ParamInfo],
+    type_defs: &TsNamedTypes<'_>,
+) -> bool {
+    if params.is_empty()
+        || !likely_query_string_semantics(&func.name)
+        || !is_ts_query_parser_return_type(func.return_type.as_deref().unwrap_or(""), type_defs)
+    {
+        return false;
+    }
+    let first = params[0].type_annotation.as_deref().unwrap_or("").trim();
+    first == "string"
+        && params[1..].iter().all(|param| {
+            ts_type_is_fuzzable(param.type_annotation.as_deref(), type_defs)
+                || is_ts_parser_setting_type(param.type_annotation.as_deref())
+        })
+}
+
+fn is_ts_parser_setting_type(type_ann: Option<&str>) -> bool {
+    let Some(type_ann) = type_ann else {
+        return false;
+    };
+    let lower = type_ann.trim().to_lowercase();
+    lower.contains("setting")
+        || lower.contains("mode")
+        || lower.contains("option")
+        || lower.contains("boolean")
+}
+
 fn ts_type_is_fuzzable(type_ann: Option<&str>, type_defs: &TsNamedTypes<'_>) -> bool {
+    ts_type_is_fuzzable_with_stack(type_ann, type_defs, &mut Vec::new(), 0)
+}
+
+fn ts_type_is_fuzzable_with_stack(
+    type_ann: Option<&str>,
+    type_defs: &TsNamedTypes<'_>,
+    stack: &mut Vec<String>,
+    depth: usize,
+) -> bool {
     let t = match type_ann {
         Some(t) => t.trim(),
         None => return true,
     };
-    if let Some(resolved) = ts_resolve_alias_text(t, type_defs) {
-        return ts_type_is_fuzzable(Some(&resolved), type_defs);
+    if depth >= TS_TYPE_RECURSION_LIMIT {
+        return true;
+    }
+    if let Some(TsNamedTypeRef::Alias(alias)) = type_defs.get(t) {
+        if ts_type_seen(stack, t) {
+            return true;
+        }
+        stack.push(t.to_string());
+        let fuzzable = ts_type_is_fuzzable_with_stack(
+            Some(alias.type_annotation.as_str()),
+            type_defs,
+            stack,
+            depth + 1,
+        );
+        stack.pop();
+        return fuzzable;
     }
 
     match t {
@@ -2101,53 +2528,78 @@ fn ts_type_is_fuzzable(type_ann: Option<&str>, type_defs: &TsNamedTypes<'_>) -> 
         | "AbortController" | "Promise" => true,
         _ if t.ends_with("[]") => {
             let inner = &t[..t.len() - 2];
-            ts_type_is_fuzzable(Some(inner), type_defs)
+            ts_type_is_fuzzable_with_stack(Some(inner), type_defs, stack, depth + 1)
         }
         _ if t.starts_with("Array<") => {
             let inner = extract_generic_arg(t);
-            ts_type_is_fuzzable(Some(&inner), type_defs)
+            ts_type_is_fuzzable_with_stack(Some(&inner), type_defs, stack, depth + 1)
         }
         _ if t.starts_with("ReadonlyArray<") => {
             let inner = extract_generic_arg(t);
-            ts_type_is_fuzzable(Some(&inner), type_defs)
+            ts_type_is_fuzzable_with_stack(Some(&inner), type_defs, stack, depth + 1)
         }
         _ if t.starts_with("Set<") || t.starts_with("ReadonlySet<") => {
             let inner = extract_generic_arg(t);
-            ts_type_is_fuzzable(Some(&inner), type_defs)
+            ts_type_is_fuzzable_with_stack(Some(&inner), type_defs, stack, depth + 1)
         }
         _ if t.starts_with("Map<") || t.starts_with("ReadonlyMap<") => {
             let (key, value) = extract_two_generic_args(t);
-            ts_type_is_fuzzable(Some(&key), type_defs)
-                && ts_type_is_fuzzable(Some(&value), type_defs)
+            ts_type_is_fuzzable_with_stack(Some(&key), type_defs, stack, depth + 1)
+                && ts_type_is_fuzzable_with_stack(Some(&value), type_defs, stack, depth + 1)
         }
         _ if t.starts_with("Record<") => {
             let (k, v) = extract_two_generic_args(t);
-            ts_type_is_fuzzable(Some(&k), type_defs) && ts_type_is_fuzzable(Some(&v), type_defs)
+            ts_type_is_fuzzable_with_stack(Some(&k), type_defs, stack, depth + 1)
+                && ts_type_is_fuzzable_with_stack(Some(&v), type_defs, stack, depth + 1)
         }
-        _ if looks_like_ts_object_type(t) => extract_ts_object_type_fields_from_text(t)
-            .iter()
-            .all(|field| ts_type_is_fuzzable(field.type_annotation.as_deref(), type_defs)),
+        _ if looks_like_ts_object_type(t) => {
+            extract_ts_object_type_fields_from_text(t)
+                .iter()
+                .all(|field| {
+                    ts_type_is_fuzzable_with_stack(
+                        field.type_annotation.as_deref(),
+                        type_defs,
+                        stack,
+                        depth + 1,
+                    )
+                })
+        }
         _ => {
             let union_branches = split_ts_top_level(t, '|');
             if union_branches.len() > 1 {
                 union_branches.iter().all(|branch| {
                     matches!(branch.trim(), "null" | "undefined")
-                        || ts_type_is_fuzzable(Some(branch.trim()), type_defs)
+                        || ts_type_is_fuzzable_with_stack(
+                            Some(branch.trim()),
+                            type_defs,
+                            stack,
+                            depth + 1,
+                        )
                 })
             } else if t.contains(" & ") {
-                split_ts_top_level(t, '&')
-                    .iter()
-                    .all(|branch| ts_type_is_fuzzable(Some(branch.trim()), type_defs))
+                split_ts_top_level(t, '&').iter().all(|branch| {
+                    ts_type_is_fuzzable_with_stack(Some(branch.trim()), type_defs, stack, depth + 1)
+                })
             } else if t.contains("=>") {
                 true
             } else if t.starts_with("Promise<") {
                 let inner = extract_generic_arg(t);
-                ts_type_is_fuzzable(Some(&inner), type_defs)
+                ts_type_is_fuzzable_with_stack(Some(&inner), type_defs, stack, depth + 1)
             } else if let Some(class) = ts_class_def(t, type_defs) {
-                class
-                    .fields
-                    .iter()
-                    .all(|field| ts_type_is_fuzzable(field.type_annotation.as_deref(), type_defs))
+                if ts_type_seen(stack, t) {
+                    return true;
+                }
+                stack.push(t.to_string());
+                let fuzzable = class.fields.iter().all(|field| {
+                    ts_type_is_fuzzable_with_stack(
+                        field.type_annotation.as_deref(),
+                        type_defs,
+                        stack,
+                        depth + 1,
+                    )
+                });
+                stack.pop();
+                fuzzable
             } else {
                 !t.chars().next().is_some_and(|c| c.is_ascii_uppercase())
             }
@@ -2162,6 +2614,9 @@ fn ts_generator_for_param(
     index: usize,
     func: &FunctionInfo,
 ) -> String {
+    if contract == Some(ContractKind::QueryStringParser) && index > 0 {
+        return "\"extended\"".to_string();
+    }
     if contract == Some(ContractKind::Comparator)
         && is_semver_like_version_type(type_ann, type_defs)
     {
@@ -2200,16 +2655,36 @@ fn ts_query_string_semantic_check(
     {
         return String::new();
     }
-    let query_call = ts_call_with_args(func, &["_queryInput"]);
+    let query_args: Vec<&str> = if param_types.len() > 1 {
+        vec!["_queryInput", "\"extended\""]
+    } else {
+        vec!["_queryInput"]
+    };
+    let query_call = ts_call_with_args(func, &query_args);
+    let (initial_label, query_cases) = if has_query_nested_brackets_contract(func) {
+        (
+            "top-level repeated array",
+            r#"        ["top-level repeated array", { page: 2, tag: ["pro", "beta"] }, [["page", "2"], ["tag", "pro"], ["tag", "beta"]]],
+        ["deep object array", { filter: { city: "Paris", tags: ["pro", "beta"] } }, [["filter[city]", "Paris"], ["filter[tags][]", "pro"], ["filter[tags][]", "beta"]]],
+        ["empty string and nullish", { filter: { city: "", zip: null } }, [["filter[city]", ""]]],
+"#,
+        )
+    } else {
+        (
+            "tag/nullish",
+            r#"        ["tag/nullish", { tag: ["pro", null, " beta "] }, [["tag", "pro"], ["tag", "beta"]]],
+        ["blank scalar", { q: "  ", page: 2 }, [["page", "2"]]],
+        ["accent fold", { q: "naïve café" }, [["q", _asciiFold("naïve café")]]],
+"#,
+        )
+    };
 
     format!(
         r#"  if (_fuzzOk) {{
-    let _queryLabel = "tag/nullish";
+    let _queryLabel = "{initial_label}";
     try {{
       const _queryCases: Array<[string, Record<string, unknown>, Array<[string, string]>]> = [
-        ["tag/nullish", {{ tag: ["pro", null, " beta "] }}, [["tag", "pro"], ["tag", "beta"]]],
-        ["blank scalar", {{ q: "  ", page: 2 }}, [["page", "2"]]],
-        ["accent fold", {{ q: "naïve café" }}, [["q", _asciiFold("naïve café")]]],
+{query_cases}
       ];
       for (const [_label, _queryInput, _expectedPairs] of _queryCases) {{
         _queryLabel = _label;
@@ -2225,6 +2700,57 @@ fn ts_query_string_semantic_check(
         message: _clipText(_e instanceof Error ? _e.message : String(_e)),
         severity: "property_violation"}});
       console.log(`  CRASH {name}(query semantics): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
+      _fuzzTotalFailures++;
+    }}
+  }}
+"#,
+        name = func.name,
+        query_call = query_call,
+        initial_label = initial_label,
+        query_cases = query_cases,
+    )
+}
+
+fn ts_query_string_parser_semantic_check(
+    func: &FunctionInfo,
+    param_types: &[String],
+    ret_type: &str,
+    type_defs: &TsNamedTypes<'_>,
+) -> String {
+    if infer_ts_contract(func, param_types, ret_type, type_defs)
+        != Some(ContractKind::QueryStringParser)
+        || !has_query_nested_brackets_contract(func)
+    {
+        return String::new();
+    }
+    let query_args: Vec<&str> = if param_types.len() > 1 {
+        vec!["_queryInput", "\"extended\""]
+    } else {
+        vec!["_queryInput"]
+    };
+    let query_call = ts_call_with_args(func, &query_args);
+
+    format!(
+        r#"  if (_fuzzOk) {{
+    let _queryParseLabel = "repeated scalar";
+    try {{
+      const _queryParseCases: Array<[string, string, Record<string, unknown>]> = [
+        ["repeated scalar", "tag=pro&tag=beta", {{ tag: ["pro", "beta"] }}],
+        ["deep object array", "filter[city]=Paris&filter[tags][]=pro&filter[tags][]=beta", {{ filter: {{ city: "Paris", tags: ["pro", "beta"] }} }}],
+      ];
+      for (const [_label, _queryInput, _expectedObject] of _queryParseCases) {{
+        _queryParseLabel = _label;
+        const _queryParsed = {query_call};
+        if (!_nanSafeEq(_queryParsed, _expectedObject)) {{
+          throw new Error(`Query parse semantics (${{_label}}): ${{JSON.stringify(_queryParsed)}} !== ${{JSON.stringify(_expectedObject)}}`);
+        }}
+      }}
+    }} catch (_e: unknown) {{
+      _fuzzResults.push({{function: "{name}", input: `query parse semantics:${{_queryParseLabel}}`,
+        error_type: _e instanceof Error ? _e.constructor.name : "unknown",
+        message: _clipText(_e instanceof Error ? _e.message : String(_e)),
+        severity: "property_violation"}});
+      console.log(`  CRASH {name}(query parse semantics): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
       _fuzzTotalFailures++;
     }}
   }}
@@ -2458,6 +2984,218 @@ fn ts_semver_caret_semantic_check(
     )
 }
 
+fn ts_same_value_zero_semantic_check(
+    func: &FunctionInfo,
+    param_types: &[String],
+    ret_type: &str,
+) -> String {
+    if !has_same_value_zero_contract(func) || param_types.len() != 2 || ret_type.trim() != "boolean"
+    {
+        return String::new();
+    }
+    let same_value_call = ts_call_with_args(func, &["_left", "_right"]);
+    let reverse_call = ts_call_with_args(func, &["_right", "_left"]);
+
+    format!(
+        r#"  if (_fuzzOk) {{
+    let _sameValueLabel = "NaN equals NaN";
+    try {{
+      const _sameValueCases: Array<[string, unknown, unknown, boolean]> = [
+        ["NaN equals NaN", NaN, NaN, true],
+        ["zero sign ignored", 0, -0, true],
+        ["same scalar", "a", "a", true],
+        ["different scalar", "a", "b", false],
+      ];
+      for (const [_label, _left, _right, _expected] of _sameValueCases) {{
+        _sameValueLabel = _label;
+        const _actual = Boolean({same_value_call});
+        if (_actual !== _expected) {{
+          throw new Error(`SameValueZero semantics (${{_label}}): ${{JSON.stringify(_actual)}} !== ${{JSON.stringify(_expected)}}`);
+        }}
+        const _reverse = Boolean({reverse_call});
+        if (_reverse !== _actual) {{
+          throw new Error(`SameValueZero symmetry (${{_label}}): ${{JSON.stringify(_reverse)}} !== ${{JSON.stringify(_actual)}}`);
+        }}
+      }}
+    }} catch (_e: unknown) {{
+      _fuzzResults.push({{function: "{name}", input: `sameValueZero semantics:${{_sameValueLabel}}`,
+        error_type: _e instanceof Error ? _e.constructor.name : "unknown",
+        message: _clipText(_e instanceof Error ? _e.message : String(_e)),
+        severity: "property_violation"}});
+      console.log(`  CRASH {name}(sameValueZero semantics): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
+      _fuzzTotalFailures++;
+    }}
+  }}
+"#,
+        name = func.name,
+        same_value_call = same_value_call,
+        reverse_call = reverse_call,
+    )
+}
+
+fn ts_http_request_metadata_semantic_check(func: &FunctionInfo, param_types: &[String]) -> String {
+    if !has_http_request_metadata_contract(func) || param_types.is_empty() {
+        return String::new();
+    }
+    let first = param_types[0].to_lowercase();
+    if !first.contains("request") && !first.contains("req") {
+        return String::new();
+    }
+    let request_call = ts_call_with_args(func, &["_request"]);
+
+    format!(
+        r#"  if (_fuzzOk) {{
+    let _requestMetaLabel = "header lookup";
+    try {{
+      const _request: any = {{
+        method: "GET",
+        url: "/?user[name]=tj&user[roles][0]=admin",
+        headers: {{
+          Host: "example.test",
+          "X-Requested-With": "XMLHttpRequest",
+          "X-Forwarded-Proto": "https, http",
+        }},
+        app: {{ __settings: new Map<string, unknown>([["query parser", "extended"], ["trust proxy", true]]) }},
+      }};
+      {request_call};
+      if (typeof _request.get !== "function" || _request.get("host") !== "example.test") {{
+        throw new Error(`HTTP request metadata (${{_requestMetaLabel}}): host lookup failed`);
+      }}
+      _requestMetaLabel = "header alias and xhr";
+      if (typeof _request.header !== "function" || _request.header("x-requested-with") !== "XMLHttpRequest" || _request.xhr !== true) {{
+        throw new Error(`HTTP request metadata (${{_requestMetaLabel}}): ${{JSON.stringify({{ via: typeof _request.header === "function" ? _request.header("x-requested-with") : undefined, xhr: _request.xhr }})}}`);
+      }}
+      _requestMetaLabel = "trusted forwarded protocol";
+      if (_request.protocol !== "https" || _request.secure !== true) {{
+        throw new Error(`HTTP request metadata (${{_requestMetaLabel}}): ${{JSON.stringify({{ protocol: _request.protocol, secure: _request.secure }})}}`);
+      }}
+      _requestMetaLabel = "extended query decoration";
+      const _expectedQuery = {{ user: {{ name: "tj", roles: ["admin"] }} }};
+      if (!_nanSafeEq(_request.query, _expectedQuery)) {{
+        throw new Error(`HTTP request metadata (${{_requestMetaLabel}}): ${{JSON.stringify(_request.query)}} !== ${{JSON.stringify(_expectedQuery)}}`);
+      }}
+    }} catch (_e: unknown) {{
+      _fuzzResults.push({{function: "{name}", input: `http request metadata:${{_requestMetaLabel}}`,
+        error_type: _e instanceof Error ? _e.constructor.name : "unknown",
+        message: _clipText(_e instanceof Error ? _e.message : String(_e)),
+        severity: "property_violation"}});
+      console.log(`  CRASH {name}(http request metadata): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
+      _fuzzTotalFailures++;
+    }}
+  }}
+"#,
+        name = func.name,
+        request_call = request_call,
+    )
+}
+
+fn ts_http_response_helpers_semantic_check(func: &FunctionInfo, param_types: &[String]) -> String {
+    if !has_http_response_helpers_contract(func) || param_types.is_empty() {
+        return String::new();
+    }
+    let first = param_types[0].to_lowercase();
+    if !first.contains("response") && !first.contains("res") {
+        return String::new();
+    }
+    let args: Vec<&str> = if param_types.len() > 1 {
+        vec!["_response", "_request"]
+    } else {
+        vec!["_response"]
+    };
+    let response_call = ts_call_with_args(func, &args);
+
+    format!(
+        r#"  if (_fuzzOk) {{
+    let _responseHelperLabel = "location encodes spaces";
+    try {{
+      const _request: any = {{
+        method: "GET",
+        headers: {{ referer: "/from" }},
+      }};
+      const _response: any = {{}};
+      {response_call};
+      if (typeof _response.location !== "function" || typeof _response.getHeader !== "function") {{
+        throw new Error(`HTTP response helpers (${{_responseHelperLabel}}): response helper methods missing`);
+      }}
+      _response.location("/a path/with spaces");
+      if (_response.getHeader("Location") !== "/a%20path/with%20spaces") {{
+        throw new Error(`HTTP response helpers (${{_responseHelperLabel}}): ${{JSON.stringify(_response.getHeader("Location"))}}`);
+      }}
+      _responseHelperLabel = "vary merges case-insensitively";
+      _response.vary("Accept-Encoding");
+      _response.vary("accept-encoding, Accept");
+      if (_response.getHeader("Vary") !== "Accept-Encoding, Accept") {{
+        throw new Error(`HTTP response helpers (${{_responseHelperLabel}}): ${{JSON.stringify(_response.getHeader("Vary"))}}`);
+      }}
+      _responseHelperLabel = "sendStatus 204 empty body";
+      _response.sendStatus(204);
+      if (_response.statusCode !== 204 || String(_response.__body ?? "") !== "") {{
+        throw new Error(`HTTP response helpers (${{_responseHelperLabel}}): ${{JSON.stringify({{ statusCode: _response.statusCode, body: _response.__body }})}}`);
+      }}
+    }} catch (_e: unknown) {{
+      _fuzzResults.push({{function: "{name}", input: `http response helpers:${{_responseHelperLabel}}`,
+        error_type: _e instanceof Error ? _e.constructor.name : "unknown",
+        message: _clipText(_e instanceof Error ? _e.message : String(_e)),
+        severity: "property_violation"}});
+      console.log(`  CRASH {name}(http response helpers): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
+      _fuzzTotalFailures++;
+    }}
+  }}
+"#,
+        name = func.name,
+        response_call = response_call,
+    )
+}
+
+fn ts_http_static_file_semantic_check(func: &FunctionInfo, param_types: &[String]) -> String {
+    if !has_http_static_file_middleware_contract(func)
+        || param_types.is_empty()
+        || param_types[0].trim() != "string"
+    {
+        return String::new();
+    }
+    let factory_call = ts_call_with_args(func, &["_staticRoot"]);
+
+    format!(
+        r#"  if (_fuzzOk) {{
+    let _staticLabel = "serve known file";
+    try {{
+      const _staticRoot = `${{process.cwd()}}/static`;
+      const _handler = {factory_call};
+      if (typeof _handler !== "function") {{
+        throw new Error(`HTTP static file middleware (${{_staticLabel}}): factory did not return a handler`);
+      }}
+      let _nextCalled = false;
+      const _request: any = {{ method: "GET", url: "/hello.txt" }};
+      const _response: any = {{
+        statusCode: 200,
+        headersSent: false,
+        __headers: new Map<string, string>(),
+        setHeader(name: string, value: string) {{ this.__headers.set(name.toLowerCase(), value); }},
+        getHeader(name: string) {{ return this.__headers.get(name.toLowerCase()); }},
+        end(body?: unknown) {{ this.headersSent = true; this.__body = body ?? ""; }},
+        send(body?: unknown) {{ this.end(body ?? ""); return this; }},
+      }};
+      _handler(_request, _response, () => {{ _nextCalled = true; }});
+      const _body = String(_response.__body ?? "");
+      if (!_response.headersSent || _nextCalled || _body !== "hello world\n") {{
+        throw new Error(`HTTP static file middleware (${{_staticLabel}}): ${{JSON.stringify({{ headersSent: _response.headersSent, nextCalled: _nextCalled, body: _body }})}}`);
+      }}
+    }} catch (_e: unknown) {{
+      _fuzzResults.push({{function: "{name}", input: `http static file middleware:${{_staticLabel}}`,
+        error_type: _e instanceof Error ? _e.constructor.name : "unknown",
+        message: _clipText(_e instanceof Error ? _e.message : String(_e)),
+        severity: "property_violation"}});
+      console.log(`  CRASH {name}(http static file middleware): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
+      _fuzzTotalFailures++;
+    }}
+  }}
+"#,
+        name = func.name,
+        factory_call = factory_call,
+    )
+}
+
 fn is_semver_like_version_type(type_ann: Option<&str>, type_defs: &TsNamedTypes<'_>) -> bool {
     let resolved = match type_ann {
         Some(t) => ts_effective_type(t, type_defs),
@@ -2513,18 +3251,23 @@ fn is_semver_like_version_type(type_ann: Option<&str>, type_defs: &TsNamedTypes<
     has_major && has_minor && has_patch && has_prerelease && prerelease_type_ok
 }
 
-fn ts_field_generator(
+fn ts_field_generator_with_stack(
     field_name: &str,
     type_ann: Option<&str>,
     type_defs: &TsNamedTypes<'_>,
+    stack: &mut Vec<String>,
+    depth: usize,
 ) -> String {
+    if depth >= TS_TYPE_RECURSION_LIMIT {
+        return "({})".into();
+    }
     if is_semver_part_field(field_name, type_ann) {
         return "_fuzzSemverPart()".into();
     }
     if is_semver_prerelease_field(field_name, type_ann) {
         return "[null, [], [_fuzzSemverIdentifier()], [_fuzzSemverIdentifier(), _fuzzSemverIdentifier()]][_fuzzIntRange(0, 3)]".into();
     }
-    let base = ts_generator(type_ann, type_defs);
+    let base = ts_generator_with_stack(type_ann, type_defs, stack, depth + 1);
     let is_string_like = type_ann.map(|t| t.contains("string")).unwrap_or(false);
 
     if is_string_like && likely_nonempty_string(field_name) {
@@ -2556,7 +3299,15 @@ fn looks_like_ts_object_type(type_ann: &str) -> bool {
     trimmed.starts_with('{') && trimmed.ends_with('}')
 }
 
-fn ts_inline_object_generator(type_ann: &str, type_defs: &TsNamedTypes<'_>) -> String {
+fn ts_inline_object_generator_with_stack(
+    type_ann: &str,
+    type_defs: &TsNamedTypes<'_>,
+    stack: &mut Vec<String>,
+    depth: usize,
+) -> String {
+    if depth >= TS_TYPE_RECURSION_LIMIT {
+        return "({})".into();
+    }
     let fields = extract_ts_object_type_fields_from_text(type_ann);
     if fields.is_empty() {
         return "({})".into();
@@ -2565,10 +3316,12 @@ fn ts_inline_object_generator(type_ann: &str, type_defs: &TsNamedTypes<'_>) -> S
     let props: Vec<String> = fields
         .iter()
         .map(|field| {
-            let field_gen = ts_field_generator(
+            let field_gen = ts_field_generator_with_stack(
                 field.name.as_str(),
                 field.type_annotation.as_deref(),
                 type_defs,
+                stack,
+                depth + 1,
             );
             let val = if field.optional {
                 format!("_fuzzBool() ? null : {}", field_gen)
@@ -2866,6 +3619,44 @@ function _shortJson(value: unknown, limit = _FUZZ_TEXT_LIMIT): string {
   }
 }
 
+function _cloneSeed<T>(value: T): T {
+  if (typeof structuredClone === "function") {
+    return structuredClone(value);
+  }
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function _isSortedNumericArray(value: unknown): value is number[] {
+  return Array.isArray(value)
+    && value.every((item) => typeof item === "number" && !Number.isNaN(item))
+    && value.every((item, index) => index === 0 || value[index - 1] <= item);
+}
+
+function _fuzzLikeSeed(value: unknown): unknown {
+  if (typeof value === "boolean") return [value, !value][_fuzzIntRange(0, 1)];
+  if (typeof value === "number") return [value, value - 1, value + 1, 0, -0][_fuzzIntRange(0, 4)];
+  if (typeof value === "string") return [value, value.trim(), value.toUpperCase(), value.toLowerCase()][_fuzzIntRange(0, 3)];
+  if (value === null || value === undefined) return value;
+  if (Array.isArray(value)) {
+    if (value.length === 0) return [];
+    if (_isSortedNumericArray(value)) {
+      const delta = [-1, 0, 1][_fuzzIntRange(0, 2)];
+      return value.map((item) => item + delta);
+    }
+    return value.map(_fuzzLikeSeed);
+  }
+  if (typeof value === "object") {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, item]) => [key, _fuzzLikeSeed(item)]));
+  }
+  return _cloneSeed(value);
+}
+
+function _fuzzSeedRow(seedRows: unknown[][]): unknown[] {
+  const row = _cloneSeed(seedRows[_fuzzIntRange(0, seedRows.length - 1)]);
+  if (_fuzzRand() < 0.65) return row;
+  return row.map(_fuzzLikeSeed);
+}
+
 // Crash detection: real bugs vs intentional validation errors
 function _isMalformedUriError(e: unknown): boolean {
   return e instanceof URIError && /malformed uri|uri malformed/i.test(e.message);
@@ -2923,7 +3714,7 @@ function _fuzzOne(
     }
   }
   for (let i = 0; i < iters; i++) {
-    allInputs.push(genArgs());
+    allInputs.push(seedRows.length > 0 ? _fuzzSeedRow(seedRows) : genArgs());
   }
   for (const args of allInputs) {
     try {
@@ -3060,6 +3851,139 @@ fn starts_with_any(s: &str, prefixes: &[&str]) -> bool {
     prefixes.iter().any(|p| s.starts_with(p))
 }
 
+fn literal_choice_expr(choices: &[String], picker: &str) -> String {
+    if choices.is_empty() {
+        return "undefined".into();
+    }
+    if choices.len() == 1 {
+        return choices[0].clone();
+    }
+    format!(
+        "[{}][{}(0, {})]",
+        choices.join(", "),
+        picker,
+        choices.len() - 1
+    )
+}
+
+fn strip_quoted_literal(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let mut chars = trimmed.chars();
+    let quote = chars.next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    if !trimmed.ends_with(quote) || trimmed.len() < 2 {
+        return None;
+    }
+    let inner = &trimmed[quote.len_utf8()..trimmed.len() - quote.len_utf8()];
+    serde_json::to_string(inner).ok()
+}
+
+fn split_top_level_args(text: &str, separator: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for (idx, ch) in text.char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '{' | '[' | '<' | '(' => depth += 1,
+            '}' | ']' | '>' | ')' => depth -= 1,
+            _ if ch == separator && depth == 0 => {
+                let part = text[start..idx].trim();
+                if !part.is_empty() {
+                    parts.push(part);
+                }
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    let tail = text[start..].trim();
+    if !tail.is_empty() {
+        parts.push(tail);
+    }
+    parts
+}
+
+fn numeric_literal_expr(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed
+            .chars()
+            .any(|ch| !(ch.is_ascii_digit() || matches!(ch, '-' | '+' | '.' | '_')))
+    {
+        return None;
+    }
+    let normalized = trimmed.replace('_', "");
+    normalized.parse::<f64>().ok()?;
+    Some(normalized)
+}
+
+fn ts_literal_expr(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if let Some(quoted) = strip_quoted_literal(trimmed) {
+        return Some(quoted);
+    }
+    match trimmed {
+        "true" | "false" | "null" | "undefined" => Some(trimmed.to_string()),
+        _ => numeric_literal_expr(trimmed),
+    }
+}
+
+fn python_literal_expr(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if let Some(quoted) = strip_quoted_literal(trimmed) {
+        return Some(quoted);
+    }
+    match trimmed {
+        "True" => Some("True".into()),
+        "False" => Some("False".into()),
+        "None" => Some("None".into()),
+        _ => numeric_literal_expr(trimmed),
+    }
+}
+
+fn python_literal_choice_exprs(type_ann: &str) -> Option<Vec<String>> {
+    let trimmed = type_ann.trim();
+    if !starts_with_any(
+        trimmed,
+        &["Literal[", "typing.Literal[", "typing_extensions.Literal["],
+    ) {
+        return None;
+    }
+
+    let inner = extract_generic_arg(trimmed);
+    let choices: Vec<String> = split_top_level_args(&inner, ',')
+        .into_iter()
+        .filter_map(python_literal_expr)
+        .collect();
+    if choices.is_empty() {
+        None
+    } else {
+        Some(choices)
+    }
+}
+
 fn extract_generic_arg(t: &str) -> String {
     let start = match t.find('[').or_else(|| t.find('<')) {
         Some(i) => i,
@@ -3141,6 +4065,9 @@ fn ts_edge_type_name(type_ann: Option<&str>, type_defs: &TsNamedTypes<'_>) -> &'
     if let Some(resolved) = ts_resolve_alias_text(t, type_defs) {
         return ts_edge_type_name(Some(&resolved), type_defs);
     }
+    if ts_type_contains_literal_domain(t, type_defs) {
+        return "";
+    }
 
     match Some(t) {
         Some("number") => "number",
@@ -3152,6 +4079,78 @@ fn ts_edge_type_name(type_ann: Option<&str>, type_defs: &TsNamedTypes<'_>) -> &'
         Some(t) if ts_class_def(t, type_defs).is_some() => "object",
         _ => "",
     }
+}
+
+fn ts_type_contains_literal_domain(type_ann: &str, type_defs: &TsNamedTypes<'_>) -> bool {
+    fn inner(
+        type_ann: &str,
+        type_defs: &TsNamedTypes<'_>,
+        stack: &mut Vec<String>,
+        depth: usize,
+    ) -> bool {
+        if depth >= TS_TYPE_RECURSION_LIMIT {
+            return false;
+        }
+        let trimmed = type_ann.trim();
+        if let Some(TsNamedTypeRef::Alias(alias)) = type_defs.get(trimmed) {
+            if ts_type_seen(stack, trimmed) {
+                return false;
+            }
+            stack.push(trimmed.to_string());
+            let contains = inner(&alias.type_annotation, type_defs, stack, depth + 1);
+            stack.pop();
+            return contains;
+        }
+
+        let union_branches = split_ts_top_level(trimmed, '|');
+        if union_branches.len() > 1 {
+            return union_branches.iter().any(|branch| {
+                let branch = branch.trim();
+                !matches!(branch, "null" | "undefined")
+                    && (ts_literal_expr(branch).is_some()
+                        || inner(branch, type_defs, stack, depth + 1))
+            });
+        }
+
+        if ts_literal_expr(trimmed).is_some() && !matches!(trimmed, "null" | "undefined") {
+            return true;
+        }
+        if trimmed.ends_with("[]") {
+            let inner_type = trimmed.trim_end_matches("[]").trim();
+            return inner(inner_type, type_defs, stack, depth + 1);
+        }
+        if trimmed.starts_with("Array<") || trimmed.starts_with("ReadonlyArray<") {
+            let inner_type = extract_generic_arg(trimmed);
+            return inner(&inner_type, type_defs, stack, depth + 1);
+        }
+        if looks_like_ts_object_type(trimmed) {
+            return extract_ts_object_type_fields_from_text(trimmed)
+                .iter()
+                .any(|field| {
+                    field
+                        .type_annotation
+                        .as_deref()
+                        .is_some_and(|field_type| inner(field_type, type_defs, stack, depth + 1))
+                });
+        }
+        if let Some(class) = ts_class_def(trimmed, type_defs) {
+            if ts_type_seen(stack, trimmed) {
+                return false;
+            }
+            stack.push(trimmed.to_string());
+            let contains = class.fields.iter().any(|field| {
+                field
+                    .type_annotation
+                    .as_deref()
+                    .is_some_and(|field_type| inner(field_type, type_defs, stack, depth + 1))
+            });
+            stack.pop();
+            return contains;
+        }
+        false
+    }
+
+    inner(type_ann, type_defs, &mut vec![], 0)
 }
 
 fn is_string_array_like_type(type_ann: &str) -> bool {

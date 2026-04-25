@@ -1,0 +1,16 @@
+{
+  "id": "external-heldout-synth-guardrail-v2",
+  "title": "External held-out synth guardrail v2",
+  "goal": "Fresh non-Terminal-Bench upstream-derived tasks held out from the saturated v1 synth guardrail. This set emphasizes task-level gold-patch replay so buggy recall and fixed-code false positives can both be measured.",
+  "suite_kind": "external_held_out_synth_guardrail",
+  "task_ids": [
+    "ts-express-fresh-body-parsers-v2",
+    "ts-express-fresh-request-meta-v2",
+    "ts-express-fresh-response-headers-v2",
+    "ts-express-fresh-static-file-v2",
+    "ts-express-fresh-urlencoded-v2",
+    "ts-qs-parse-nested-brackets",
+    "ts-qs-stringify-empty-values",
+    "ts-qs-stringify-nested-nullish"
+  ]
+}

@@ -1,0 +1,42 @@
+{
+  "id": "py-literal-list-element-v3",
+  "title": "Python list Literal element branch is exercised from the signature",
+  "repo_fixture": "mini_py_literal_domain_service",
+  "prompt": "Fix count_billable_actions so every Literal action inside the list element type is handled.",
+  "language": "python",
+  "bucket": "signature_domain_fresh",
+  "verify_paths": [
+    "workflow.py"
+  ],
+  "gold_patch_path": "gold/workflow_literal_domain_fix.patch",
+  "gold_changed_files": [
+    "workflow.py"
+  ],
+  "expected_files": [
+    "workflow.py"
+  ],
+  "family": "signature_domain",
+  "bug_class": "missing_literal_branch",
+  "bug_surface": "type_signature",
+  "difficulty": "medium",
+  "golden_patch_description": "Handle the delete literal branch declared inside the list element type.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": false,
+  "cross_file": false,
+  "upstream_benchmark": "synthetic_external_guardrail",
+  "upstream_instance_id": "py-literal-list-element-v3",
+  "instance_notes": "Fresh v3 guardrail task for nested Python typing.Literal domains.",
+  "tags": [
+    "python",
+    "signature_domain",
+    "literal",
+    "collection_element",
+    "fresh_guardrail"
+  ]
+}

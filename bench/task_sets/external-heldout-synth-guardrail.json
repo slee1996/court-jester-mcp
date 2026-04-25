@@ -1,0 +1,17 @@
+{
+  "id": "external-heldout-synth-guardrail",
+  "title": "External held-out synth guardrail",
+  "goal": "Non-Terminal-Bench upstream-derived tasks used to check that synth improvements generalize beyond QuixBugs-shaped fixtures.",
+  "suite_kind": "external_held_out_synth_guardrail",
+  "task_ids": [
+    "py-swebench-lite-cookiejar-quoted",
+    "py-packaging-version-ordering",
+    "py-packaging-specifier-prerelease-membership",
+    "py-packaging-filter-prerelease-fallback",
+    "ts-semver-max-satisfying-caret-prerelease",
+    "ts-qs-parse-deep-collections",
+    "ts-qs-stringify-deep-collections",
+    "ts-lodash-array-slice-1",
+    "ts-lodash-object-slice-1"
+  ]
+}

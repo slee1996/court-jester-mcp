@@ -1,0 +1,41 @@
+{
+  "id": "py-literal-param-status-v3",
+  "title": "Python Literal parameter branch is exercised from the signature",
+  "repo_fixture": "mini_py_literal_domain_service",
+  "prompt": "Fix status_label so every Literal status in its signature is handled.",
+  "language": "python",
+  "bucket": "signature_domain_fresh",
+  "verify_paths": [
+    "status.py"
+  ],
+  "gold_patch_path": "gold/status_literal_domain_fix.patch",
+  "gold_changed_files": [
+    "status.py"
+  ],
+  "expected_files": [
+    "status.py"
+  ],
+  "family": "signature_domain",
+  "bug_class": "missing_literal_branch",
+  "bug_surface": "type_signature",
+  "difficulty": "medium",
+  "golden_patch_description": "Handle the published literal branch declared by the function signature.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": false,
+  "cross_file": false,
+  "upstream_benchmark": "synthetic_external_guardrail",
+  "upstream_instance_id": "py-literal-param-status-v3",
+  "instance_notes": "Fresh v3 guardrail task for Python typing.Literal input domains.",
+  "tags": [
+    "python",
+    "signature_domain",
+    "literal",
+    "fresh_guardrail"
+  ]
+}

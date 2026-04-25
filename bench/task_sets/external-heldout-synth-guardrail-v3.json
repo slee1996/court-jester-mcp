@@ -1,0 +1,12 @@
+{
+  "id": "external-heldout-synth-guardrail-v3",
+  "title": "External held-out synth guardrail v3",
+  "goal": "Fresh non-Terminal-Bench tasks for signature-derived input domains. This set avoids framework-specific contract packs and checks whether synth walks type signatures deeply enough to exercise literal branches.",
+  "suite_kind": "external_held_out_synth_guardrail",
+  "task_ids": [
+    "ts-literal-union-param-method-v3",
+    "ts-literal-object-field-v3",
+    "py-literal-param-status-v3",
+    "py-literal-list-element-v3"
+  ]
+}

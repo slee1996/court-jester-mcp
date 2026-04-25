@@ -1,0 +1,7 @@
+--- a/billing.ts
++++ b/billing.ts
+@@ -3,3 +3,4 @@
+ const DAYS: Partial<Record<BillingCycle, number>> = {
+   [BillingCycle.Monthly]: 30,
++  [BillingCycle.Annual]: 365,
+ };

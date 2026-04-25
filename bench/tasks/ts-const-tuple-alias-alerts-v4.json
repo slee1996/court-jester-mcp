@@ -1,0 +1,42 @@
+{
+  "id": "ts-const-tuple-alias-alerts-v4",
+  "title": "TypeScript const tuple alias branch is exercised from local source context",
+  "repo_fixture": "mini_ts_closed_domain_service",
+  "prompt": "Fix alertSeverity so every AlertLevel derived from ALERT_LEVELS is handled.",
+  "language": "typescript",
+  "bucket": "signature_domain_fresh_v4",
+  "verify_paths": [
+    "alerts.ts"
+  ],
+  "gold_patch_path": "gold/alerts_const_tuple_domain_fix.patch",
+  "gold_changed_files": [
+    "alerts.ts"
+  ],
+  "expected_files": [
+    "alerts.ts"
+  ],
+  "family": "signature_domain",
+  "bug_class": "missing_closed_domain_branch",
+  "bug_surface": "const_tuple_type_alias",
+  "difficulty": "medium",
+  "golden_patch_description": "Handle the critical branch declared by ALERT_LEVELS.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": true,
+  "uses_relative_imports": false,
+  "cross_file": false,
+  "upstream_benchmark": "synthetic_external_guardrail",
+  "upstream_instance_id": "ts-const-tuple-alias-alerts-v4",
+  "instance_notes": "Fresh v4 guardrail task for const tuple-derived input domains.",
+  "tags": [
+    "typescript",
+    "signature_domain",
+    "as_const",
+    "type_alias",
+    "fresh_guardrail"
+  ]
+}

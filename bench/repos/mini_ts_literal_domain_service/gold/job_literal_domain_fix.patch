@@ -1,0 +1,7 @@
+--- a/job.ts
++++ b/job.ts
+@@ -5,3 +5,4 @@
+ const QUEUE_NAMES: Partial<Record<QueueJob["kind"], string>> = {
+   email: "email",
++  digest: "digest",
+ };

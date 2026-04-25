@@ -1,0 +1,41 @@
+{
+  "id": "ts-literal-union-param-method-v3",
+  "title": "TypeScript literal union method branch is exercised from the signature",
+  "repo_fixture": "mini_ts_literal_domain_service",
+  "prompt": "Fix methodAllowsBody so every HttpMethod literal in its signature is handled.",
+  "language": "typescript",
+  "bucket": "signature_domain_fresh",
+  "verify_paths": [
+    "method.ts"
+  ],
+  "gold_patch_path": "gold/method_literal_domain_fix.patch",
+  "gold_changed_files": [
+    "method.ts"
+  ],
+  "expected_files": [
+    "method.ts"
+  ],
+  "family": "signature_domain",
+  "bug_class": "missing_literal_branch",
+  "bug_surface": "type_signature",
+  "difficulty": "medium",
+  "golden_patch_description": "Handle the PATCH literal branch declared by HttpMethod.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": false,
+  "uses_relative_imports": false,
+  "cross_file": false,
+  "upstream_benchmark": "synthetic_external_guardrail",
+  "upstream_instance_id": "ts-literal-union-param-method-v3",
+  "instance_notes": "Fresh v3 guardrail task for signature-derived literal domains, not tests or domain-specific contract packs.",
+  "tags": [
+    "typescript",
+    "signature_domain",
+    "literal_union",
+    "fresh_guardrail"
+  ]
+}

@@ -61,6 +61,7 @@ pub fn analyze(code: &str, language: &Language) -> AnalysisResult {
                 0,
             );
             mark_typescript_explicit_exports(&root, bytes, &mut functions);
+            apply_typescript_const_tuple_alias_domains(&root, bytes, &mut aliases);
         }
     }
 
@@ -112,6 +113,31 @@ fn normalize_declared_property(token: &str) -> Option<&'static str> {
         "antisymmetric" | "comparator" => Some("antisymmetric"),
         "bounded" => Some("bounded"),
         "no_nullish_string" => Some("no_nullish_string"),
+        "palindrome" | "palindrome_sequence" => Some("palindrome"),
+        "query_nested_brackets" | "nested_query_brackets" | "query_bracket_notation" => {
+            Some("query_nested_brackets")
+        }
+        "same_value_zero" | "samevaluezero" | "same-value-zero" => Some("same_value_zero"),
+        "pep440_version_ordering" | "pep440_ordering" | "pep_440_ordering" => {
+            Some("pep440_version_ordering")
+        }
+        "pep440_specifier_membership" | "pep440_specifier" | "pep_440_specifier" => {
+            Some("pep440_specifier_membership")
+        }
+        "pep440_filter_prerelease" | "pep440_prerelease_fallback" => {
+            Some("pep440_filter_prerelease")
+        }
+        "cookie_value_quote" | "cookie_quote_value" => Some("cookie_value_quote"),
+        "cookie_header_quote" | "cookie_header_quoting" => Some("cookie_header_quote"),
+        "http_request_metadata" | "request_metadata" | "request_decoration" => {
+            Some("http_request_metadata")
+        }
+        "http_response_helpers" | "response_helpers" | "response_header_helpers" => {
+            Some("http_response_helpers")
+        }
+        "http_static_file_middleware" | "static_file_middleware" | "static_serving" => {
+            Some("http_static_file_middleware")
+        }
         _ => None,
     }
 }
@@ -883,12 +909,7 @@ fn visit_typescript(
                         .map(|n| text(&n, source).to_string())
                         .unwrap_or_default();
                     if !base_name.is_empty() {
-                        collect_exported_container_callables(
-                            &base_name,
-                            &value,
-                            source,
-                            functions,
-                        );
+                        collect_exported_container_callables(&base_name, &value, source, functions);
                     }
                 }
             }
@@ -947,6 +968,11 @@ fn visit_typescript(
                 }
             }
         }
+        "enum_declaration" => {
+            if let Some(alias) = parse_typescript_enum_alias(node, source) {
+                aliases.push(alias);
+            }
+        }
         "import_statement" => {
             imports.push(ImportInfo {
                 statement: text(node, source).to_string(),
@@ -968,6 +994,268 @@ fn visit_typescript(
             child_depth,
         );
     }
+}
+
+fn parse_typescript_enum_alias(node: &tree_sitter::Node, source: &[u8]) -> Option<TypeAliasInfo> {
+    let raw = text(node, source);
+    let enum_idx = raw.find("enum")?;
+    let rest = raw[enum_idx + "enum".len()..].trim_start();
+    let name = rest
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '$'))
+        .next()
+        .unwrap_or("")
+        .trim();
+    if name.is_empty() {
+        return None;
+    }
+
+    let body_start = raw.find('{')?;
+    let body_end = raw.rfind('}')?;
+    if body_end <= body_start {
+        return None;
+    }
+    let body = &raw[body_start + 1..body_end];
+    let mut literals = Vec::new();
+    let mut next_numeric = 0i64;
+    for member in split_typescript_top_level_commas(body) {
+        let member = member.trim();
+        if member.is_empty() {
+            continue;
+        }
+        let literal = if let Some((_, initializer)) = member.split_once('=') {
+            let initializer = initializer.trim();
+            let literal = typescript_literal_expr(initializer)?;
+            if let Ok(value) = literal.parse::<i64>() {
+                next_numeric = value.saturating_add(1);
+            } else {
+                next_numeric = next_numeric.saturating_add(1);
+            }
+            literal
+        } else {
+            let literal = next_numeric.to_string();
+            next_numeric = next_numeric.saturating_add(1);
+            literal
+        };
+        literals.push(literal);
+    }
+    if literals.is_empty() {
+        return None;
+    }
+
+    Some(TypeAliasInfo {
+        name: name.to_string(),
+        type_annotation: literals.join(" | "),
+        line: node.start_position().row + 1,
+    })
+}
+
+fn apply_typescript_const_tuple_alias_domains(
+    root: &tree_sitter::Node,
+    source: &[u8],
+    aliases: &mut [TypeAliasInfo],
+) {
+    let domains = collect_typescript_const_tuple_domains(root, source);
+    if domains.is_empty() {
+        return;
+    }
+
+    for alias in aliases {
+        let Some(tuple_name) = typescript_typeof_tuple_name(&alias.type_annotation) else {
+            continue;
+        };
+        if let Some(domain) = domains.get(tuple_name.as_str()) {
+            alias.type_annotation = domain.clone();
+        }
+    }
+}
+
+fn collect_typescript_const_tuple_domains(
+    root: &tree_sitter::Node,
+    source: &[u8],
+) -> HashMap<String, String> {
+    fn visit(node: &tree_sitter::Node, source: &[u8], domains: &mut HashMap<String, String>) {
+        if node.kind() == "variable_declarator" {
+            if let (Some(name), Some(value)) = (
+                node.child_by_field_name("name"),
+                node.child_by_field_name("value"),
+            ) {
+                let name = text(&name, source).trim();
+                let value = text(&value, source);
+                if let Some(domain) = parse_typescript_const_tuple_domain(value) {
+                    domains.insert(name.to_string(), domain);
+                }
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            visit(&child, source, domains);
+        }
+    }
+
+    let mut domains = HashMap::new();
+    visit(root, source, &mut domains);
+    domains
+}
+
+fn parse_typescript_const_tuple_domain(value: &str) -> Option<String> {
+    if !value.contains("as const") {
+        return None;
+    }
+    let start = value.find('[')?;
+    let end = matching_bracket_index(value, start, '[', ']')?;
+    let inner = &value[start + 1..end];
+    let literals: Vec<String> = split_typescript_top_level_commas(inner)
+        .into_iter()
+        .filter_map(|item| typescript_literal_expr(item.trim()))
+        .collect();
+    if literals.is_empty() {
+        None
+    } else {
+        Some(literals.join(" | "))
+    }
+}
+
+fn typescript_typeof_tuple_name(type_annotation: &str) -> Option<String> {
+    let compact: String = type_annotation
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    let raw = compact
+        .strip_prefix("typeof")
+        .and_then(|rest| rest.strip_suffix("[number]"))
+        .or_else(|| {
+            compact
+                .strip_prefix("(typeof")
+                .and_then(|rest| rest.strip_suffix(")[number]"))
+        })?;
+    if raw.is_empty()
+        || !raw
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$')
+    {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
+fn split_typescript_top_level_commas(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut start = 0usize;
+
+    for (idx, ch) in text.char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' | '\'' | '`' => quote = Some(ch),
+            '[' | '{' | '(' | '<' => depth += 1,
+            ']' | '}' | ')' | '>' => depth -= 1,
+            ',' if depth == 0 => {
+                let part = text[start..idx].trim();
+                if !part.is_empty() {
+                    parts.push(part);
+                }
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    let tail = text[start..].trim();
+    if !tail.is_empty() {
+        parts.push(tail);
+    }
+    parts
+}
+
+fn matching_bracket_index(text: &str, start: usize, open: char, close: char) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (idx, ch) in text[start..].char_indices() {
+        let absolute = start + idx;
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' | '\'' | '`' => quote = Some(ch),
+            _ if ch == open => depth += 1,
+            _ if ch == close => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(absolute);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn typescript_literal_expr(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches(';').trim();
+    if let Some(quoted) = quoted_string_literal_expr(trimmed) {
+        return Some(quoted);
+    }
+    match trimmed {
+        "true" | "false" | "null" | "undefined" => Some(trimmed.to_string()),
+        _ => numeric_literal_expr(trimmed),
+    }
+}
+
+fn quoted_string_literal_expr(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let quote = trimmed.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    if !trimmed.ends_with(quote) || trimmed.len() < 2 {
+        return None;
+    }
+    let inner = &trimmed[quote.len_utf8()..trimmed.len() - quote.len_utf8()];
+    serde_json::to_string(inner).ok()
+}
+
+fn numeric_literal_expr(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed
+            .chars()
+            .any(|ch| !(ch.is_ascii_digit() || matches!(ch, '-' | '+' | '.' | '_')))
+    {
+        return None;
+    }
+    let normalized = trimmed.replace('_', "");
+    normalized.parse::<f64>().ok()?;
+    Some(normalized)
 }
 
 fn ts_exported_class_method_surface(
@@ -1071,8 +1359,9 @@ fn collect_ts_surfaced_object_callables(
     for child in object.named_children(&mut cursor) {
         match child.kind() {
             "method_definition" => {
-                let Some(method_name) =
-                    child.child_by_field_name("name").and_then(|n| ts_property_name(&n, source))
+                let Some(method_name) = child
+                    .child_by_field_name("name")
+                    .and_then(|n| ts_property_name(&n, source))
                 else {
                     continue;
                 };
@@ -1179,18 +1468,12 @@ fn ts_supported_container_return_object<'a>(
     ts_find_object_returning_callback_in_call(value)
 }
 
-fn ts_call_has_supported_container_callee(
-    call: tree_sitter::Node,
-    source: &[u8],
-) -> bool {
+fn ts_call_has_supported_container_callee(call: tree_sitter::Node, source: &[u8]) -> bool {
     call.child_by_field_name("function")
         .is_some_and(|function| ts_expr_contains_supported_container_callee(function, source))
 }
 
-fn ts_expr_contains_supported_container_callee(
-    expr: tree_sitter::Node,
-    source: &[u8],
-) -> bool {
+fn ts_expr_contains_supported_container_callee(expr: tree_sitter::Node, source: &[u8]) -> bool {
     match expr.kind() {
         "identifier" | "property_identifier" => TS_SUPPORTED_CONTAINER_CALLEES
             .iter()
@@ -1202,9 +1485,9 @@ fn ts_expr_contains_supported_container_callee(
                         .iter()
                         .any(|candidate| text(&property, source).trim() == *candidate)
                 })
-                || expr
-                    .child_by_field_name("object")
-                    .is_some_and(|object| ts_expr_contains_supported_container_callee(object, source))
+                || expr.child_by_field_name("object").is_some_and(|object| {
+                    ts_expr_contains_supported_container_callee(object, source)
+                })
         }
         _ => {
             if let Some(function) = expr.child_by_field_name("function") {
@@ -1250,9 +1533,7 @@ fn ts_find_object_returning_callback_in_expression<'a>(
     }
 }
 
-fn ts_returned_object_node<'a>(
-    callable: tree_sitter::Node<'a>,
-) -> Option<tree_sitter::Node<'a>> {
+fn ts_returned_object_node<'a>(callable: tree_sitter::Node<'a>) -> Option<tree_sitter::Node<'a>> {
     let body = callable.child_by_field_name("body")?;
     if body.kind() == "statement_block" {
         let mut cursor = body.walk();
@@ -1273,9 +1554,7 @@ fn ts_returned_object_node<'a>(
     }
 }
 
-fn ts_expression_object_node<'a>(
-    expr: tree_sitter::Node<'a>,
-) -> Option<tree_sitter::Node<'a>> {
+fn ts_expression_object_node<'a>(expr: tree_sitter::Node<'a>) -> Option<tree_sitter::Node<'a>> {
     if expr.kind() == "object" {
         return Some(expr);
     }

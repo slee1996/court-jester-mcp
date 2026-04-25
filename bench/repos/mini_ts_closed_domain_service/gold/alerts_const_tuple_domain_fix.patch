@@ -1,0 +1,7 @@
+--- a/alerts.ts
++++ b/alerts.ts
+@@ -3,3 +3,4 @@
+ const SEVERITY: Partial<Record<AlertLevel, number>> = {
+   info: 1,
++  critical: 5,
+ };

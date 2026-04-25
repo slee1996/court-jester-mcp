@@ -1,6 +1,8 @@
-use court_jester_mcp::tools::synthesize::{synthesize_calls, synthesize_plan};
+use court_jester_mcp::tools::synthesize::{
+    synthesize_calls, synthesize_plan, synthesize_plan_for_with_seeds,
+};
 use court_jester_mcp::types::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 fn make_analysis(functions: Vec<FunctionInfo>, classes: Vec<ClassInfo>) -> AnalysisResult {
     AnalysisResult {
@@ -116,28 +118,102 @@ fn python_generates_fuzz_harness() {
 }
 
 #[test]
-fn python_idempotency_for_clean_function() {
+fn python_seed_rows_shape_fuzz_domain() {
+    let functions = vec![func(
+        "find_in_sorted",
+        vec![("arr", None), ("x", None)],
+        None,
+    )];
+    let mut seeds = HashMap::new();
+    seeds.insert(
+        "find_in_sorted".to_string(),
+        vec![vec!["[1, 2, 3]".to_string(), "2".to_string()]],
+    );
+    let plan = synthesize_plan_for_with_seeds(&functions, &[], &[], &Language::Python, &seeds);
+    assert!(
+        plan.code.contains("_seed_rows = [[[1, 2, 3], 2]]"),
+        "expected embedded Python seed rows, got: {}",
+        plan.code
+    );
+    assert!(
+        plan.code.contains("_fuzz_seed_row(_seed_rows)"),
+        "expected seed-shaped fuzzing instead of only broad generators, got: {}",
+        plan.code
+    );
+}
+
+#[test]
+fn python_literal_params_generate_declared_domain_values() {
+    let functions = vec![func(
+        "status_label",
+        vec![("status", Some("Literal[\"draft\", \"published\"]"))],
+        Some("str"),
+    )];
+    let plan =
+        synthesize_plan_for_with_seeds(&functions, &[], &[], &Language::Python, &HashMap::new());
+    assert!(
+        plan.code
+            .contains("[\"draft\", \"published\"][_fuzz_int_range(0, 1)]"),
+        "Literal params should generate declared values, got: {}",
+        plan.code
+    );
+}
+
+#[test]
+fn python_nested_literal_list_elements_generate_declared_domain_values() {
+    let functions = vec![func(
+        "count_billable_actions",
+        vec![("actions", Some("list[Literal[\"create\", \"delete\"]]"))],
+        Some("int"),
+    )];
+    let plan =
+        synthesize_plan_for_with_seeds(&functions, &[], &[], &Language::Python, &HashMap::new());
+    assert!(
+        plan.code
+            .contains("[\"create\", \"delete\"][_fuzz_int_range(0, 1)] for _ in range"),
+        "nested Literal element types should shape collection values, got: {}",
+        plan.code
+    );
+}
+
+#[test]
+fn python_untyped_params_without_seed_domain_are_skipped() {
+    let functions = vec![func("walk_graph", vec![("node", None)], None)];
+    let plan =
+        synthesize_plan_for_with_seeds(&functions, &[], &[], &Language::Python, &HashMap::new());
+    assert!(
+        plan.code.is_empty(),
+        "untyped params without domain evidence should not get arbitrary fuzz code: {}",
+        plan.code
+    );
+    assert_eq!(
+        plan.coverage[0].status,
+        FuzzFunctionStatus::SkippedUnsupportedType
+    );
+}
+
+#[test]
+fn python_idempotency_requires_declared_property() {
+    let mut clean_text = func("clean_text", vec![("s", Some("str"))], Some("str"));
+    clean_text.declared_properties = vec!["idempotent".into()];
+    let a = make_analysis(vec![clean_text], vec![]);
+    let code = synthesize_calls(&a, &Language::Python);
+    assert!(
+        code.contains("idempotent"),
+        "declared idempotent str→str should check idempotency, got: {code}"
+    );
+}
+
+#[test]
+fn python_no_idempotency_from_name_only() {
     let a = make_analysis(
         vec![func("clean_text", vec![("s", Some("str"))], Some("str"))],
         vec![],
     );
     let code = synthesize_calls(&a, &Language::Python);
     assert!(
-        code.contains("idempotent"),
-        "clean_text str→str should check idempotency, got: {code}"
-    );
-}
-
-#[test]
-fn python_no_idempotency_for_non_clean_names() {
-    let a = make_analysis(
-        vec![func("double", vec![("x", Some("int"))], Some("int"))],
-        vec![],
-    );
-    let code = synthesize_calls(&a, &Language::Python);
-    assert!(
         !code.contains("idempotent"),
-        "double should NOT check idempotency, got: {code}"
+        "name alone should NOT check idempotency, got: {code}"
     );
 }
 
@@ -188,6 +264,109 @@ fn python_query_string_serializer_gets_semantic_examples() {
 }
 
 #[test]
+fn python_pep440_version_ordering_property_gets_semantic_examples() {
+    let mut compare_versions = func(
+        "compare_versions",
+        vec![("left", Some("str")), ("right", Some("str"))],
+        Some("int"),
+    );
+    compare_versions.declared_properties = vec!["pep440_version_ordering".into()];
+    let a = make_analysis(vec![compare_versions], vec![]);
+    let code = synthesize_calls(&a, &Language::Python);
+    assert!(
+        code.contains("pep440 version ordering:{_pep440_label}"),
+        "PEP 440 ordering harness should label failures, got: {code}"
+    );
+    assert!(
+        code.contains("\"1.0rc1\", \"1.0\", -1"),
+        "PEP 440 ordering harness should check rc before final, got: {code}"
+    );
+}
+
+#[test]
+fn python_pep440_specifier_property_gets_semantic_examples() {
+    let mut allows = func(
+        "allows",
+        vec![("version", Some("str")), ("specifier", Some("str"))],
+        Some("bool"),
+    );
+    allows.declared_properties = vec!["pep440_specifier_membership".into()];
+    let a = make_analysis(vec![allows], vec![]);
+    let code = synthesize_calls(&a, &Language::Python);
+    assert!(
+        code.contains("pep440 specifier membership:{_specifier_label}"),
+        "PEP 440 specifier harness should label failures, got: {code}"
+    );
+    assert!(
+        code.contains("\"1.5.0\", \"~=1.4.5\", False"),
+        "PEP 440 specifier harness should check compatible upper bound, got: {code}"
+    );
+}
+
+#[test]
+fn python_pep440_filter_property_gets_semantic_examples() {
+    let mut filter_versions = func(
+        "filter_versions",
+        vec![
+            ("candidates", Some("list[str]")),
+            ("specifier", Some("str")),
+        ],
+        Some("list[str]"),
+    );
+    filter_versions.declared_properties = vec!["pep440_filter_prerelease".into()];
+    let a = make_analysis(vec![filter_versions], vec![]);
+    let code = synthesize_calls(&a, &Language::Python);
+    assert!(
+        code.contains("pep440 filter prerelease:{_filter_label}"),
+        "PEP 440 filter harness should label failures, got: {code}"
+    );
+    assert!(
+        code.contains("[\"1.2\", \"1.5a1\"], \">=1.5\", [\"1.5a1\"]"),
+        "PEP 440 filter harness should check prerelease fallback, got: {code}"
+    );
+}
+
+#[test]
+fn python_cookie_value_quote_property_gets_semantic_examples() {
+    let mut format_cookie_value = func(
+        "format_cookie_value",
+        vec![("value", Some("str"))],
+        Some("str"),
+    );
+    format_cookie_value.declared_properties = vec!["cookie_value_quote".into()];
+    let a = make_analysis(vec![format_cookie_value], vec![]);
+    let code = synthesize_calls(&a, &Language::Python);
+    assert!(
+        code.contains("cookie value quote:{_cookie_value_label}"),
+        "cookie value harness should label failures, got: {code}"
+    );
+    assert!(
+        code.contains("'\"two words\"', '\"two words\"'"),
+        "cookie value harness should preserve already-quoted values, got: {code}"
+    );
+}
+
+#[test]
+fn python_cookie_header_quote_property_gets_semantic_examples() {
+    let mut build_cookie_header = func(
+        "build_cookie_header",
+        vec![("cookies", Some("Mapping[str, str | None]"))],
+        Some("str"),
+    );
+    build_cookie_header.declared_properties = vec!["cookie_header_quote".into()];
+    let a = make_analysis(vec![build_cookie_header], vec![]);
+    let code = synthesize_calls(&a, &Language::Python);
+    assert!(
+        code.contains("cookie header quote:{_cookie_header_label}"),
+        "cookie header harness should label failures, got: {code}"
+    );
+    assert!(
+        code.contains("'session=\"two words\"'"),
+        "cookie header harness should preserve already-quoted values, got: {code}"
+    );
+}
+
+#[test]
 fn python_non_query_serializer_skips_query_semantics() {
     let a = make_analysis(
         vec![func(
@@ -201,6 +380,27 @@ fn python_non_query_serializer_skips_query_semantics() {
     assert!(
         !code.contains("query semantics:{_query_label}"),
         "non-query serializer should not get query semantics, got: {code}"
+    );
+}
+
+#[test]
+fn python_mapping_annotation_generates_mapping_input() {
+    let a = make_analysis(
+        vec![func(
+            "build_cookie_header",
+            vec![("cookies", Some("Mapping[str, str | None]"))],
+            Some("str"),
+        )],
+        vec![],
+    );
+    let code = synthesize_calls(&a, &Language::Python);
+    assert!(
+        code.contains("{_fuzz_str(): [_fuzz_str(), None][_fuzz_int_range(0, 1)]"),
+        "Mapping annotations should generate mapping-shaped inputs, got: {code}"
+    );
+    assert!(
+        !code.contains("_call_args = [None]"),
+        "non-optional Mapping annotations should not generate None as the container, got: {code}"
     );
 }
 
@@ -234,7 +434,7 @@ fn python_keyword_only_in_fuzz() {
     );
     let code = synthesize_calls(&a, &Language::Python);
     assert!(
-        code.contains("mode=_args[1]"),
+        code.contains("mode=_call_args[1]"),
         "keyword-only should use name=, got: {code}"
     );
     assert!(
@@ -315,6 +515,51 @@ fn typescript_generates_fuzz_harness() {
     assert!(
         code.contains("\"number\""),
         "should check return type, got: {code}"
+    );
+}
+
+#[test]
+fn typescript_literal_union_params_generate_declared_domain_values() {
+    let a = make_analysis(
+        vec![func(
+            "methodAllowsBody",
+            vec![("method", Some("\"GET\" | \"PATCH\""))],
+            Some("boolean"),
+        )],
+        vec![],
+    );
+    let code = synthesize_calls(&a, &Language::TypeScript);
+    assert!(
+        code.contains("[\"GET\", \"PATCH\"][_fuzzIntRange(0, 1)]"),
+        "literal union params should generate declared values, got: {code}"
+    );
+}
+
+#[test]
+fn typescript_literal_object_fields_generate_declared_domain_values() {
+    let a = make_analysis(
+        vec![func(
+            "queueName",
+            vec![(
+                "job",
+                Some("{ kind: \"email\" | \"digest\"; attempts: number }"),
+            )],
+            Some("string"),
+        )],
+        vec![],
+    );
+    let code = synthesize_calls(&a, &Language::TypeScript);
+    assert!(
+        code.contains("kind: [\"email\", \"digest\"][_fuzzIntRange(0, 1)]"),
+        "literal union object fields should generate declared values, got: {code}"
+    );
+    let fuzz_call = code
+        .lines()
+        .find(|line| line.contains("_fuzzOne(\"queueName\""))
+        .expect("queueName fuzz call should exist");
+    assert!(
+        !fuzz_call.contains("\"object\""),
+        "closed literal-domain objects should not receive broad object edge cases, got: {fuzz_call}"
     );
 }
 
@@ -531,14 +776,13 @@ fn typescript_uses_interface_fields() {
 
 #[test]
 fn typescript_query_string_serializer_gets_semantic_examples() {
-    let a = make_analysis(
-        vec![func(
-            "canonicalQuery",
-            vec![("params", Some("Record<string, unknown>"))],
-            Some("string"),
-        )],
-        vec![],
+    let mut stringify = func(
+        "stringifyQuery",
+        vec![("params", Some("Record<string, unknown>"))],
+        Some("string"),
     );
+    stringify.declared_properties = vec!["query_nested_brackets".into()];
+    let a = make_analysis(vec![stringify], vec![]);
     let code = synthesize_calls(&a, &Language::TypeScript);
     assert!(
         code.contains("new URLSearchParams"),
@@ -549,8 +793,225 @@ fn typescript_query_string_serializer_gets_semantic_examples() {
         "query-string harness should label semantic failures, got: {code}"
     );
     assert!(
+        code.contains("top-level repeated array"),
+        "query-string harness should check repeated array encoding, got: {code}"
+    );
+    assert!(
+        code.contains("filter[tags][]"),
+        "query-string harness should check nested array bracket encoding, got: {code}"
+    );
+    assert!(
+        !code.contains("_asciiFold(\"naïve café\")"),
+        "qs-style stringification should not inherit canonical accent folding, got: {code}"
+    );
+}
+
+#[test]
+fn typescript_query_string_serializer_does_not_assume_deep_brackets_without_context() {
+    let a = make_analysis(
+        vec![func(
+            "canonicalQuery",
+            vec![("params", Some("Record<string, unknown>"))],
+            Some("string"),
+        )],
+        vec![],
+    );
+    let code = synthesize_calls(&a, &Language::TypeScript);
+    assert!(
+        !code.contains("filter[tags][]"),
+        "query-string harness should not infer nested bracket semantics without context, got: {code}"
+    );
+    assert!(
         code.contains("_asciiFold(\"naïve café\")"),
-        "query-string harness should check accent folding, got: {code}"
+        "canonical query harness should keep canonical accent folding, got: {code}"
+    );
+}
+
+#[test]
+fn typescript_query_string_parser_gets_semantic_examples() {
+    let mut parse = func(
+        "parseQuery",
+        vec![("query", Some("string"))],
+        Some("Record<string, unknown>"),
+    );
+    parse.declared_properties = vec!["query_nested_brackets".into()];
+    let a = make_analysis(vec![parse], vec![]);
+    let code = synthesize_calls(&a, &Language::TypeScript);
+    assert!(
+        code.contains("query parse semantics:${_queryParseLabel}"),
+        "query parser harness should label semantic failures, got: {code}"
+    );
+    assert!(
+        code.contains("tag=pro&tag=beta"),
+        "query parser harness should check repeated keys, got: {code}"
+    );
+    assert!(
+        code.contains("filter[tags][]=pro"),
+        "query parser harness should check nested array bracket parsing, got: {code}"
+    );
+}
+
+#[test]
+fn typescript_query_string_parser_setting_param_uses_extended_mode() {
+    let mut parse = func(
+        "parseQueryString",
+        vec![
+            ("input", Some("string")),
+            ("setting", Some("QueryParserSetting")),
+        ],
+        Some("unknown"),
+    );
+    parse.declared_properties = vec!["query_nested_brackets".into()];
+    let a = make_analysis(vec![parse], vec![]);
+    let code = synthesize_calls(&a, &Language::TypeScript);
+    assert!(
+        code.contains("(parseQueryString as Function)(_queryInput, \"extended\")"),
+        "two-argument query parser semantics should exercise extended mode, got: {code}"
+    );
+    assert!(
+        code.contains("filter[tags][]=pro"),
+        "two-argument query parser should still get nested bracket examples, got: {code}"
+    );
+}
+
+#[test]
+fn typescript_same_value_zero_exact_standard_name_gets_semantic_examples() {
+    let same_value_zero = func(
+        "sameValueZero",
+        vec![("left", Some("unknown")), ("right", Some("unknown"))],
+        Some("boolean"),
+    );
+    let a = make_analysis(vec![same_value_zero], vec![]);
+    let code = synthesize_calls(&a, &Language::TypeScript);
+    assert!(
+        code.contains("sameValueZero semantics:${_sameValueLabel}"),
+        "same-value-zero harness should label semantic failures, got: {code}"
+    );
+    assert!(
+        code.contains("NaN, NaN, true"),
+        "same-value-zero harness should check NaN reflexivity, got: {code}"
+    );
+    assert!(
+        code.contains("0, -0, true"),
+        "same-value-zero harness should check signed zero equivalence, got: {code}"
+    );
+}
+
+#[test]
+fn typescript_http_request_metadata_property_gets_side_effect_examples() {
+    let mut decorate = func(
+        "decorateRequest",
+        vec![("request", Some("RequestLike"))],
+        Some("void"),
+    );
+    decorate.declared_properties = vec!["http_request_metadata".into()];
+    let a = make_analysis(
+        vec![decorate],
+        vec![ClassInfo {
+            name: "RequestLike".into(),
+            bases: vec![],
+            line: 1,
+            fields: vec![FieldInfo {
+                name: "headers".into(),
+                type_annotation: Some("Record<string, string | undefined>".into()),
+                optional: true,
+                has_default: false,
+            }],
+        }],
+    );
+    let code = synthesize_calls(&a, &Language::TypeScript);
+    assert!(
+        code.contains("HTTP request metadata"),
+        "request metadata property should emit side-effect checks, got: {code}"
+    );
+    assert!(
+        code.contains("X-Forwarded-Proto") && code.contains("extended query decoration"),
+        "request metadata should cover forwarded protocol and query decoration, got: {code}"
+    );
+}
+
+#[test]
+fn typescript_http_response_helpers_property_gets_side_effect_examples() {
+    let mut decorate = func(
+        "decorateResponse",
+        vec![
+            ("response", Some("ResponseLike")),
+            ("request", Some("RequestLike")),
+        ],
+        Some("void"),
+    );
+    decorate.declared_properties = vec!["http_response_helpers".into()];
+    let a = make_analysis(
+        vec![decorate],
+        vec![
+            ClassInfo {
+                name: "ResponseLike".into(),
+                bases: vec![],
+                line: 1,
+                fields: vec![FieldInfo {
+                    name: "statusCode".into(),
+                    type_annotation: Some("number".into()),
+                    optional: true,
+                    has_default: false,
+                }],
+            },
+            ClassInfo {
+                name: "RequestLike".into(),
+                bases: vec![],
+                line: 2,
+                fields: vec![FieldInfo {
+                    name: "headers".into(),
+                    type_annotation: Some("Record<string, string | undefined>".into()),
+                    optional: true,
+                    has_default: false,
+                }],
+            },
+        ],
+    );
+    let code = synthesize_calls(&a, &Language::TypeScript);
+    assert!(
+        code.contains("HTTP response helpers"),
+        "response helper property should emit side-effect checks, got: {code}"
+    );
+    assert!(
+        code.contains("location encodes spaces") && code.contains("sendStatus 204 empty body"),
+        "response helper checks should cover location and empty-body status semantics, got: {code}"
+    );
+}
+
+#[test]
+fn typescript_http_static_file_property_gets_middleware_examples() {
+    let mut create_static = func(
+        "createStaticMiddleware",
+        vec![
+            ("root", Some("string")),
+            ("options", Some("StaticMiddlewareOptions")),
+        ],
+        Some("Handler"),
+    );
+    create_static.declared_properties = vec!["http_static_file_middleware".into()];
+    let a = make_analysis(
+        vec![create_static],
+        vec![ClassInfo {
+            name: "StaticMiddlewareOptions".into(),
+            bases: vec![],
+            line: 1,
+            fields: vec![FieldInfo {
+                name: "index".into(),
+                type_annotation: Some("string | false".into()),
+                optional: true,
+                has_default: false,
+            }],
+        }],
+    );
+    let code = synthesize_calls(&a, &Language::TypeScript);
+    assert!(
+        code.contains("HTTP static file middleware"),
+        "static file middleware property should emit returned-handler checks, got: {code}"
+    );
+    assert!(
+        code.contains("/hello.txt") && code.contains("hello world\\n"),
+        "static file middleware should exercise a known project static file, got: {code}"
     );
 }
 
@@ -799,6 +1260,54 @@ fn typescript_fuzzes_resolved_alias_params() {
 }
 
 #[test]
+fn typescript_recursive_alias_params_do_not_overflow() {
+    let analysis = AnalysisResult {
+        functions: vec![func(
+            "decorateRequest",
+            vec![("request", Some("RequestLike"))],
+            Some("void"),
+        )],
+        classes: vec![],
+        aliases: vec![
+            TypeAliasInfo {
+                name: "RequestLike".into(),
+                type_annotation:
+                    "{ headers?: Record<string, string | undefined>; app?: ApplicationLike }"
+                        .into(),
+                line: 1,
+            },
+            TypeAliasInfo {
+                name: "ApplicationLike".into(),
+                type_annotation: "RouterLike & { parent?: ApplicationLike }".into(),
+                line: 2,
+            },
+            TypeAliasInfo {
+                name: "RouterLike".into(),
+                type_annotation:
+                    "((req: RequestLike) => void) & { use: (...args: unknown[]) => RouterLike; parent?: ApplicationLike }"
+                        .into(),
+                line: 3,
+            },
+        ],
+        imports: vec![],
+        complexity: 1,
+        cognitive_complexity: 0,
+        max_nesting_depth: 0,
+        complexity_breakdown: BTreeMap::new(),
+        parse_error: false,
+    };
+    let code = synthesize_calls(&analysis, &Language::TypeScript);
+    assert!(
+        code.contains("_fuzzOne(\"decorateRequest\""),
+        "recursive but object-shaped aliases should remain fuzzable, got: {code}"
+    );
+    assert!(
+        code.len() < 60_000,
+        "recursive aliases should be bounded during generator expansion"
+    );
+}
+
+#[test]
 fn typescript_semver_fields_use_constrained_generators() {
     let classes = vec![ClassInfo {
         name: "ParsedVersion".into(),
@@ -1011,19 +1520,14 @@ fn verify_catches_empty_string_crash() {
 // ── Enhancement 2: Smarter property inference ───────────────────────────────
 
 #[test]
-fn python_boundedness_for_normalize() {
-    let a = make_analysis(
-        vec![func(
-            "normalize_label",
-            vec![("s", Some("str"))],
-            Some("str"),
-        )],
-        vec![],
-    );
+fn python_boundedness_requires_declared_property() {
+    let mut normalize_label = func("normalize_label", vec![("s", Some("str"))], Some("str"));
+    normalize_label.declared_properties = vec!["bounded".into()];
+    let a = make_analysis(vec![normalize_label], vec![]);
     let code = synthesize_calls(&a, &Language::Python);
     assert!(
         code.contains("bounded"),
-        "normalize str→str should check boundedness, got: {code}"
+        "declared bounded str→str should check boundedness, got: {code}"
     );
     assert!(
         code.contains("len(_result) <= len(_args[0])"),
@@ -1032,32 +1536,30 @@ fn python_boundedness_for_normalize() {
 }
 
 #[test]
-fn python_nonneg_for_count() {
-    let a = make_analysis(
-        vec![func("count_words", vec![("s", Some("str"))], Some("int"))],
-        vec![],
-    );
+fn python_nonneg_requires_declared_property() {
+    let mut count_words = func("count_words", vec![("s", Some("str"))], Some("int"));
+    count_words.declared_properties = vec!["nonneg".into()];
+    let a = make_analysis(vec![count_words], vec![]);
     let code = synthesize_calls(&a, &Language::Python);
     assert!(
         code.contains(">= 0"),
-        "count_words → int should check non-negativity, got: {code}"
+        "declared nonneg int return should check non-negativity, got: {code}"
     );
 }
 
 #[test]
-fn python_symmetry_for_distance() {
-    let a = make_analysis(
-        vec![func(
-            "distance",
-            vec![("a", Some("str")), ("b", Some("str"))],
-            Some("int"),
-        )],
-        vec![],
+fn python_symmetry_requires_declared_property() {
+    let mut distance = func(
+        "distance",
+        vec![("a", Some("str")), ("b", Some("str"))],
+        Some("int"),
     );
+    distance.declared_properties = vec!["symmetric".into()];
+    let a = make_analysis(vec![distance], vec![]);
     let code = synthesize_calls(&a, &Language::Python);
     assert!(
         code.contains("symmetric"),
-        "distance(str,str) should check symmetry, got: {code}"
+        "declared symmetric function should check symmetry, got: {code}"
     );
     assert!(
         code.contains("_args[1], _args[0]"),
@@ -1112,36 +1614,26 @@ fn python_no_nonneg_for_wrong_return_type() {
 }
 
 #[test]
-fn typescript_boundedness_for_trim() {
-    let a = make_analysis(
-        vec![func(
-            "trim_text",
-            vec![("s", Some("string"))],
-            Some("string"),
-        )],
-        vec![],
-    );
+fn typescript_boundedness_requires_declared_property() {
+    let mut trim_text = func("trim_text", vec![("s", Some("string"))], Some("string"));
+    trim_text.declared_properties = vec!["bounded".into()];
+    let a = make_analysis(vec![trim_text], vec![]);
     let code = synthesize_calls(&a, &Language::TypeScript);
     assert!(
         code.contains("\"bounded\""),
-        "trim string→string should have bounded property, got: {code}"
+        "declared bounded string→string should have bounded property, got: {code}"
     );
 }
 
 #[test]
-fn typescript_nonneg_for_count() {
-    let a = make_analysis(
-        vec![func(
-            "count_items",
-            vec![("s", Some("string"))],
-            Some("number"),
-        )],
-        vec![],
-    );
+fn typescript_nonneg_requires_declared_property() {
+    let mut count_items = func("count_items", vec![("s", Some("string"))], Some("number"));
+    count_items.declared_properties = vec!["nonneg".into()];
+    let a = make_analysis(vec![count_items], vec![]);
     let code = synthesize_calls(&a, &Language::TypeScript);
     assert!(
         code.contains("\"nonneg\""),
-        "count→number should have nonneg property, got: {code}"
+        "declared nonneg number return should have nonneg property, got: {code}"
     );
 }
 
@@ -1182,15 +1674,14 @@ fn python_declared_clamped_property_is_emitted() {
 }
 
 #[test]
-fn typescript_nonempty_string_for_label() {
-    let a = make_analysis(
-        vec![func(
-            "secondary_label",
-            vec![("labels", Some("string[]"))],
-            Some("string"),
-        )],
-        vec![],
+fn typescript_nonempty_string_for_label_requires_declared_property_for_array_input() {
+    let mut secondary_label = func(
+        "secondary_label",
+        vec![("labels", Some("string[]"))],
+        Some("string"),
     );
+    secondary_label.declared_properties = vec!["nonempty_string".into()];
+    let a = make_analysis(vec![secondary_label], vec![]);
     let code = synthesize_calls(&a, &Language::TypeScript);
     assert!(
         code.contains("\"nonempty_string\""),
@@ -1262,19 +1753,18 @@ fn typescript_nullable_string_array_uses_string_array_edges() {
 }
 
 #[test]
-fn typescript_symmetry_for_distance() {
-    let a = make_analysis(
-        vec![func(
-            "hamming_distance",
-            vec![("a", Some("string")), ("b", Some("string"))],
-            Some("number"),
-        )],
-        vec![],
+fn typescript_symmetry_requires_declared_property() {
+    let mut hamming_distance = func(
+        "hamming_distance",
+        vec![("a", Some("string")), ("b", Some("string"))],
+        Some("number"),
     );
+    hamming_distance.declared_properties = vec!["symmetric".into()];
+    let a = make_analysis(vec![hamming_distance], vec![]);
     let code = synthesize_calls(&a, &Language::TypeScript);
     assert!(
         code.contains("\"symmetric\""),
-        "hamming_distance(string,string) should have symmetric property, got: {code}"
+        "declared symmetric function should have symmetric property, got: {code}"
     );
 }
 

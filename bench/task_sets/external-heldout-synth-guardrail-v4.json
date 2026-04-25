@@ -1,0 +1,12 @@
+{
+  "id": "external-heldout-synth-guardrail-v4",
+  "title": "External held-out synth guardrail v4",
+  "goal": "Fresh non-Terminal-Bench tasks for source-derived closed input domains. This set checks whether synth walks enum declarations and const tuple aliases, including imported type context, before fuzzing.",
+  "suite_kind": "external_held_out_synth_guardrail",
+  "task_ids": [
+    "ts-enum-param-transport-v4",
+    "ts-imported-enum-param-billing-v4",
+    "ts-const-tuple-alias-alerts-v4",
+    "ts-imported-const-tuple-alias-notify-v4"
+  ]
+}

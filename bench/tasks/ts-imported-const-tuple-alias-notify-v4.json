@@ -1,0 +1,43 @@
+{
+  "id": "ts-imported-const-tuple-alias-notify-v4",
+  "title": "TypeScript const tuple alias branch is exercised from imported source context",
+  "repo_fixture": "mini_ts_closed_domain_service",
+  "prompt": "Fix channelLabel so every imported AlertChannel derived from ALERT_CHANNELS is handled.",
+  "language": "typescript",
+  "bucket": "signature_domain_fresh_v4",
+  "verify_paths": [
+    "notify.ts"
+  ],
+  "gold_patch_path": "gold/notify_imported_const_tuple_domain_fix.patch",
+  "gold_changed_files": [
+    "notify.ts"
+  ],
+  "expected_files": [
+    "notify.ts"
+  ],
+  "family": "signature_domain",
+  "bug_class": "missing_closed_domain_branch",
+  "bug_surface": "imported_const_tuple_type_alias",
+  "difficulty": "medium",
+  "golden_patch_description": "Handle the sms branch declared by the imported ALERT_CHANNELS tuple.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": true,
+  "uses_relative_imports": true,
+  "cross_file": true,
+  "upstream_benchmark": "synthetic_external_guardrail",
+  "upstream_instance_id": "ts-imported-const-tuple-alias-notify-v4",
+  "instance_notes": "Fresh v4 guardrail task for imported const tuple-derived input domains.",
+  "tags": [
+    "typescript",
+    "signature_domain",
+    "as_const",
+    "type_alias",
+    "cross_file",
+    "fresh_guardrail"
+  ]
+}

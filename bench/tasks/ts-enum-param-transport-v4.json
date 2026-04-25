@@ -1,0 +1,41 @@
+{
+  "id": "ts-enum-param-transport-v4",
+  "title": "TypeScript enum parameter branch is exercised from local source context",
+  "repo_fixture": "mini_ts_closed_domain_service",
+  "prompt": "Fix routeChannel so every DeliveryChannel enum value is handled.",
+  "language": "typescript",
+  "bucket": "signature_domain_fresh_v4",
+  "verify_paths": [
+    "transport.ts"
+  ],
+  "gold_patch_path": "gold/transport_enum_domain_fix.patch",
+  "gold_changed_files": [
+    "transport.ts"
+  ],
+  "expected_files": [
+    "transport.ts"
+  ],
+  "family": "signature_domain",
+  "bug_class": "missing_closed_domain_branch",
+  "bug_surface": "enum_signature",
+  "difficulty": "medium",
+  "golden_patch_description": "Handle the Sms branch declared by the local enum.",
+  "expected_verify_outcome": "fail",
+  "expected_verify_failure_kinds": [
+    "test"
+  ],
+  "expected_hidden_failure_without_fix": true,
+  "expected_public_failure_without_fix": true,
+  "uses_project_dir": true,
+  "uses_relative_imports": false,
+  "cross_file": false,
+  "upstream_benchmark": "synthetic_external_guardrail",
+  "upstream_instance_id": "ts-enum-param-transport-v4",
+  "instance_notes": "Fresh v4 guardrail task for enum-derived input domains.",
+  "tags": [
+    "typescript",
+    "signature_domain",
+    "enum",
+    "fresh_guardrail"
+  ]
+}

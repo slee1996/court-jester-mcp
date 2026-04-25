@@ -269,7 +269,10 @@ export const useReorderer = create(() => ({
         .expect("container method should be analyzed");
     assert!(reorder.is_exported);
     assert!(reorder.is_method);
-    assert!(!reorder.is_nested, "surfaced container method should not be treated as nested");
+    assert!(
+        !reorder.is_nested,
+        "surfaced container method should not be treated as nested"
+    );
     assert_eq!(
         reorder.invocation_target.as_deref(),
         Some("useReorderer.getState().reorder")
@@ -443,6 +446,86 @@ fn typescript_type_alias_non_object_recorded_for_resolution() {
     assert_eq!(r.aliases[0].type_annotation, "string");
     assert_eq!(r.aliases[1].name, "Pair");
     assert_eq!(r.aliases[1].type_annotation, "[string, number]");
+}
+
+#[test]
+fn typescript_enum_is_recorded_as_literal_union_alias() {
+    let code = r#"
+export enum DeliveryChannel {
+  Email = "email",
+  Sms = "sms",
+}
+"#;
+    let r = analyze(code, &Language::TypeScript);
+    let alias = r
+        .aliases
+        .iter()
+        .find(|alias| alias.name == "DeliveryChannel")
+        .expect("enum should be exposed as a type alias");
+    assert_eq!(alias.type_annotation, "\"email\" | \"sms\"");
+}
+
+#[test]
+fn typescript_const_tuple_type_alias_is_rewritten_to_literal_union() {
+    let code = r#"
+export const ALERT_LEVELS = ["info", "critical"] as const;
+export type AlertLevel = typeof ALERT_LEVELS[number];
+"#;
+    let r = analyze(code, &Language::TypeScript);
+    let alias = r
+        .aliases
+        .iter()
+        .find(|alias| alias.name == "AlertLevel")
+        .expect("const tuple type alias should be recorded");
+    assert_eq!(alias.type_annotation, "\"info\" | \"critical\"");
+}
+
+#[test]
+fn resolve_imported_closed_domain_aliases_from_sibling() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("types.ts"),
+        r#"
+export enum BillingCycle {
+  Monthly = "monthly",
+  Annual = "annual",
+}
+export const ALERT_CHANNELS = ["email", "sms"] as const;
+export type AlertChannel = typeof ALERT_CHANNELS[number];
+"#,
+    )
+    .unwrap();
+
+    let main_path = dir.path().join("main.ts");
+    std::fs::write(
+        &main_path,
+        r#"
+import { BillingCycle } from "./types";
+import type { AlertChannel } from "./types";
+export function cycleDays(cycle: BillingCycle): number { return 30; }
+export function channelLabel(channel: AlertChannel): string { return channel; }
+"#,
+    )
+    .unwrap();
+
+    let code = std::fs::read_to_string(&main_path).unwrap();
+    let analysis = analyze(&code, &Language::TypeScript);
+    let imported = analyze::resolve_imported_types(
+        &analysis,
+        main_path.to_str().unwrap(),
+        &Language::TypeScript,
+    );
+    let aliases: std::collections::HashMap<_, _> = imported
+        .aliases
+        .iter()
+        .map(|alias| (alias.name.as_str(), alias.type_annotation.as_str()))
+        .collect();
+
+    assert_eq!(
+        aliases.get("BillingCycle"),
+        Some(&"\"monthly\" | \"annual\"")
+    );
+    assert_eq!(aliases.get("AlertChannel"), Some(&"\"email\" | \"sms\""));
 }
 
 // ── Import resolution ───────────────────────────────────────────────────────

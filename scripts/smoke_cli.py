@@ -12,11 +12,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 SAMPLE_FIXTURE = {
-    "verify_file": REPO_ROOT / "bench/repos/mini_py_service/profile.py",
+    "verify_file": REPO_ROOT / "bench/repos/mini_py_literal_domain_service/status.py",
     "language": "python",
-    "project_dir": REPO_ROOT / "bench/repos/mini_py_service",
-    "test_file": REPO_ROOT
-    / "bench/repos/mini_py_service/tests/court_jester_public_verify.py",
+    "project_dir": REPO_ROOT / "bench/repos/mini_py_literal_domain_service",
+    "test_file": None,
 }
 
 
@@ -92,7 +91,8 @@ def main() -> int:
         args.verify_file = str(SAMPLE_FIXTURE["verify_file"])
         args.language = SAMPLE_FIXTURE["language"]
         args.project_dir = str(SAMPLE_FIXTURE["project_dir"])
-        args.test_file = str(SAMPLE_FIXTURE["test_file"])
+        if SAMPLE_FIXTURE["test_file"]:
+            args.test_file = str(SAMPLE_FIXTURE["test_file"])
 
     try:
         binary = resolve_binary(args)

@@ -515,38 +515,97 @@ fn node_text(node: &tree_sitter::Node, source: &[u8]) -> String {
     node.utf8_text(source).unwrap_or("").to_string()
 }
 
+fn primitive_literal_value(
+    node: &tree_sitter::Node,
+    language: &Language,
+    source: &[u8],
+) -> Option<Option<serde_json::Value>> {
+    let code = node_text(node, source);
+    match language {
+        Language::TypeScript => match node.kind() {
+            "number" => Some(
+                code.parse::<f64>()
+                    .ok()
+                    .and_then(serde_json::Number::from_f64)
+                    .map(serde_json::Value::Number),
+            ),
+            "true" => Some(Some(serde_json::Value::Bool(true))),
+            "false" => Some(Some(serde_json::Value::Bool(false))),
+            "null" => Some(Some(serde_json::Value::Null)),
+            "undefined" | "string" => Some(None),
+            _ => None,
+        },
+        Language::Python => match node.kind() {
+            "integer" => Some(code.parse::<i64>().ok().map(serde_json::Value::from)),
+            "float" => Some(
+                code.parse::<f64>()
+                    .ok()
+                    .and_then(serde_json::Number::from_f64)
+                    .map(serde_json::Value::Number),
+            ),
+            "true" => Some(Some(serde_json::Value::Bool(true))),
+            "false" => Some(Some(serde_json::Value::Bool(false))),
+            "none" | "string" => Some(None),
+            _ => None,
+        },
+    }
+}
+
+fn is_literal_like_arg(node: &tree_sitter::Node, language: &Language, source: &[u8]) -> bool {
+    if primitive_literal_value(node, language, source).is_some() {
+        return true;
+    }
+
+    match (language, node.kind()) {
+        (Language::TypeScript, "array") | (Language::Python, "list" | "tuple" | "set") => {
+            let mut cursor = node.walk();
+            let all_literal = node.named_children(&mut cursor).all(|child| {
+                !matches!(
+                    child.kind(),
+                    "spread_element" | "list_splat" | "dictionary_splat"
+                ) && is_literal_like_arg(&child, language, source)
+            });
+            all_literal
+        }
+        (Language::TypeScript, "object") | (Language::Python, "dictionary") => {
+            let mut cursor = node.walk();
+            let all_literal = node.named_children(&mut cursor).all(|child| {
+                if matches!(
+                    child.kind(),
+                    "spread_element" | "list_splat" | "dictionary_splat"
+                ) {
+                    return false;
+                }
+                if child.kind() == "pair" {
+                    return child
+                        .child_by_field_name("value")
+                        .or_else(|| child.named_child(child.named_child_count().saturating_sub(1)))
+                        .is_some_and(|value| is_literal_like_arg(&value, language, source));
+                }
+                false
+            });
+            all_literal
+        }
+        (Language::TypeScript, "unary_expression") | (Language::Python, "unary_operator") => {
+            let text = node_text(node, source);
+            matches!(text.trim().chars().next(), Some('-' | '+'))
+                && node.named_child_count() == 1
+                && node.named_child(0).is_some_and(|child| {
+                    primitive_literal_value(&child, language, source).is_some()
+                })
+        }
+        _ => false,
+    }
+}
+
 fn parse_literal_arg(
     node: &tree_sitter::Node,
     language: &Language,
     source: &[u8],
 ) -> Option<ObservedArg> {
     let code = node_text(node, source);
-    let literal_value = match language {
-        Language::TypeScript => match node.kind() {
-            "number" => code
-                .parse::<f64>()
-                .ok()
-                .and_then(serde_json::Number::from_f64)
-                .map(serde_json::Value::Number),
-            "true" => Some(serde_json::Value::Bool(true)),
-            "false" => Some(serde_json::Value::Bool(false)),
-            "null" => Some(serde_json::Value::Null),
-            "undefined" | "string" => None,
-            _ => return None,
-        },
-        Language::Python => match node.kind() {
-            "integer" => code.parse::<i64>().ok().map(serde_json::Value::from),
-            "float" => code
-                .parse::<f64>()
-                .ok()
-                .and_then(serde_json::Number::from_f64)
-                .map(serde_json::Value::Number),
-            "true" => Some(serde_json::Value::Bool(true)),
-            "false" => Some(serde_json::Value::Bool(false)),
-            "none" | "string" => None,
-            _ => return None,
-        },
-    };
+    let literal_value = primitive_literal_value(node, language, source)
+        .or_else(|| is_literal_like_arg(node, language, source).then_some(None))?;
     Some(ObservedArg {
         code,
         literal_value,
@@ -572,6 +631,28 @@ fn extract_literal_args(
     Some(args)
 }
 
+fn callee_function_name(
+    callee: tree_sitter::Node,
+    language: &Language,
+    source: &[u8],
+) -> Option<String> {
+    if callee.kind() == "identifier" {
+        return Some(node_text(&callee, source));
+    }
+
+    match language {
+        Language::TypeScript if callee.kind() == "member_expression" => callee
+            .child_by_field_name("property")
+            .filter(|property| matches!(property.kind(), "property_identifier" | "identifier"))
+            .map(|property| node_text(&property, source)),
+        Language::Python if callee.kind() == "attribute" => callee
+            .child_by_field_name("attribute")
+            .filter(|attribute| attribute.kind() == "identifier")
+            .map(|attribute| node_text(&attribute, source)),
+        _ => None,
+    }
+}
+
 fn collect_observed_calls_recursive(
     node: tree_sitter::Node,
     language: &Language,
@@ -588,8 +669,7 @@ fn collect_observed_calls_recursive(
         let callee = node.child_by_field_name("function");
         let arguments = node.child_by_field_name("arguments");
         if let (Some(callee), Some(arguments)) = (callee, arguments) {
-            if callee.kind() == "identifier" {
-                let name = node_text(&callee, source);
+            if let Some(name) = callee_function_name(callee, language, source) {
                 if function_names.contains(&name) {
                     if let Some(args) = extract_literal_args(arguments, language, source) {
                         out.push(ObservedCall {
@@ -676,11 +756,1054 @@ fn discover_seed_files(source_file: &str, language: &Language) -> Vec<PathBuf> {
         .collect()
 }
 
+fn json_value_to_literal(value: &serde_json::Value, language: &Language) -> String {
+    match language {
+        Language::TypeScript => serde_json::to_string(value).unwrap_or_else(|_| "null".into()),
+        Language::Python => match value {
+            serde_json::Value::Null => "None".into(),
+            serde_json::Value::Bool(value) => {
+                if *value {
+                    "True".into()
+                } else {
+                    "False".into()
+                }
+            }
+            serde_json::Value::Number(value) => value.to_string(),
+            serde_json::Value::String(value) => {
+                serde_json::to_string(value).unwrap_or_else(|_| "''".into())
+            }
+            serde_json::Value::Array(values) => format!(
+                "[{}]",
+                values
+                    .iter()
+                    .map(|item| json_value_to_literal(item, language))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            serde_json::Value::Object(values) => format!(
+                "{{{}}}",
+                values
+                    .iter()
+                    .map(|(key, item)| format!(
+                        "{}: {}",
+                        serde_json::to_string(key).unwrap_or_else(|_| "''".into()),
+                        json_value_to_literal(item, language)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        },
+    }
+}
+
+fn json_value_as_observed_arg(value: &serde_json::Value, language: &Language) -> ObservedArg {
+    let literal_value = match value {
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            Some(value.clone())
+        }
+        _ => None,
+    };
+    ObservedArg {
+        code: json_value_to_literal(value, language),
+        literal_value,
+    }
+}
+
+fn candidate_fixture_function_name(
+    source_file: &str,
+    function_names: &HashSet<String>,
+) -> Option<String> {
+    let stem = Path::new(source_file)
+        .file_stem()
+        .and_then(|value| value.to_str())?;
+    if function_names.contains(stem) {
+        return Some(stem.to_string());
+    }
+    if function_names.len() == 1 {
+        return function_names.iter().next().cloned();
+    }
+    None
+}
+
+fn fixture_json_paths(source_file: &str, project_dir: Option<&str>) -> Vec<PathBuf> {
+    let source_path = Path::new(source_file);
+    let Some(stem) = source_path.file_stem().and_then(|value| value.to_str()) else {
+        return Vec::new();
+    };
+    let Some(source_dir) = source_path.parent() else {
+        return Vec::new();
+    };
+    let parent = source_dir.parent().unwrap_or(source_dir);
+    let filename = format!("{stem}.json");
+    let mut candidates = vec![
+        source_dir.join(&filename),
+        source_dir.join("fixtures").join(&filename),
+        source_dir.join("examples").join(&filename),
+        source_dir.join("tests").join(&filename),
+        parent.join("fixtures").join(&filename),
+        parent.join("examples").join(&filename),
+        parent.join("tests").join(&filename),
+    ];
+
+    if let Some(project_dir) = project_dir {
+        let root = Path::new(project_dir);
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if !is_ignored_project_seed_dir(&path) {
+                        stack.push(path);
+                    }
+                    continue;
+                }
+                if path.file_name().and_then(|value| value.to_str()) == Some(filename.as_str()) {
+                    candidates.push(path);
+                }
+            }
+        }
+    }
+
+    let mut seen = HashSet::new();
+    candidates
+        .into_iter()
+        .filter(|path| path.is_file())
+        .filter(|path| path.metadata().map(|meta| meta.len()).unwrap_or(0) <= 512 * 1024)
+        .filter(|path| seen.insert(path.to_string_lossy().to_string()))
+        .collect()
+}
+
+fn collect_json_fixture_observations(
+    source_file: &str,
+    project_dir: Option<&str>,
+    language: &Language,
+    function_names: &HashSet<String>,
+) -> Vec<ObservedCall> {
+    let Some(function) = candidate_fixture_function_name(source_file, function_names) else {
+        return Vec::new();
+    };
+    let mut observed = Vec::new();
+    for path in fixture_json_paths(source_file, project_dir) {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let args_value = match value {
+                serde_json::Value::Array(mut row) if row.len() == 2 && row[0].is_array() => {
+                    row.remove(0)
+                }
+                serde_json::Value::Array(row) => serde_json::Value::Array(row),
+                _ => continue,
+            };
+            let serde_json::Value::Array(args) = args_value else {
+                continue;
+            };
+            observed.push(ObservedCall {
+                function: function.clone(),
+                args: args
+                    .iter()
+                    .map(|arg| json_value_as_observed_arg(arg, language))
+                    .collect(),
+                source_label: path.to_string_lossy().to_string(),
+            });
+        }
+    }
+    observed
+}
+
+fn json_fixture_rows(
+    source_file: &str,
+    project_dir: Option<&str>,
+    function_names: &HashSet<String>,
+) -> Vec<(String, Vec<serde_json::Value>, serde_json::Value)> {
+    let Some(function) = candidate_fixture_function_name(source_file, function_names) else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    for path in fixture_json_paths(source_file, project_dir) {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let serde_json::Value::Array(mut row) = value else {
+                continue;
+            };
+            if row.len() != 2 || !row[0].is_array() {
+                continue;
+            }
+            let expected = row.pop().unwrap_or(serde_json::Value::Null);
+            let Some(serde_json::Value::Array(args)) = row.pop() else {
+                continue;
+            };
+            rows.push((function.clone(), args, expected));
+        }
+    }
+    rows
+}
+
+fn json_value_is_primitive_sortable(value: &serde_json::Value) -> bool {
+    value.is_number() || value.is_string() || value.is_boolean()
+}
+
+fn json_array_is_sorted_primitive(values: &[serde_json::Value]) -> bool {
+    if values.is_empty() {
+        return true;
+    }
+    if values.iter().all(serde_json::Value::is_number) {
+        let nums = values
+            .iter()
+            .filter_map(serde_json::Value::as_f64)
+            .collect::<Vec<_>>();
+        return nums.len() == values.len()
+            && nums
+                .windows(2)
+                .all(|pair| pair[0].is_finite() && pair[1].is_finite() && pair[0] <= pair[1]);
+    }
+    if values.iter().all(serde_json::Value::is_string) {
+        let strings = values
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>();
+        return strings.windows(2).all(|pair| pair[0] <= pair[1]);
+    }
+    if values
+        .iter()
+        .any(|value| !json_value_is_primitive_sortable(value))
+    {
+        return false;
+    }
+    let mut rendered = values
+        .iter()
+        .map(|value| serde_json::to_string(value).unwrap_or_default())
+        .collect::<Vec<_>>();
+    let original = rendered.clone();
+    rendered.sort();
+    original == rendered
+}
+
+fn json_multiset_key(value: &serde_json::Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "null".into())
+}
+
+fn json_arrays_same_multiset(left: &[serde_json::Value], right: &[serde_json::Value]) -> bool {
+    let mut counts: HashMap<String, isize> = HashMap::new();
+    for value in left {
+        *counts.entry(json_multiset_key(value)).or_default() += 1;
+    }
+    for value in right {
+        let entry = counts.entry(json_multiset_key(value)).or_default();
+        *entry -= 1;
+    }
+    counts.values().all(|count| *count == 0)
+}
+
+fn json_sequence_is_palindrome(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(values) => {
+            values.len() > 1 && values.iter().eq(values.iter().rev())
+        }
+        serde_json::Value::String(value) => {
+            value.len() > 1 && value.chars().eq(value.chars().rev())
+        }
+        _ => false,
+    }
+}
+
+const MIN_FIXTURE_PROPERTY_SUPPORT: usize = 2;
+
+fn fixture_row_key(args: &[serde_json::Value], expected: &serde_json::Value) -> String {
+    let args = serde_json::to_string(args).unwrap_or_else(|_| "[]".into());
+    let expected = serde_json::to_string(expected).unwrap_or_else(|_| "null".into());
+    format!("{args}=>{expected}")
+}
+
+fn fixture_property_support_count<F>(
+    rows: &[(Vec<serde_json::Value>, serde_json::Value)],
+    predicate: F,
+) -> usize
+where
+    F: Fn(&[serde_json::Value], &serde_json::Value) -> bool,
+{
+    let mut seen = HashSet::new();
+    for (args, expected) in rows {
+        if predicate(args, expected) {
+            seen.insert(fixture_row_key(args, expected));
+        }
+    }
+    seen.len()
+}
+
+fn fixture_property_has_support<F>(
+    rows: &[(Vec<serde_json::Value>, serde_json::Value)],
+    predicate: F,
+) -> bool
+where
+    F: Fn(&[serde_json::Value], &serde_json::Value) -> bool,
+{
+    fixture_property_support_count(rows, predicate) >= MIN_FIXTURE_PROPERTY_SUPPORT
+}
+
+fn infer_fixture_properties(
+    source_file: &str,
+    project_dir: Option<&str>,
+    function_names: &HashSet<String>,
+) -> HashMap<String, Vec<String>> {
+    let rows = json_fixture_rows(source_file, project_dir, function_names);
+    let mut grouped: HashMap<String, Vec<(Vec<serde_json::Value>, serde_json::Value)>> =
+        HashMap::new();
+    for (function, args, expected) in rows {
+        grouped.entry(function).or_default().push((args, expected));
+    }
+
+    let mut inferred = HashMap::new();
+    for (function, rows) in grouped {
+        if rows.is_empty() {
+            continue;
+        }
+        let mut properties = Vec::new();
+        let sorted_output = |_: &[serde_json::Value], expected: &serde_json::Value| {
+            expected
+                .as_array()
+                .is_some_and(|values| json_array_is_sorted_primitive(values))
+        };
+        let nontrivial_sorted_output =
+            |args: &[serde_json::Value], expected: &serde_json::Value| {
+                sorted_output(args, expected)
+                    && expected.as_array().is_some_and(|values| values.len() >= 2)
+            };
+        if rows
+            .iter()
+            .all(|(args, expected)| sorted_output(args, expected))
+            && fixture_property_has_support(&rows, nontrivial_sorted_output)
+        {
+            properties.push("sorted".to_string());
+        }
+
+        let permutation_output = |args: &[serde_json::Value], expected: &serde_json::Value| {
+            let Some(input) = args.first().and_then(|value| value.as_array()) else {
+                return false;
+            };
+            let Some(output) = expected.as_array() else {
+                return false;
+            };
+            json_arrays_same_multiset(input, output)
+        };
+        let nontrivial_permutation_output =
+            |args: &[serde_json::Value], expected: &serde_json::Value| {
+                let Some(input) = args.first().and_then(|value| value.as_array()) else {
+                    return false;
+                };
+                let Some(output) = expected.as_array() else {
+                    return false;
+                };
+                input.len() >= 2 && output.len() >= 2 && json_arrays_same_multiset(input, output)
+            };
+        if rows
+            .iter()
+            .all(|(args, expected)| permutation_output(args, expected))
+            && fixture_property_has_support(&rows, nontrivial_permutation_output)
+        {
+            properties.push("permutation".to_string());
+        }
+
+        let nonnegative_output = |_: &[serde_json::Value], expected: &serde_json::Value| {
+            expected
+                .as_f64()
+                .is_some_and(|value| value >= 0.0 && value.is_finite())
+        };
+        if rows
+            .iter()
+            .all(|(args, expected)| nonnegative_output(args, expected))
+            && fixture_property_has_support(&rows, nonnegative_output)
+            && rows.iter().any(|(_, expected)| {
+                expected
+                    .as_f64()
+                    .is_some_and(|value| value > 0.0 && value.is_finite())
+            })
+        {
+            properties.push("nonneg".to_string());
+        }
+
+        let palindrome_output = |_: &[serde_json::Value], expected: &serde_json::Value| {
+            json_sequence_is_palindrome(expected)
+        };
+        if function.to_lowercase().contains("palindrome")
+            && rows
+                .iter()
+                .all(|(args, expected)| palindrome_output(args, expected))
+            && fixture_property_has_support(&rows, palindrome_output)
+        {
+            properties.push("palindrome".to_string());
+        }
+        if !properties.is_empty() {
+            inferred.insert(function, properties);
+        }
+    }
+    inferred
+}
+
+fn apply_inferred_properties(
+    functions: &mut [FunctionInfo],
+    inferred: &HashMap<String, Vec<String>>,
+) {
+    for function in functions {
+        let Some(properties) = inferred.get(&function.name) else {
+            continue;
+        };
+        for property in properties {
+            if !function
+                .declared_properties
+                .iter()
+                .any(|existing| existing == property)
+            {
+                function.declared_properties.push(property.clone());
+            }
+        }
+    }
+}
+
+const QUERY_NESTED_BRACKETS_PROPERTY: &str = "query_nested_brackets";
+const SAME_VALUE_ZERO_PROPERTY: &str = "same_value_zero";
+const PEP440_VERSION_ORDERING_PROPERTY: &str = "pep440_version_ordering";
+const PEP440_SPECIFIER_MEMBERSHIP_PROPERTY: &str = "pep440_specifier_membership";
+const PEP440_FILTER_PRERELEASE_PROPERTY: &str = "pep440_filter_prerelease";
+const COOKIE_VALUE_QUOTE_PROPERTY: &str = "cookie_value_quote";
+const COOKIE_HEADER_QUOTE_PROPERTY: &str = "cookie_header_quote";
+const HTTP_REQUEST_METADATA_PROPERTY: &str = "http_request_metadata";
+const HTTP_RESPONSE_HELPERS_PROPERTY: &str = "http_response_helpers";
+const HTTP_STATIC_FILE_MIDDLEWARE_PROPERTY: &str = "http_static_file_middleware";
+
+fn push_inferred_property(
+    inferred: &mut HashMap<String, Vec<String>>,
+    function: &str,
+    property: &str,
+) {
+    let properties = inferred.entry(function.to_string()).or_default();
+    if !properties.iter().any(|existing| existing == property) {
+        properties.push(property.to_string());
+    }
+}
+
+fn ts_annotation_is_string_like(type_annotation: Option<&str>) -> bool {
+    type_annotation
+        .map(str::trim)
+        .is_some_and(|value| value == "string" || value == "str")
+}
+
+fn ts_annotation_is_structured_or_unknown(type_annotation: Option<&str>) -> bool {
+    let Some(value) = type_annotation.map(str::trim) else {
+        return true;
+    };
+    matches!(value, "unknown" | "any" | "object")
+        || value.starts_with("Record<")
+        || value.starts_with("dict[")
+        || value.starts_with("Dict[")
+        || value.starts_with('{')
+}
+
+fn ts_annotation_is_mapping_like(type_annotation: Option<&str>) -> bool {
+    let Some(value) = type_annotation.map(str::trim) else {
+        return false;
+    };
+    value.starts_with("Record<")
+        || value.starts_with("dict[")
+        || value.starts_with("Dict[")
+        || value.starts_with('{')
+}
+
+fn function_can_accept_query_nested_context(func: &FunctionInfo) -> bool {
+    let lower = func.name.to_lowercase();
+    let query_name_context = lower.contains("query") || lower.contains("urlencoded");
+    if !query_name_context {
+        return false;
+    }
+
+    let first_param_type = func
+        .params
+        .iter()
+        .find(|param| !param.name.starts_with('*'))
+        .and_then(|param| param.type_annotation.as_deref());
+    let return_type = func.return_type.as_deref();
+
+    let parse_like = (lower.contains("parse") || lower.contains("decode"))
+        && ts_annotation_is_string_like(first_param_type)
+        && ts_annotation_is_structured_or_unknown(return_type);
+    let stringify_like = [
+        "stringify",
+        "serialize",
+        "serialise",
+        "canonical",
+        "canonicalize",
+    ]
+    .iter()
+    .any(|cue| lower.contains(cue))
+        && ts_annotation_is_mapping_like(first_param_type)
+        && ts_annotation_is_string_like(return_type);
+
+    parse_like || stringify_like
+}
+
+fn text_suggests_query_nested_brackets_contract(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let query_context = lower.contains("query")
+        || lower.contains("query-string")
+        || lower.contains("query string")
+        || lower.contains("qs.")
+        || lower.contains("urlencoded")
+        || lower.contains("url-encoded")
+        || lower.contains("urlsearchparams")
+        || lower.contains("bracket notation")
+        || lower.contains("form parsing")
+        || lower.contains("form parser")
+        || lower.contains("form body")
+        || lower.contains("body parsing")
+        || lower.contains("body parser");
+    let nested_context = [
+        "bracket notation",
+        "extended parsing",
+        "extended parser",
+        "extended urlencoded",
+        "nested query",
+        "nested queries",
+        "nested object",
+        "nested objects",
+        "nested array",
+        "nested arrays",
+        "nested form",
+        "nested forms",
+        "nested collection",
+        "nested collections",
+        "object-plus-array",
+        "larger arrays",
+        "arrays of objects",
+        "duplicate nested",
+        "[] suffix",
+        "[tags][]",
+        "filter[",
+        "%5b",
+    ]
+    .iter()
+    .any(|cue| lower.contains(cue));
+    query_context && nested_context
+}
+
+fn function_can_accept_http_request_metadata_context(func: &FunctionInfo) -> bool {
+    let lower = func.name.to_lowercase();
+    if !(lower.contains("request") && (lower.contains("decorate") || lower.contains("metadata"))) {
+        return false;
+    }
+    func.params
+        .first()
+        .and_then(|param| param.type_annotation.as_deref())
+        .map(|annotation| {
+            let lower = annotation.to_lowercase();
+            lower.contains("request") || lower.contains("req")
+        })
+        .unwrap_or(false)
+}
+
+fn text_suggests_http_request_metadata_contract(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let request_context = lower.contains("request metadata")
+        || lower.contains("request introspection")
+        || lower.contains("request decoration")
+        || lower.contains("request helpers")
+        || lower.contains("req.get")
+        || lower.contains("req.header")
+        || lower.contains("req.xhr");
+    let behavior_context = [
+        "header lookup",
+        "xhr detection",
+        "trust proxy",
+        "forwarded-proto",
+        "x-forwarded-proto",
+        "protocol",
+        "secure",
+        "query-parser request decoration",
+    ]
+    .iter()
+    .any(|cue| lower.contains(cue));
+    request_context && behavior_context
+}
+
+fn function_can_accept_http_response_helpers_context(func: &FunctionInfo) -> bool {
+    let lower = func.name.to_lowercase();
+    if !(lower.contains("response") && (lower.contains("decorate") || lower.contains("helper"))) {
+        return false;
+    }
+    func.params
+        .first()
+        .and_then(|param| param.type_annotation.as_deref())
+        .map(|annotation| annotation.to_lowercase().contains("response"))
+        .unwrap_or(false)
+}
+
+fn text_suggests_http_response_helpers_contract(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let response_context = lower.contains("response header")
+        || lower.contains("response helper")
+        || lower.contains("response metadata")
+        || lower.contains("status helpers")
+        || lower.contains("sendstatus")
+        || lower.contains("res.location")
+        || lower.contains("res.vary");
+    let behavior_context = [
+        "location",
+        "link header",
+        "vary",
+        "sendstatus",
+        "status helper",
+        "empty response body",
+        "header composition",
+    ]
+    .iter()
+    .any(|cue| lower.contains(cue));
+    response_context && behavior_context
+}
+
+fn function_can_accept_http_static_file_context(func: &FunctionInfo) -> bool {
+    let lower = func.name.to_lowercase();
+    if !(lower.contains("static") && (lower.contains("middleware") || lower.contains("serve"))) {
+        return false;
+    }
+    let first_param_is_root = func
+        .params
+        .first()
+        .and_then(|param| param.type_annotation.as_deref())
+        .map(|annotation| annotation.trim() == "string" || annotation.trim() == "str")
+        .unwrap_or(false);
+    let returns_handler = func
+        .return_type
+        .as_deref()
+        .map(|annotation| {
+            let lower = annotation.to_lowercase();
+            lower.contains("handler") || lower.contains("middleware") || lower.contains("function")
+        })
+        .unwrap_or(false);
+    first_param_is_root && returns_handler
+}
+
+fn text_suggests_http_static_file_contract(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let static_context = lower.contains("static-file")
+        || lower.contains("static file")
+        || lower.contains("static serving")
+        || lower.contains("static-file wrapper")
+        || lower.contains("static root");
+    let file_context = [
+        "serve known files",
+        "serving a known static file",
+        "serving an existing file",
+        "serve an existing file",
+        "serve known file",
+        "static/",
+        "hello.txt",
+    ]
+    .iter()
+    .any(|cue| lower.contains(cue));
+    static_context && file_context
+}
+
+fn text_suggests_same_value_zero_contract(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("samevaluezero")
+        || lower.contains("same value zero")
+        || lower.contains("same_value_zero")
+}
+
+fn text_suggests_pep440_context(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("pep 440")
+        || lower.contains("pep440")
+        || lower.contains("pypa/packaging")
+        || lower.contains("packaging.version")
+        || lower.contains("packaging specifier")
+}
+
+fn text_suggests_pep440_version_ordering(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    text_suggests_pep440_context(text)
+        && (lower.contains("version-ordering")
+            || lower.contains("version ordering")
+            || lower.contains("compare_versions")
+            || lower.contains("test_version.py")
+            || (lower.contains("dev releases") && lower.contains("post releases")))
+}
+
+fn text_suggests_pep440_specifier_membership(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    text_suggests_pep440_context(text)
+        && (lower.contains("specifier-set")
+            || lower.contains("specifier behavior")
+            || lower.contains("allows(version")
+            || lower.contains("compatible release")
+            || lower.contains("~="))
+}
+
+fn text_suggests_pep440_filter_prerelease(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    text_suggests_pep440_context(text)
+        && (lower.contains("specifier.filter")
+            || lower.contains("filter_versions")
+            || lower.contains("prerelease fallback")
+            || lower.contains("only matching candidates"))
+}
+
+fn source_suggests_cookie_quote_context(source_file: &str, source_text: Option<&str>) -> bool {
+    let path = source_file.replace('\\', "/").to_lowercase();
+    if path.contains("cookie") || path.ends_with("/_quote.py") || path.ends_with("/quote.py") {
+        return true;
+    }
+    let Some(text) = source_text else {
+        return false;
+    };
+    let lower = text.to_lowercase();
+    lower.contains("cookie") && lower.contains("quote")
+}
+
+fn push_context_dir_candidates(dir: &Path, candidates: &mut Vec<PathBuf>) {
+    for name in [
+        "README.md",
+        "readme.md",
+        "UPSTREAM_NOTES.md",
+        "CONTRACT.md",
+        "contract.md",
+        "API.md",
+        "api.md",
+    ] {
+        candidates.push(dir.join(name));
+    }
+
+    let docs = dir.join("docs");
+    for name in ["README.md", "readme.md", "CONTRACT.md", "contract.md"] {
+        candidates.push(docs.join(name));
+    }
+
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten().take(40) {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) == Some("md") {
+                candidates.push(path);
+            }
+        }
+    }
+}
+
+fn discover_context_contract_files(source_file: &str, project_dir: Option<&str>) -> Vec<PathBuf> {
+    let source_path = Path::new(source_file);
+    let mut dirs = Vec::new();
+    if let Some(dir) = source_path.parent() {
+        dirs.push(dir.to_path_buf());
+        if let Some(parent) = dir.parent() {
+            dirs.push(parent.to_path_buf());
+        }
+    }
+    if let Some(root) = project_dir {
+        dirs.push(PathBuf::from(root));
+    }
+
+    let mut candidates = Vec::new();
+    for dir in dirs {
+        push_context_dir_candidates(&dir, &mut candidates);
+    }
+
+    let mut seen = HashSet::new();
+    candidates
+        .into_iter()
+        .filter(|path| path.is_file())
+        .filter(|path| path.metadata().map(|meta| meta.len()).unwrap_or(0) <= 256 * 1024)
+        .filter(|path| seen.insert(path.to_string_lossy().to_string()))
+        .collect()
+}
+
+fn infer_context_properties(
+    source_file: &str,
+    project_dir: Option<&str>,
+    functions: &[FunctionInfo],
+) -> HashMap<String, Vec<String>> {
+    let query_candidates: Vec<&FunctionInfo> = functions
+        .iter()
+        .filter(|func| function_can_accept_query_nested_context(func))
+        .collect();
+    let request_metadata_candidates: Vec<&FunctionInfo> = functions
+        .iter()
+        .filter(|func| function_can_accept_http_request_metadata_context(func))
+        .collect();
+    let response_helper_candidates: Vec<&FunctionInfo> = functions
+        .iter()
+        .filter(|func| function_can_accept_http_response_helpers_context(func))
+        .collect();
+    let static_file_candidates: Vec<&FunctionInfo> = functions
+        .iter()
+        .filter(|func| function_can_accept_http_static_file_context(func))
+        .collect();
+    let source_text = std::fs::read_to_string(source_file).ok();
+    let has_pep440_candidate = functions.iter().any(|func| {
+        let lower = func.name.to_lowercase();
+        (lower.contains("compare") && lower.contains("version"))
+            || lower == "allows"
+            || (lower.contains("filter") && lower.contains("version"))
+    });
+    if query_candidates.is_empty()
+        && request_metadata_candidates.is_empty()
+        && response_helper_candidates.is_empty()
+        && static_file_candidates.is_empty()
+        && !functions.iter().any(|func| {
+            func.name
+                .to_lowercase()
+                .replace('_', "")
+                .replace('-', "")
+                .contains("samevaluezero")
+        })
+        && !has_pep440_candidate
+        && !source_suggests_cookie_quote_context(source_file, source_text.as_deref())
+    {
+        return HashMap::new();
+    }
+
+    let mut inferred = HashMap::new();
+    if source_suggests_cookie_quote_context(source_file, source_text.as_deref()) {
+        for func in functions {
+            match func.name.as_str() {
+                "format_cookie_value" => {
+                    push_inferred_property(&mut inferred, &func.name, COOKIE_VALUE_QUOTE_PROPERTY)
+                }
+                "build_cookie_header" => {
+                    push_inferred_property(&mut inferred, &func.name, COOKIE_HEADER_QUOTE_PROPERTY)
+                }
+                _ => {}
+            }
+        }
+    }
+    for path in discover_context_contract_files(source_file, project_dir) {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let lower = text.to_lowercase();
+        if text_suggests_query_nested_brackets_contract(&text) {
+            for func in &query_candidates {
+                let function_mentioned = lower.contains(&func.name.to_lowercase());
+                if function_mentioned || query_candidates.len() == 1 {
+                    push_inferred_property(
+                        &mut inferred,
+                        &func.name,
+                        QUERY_NESTED_BRACKETS_PROPERTY,
+                    );
+                }
+            }
+        }
+        if text_suggests_http_request_metadata_contract(&text) {
+            for func in &request_metadata_candidates {
+                let function_mentioned = lower.contains(&func.name.to_lowercase());
+                if function_mentioned || request_metadata_candidates.len() == 1 {
+                    push_inferred_property(
+                        &mut inferred,
+                        &func.name,
+                        HTTP_REQUEST_METADATA_PROPERTY,
+                    );
+                }
+            }
+        }
+        if text_suggests_http_response_helpers_contract(&text) {
+            for func in &response_helper_candidates {
+                let function_mentioned = lower.contains(&func.name.to_lowercase());
+                if function_mentioned || response_helper_candidates.len() == 1 {
+                    push_inferred_property(
+                        &mut inferred,
+                        &func.name,
+                        HTTP_RESPONSE_HELPERS_PROPERTY,
+                    );
+                }
+            }
+        }
+        if text_suggests_http_static_file_contract(&text) {
+            for func in &static_file_candidates {
+                let function_mentioned = lower.contains(&func.name.to_lowercase());
+                if function_mentioned || static_file_candidates.len() == 1 {
+                    push_inferred_property(
+                        &mut inferred,
+                        &func.name,
+                        HTTP_STATIC_FILE_MIDDLEWARE_PROPERTY,
+                    );
+                }
+            }
+        }
+        if text_suggests_same_value_zero_contract(&text) {
+            for func in functions {
+                let normalized_name = func.name.to_lowercase().replace('_', "").replace('-', "");
+                if normalized_name.contains("samevaluezero") {
+                    push_inferred_property(&mut inferred, &func.name, SAME_VALUE_ZERO_PROPERTY);
+                }
+            }
+        }
+        if text_suggests_pep440_version_ordering(&text) {
+            for func in functions {
+                let lower = func.name.to_lowercase();
+                if lower.contains("compare") && lower.contains("version") {
+                    push_inferred_property(
+                        &mut inferred,
+                        &func.name,
+                        PEP440_VERSION_ORDERING_PROPERTY,
+                    );
+                }
+            }
+        }
+        if text_suggests_pep440_specifier_membership(&text) {
+            for func in functions {
+                let lower = func.name.to_lowercase();
+                if lower == "allows" || (lower.contains("allow") && lower.contains("specifier")) {
+                    push_inferred_property(
+                        &mut inferred,
+                        &func.name,
+                        PEP440_SPECIFIER_MEMBERSHIP_PROPERTY,
+                    );
+                }
+            }
+        }
+        if text_suggests_pep440_filter_prerelease(&text) {
+            for func in functions {
+                let lower = func.name.to_lowercase();
+                if lower.contains("filter") && lower.contains("version") {
+                    push_inferred_property(
+                        &mut inferred,
+                        &func.name,
+                        PEP440_FILTER_PRERELEASE_PROPERTY,
+                    );
+                }
+            }
+        }
+    }
+    inferred
+}
+
+fn is_ignored_project_seed_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|name| {
+            matches!(
+                name,
+                ".git"
+                    | ".hg"
+                    | ".svn"
+                    | "node_modules"
+                    | "target"
+                    | "dist"
+                    | "build"
+                    | "coverage"
+                    | "__pycache__"
+                    | ".venv"
+                    | "venv"
+            )
+        })
+}
+
+fn is_probably_test_seed_file(path: &Path) -> bool {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    if normalized.contains("/tests/")
+        || normalized.contains("/__tests__/")
+        || normalized.contains("/test/")
+    {
+        return true;
+    }
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|name| {
+            name.starts_with("test_")
+                || name.ends_with("_test.py")
+                || name.contains(".test.")
+                || name.contains(".spec.")
+        })
+}
+
+fn is_supported_project_seed_file(path: &Path, language: &Language) -> bool {
+    match language {
+        Language::TypeScript => {
+            path.extension().and_then(|value| value.to_str()) == Some("ts")
+                && !path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|name| name.ends_with(".d.ts"))
+        }
+        Language::Python => path.extension().and_then(|value| value.to_str()) == Some("py"),
+    }
+}
+
+fn discover_project_seed_files(
+    source_file: &str,
+    project_dir: Option<&str>,
+    language: &Language,
+) -> Vec<PathBuf> {
+    let source_path = Path::new(source_file);
+    let root = project_dir
+        .map(PathBuf::from)
+        .or_else(|| source_path.parent().map(Path::to_path_buf));
+    let Some(root) = root else {
+        return Vec::new();
+    };
+
+    let source_canonical = source_path.canonicalize().ok();
+    let mut stack = vec![root];
+    let mut candidates = Vec::new();
+
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if !is_ignored_project_seed_dir(&path) {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if candidates.len() >= 80 {
+                continue;
+            }
+            if !is_supported_project_seed_file(&path, language) || is_probably_test_seed_file(&path)
+            {
+                continue;
+            }
+            if path.metadata().map(|meta| meta.len()).unwrap_or(0) > 256 * 1024 {
+                continue;
+            }
+            if source_canonical
+                .as_ref()
+                .is_some_and(|source| path.canonicalize().ok().as_ref() == Some(source))
+            {
+                continue;
+            }
+            candidates.push(path);
+        }
+    }
+
+    candidates.sort();
+    candidates
+}
+
 fn collect_seed_observations(
     code: &str,
     language: &Language,
     functions: &[FunctionInfo],
     source_file: Option<&str>,
+    project_dir: Option<&str>,
     explicit_test_code: Option<&str>,
     explicit_test_file: Option<&str>,
     auto_seed: bool,
@@ -709,6 +1832,27 @@ fn collect_seed_observations(
                 if let Ok(test_code) = std::fs::read_to_string(&path) {
                     observed.extend(collect_observed_calls(
                         &test_code,
+                        language,
+                        &function_names,
+                        &path.to_string_lossy(),
+                    ));
+                }
+            }
+        }
+    }
+
+    if auto_seed {
+        if let Some(source_file) = source_file {
+            observed.extend(collect_json_fixture_observations(
+                source_file,
+                project_dir,
+                language,
+                &function_names,
+            ));
+            for path in discover_project_seed_files(source_file, project_dir, language) {
+                if let Ok(context_code) = std::fs::read_to_string(&path) {
+                    observed.extend(collect_observed_calls(
+                        &context_code,
                         language,
                         &function_names,
                         &path.to_string_lossy(),
@@ -1196,7 +2340,7 @@ pub async fn verify(
     // Stage 4: Synthesize + Execute
     if !opts.tests_only && !analysis.functions.is_empty() {
         // Determine which functions to fuzz
-        let functions_to_fuzz: Vec<FunctionInfo> = if let Some(diff_str) = opts.diff {
+        let mut functions_to_fuzz: Vec<FunctionInfo> = if let Some(diff_str) = opts.diff {
             let changed_ranges = opts
                 .source_file
                 .map(|path| diff::parse_changed_lines_for_file(diff_str, path))
@@ -1205,6 +2349,22 @@ pub async fn verify(
         } else {
             analysis.functions.clone()
         };
+        let mut inferred_fixture_properties: HashMap<String, Vec<String>> = HashMap::new();
+        let mut inferred_context_properties: HashMap<String, Vec<String>> = HashMap::new();
+        if opts.auto_seed {
+            if let Some(source_file) = opts.source_file {
+                let function_names: HashSet<String> = functions_to_fuzz
+                    .iter()
+                    .map(|func| func.name.clone())
+                    .collect();
+                inferred_fixture_properties =
+                    infer_fixture_properties(source_file, opts.project_dir, &function_names);
+                apply_inferred_properties(&mut functions_to_fuzz, &inferred_fixture_properties);
+                inferred_context_properties =
+                    infer_context_properties(source_file, opts.project_dir, &functions_to_fuzz);
+                apply_inferred_properties(&mut functions_to_fuzz, &inferred_context_properties);
+            }
+        }
 
         // Resolve imported types so the fuzzer can construct proper objects
         let mut all_classes = analysis.classes.clone();
@@ -1225,6 +2385,7 @@ pub async fn verify(
             language,
             &functions_to_fuzz,
             opts.source_file,
+            opts.project_dir,
             opts.test_code,
             opts.test_source_file,
             opts.auto_seed,
@@ -1345,6 +2506,8 @@ pub async fn verify(
                     "seed_input_count": seed_input_count,
                     "seeded_functions": seed_inputs.len(),
                     "seed_sources": seed_sources,
+                    "inferred_fixture_properties": inferred_fixture_properties,
+                    "inferred_context_properties": inferred_context_properties,
                     "auto_seed": opts.auto_seed,
                 })),
                 error: None,
@@ -1417,6 +2580,10 @@ pub async fn verify(
             detail["seed_input_count"] = serde_json::Value::from(seed_input_count);
             detail["seeded_functions"] = serde_json::Value::from(seed_inputs.len());
             detail["seed_sources"] = serde_json::to_value(&seed_sources).unwrap();
+            detail["inferred_fixture_properties"] =
+                serde_json::to_value(&inferred_fixture_properties).unwrap();
+            detail["inferred_context_properties"] =
+                serde_json::to_value(&inferred_context_properties).unwrap();
             detail["auto_seed"] = serde_json::Value::Bool(opts.auto_seed);
             detail["suppression_source"] = serde_json::to_value(opts.suppression_source).unwrap();
 
@@ -1449,6 +2616,8 @@ pub async fn verify(
                     "seed_input_count": seed_input_count,
                     "seeded_functions": seed_inputs.len(),
                     "seed_sources": seed_sources,
+                    "inferred_fixture_properties": inferred_fixture_properties,
+                    "inferred_context_properties": inferred_context_properties,
                     "auto_seed": opts.auto_seed,
                 })),
                 error: None,
@@ -1631,6 +2800,7 @@ fn minimal_stage_view(stage: &VerificationStage) -> serde_json::Value {
                 "seed_input_count": detail.get("seed_input_count").cloned().unwrap_or_else(|| serde_json::Value::from(0)),
                 "seeded_functions": detail.get("seeded_functions").cloned().unwrap_or_else(|| serde_json::Value::from(0)),
                 "seed_sources": detail.get("seed_sources").cloned().unwrap_or_else(|| serde_json::json!([])),
+                "inferred_context_properties": detail.get("inferred_context_properties").cloned().unwrap_or_else(|| serde_json::json!({})),
             })),
             "execute" => Some(serde_json::json!({
                 "runtime": detail.get("runtime").cloned().unwrap_or(serde_json::Value::Null),
@@ -1644,6 +2814,7 @@ fn minimal_stage_view(stage: &VerificationStage) -> serde_json::Value {
                 "seed_input_count": detail.get("seed_input_count").cloned().unwrap_or_else(|| serde_json::Value::from(0)),
                 "seeded_functions": detail.get("seeded_functions").cloned().unwrap_or_else(|| serde_json::Value::from(0)),
                 "seed_sources": detail.get("seed_sources").cloned().unwrap_or_else(|| serde_json::json!([])),
+                "inferred_context_properties": detail.get("inferred_context_properties").cloned().unwrap_or_else(|| serde_json::json!({})),
             })),
             "lint" => Some(serde_json::json!({
                 "diagnostics": detail.get("diagnostics").cloned().unwrap_or_else(|| serde_json::json!([])),

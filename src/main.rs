@@ -184,7 +184,10 @@ fn parse_flags(rest: &[String]) -> Result<CliArgs, String> {
             "--report" => {
                 let raw = take_value(&mut i)?;
                 out.ci_report_format = CiReportFormat::parse(&raw).ok_or_else(|| {
-                    format!("--report must be one of: human, github, json (got '{}')", raw)
+                    format!(
+                        "--report must be one of: human, github, json (got '{}')",
+                        raw
+                    )
                 })?;
             }
             "--project-dir" => out.project_dir = Some(take_value(&mut i)?),
@@ -472,10 +475,7 @@ fn ci_changed_source_files(
 
 fn ci_unified_diff(repo_dir: &Path, base: &str, head: &str) -> Result<String, String> {
     let range = format!("{base}...{head}");
-    git_output(
-        repo_dir,
-        &["diff".into(), "--unified=0".into(), range],
-    )
+    git_output(repo_dir, &["diff".into(), "--unified=0".into(), range])
 }
 
 async fn run_ci_for_repo(repo_dir: &Path, args: &CliArgs) -> Result<CiRunResult, String> {
@@ -523,7 +523,11 @@ async fn run_ci_for_repo(repo_dir: &Path, args: &CliArgs) -> Result<CiRunResult,
                 project_dir: project_dir.as_deref(),
                 lint_config_path: args.config_path.as_deref(),
                 lint_virtual_file_path: None,
-                diff: if diff.is_empty() { None } else { Some(diff.as_str()) },
+                diff: if diff.is_empty() {
+                    None
+                } else {
+                    Some(diff.as_str())
+                },
                 suppressions: None,
                 suppression_source: None,
                 auto_seed: !args.no_auto_seed,
@@ -590,10 +594,9 @@ fn ci_stage_brief(stage: &court_jester_mcp::types::VerificationStage) -> String 
                 .unwrap_or(0);
             format!("{crashes} crash(es), {property} property violation(s)")
         }
-        "test" | "parse" | "portability" | "lint" => stage
-            .error
-            .clone()
-            .unwrap_or_else(|| "stage failed".into()),
+        "test" | "parse" | "portability" | "lint" => {
+            stage.error.clone().unwrap_or_else(|| "stage failed".into())
+        }
         _ => stage.error.clone().unwrap_or_else(|| "stage failed".into()),
     }
 }
@@ -613,10 +616,7 @@ fn render_ci_human(result: &CiRunResult) -> String {
     ));
     out.push_str(&format!("Gates: {}\n", result.gates.join(", ")));
     if !result.skipped_files.is_empty() {
-        out.push_str(&format!(
-            "Skipped: {}\n",
-            result.skipped_files.join(", ")
-        ));
+        out.push_str(&format!("Skipped: {}\n", result.skipped_files.join(", ")));
     }
     if result.files.iter().all(|file| file.selected_gate_ok) {
         return out;

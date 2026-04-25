@@ -1,0 +1,7 @@
+--- a/method.ts
++++ b/method.ts
+@@ -3,3 +3,4 @@
+ const METHOD_RULES: Partial<Record<HttpMethod, { allowsBody: boolean }>> = {
+   GET: { allowsBody: false },
++  PATCH: { allowsBody: true },
+ };
