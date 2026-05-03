@@ -15,3 +15,4 @@ htmlcov/
 .playwright-mcp/
 .ruff_cache/
 Library/
+tasks.json
