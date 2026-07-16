@@ -1,31 +1,48 @@
 # Report Schema And Stability
 
-Court Jester verify reports are intended to be machine-consumable. This document defines the current stability contract for `schema_version: 2`.
+Court Jester reports are machine-consumable contracts. The active report schema is **v3** (`schema_version: 3`). A consumer MUST branch on the typed `verdict` and `strength` fields; a missing, unknown, or older schema is not a successful verification.
 
-## Top-Level Contract
+## Top-level report
 
-Full and minimal verify reports both expose these top-level keys:
+Full and minimal `verify` reports contain:
 
-- `schema_version`
-- `overall_ok`
-- `summary`
-- `stages`
-- `report_path` on direct CLI output
-- `meta` on persisted reports written via `--output-dir`
+- `schema_version`: integer `3`.
+- `verdict`: `pass`, `fail`, or `inconclusive`.
+- `strength`: `none`, `parse_only`, `static_checked`, `runtime_smoke`, `property_checked`, or `authoritative_tests`.
+- `summary`: aggregate function, finding, lint, complexity, and coverage counts.
+- `stages`: ordered stage records.
+- `report_path`: present on direct output when a report was persisted.
+- persisted reports additionally contain `meta` (`source_file`, `language`, `timestamp`, and `duration_ms`).
 
-Within a given `schema_version`, these keys are stable. Breaking changes to their meaning or shape require a schema bump.
+The v3 contract is a clean cutover: consumers must not infer a verdict from a legacy boolean field or compatibility alias.
 
-## Stage Contract
+### Verdict semantics
 
-Stage objects use this stable shape:
+Verdict precedence is fail > inconclusive > pass:
 
-- `name`
-- `ok`
-- `duration_ms`
-- `detail` when the stage has structured detail
-- `error` when the stage failed or has an advisory warning
+- `fail`: syntax/complexity gate failure, a gated finding, or an authoritative test failure.
+- `inconclusive`: no valid behavioral evidence, a required coverage gap, unsupported or blocked module loading, rejected/all-invalid inputs, timeout or resource kill, or an infrastructure condition that prevents a trustworthy check.
+- `pass`: the applicable gates completed, required surfaces were behaviorally checked, and no gated finding or test failure occurred.
 
-Current stage names in schema v2 are:
+An advisory finding or advisory lint/portability warning remains visible without changing a pass to a fail. `--inferred-oracle-gate fail` promotes low-confidence inferred semantic findings to the gate; the default is `advisory`.
+
+Strength describes evidence, not the verdict: a parse failure can be `parse_only`; completed static checks can be `static_checked`; a valid invocation without an evaluated oracle is `runtime_smoke`; an evaluated runtime/type/declared/generic oracle is `property_checked`; and a completed authoritative test is `authoritative_tests`.
+
+## Stage contract
+
+Each stage has this shape:
+
+```json
+{
+  "name": "execute",
+  "status": "passed",
+  "duration_ms": 42,
+  "detail": {},
+  "message": "optional human-readable context"
+}
+```
+
+`detail` and `message` are optional. `status` is one of `passed`, `failed`, `inconclusive`, `advisory`, or `skipped`. Current stage names are:
 
 - `parse`
 - `complexity`
@@ -35,51 +52,19 @@ Current stage names in schema v2 are:
 - `execute`
 - `test`
 
-Stage names are append-only within a schema version. Existing names will not be repurposed silently. If a future change needs to remove or fundamentally redefine a stage, the report schema must bump.
+Lint is advisory by design. Portability is advisory after a successful repository-native fallback and inconclusive when loading prevents behavioral execution.
 
-## Full vs Minimal
+## Coverage contract
 
-`--report-level full` keeps the complete stage detail payload, including raw parse output, stderr, and detailed fuzz artifacts.
+The default `--coverage-gate changed-exports` requires every changed exported/invocable surface when a diff is supplied, and every exported/invocable surface otherwise. If a file has no exports, selected top-level callables are the fallback. `--coverage-gate none` disables per-surface enforcement but does not manufacture a pass when there is zero valid behavioral evidence and no authoritative test.
 
-`--report-level minimal` keeps the fields intended for CI and dashboards:
+Coverage entries use typed statuses:
 
-- top-level pass/fail and summary
-- stage names, outcomes, and durations
-- execute finding counts and failure lists
-- complexity violations
-- coverage counts
-- portability reason, imports, and fix hint
-
-If a field exists only in `full`, consumers should treat it as debug-only and not build hard CI dependencies on it.
-
-## Execute Severity Contract
-
-Execute findings currently use these categories:
-
-- `crash`
-- `property_violation`
-- `no_inputs_reached`
-
-Execute findings may also include an optional `classification` field when Court Jester can refine the result without changing the base severity. Current classifications include:
-
-- `type_signature_wider_than_usage`
-
-`no_inputs_reached` is diagnostic-only by default. It is reported in stage detail and summary counts, but it does not fail the execute stage unless a future gate explicitly chooses to do so.
-
-`--execute-gate` controls which execute severities fail the run:
-
-- `all`: fail on crash and property-violation findings
-- `crash`: fail only on crash findings
-- `none`: never fail on execute findings
-
-The selected gate is recorded in the execute stage detail.
-
-## Coverage Status Contract
-
-Coverage detail reports per-function statuses such as:
-
-- `fuzzed`
-- `fuzzed_via_factory`
+- `checked_direct`
+- `reached_via_factory`
+- `checked_via_factory`
+- `checked_via_caller`
+- `checked_via_authoritative_test`
 - `skipped_no_fuzzable_surface`
 - `skipped_unsupported_type`
 - `skipped_internal_helper`
@@ -89,65 +74,70 @@ Coverage detail reports per-function statuses such as:
 - `skipped_diff_filtered`
 - `blocked_module_load`
 
-`skipped_no_fuzzable_surface` is used for zero-argument functions where Court Jester cannot derive a meaningful parameter surface or stable return contract to exercise.
+Every entry also has `required`, `invocation_path`, and an optional `reason`. A factory/caller reach event alone is not behavioral checking. `CoverageSummary` reports `required`, `behaviorally_checked`, `reached_only`, `no_inputs_reached`, `skipped`, and `blocked`.
 
-`fuzzed_via_factory` is used for callable methods discovered on a returned factory object surface. Those entries are reported explicitly even when the callable itself is not a top-level function.
+In `--tests-only`, the supplied test process is the sole behavioral gate: each required surface must emit its matching entry event. A passing test that does not cover all required surfaces is inconclusive.
 
-Supported container-backed callables, such as Zustand-style `create(... => ({ ... }))` stores, are reported as normal `fuzzed` entries with explicit surfaced names like `useStore.method`. That keeps them distinct from incidental nested helpers, which remain `skipped_nested`.
+## Findings and repros
 
-## Complexity Contract
+Execute detail contains typed `findings`, `suppressed_findings`, and `findings_summary`; it does not contain the obsolete `fuzz_failures` arrays. A finding includes:
 
-Complexity threshold reports include:
+- `id`, `severity`, `confidence`, `category`, `location`, `oracle`, and `input_classification`;
+- a structured `repro` with kind, arguments, minimized expressions, snippet, expectation, and (when persisted) replay command;
+- `minimization` with `status`, `attempts`, `original`, and an optional reconfirmed `minimized` case;
+- optional `error_type`, `classification`, `suggestion`, and `suppressed`.
 
-- `threshold`
-- `metric`
-- `violations`
-- `suppressed_violations`
-- `checked_functions`
-- `diff_scoped`
+Enums are serialized in snake case. Severities are `crash`, `property_violation`, `behavioral_regression`, and `infrastructure`; confidences are `authoritative`, `high`, `medium`, and `low`; categories are `exception`, `property`, `test`, `differential`, and `infrastructure`. Oracle kinds are `authoritative_test`, `runtime_contract`, `type_contract`, `declared_property`, `seed_regression`, `differential`, `generic_property`, and `inferred_semantic`.
 
-`metric` is explicit so consumers know whether the gate used `cyclomatic` or `cognitive` complexity.
+Every finding has a machine-verifiable replay snippet. The snippet emits exactly one `__COURT_JESTER_REPLAY_JSON__` sentinel followed by `{reproduced,severity,oracle_kind,category}`. A persisted report gets `court-jester replay --report <report_path> --finding <id>` in the repro; direct stdout reports keep `command: null`.
 
-## Suppressions
+Differential repros embed base/candidate local source closures and a dependency contract. A base/candidate behavior difference is advisory unless an authoritative fixture, test, or declared contract proves the candidate side wrong. Replay requires matching third-party/runtime dependencies; missing or mismatched dependencies are inconclusive.
 
-When `--suppressions-file` is used, suppressed findings remain visible in the report:
+## Full, minimal, and repair output
 
-- execute stage:
-  - `suppressed_fuzz_failures`
-  - `suppressed_finding_counts`
-- complexity stage:
-  - `suppressed_violations`
-- portability stage:
-  - `suppressed: true`
+`--report-level full` retains complete stage detail, structured findings, repros, and execution diagnostics. `--report-level minimal` keeps the verdict/strength, stage statuses and durations, actionable findings/repros, summary counts, and coverage summary while omitting verbose parse and harness detail. Consumers MUST use values, not field presence, to make gate decisions.
 
-The suppression file path is echoed back as `suppression_source` where relevant.
+`--summary repair-json` emits only:
 
-## Seed Inputs
+```json
+{
+  "schema_version": 3,
+  "verdict": "inconclusive",
+  "strength": "static_checked",
+  "recommended_action": "add_contract_or_test",
+  "primary_finding": null,
+  "findings": [],
+  "coverage": {}
+}
+```
 
-When auto-seeding is enabled, coverage and execute detail can include:
+`recommended_action` is exactly `repair` for `fail`, `inspect_environment` for infrastructure inconclusive, `add_contract_or_test` for coverage/no-input inconclusive, and `none` for `pass`. Suppressed findings cannot become `primary_finding`.
 
-- `seed_input_count`
-- `seeded_functions`
-- `seed_sources`
+## CI and exit codes
 
-Court Jester seeds fuzzing from:
+`court-jester ci` defaults to `parse,lint,coverage,portability,execute,test`; `--gate` selects a comma-separated subset or `all`. Aggregate and per-file results use typed verdicts, with fail taking precedence over inconclusive, then pass. CI JSON uses the same typed contract as `verify`.
 
-- simple literal call sites in the source file
-- explicit test files provided to `verify`
-- conventional nearby test files when `--no-auto-seed` is not set
+For `verify` and `ci`:
 
-## Schema Bump Rules
+- `0`: pass;
+- `1`: fail;
+- `2`: usage/setup error before a report exists;
+- `3`: inconclusive report.
 
-These changes require a new `schema_version`:
+`execute`, `doctor`, and `replay` preserve their own command contracts. `doctor` returns a schema-v3 readiness report and exits `0` for pass, `1` for failed readiness, and `2` for usage. `replay` returns `0` for `reproduced`, `1` for `not_reproduced`, `2` for invalid report/id/arguments, and `3` for inconclusive runtime/dependency/protocol conditions.
 
-- removing or renaming an existing top-level key
-- removing or renaming an existing stage
-- changing the type of an existing stable field
-- changing the meaning of `overall_ok` or a stable severity class
+## Runtime profiles
 
-These changes do not require a schema bump:
+`--runtime-profile local-trusted` (the default) runs the existing host subprocess path and is not a security boundary. `--runtime-profile isolated` uses Docker with the selected language image (`python:3.12-slim` or `node:24-bookworm-slim` by default), no network, read-only mounts/root filesystem, bounded CPU/memory/processes, and cleanup on every path. `--python-docker-image` and `--typescript-docker-image` are valid only with `isolated`; timeout and memory values must be finite/positive. Docker/image/daemon failures are structured inconclusive results and never fall back to local execution.
 
-- adding a new stage
-- adding new fields to `detail`
-- adding new summary counters
-- adding new optional execute or portability reason strings
+`court-jester doctor --language python|typescript|all` checks the selected runtime profile, images, and optional linters. Its JSON includes `schema_version`, `verdict`, `runtime_profile`, and typed `checks`.
+
+## Stability and migration
+
+Schema v3 is a clean cutover. Consumers MUST reject any report whose `schema_version` is not `3`; they MUST NOT infer a verdict from legacy boolean fields or from stage names. Adding optional detail fields or counters is compatible. Removing/renaming a stable v3 field, changing an enum, or changing the meaning of a verdict/strength requires a future schema bump.
+
+Benchmark artifacts from earlier releases remain historical evidence only. They are not silently converted into v3 reports or artifact-v1 benchmark inputs.
+
+## Benchmark artifact boundary
+
+The Python benchmark has its own immutable `artifact_schema_version: 1`; every `matrix.json`, `run.json`, `result.json`, summary, and evidence manifest also records `verify_schema_version_required: 3`. Missing, mixed, or mismatched versions are abstentions and are excluded from semantic gates unless an explicit legacy mode labels them as historical. Evidence bundles are checksummed and redaction-aware. Optional shadow JSONL records carry `blocking_mode: shadow` and never alter task success. Gate decisions are emitted separately as `none`, `private-beta-default`, or `strict-heldout` and are ineligible when required cells or metrics are missing.

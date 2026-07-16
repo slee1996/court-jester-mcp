@@ -123,7 +123,7 @@ If this were submitted now, the obvious reviewer objections would be:
 1. No statistical significance treatment in the paper-ready sense.
 2. Limited external validity beyond the curated benchmark suites.
 3. Related work and baseline framing are still absent.
-4. A two-step proving-ground run is still absent unless we intentionally scope it out.
+4. The paper does not exhaust every robustness variant, but the missing two-step proving-ground variant can be explicitly scoped out as non-essential to the central claim.
 5. No section yet isolating where lift comes from by task family or failure type.
 
 Those are fixable. But they are real.
@@ -153,7 +153,7 @@ A main-conference submission is possible only if the paper becomes more discipli
 2. Break out results by model family, task family, and failure class.
 3. Add paper figures before drafting full prose.
 4. Build related work around agentic code repair, execution-based verification, and program-repair feedback loops. Use verified citations only.
-5. Decide whether to run the two-step proving-ground matrix or explicitly scope it out in the paper.
+5. Keep the two-step proving-ground matrix explicitly scoped out unless a venue-specific reason emerges to add it.
 
 ## Bottom line
 There is a real paper here. But the paper is smaller than the product ambition. That is fine. The smaller true paper is stronger than the bigger inflated one.

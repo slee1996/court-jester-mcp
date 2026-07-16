@@ -75,7 +75,7 @@ Best fits:
 1. Add significance analysis over repeated runs.
 2. Break results out by model and task family.
 3. Add a failure taxonomy table for remaining misses.
-4. Decide whether to run the two-step proving-ground matrix or explicitly scope it out.
+4. Explicitly scope out the two-step proving-ground matrix as non-essential reviewer armor unless a venue-specific reason emerges.
 5. Decide whether the paper is a product benchmark paper or a more general claim about agent-verifier feedback.
 
 ## Draft abstract spine

@@ -1,5 +1,5 @@
-use court_jester_mcp::tools::synthesize::synthesize_calls;
-use court_jester_mcp::types::*;
+use court_jester::tools::synthesize::synthesize_calls;
+use court_jester::types::*;
 use std::collections::BTreeMap;
 
 #[test]

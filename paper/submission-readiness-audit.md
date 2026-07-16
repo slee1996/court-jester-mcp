@@ -49,7 +49,7 @@ That matters because public repair does improve over baseline on the suite desig
 
 What remains is robustness breadth, not primary attribution:
 - the two-step `core-current` matrix is now complete and preserves the same ranking
-- ideally run the two-step proving-ground matrix too, unless you intentionally scope the paper around the completed package
+- a two-step proving-ground matrix could be added as extra reviewer armor, but it is not necessary for the paper's central claim and can be explicitly scoped out
 
 ### Blocker 2: Statistics and failure-analysis package now needs conversion into final paper tables and figures
 Severity: high
@@ -146,7 +146,7 @@ This becomes submission-ready when all of the following are true:
 - [ ] figures exist and are paper-ready
 - [ ] intro and limitations are written in scoped, non-inflated language
 - [x] two-step `core-current` robustness package is complete
-- [ ] two-step proving-ground robustness package is complete or intentionally scoped out
+- [x] two-step proving-ground robustness is explicitly scoped out as non-essential to the central claim
 
 ## Best current framing
 If forced to submit soon, frame the paper as:

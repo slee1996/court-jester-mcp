@@ -62,8 +62,8 @@ The current repo story is therefore stronger than the earlier April 18 headline 
 
 Large-scale product-clone roadmap:
 
-- [bench/express-full-clone-plan.md](/Users/spencerlee/court-jester-mcp/bench/express-full-clone-plan.md)
-- [bench/express-testfile-gauntlet-v1-plan.md](/Users/spencerlee/court-jester-mcp/bench/express-testfile-gauntlet-v1-plan.md)
+- [bench/express-full-clone-plan.md](express-full-clone-plan.md)
+- [bench/express-testfile-gauntlet-v1-plan.md](express-testfile-gauntlet-v1-plan.md)
 - the near-term goal is an Express-derived gauntlet that rolls cleanly into `express-full-clone-alpha`, not another disconnected toy slice
 
 ## Benchmark Guardrails
@@ -172,7 +172,7 @@ Current Express alpha status:
 
 Mutation recall and broader verify-eval planning:
 
-- [bench/verify-eval-roadmap.md](/Users/spencerlee/court-jester-mcp/bench/verify-eval-roadmap.md)
+- [bench/verify-eval-roadmap.md](verify-eval-roadmap.md)
 
 Each run directory now records more than the final outcome:
 
@@ -198,6 +198,14 @@ For CLI benchmarks, evaluator isolation is mandatory. If a hidden or verifier-on
 - `agent_trace_overhead_estimate_ms`
 
 The estimate is intentionally simple: fixed setup/summary time plus a per-event shell-wrapper cost estimate. It is useful for comparing policies and providers, not for precise per-command profiling.
+
+## Artifact v1, evidence, and gates
+
+Every matrix, run, result, summary, and evidence manifest is artifact schema `1` and records `verify_schema_version_required: 3`. The runner writes a typed `verifier_observation` (`pass`, `fail`, or `abstain`); timeouts, tool/setup errors, schema mismatches, and verifier `inconclusive` results are abstentions rather than semantic failures. Legacy artifacts are rejected by default and may be included only with an explicit legacy option, clearly labeled and excluded from release gates.
+
+All non-dry `bench.run_matrix` commands require a passing schema-v3 `--doctor-report` for the selected `--verify-runtime-profile local-trusted|isolated`; reproducible lanes persist the selected profile, resolved image/runtime IDs, doctor digest, and paired hidden-seed digest. Use `--summary-json`, `--baseline-policy`, `--candidate-policy`, `--bootstrap-samples`, and `--gate-policy none|private-beta-default|strict-heldout`; `--fail-on-gate` makes an ineligible or failed gate exit non-zero. Private-beta gates require complete eligible pairs and bounded provider, timeout, setup, schema, and abstention rates; strict-heldout also requires a positive bootstrap lower bound.
+
+`--evidence-bundle` creates a portable, checksummed bundle. `--evidence-redaction none|transcripts|all-text` controls text removal (the default is `transcripts`), and `--strict-evidence` rejects missing or mismatched required artifacts. `--shadow-records` appends artifact-v1 JSONL with `blocking_mode: shadow`; the summarizer accepts matching `--shadow-records` and `--shadow-outcomes`, resolves labeled outcomes by precedence, and never changes benchmark success.
 
 ## Manifest Shapes
 

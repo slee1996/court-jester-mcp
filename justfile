@@ -54,3 +54,16 @@ fmt:
 # Clippy lint the Rust sources.
 clippy:
     cargo clippy --all-targets -- -D warnings
+
+# Validate every local gate required before creating a release tag.
+release-check:
+    python3 scripts/check_release.py --tag v0.2.0
+    cargo fmt --all -- --check
+    cargo clippy --locked --all-targets -- -D warnings
+    cargo test --locked --tests
+    python3 -m unittest bench.test_run_matrix bench.test_runner bench.test_summarize_runs bench.test_evidence
+    python3 -m unittest discover -s tests -p 'release_test.py'
+    cargo build --locked --release --bin court-jester
+    python3 scripts/smoke_cli.py --binary target/release/court-jester --verify-sample
+    python3 scripts/prepare_release.py --binary target/release/court-jester --bundle-dir target/release-check/staged
+    python3 -m bench.run_matrix --task-set swebench-lite-pilot --models noop --policies baseline --dry-run --enforce-heldout-lock --output-dir target/release-check/heldout-dry

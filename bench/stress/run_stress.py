@@ -27,7 +27,7 @@ class StressRequestResult:
     process_pid: int | None
     process_return_code: int | None
     stderr_tail: str | None
-    overall_ok: bool | None
+    verdict: str | None
     parsed_exit_code: int | None
     parsed_timed_out: bool | None
     parsed_memory_error: bool | None
@@ -141,8 +141,7 @@ def worker_run(
             arguments = build_arguments(tool, payload)
             started = time.time()
             ok = False
-            overall_ok = None
-            error_kind = None
+            verdict = None
             error_message = None
             process_pid = None
             process_return_code = None
@@ -154,8 +153,10 @@ def worker_run(
             try:
                 response = client.call_tool(tool, arguments)
                 parsed = response.get("result", {}).get("parsed")
-                if isinstance(parsed, dict) and "overall_ok" in parsed:
-                    overall_ok = bool(parsed.get("overall_ok"))
+                if isinstance(parsed, dict):
+                    parsed_verdict = parsed.get("verdict")
+                    if parsed_verdict in {"pass", "fail", "inconclusive"}:
+                        verdict = parsed_verdict
                 if isinstance(parsed, dict):
                     if "exit_code" in parsed:
                         parsed_exit_code = parsed.get("exit_code")
@@ -189,7 +190,7 @@ def worker_run(
                         process_pid=process_pid,
                         process_return_code=process_return_code,
                         stderr_tail=stderr_tail,
-                        overall_ok=overall_ok,
+                        verdict=verdict,
                         parsed_exit_code=parsed_exit_code,
                         parsed_timed_out=parsed_timed_out,
                         parsed_memory_error=parsed_memory_error,
@@ -286,7 +287,7 @@ def main() -> int:
                         "process_pid": item.process_pid,
                         "process_return_code": item.process_return_code,
                         "stderr_tail": item.stderr_tail,
-                        "overall_ok": item.overall_ok,
+                        "verdict": item.verdict,
                         "parsed_exit_code": item.parsed_exit_code,
                         "parsed_timed_out": item.parsed_timed_out,
                         "parsed_memory_error": item.parsed_memory_error,

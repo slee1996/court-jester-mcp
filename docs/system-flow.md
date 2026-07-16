@@ -159,7 +159,7 @@ For each verified file, Court Jester runs a staged pipeline:
    - runs explicit public verify tests when configured
 
 6. Report
-   - JSON report per file with stage details and overall pass/fail
+   - schema-v3 JSON report per file with stage details, typed `pass|fail|inconclusive` verdict, and evidence strength
 
 ## Sandbox Flow
 

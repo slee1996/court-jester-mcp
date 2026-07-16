@@ -1,4 +1,4 @@
-use court_jester_mcp::tools::diff::{parse_changed_lines, parse_changed_lines_for_file};
+use court_jester::tools::diff::{parse_changed_lines, parse_changed_lines_for_file};
 
 #[test]
 fn parse_simple_hunk() {

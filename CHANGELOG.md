@@ -4,6 +4,15 @@ This changelog tracks user-visible verifier semantics, report-shape changes, and
 
 ## Unreleased
 
+## 0.2.0 - 2026-07-15
+
+### Report and verification contract
+
+- Verification reports now use schema `3` with typed `pass`, `fail`, and `inconclusive` verdicts, evidence strength, stage statuses, strict changed-export coverage, typed invocation paths, and provenance-rich findings/repros. A coverage or runtime evidence gap is inconclusive rather than a silent pass.
+- Added `--coverage-gate changed-exports|none`, `--inferred-oracle-gate advisory|fail`, `--runtime-profile local-trusted|isolated`, Docker image overrides, `doctor`, `repair-json`, differential base-tree inputs, and persisted finding replay. Low-confidence inferred and unproven differential findings remain advisory by default.
+- Added artifact-v1 benchmark metadata: schema-v3 doctor prerequisites, abstention-aware observations and paired statistics, held-out locks, portable redaction-aware evidence bundles, release gate policies, and opt-in non-blocking shadow records.
+- Reports and benchmark artifacts from earlier releases remain historical evidence; they are not silently converted to the active v3/artifact-v1 contracts.
+
 ## 0.1.16 - 2026-04-25
 
 ### Domain-Aware Synthesis

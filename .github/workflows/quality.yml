@@ -1,0 +1,58 @@
+name: Quality
+
+on:
+  pull_request:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to validate. Empty uses the triggering ref.
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.86.0
+        with:
+          components: rustfmt, clippy
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Run Rust integration targets
+        run: cargo test --locked --tests
+
+      - name: Run benchmark unit tests
+        run: python3 -m unittest bench.test_run_matrix bench.test_runner bench.test_summarize_runs bench.test_evidence
+
+      - name: Run release contract tests
+        run: python3 -m unittest discover -s tests -p 'release_test.py'
+
+      - name: Build release binary
+        run: cargo build --locked --release --bin court-jester
+
+      - name: Run release CLI smoke test
+        run: python3 scripts/smoke_cli.py --binary target/release/court-jester
+
+      - name: Run locked benchmark dry-run
+        run: python3 -m bench.run_matrix --task-set swebench-lite-pilot --models noop --policies baseline --dry-run --enforce-heldout-lock --output-dir /tmp/cj-heldout-dry

@@ -20,6 +20,7 @@ It is just a CLI. No MCP transport, editor plugin, or custom agent integration l
 Release and CI wiring docs:
 
 - [CHANGELOG.md](CHANGELOG.md)
+- [docs/releasing.md](docs/releasing.md)
 - [docs/report-schema.md](docs/report-schema.md)
 - [docs/ci-adoption.md](docs/ci-adoption.md)
 - [docs/proof-points.md](docs/proof-points.md)
@@ -30,7 +31,7 @@ Release and CI wiring docs:
 - Produces concrete repros instead of vague "something seems wrong" feedback
 - Fits into any agent loop or CI job because it shells out like any other CLI
 - Uses the target project's Ruff and Biome config instead of detached temp-dir defaults
-- Returns structured JSON so automation can make decisions on pass/fail
+- Returns typed JSON (`verdict`: `pass`, `fail`, or `inconclusive`) plus evidence `strength` so automation can distinguish a clean result from a coverage or environment gap
 
 ## Where It Helps Most
 
@@ -116,8 +117,8 @@ Prompt snippet:
 
 ```text
 After every code change, run `court-jester verify --file <changed-file> --language <python|typescript>`.
-If verify returns overall_ok: false, fix the failing repro and verify again.
-Treat verify repros as authoritative.
+Repair when `verdict: fail`; inspect the report and add a contract or authoritative test when `verdict: inconclusive`; ship only when `verdict: pass`.
+Treat persisted findings and their replay commands as the repair contract.
 ```
 
 If the repo has a local virtualenv, `node_modules`, or lint config, pass `--project-dir` so lint and execution resolve in the right project context:
@@ -256,6 +257,16 @@ Useful `verify` flags:
 - `--complexity-metric cyclomatic|cognitive`: choose which complexity metric drives threshold failures
 - `--complexity-threshold <N>`: fail when a function exceeds the threshold
 - `--execute-gate all|crash|none`: choose which execute severities fail the run
+- `--base-file <PATH>` with `--base-project-dir <PATH>`: compare the candidate against a complete read-only baseline tree; both options are required together.
+- `--summary json|human|repair-json`: select machine, human, or repair-loop output.
+
+Runtime and evidence controls:
+
+- `--coverage-gate changed-exports|none` (default `changed-exports`) requires changed exported/invocable surfaces to be behaviorally checked; `none` disables per-surface enforcement but does not turn zero evidence into a pass.
+- `--inferred-oracle-gate advisory|fail` (default `advisory`) keeps low-confidence name/context findings non-gating unless explicitly promoted.
+- `--runtime-profile local-trusted|isolated` (default `local-trusted`) selects host execution or Docker isolation. Isolated mode accepts `--python-docker-image` (`python:3.12-slim`) and `--typescript-docker-image` (`node:24-bookworm-slim`).
+- `court-jester doctor --language python|typescript|all` checks the selected runtime; use its schema-v3 report as a prerequisite for benchmark evidence.
+- `court-jester replay --report <PATH> --finding <ID>` reruns a persisted structured repro and returns a typed replay outcome.
 
 Sandbox flags for `execute`:
 
@@ -266,11 +277,17 @@ Use `court-jester --help` for the full CLI help text.
 
 ## Exit Codes And Output
 
-- `0`: command succeeded and the code passed
-- `1`: the code failed verification or execution, but Court Jester still returned structured JSON
-- `2`: CLI usage or setup error
+- `0`: the command produced a passing verdict (or a replay reproduced its expectation)
+- `1`: verification failed (or replay did not reproduce)
+- `2`: CLI usage, argument, or setup error before a report
+- `3`: verification was inconclusive (coverage, runtime, timeout, or other missing evidence)
 
-Verify reports now carry `schema_version: 2` at the top level. The stability contract for stage names and JSON keys lives in [docs/report-schema.md](docs/report-schema.md).
+Verify and persisted reports carry `schema_version: 3` at the top level. Reports expose typed `verdict` and `strength`; stages use `status` values such as `passed`, `failed`, `inconclusive`, `advisory`, and `skipped`. The stability contract for keys and findings lives in [docs/report-schema.md](docs/report-schema.md).
+
+The intended repair view is `court-jester verify ... --summary repair-json`: it returns `recommended_action` (`repair`, `inspect_environment`, `add_contract_or_test`, or `none`) without changing the exit code.
+Benchmark evidence is a separate contract: matrix, run, result, summary, and evidence-manifest files use `artifact_schema_version: 1` and require verifier schema `3`. Missing or mixed versions are abstentions (or hard errors in strict evidence mode), not successful runs. The benchmark supports `--verify-runtime-profile local-trusted|isolated`, `--doctor-report`, `--gate-policy none|private-beta-default|strict-heldout`, `--evidence-bundle`, and opt-in `--shadow-records`; shadow records never change run success.
+
+The repository's working install and source URLs intentionally retain the historical `court-jester-mcp` GitHub path until a confirmed remote rename; do not substitute an unverified URL.
 
 That makes it easy to use in:
 

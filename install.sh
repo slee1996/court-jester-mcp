@@ -49,6 +49,23 @@ if ! curl -fsSL "${URL}" -o "${TMPDIR}/${ASSET}"; then
   exit 1
 fi
 
+if ! curl -fsSL "${URL}.sha256" -o "${TMPDIR}/${ASSET}.sha256"; then
+  echo "Release checksum is unavailable for ${ASSET}; refusing to install an unverified binary." >&2
+  exit 1
+fi
+
+(
+  cd "${TMPDIR}"
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 -c "${ASSET}.sha256"
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum -c "${ASSET}.sha256"
+  else
+    echo "Neither shasum nor sha256sum is available; cannot verify ${ASSET}." >&2
+    exit 1
+  fi
+)
+
 tar xzf "${TMPDIR}/${ASSET}" -C "${TMPDIR}"
 
 # Find the binary — tarball may contain a subdirectory
@@ -103,4 +120,6 @@ echo ""
 echo "And add this to your agent prompt:"
 echo ""
 echo "  After every code change, call court-jester verify on each changed file."
-echo "  If verify returns overall_ok: false, fix the failing repro and verify again."
+echo "  On verdict: fail, repair the reported finding and verify again."
+echo "  On verdict: inconclusive, inspect the environment or add coverage/tests before shipping."
+echo "  Ship only when verdict: pass."

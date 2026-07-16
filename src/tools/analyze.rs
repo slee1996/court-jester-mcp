@@ -820,19 +820,22 @@ fn visit_typescript(
                     .parent()
                     .is_some_and(|parent| parent.kind() == "object")
                 {
-                    let mut cursor = node.walk();
-                    for child in node.named_children(&mut cursor) {
-                        visit_typescript(
-                            &child,
-                            source,
-                            functions,
-                            classes,
-                            aliases,
-                            imports,
-                            child_depth,
-                        );
+                    if !ts_is_returned_object_method(*node) {
+                        let mut cursor = node.walk();
+                        for child in node.named_children(&mut cursor) {
+                            visit_typescript(
+                                &child,
+                                source,
+                                functions,
+                                classes,
+                                aliases,
+                                imports,
+                                child_depth,
+                            );
+                        }
+                        return;
                     }
-                    return;
+                    (method_name.clone(), false, None)
                 } else {
                     (method_name.clone(), false, None)
                 };
@@ -862,9 +865,9 @@ fn visit_typescript(
             child_depth = func_depth + 1;
         }
         "variable_declarator" => {
-            // Detect arrow functions: const foo = (x: string): string => ...
+            // Detect function-valued bindings: const foo = (...) => ... / function (...) { ... }
             if let Some(value) = node.child_by_field_name("value") {
-                if value.kind() == "arrow_function" {
+                if matches!(value.kind(), "arrow_function" | "function_expression") {
                     let name = node
                         .child_by_field_name("name")
                         .map(|n| text(&n, source).to_string())
@@ -1405,6 +1408,7 @@ fn collect_ts_surfaced_object_callables(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_ts_surfaced_callable(
     functions: &mut Vec<FunctionInfo>,
     base_name: &str,
@@ -1502,9 +1506,9 @@ fn ts_expr_contains_supported_container_callee(expr: tree_sitter::Node, source: 
     }
 }
 
-fn ts_find_object_returning_callback_in_call<'a>(
-    call: tree_sitter::Node<'a>,
-) -> Option<tree_sitter::Node<'a>> {
+fn ts_find_object_returning_callback_in_call(
+    call: tree_sitter::Node<'_>,
+) -> Option<tree_sitter::Node<'_>> {
     let args = call.child_by_field_name("arguments")?;
     let mut cursor = args.walk();
     for arg in args.named_children(&mut cursor) {
@@ -1515,9 +1519,9 @@ fn ts_find_object_returning_callback_in_call<'a>(
     None
 }
 
-fn ts_find_object_returning_callback_in_expression<'a>(
-    expr: tree_sitter::Node<'a>,
-) -> Option<tree_sitter::Node<'a>> {
+fn ts_find_object_returning_callback_in_expression(
+    expr: tree_sitter::Node<'_>,
+) -> Option<tree_sitter::Node<'_>> {
     match expr.kind() {
         "arrow_function" | "function_expression" => ts_returned_object_node(expr),
         "call_expression" => ts_find_object_returning_callback_in_call(expr),
@@ -1533,7 +1537,7 @@ fn ts_find_object_returning_callback_in_expression<'a>(
     }
 }
 
-fn ts_returned_object_node<'a>(callable: tree_sitter::Node<'a>) -> Option<tree_sitter::Node<'a>> {
+fn ts_returned_object_node(callable: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
     let body = callable.child_by_field_name("body")?;
     if body.kind() == "statement_block" {
         let mut cursor = body.walk();
@@ -1554,7 +1558,26 @@ fn ts_returned_object_node<'a>(callable: tree_sitter::Node<'a>) -> Option<tree_s
     }
 }
 
-fn ts_expression_object_node<'a>(expr: tree_sitter::Node<'a>) -> Option<tree_sitter::Node<'a>> {
+fn ts_is_returned_object_method(method: tree_sitter::Node<'_>) -> bool {
+    let Some(object) = method.parent().filter(|parent| parent.kind() == "object") else {
+        return false;
+    };
+
+    let mut ancestor = object.parent();
+    while let Some(node) = ancestor {
+        if matches!(
+            node.kind(),
+            "function_declaration" | "function_expression" | "arrow_function" | "method_definition"
+        ) {
+            return ts_returned_object_node(node)
+                .is_some_and(|returned_object| returned_object.id() == object.id());
+        }
+        ancestor = node.parent();
+    }
+    false
+}
+
+fn ts_expression_object_node(expr: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
     if expr.kind() == "object" {
         return Some(expr);
     }
@@ -1568,6 +1591,184 @@ fn ts_expression_object_node<'a>(expr: tree_sitter::Node<'a>) -> Option<tree_sit
     None
 }
 
+fn ts_expression_is_function(expression: tree_sitter::Node<'_>) -> bool {
+    match expression.kind() {
+        "arrow_function" | "function_expression" => true,
+        "parenthesized_expression"
+        | "as_expression"
+        | "satisfies_expression"
+        | "type_assertion"
+        | "non_null_expression" => {
+            let mut cursor = expression.walk();
+            let contains_function = expression
+                .named_children(&mut cursor)
+                .any(ts_expression_is_function);
+            contains_function
+        }
+        _ => false,
+    }
+}
+
+fn ts_is_lexical_binding_scope(node: tree_sitter::Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "statement_block"
+            | "for_statement"
+            | "for_in_statement"
+            | "catch_clause"
+            | "switch_case"
+            | "switch_default"
+    )
+}
+
+fn ts_declaration_binding_scope<'a>(
+    declaration: tree_sitter::Node<'a>,
+    factory_body: tree_sitter::Node<'a>,
+    function_scoped: bool,
+) -> tree_sitter::Node<'a> {
+    if function_scoped {
+        return factory_body;
+    }
+
+    let mut ancestor = declaration.parent();
+    while let Some(node) = ancestor {
+        if node.id() == factory_body.id() || ts_is_lexical_binding_scope(node) {
+            return node;
+        }
+        ancestor = node.parent();
+    }
+    factory_body
+}
+
+fn ts_update_callable_binding(
+    best: &mut Option<(usize, bool)>,
+    declaration: tree_sitter::Node<'_>,
+    callable: bool,
+) {
+    let position = declaration.start_byte();
+    if best.is_none_or(|(best_position, _)| position >= best_position) {
+        *best = Some((position, callable));
+    }
+}
+
+fn ts_find_callable_binding_in_scope(
+    node: tree_sitter::Node<'_>,
+    factory_body: tree_sitter::Node<'_>,
+    target_scope: tree_sitter::Node<'_>,
+    reference_byte: usize,
+    name: &str,
+    source: &[u8],
+    best: &mut Option<(usize, bool)>,
+) {
+    match node.kind() {
+        "function_declaration" => {
+            let binding_matches = node
+                .child_by_field_name("name")
+                .is_some_and(|binding| text(&binding, source).trim() == name);
+            if binding_matches
+                && ts_declaration_binding_scope(node, factory_body, false).id() == target_scope.id()
+            {
+                // Function declarations are initialized when their lexical scope is entered.
+                ts_update_callable_binding(best, node, true);
+            }
+            return;
+        }
+        "variable_declarator" => {
+            let binding_matches = node
+                .child_by_field_name("name")
+                .filter(|binding| binding.kind() == "identifier")
+                .is_some_and(|binding| text(&binding, source).trim() == name);
+            if binding_matches {
+                let function_scoped = node
+                    .parent()
+                    .is_some_and(|declaration| declaration.kind() == "variable_declaration");
+                if ts_declaration_binding_scope(node, factory_body, function_scoped).id()
+                    == target_scope.id()
+                {
+                    let callable = node.start_byte() < reference_byte
+                        && node
+                            .child_by_field_name("value")
+                            .is_some_and(ts_expression_is_function);
+                    // A declaration after the return still shadows outer bindings, but its
+                    // value is unavailable at the returned object expression.
+                    ts_update_callable_binding(best, node, callable);
+                }
+            }
+            return;
+        }
+        "class_declaration" | "enum_declaration" => {
+            let binding_matches = node
+                .child_by_field_name("name")
+                .is_some_and(|binding| text(&binding, source).trim() == name);
+            if binding_matches
+                && ts_declaration_binding_scope(node, factory_body, false).id() == target_scope.id()
+            {
+                ts_update_callable_binding(best, node, false);
+            }
+            return;
+        }
+        "arrow_function" | "function_expression" | "method_definition" => return,
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        ts_find_callable_binding_in_scope(
+            child,
+            factory_body,
+            target_scope,
+            reference_byte,
+            name,
+            source,
+            best,
+        );
+    }
+}
+
+fn ts_shorthand_resolves_to_callable(
+    callable: tree_sitter::Node<'_>,
+    returned_object: tree_sitter::Node<'_>,
+    name: &str,
+    source: &[u8],
+) -> bool {
+    let Some(factory_body) = callable.child_by_field_name("body") else {
+        return false;
+    };
+
+    // Resolve from the returned expression's innermost lexical scope outward. A
+    // non-callable binding is conclusive and prevents a same-named outer function
+    // from being mistaken for the returned value.
+    let mut scopes = Vec::new();
+    let mut ancestor = returned_object.parent();
+    while let Some(node) = ancestor {
+        if node.id() == factory_body.id() {
+            scopes.push(node);
+            break;
+        }
+        if ts_is_lexical_binding_scope(node) {
+            scopes.push(node);
+        }
+        ancestor = node.parent();
+    }
+
+    for scope in scopes {
+        let mut best = None;
+        ts_find_callable_binding_in_scope(
+            factory_body,
+            factory_body,
+            scope,
+            returned_object.start_byte(),
+            name,
+            source,
+            &mut best,
+        );
+        if let Some((_, is_callable)) = best {
+            return is_callable;
+        }
+    }
+    false
+}
+
 fn extract_ts_returned_object_callables(
     callable: &tree_sitter::Node,
     source: &[u8],
@@ -1579,16 +1780,10 @@ fn extract_ts_returned_object_callables(
     let mut callables = Vec::new();
     let mut cursor = object.walk();
     for child in object.named_children(&mut cursor) {
-        match child.kind() {
-            "method_definition" => {
-                let name = child
-                    .child_by_field_name("name")
-                    .map(|n| text(&n, source).to_string())
-                    .unwrap_or_default();
-                if !name.is_empty() && !callables.iter().any(|existing| existing == &name) {
-                    callables.push(name);
-                }
-            }
+        let name = match child.kind() {
+            "method_definition" => child
+                .child_by_field_name("name")
+                .and_then(|name| ts_property_name(&name, source)),
             "pair" => {
                 let Some(key) = child.child_by_field_name("key") else {
                     continue;
@@ -1596,25 +1791,23 @@ fn extract_ts_returned_object_callables(
                 let Some(value) = child.child_by_field_name("value") else {
                     continue;
                 };
-                if !matches!(value.kind(), "arrow_function" | "function_expression") {
-                    continue;
-                }
-                let name = text(&key, source)
-                    .trim()
-                    .trim_matches('"')
-                    .trim_matches('\'')
-                    .to_string();
-                if !name.is_empty() && !callables.iter().any(|existing| existing == &name) {
-                    callables.push(name);
-                }
+                ts_expression_is_function(value)
+                    .then(|| ts_property_name(&key, source))
+                    .flatten()
             }
             "shorthand_property_identifier" | "property_identifier" => {
-                let name = text(&child, source).trim().to_string();
-                if !name.is_empty() && !callables.iter().any(|existing| existing == &name) {
-                    callables.push(name);
-                }
+                let name = text(&child, source).trim();
+                (!name.is_empty()
+                    && ts_shorthand_resolves_to_callable(*callable, object, name, source))
+                .then(|| name.to_string())
             }
-            _ => {}
+            _ => None,
+        };
+
+        if let Some(name) = name {
+            if !callables.iter().any(|existing| existing == &name) {
+                callables.push(name);
+            }
         }
     }
     callables
@@ -2499,4 +2692,174 @@ pub fn filter_changed_functions(
         })
         .cloned()
         .collect()
+}
+
+/// Collect local call edges from supported source/test files. The scanner is
+fn parser_for_language(language: &Language) -> Option<Parser> {
+    let mut parser = Parser::new();
+    let grammar = match language {
+        Language::Python => tree_sitter_python::LANGUAGE.into(),
+        Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+    };
+    parser.set_language(&grammar).ok()?;
+    Some(parser)
+}
+
+fn node_text(node: &tree_sitter::Node<'_>, source: &[u8]) -> String {
+    node.utf8_text(source).unwrap_or("").to_string()
+}
+
+/// deliberately bounded and never treats dynamic calls as coverage proof.
+/// `files` is a deterministic `(path, source)` list; ignored directories are
+/// skipped and at most 80 files are inspected.
+pub fn collect_call_edges(files: &[(String, String)], language: &Language) -> Vec<CallEdge> {
+    let ignored = [
+        ".git",
+        "node_modules",
+        "target",
+        "dist",
+        "build",
+        "coverage",
+        "__pycache__",
+        ".venv",
+        "venv",
+    ];
+    let mut ordered = files
+        .iter()
+        .filter(|(path, _)| !path.split(['/', '\\']).any(|part| ignored.contains(&part)))
+        .take(80)
+        .collect::<Vec<_>>();
+    ordered.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut symbols = std::collections::HashMap::<String, String>::new();
+    let mut imported = std::collections::HashMap::<(String, String), CallResolution>::new();
+    for (path, source) in &ordered {
+        let analysis = analyze(source, language);
+        for function in analysis.functions.iter().filter(|f| !f.is_nested) {
+            symbols
+                .entry(function.name.clone())
+                .or_insert_with(|| format!("{}:{}", function.name, function.line));
+        }
+        for imp in &analysis.imports {
+            let statement = imp.statement.trim();
+            if let Some((module, names)) = statement
+                .strip_prefix("from ")
+                .and_then(|rest| rest.split_once(" import "))
+            {
+                for binding in names.split(',') {
+                    let parts = binding.trim().split(" as ").collect::<Vec<_>>();
+                    let local = parts.last().copied().unwrap_or("").trim();
+                    let symbol = parts.first().copied().unwrap_or(local).trim();
+                    if !local.is_empty() {
+                        imported.insert(
+                            (path.clone(), local.to_string()),
+                            CallResolution::Imported {
+                                module: module.trim().to_string(),
+                                symbol: symbol.to_string(),
+                            },
+                        );
+                    }
+                }
+            } else if let Some(rest) = statement.strip_prefix("import ") {
+                for binding in rest.split(',') {
+                    let parts = binding.trim().split(" as ").collect::<Vec<_>>();
+                    let local = parts.last().copied().unwrap_or("").trim();
+                    let module = parts.first().copied().unwrap_or(local).trim();
+                    if !local.is_empty() {
+                        imported.insert(
+                            (path.clone(), local.to_string()),
+                            CallResolution::Imported {
+                                module: module.to_string(),
+                                symbol: module.rsplit('.').next().unwrap_or(module).to_string(),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+    let mut edges = Vec::new();
+    for (path, source) in ordered {
+        let Some(mut parser) = parser_for_language(language) else {
+            continue;
+        };
+        let Some(tree) = parser.parse(source, None) else {
+            continue;
+        };
+        let mut cursor = tree.root_node().walk();
+        let mut stack = vec![(tree.root_node(), String::new())];
+        while let Some((node, current_caller)) = stack.pop() {
+            let mut caller = current_caller.clone();
+            if is_callable_node(node, language) {
+                if let Some(name) = node
+                    .child_by_field_name("name")
+                    .map(|n| node_text(&n, source.as_bytes()))
+                {
+                    caller = format!("{}:{}", name, node.start_position().row + 1);
+                }
+            }
+            if matches!(
+                (language, node.kind()),
+                (Language::Python, "call") | (Language::TypeScript, "call_expression")
+            ) {
+                if let Some(callee) = node.child_by_field_name("function") {
+                    let raw = node_text(&callee, source.as_bytes());
+                    let simple = raw
+                        .rsplit(['.', ':'])
+                        .next()
+                        .unwrap_or(raw.as_str())
+                        .to_string();
+                    if !caller.is_empty() && !simple.is_empty() {
+                        let resolution = imported
+                            .get(&(path.clone(), simple.clone()))
+                            .cloned()
+                            .or_else(|| symbols.get(&simple).map(|_| CallResolution::Local))
+                            .unwrap_or_else(|| {
+                                if raw.contains('.') {
+                                    CallResolution::Dynamic
+                                } else {
+                                    CallResolution::Unresolved
+                                }
+                            });
+                        let callee_id = symbols
+                            .get(&simple)
+                            .cloned()
+                            .unwrap_or_else(|| format!("{}:0", simple));
+                        edges.push(CallEdge {
+                            caller_surface_id: caller.clone(),
+                            callee_surface_id: callee_id,
+                            source_file: path.clone(),
+                            line: node.start_position().row + 1,
+                            resolution,
+                        });
+                    }
+                }
+            }
+            let mut children = node.named_children(&mut cursor).collect::<Vec<_>>();
+            children.reverse();
+            for child in children {
+                stack.push((child, caller.clone()));
+            }
+        }
+    }
+    edges.sort_by(|a, b| {
+        a.source_file
+            .cmp(&b.source_file)
+            .then(a.line.cmp(&b.line))
+            .then(a.caller_surface_id.cmp(&b.caller_surface_id))
+    });
+    edges.dedup();
+    edges
+}
+
+fn is_callable_node(node: tree_sitter::Node<'_>, language: &Language) -> bool {
+    match language {
+        Language::Python => matches!(
+            node.kind(),
+            "function_definition" | "async_function_definition"
+        ),
+        Language::TypeScript => matches!(
+            node.kind(),
+            "function_declaration" | "method_definition" | "arrow_function" | "function_expression"
+        ),
+    }
 }

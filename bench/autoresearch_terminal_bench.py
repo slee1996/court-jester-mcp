@@ -271,11 +271,11 @@ def run_cj(
         return {
             "command_timeout": True,
             "duration_ms": int((time.time() - started) * 1000),
-            "overall_ok": None,
+            "verdict": "inconclusive",
             "exit_code": None,
             "stderr": str(exc),
             "stage_status": {},
-            "test_error": None,
+            "test_message": None,
             "first_execute_failure": None,
         }
 
@@ -286,54 +286,58 @@ def run_cj(
 
     stages = report.get("stages", []) if isinstance(report, dict) else []
     stage_status = {
-        stage.get("name"): stage.get("ok")
+        stage.get("name"): stage.get("status")
         for stage in stages
         if isinstance(stage, dict)
     }
-    test_error = None
+    test_message = None
     first_execute_failure = None
     for stage in stages:
         if not isinstance(stage, dict):
             continue
         if stage.get("name") == "test":
-            test_error = stage.get("error")
+            test_message = stage.get("message")
         if stage.get("name") == "execute":
-            failures = (stage.get("detail") or {}).get("fuzz_failures") or []
-            if failures:
-                first = failures[0]
-                first_execute_failure = {
-                    "function": first.get("function"),
-                    "input": first.get("input"),
-                    "error_type": first.get("error_type"),
-                    "message": first.get("message"),
-                    "severity": first.get("severity"),
-                }
-            elif not stage.get("ok"):
-                first_execute_failure = {"error": stage.get("error")}
+            detail = stage.get("detail") if isinstance(stage.get("detail"), dict) else {}
+            findings = detail.get("findings") if isinstance(detail, dict) else None
+            if isinstance(findings, list) and findings:
+                first = findings[0]
+                if isinstance(first, dict):
+                    location = first.get("location") if isinstance(first.get("location"), dict) else {}
+                    repro = first.get("repro") if isinstance(first.get("repro"), dict) else {}
+                    first_execute_failure = {
+                        "function": location.get("function") or first.get("function"),
+                        "input": repro.get("snippet") or repro.get("arguments") or first.get("input"),
+                        "error_type": first.get("error_type"),
+                        "message": first.get("message"),
+                        "severity": first.get("severity"),
+                    }
+            elif stage.get("status") == "failed":
+                first_execute_failure = {"message": stage.get("message")}
 
     return {
         "command_timeout": False,
         "duration_ms": int((time.time() - started) * 1000),
-        "overall_ok": report.get("overall_ok") if isinstance(report, dict) else None,
+        "verdict": report.get("verdict") if isinstance(report, dict) else "inconclusive",
         "exit_code": proc.returncode,
         "stderr": proc.stderr,
         "summary": report.get("summary") if isinstance(report, dict) else None,
         "stage_status": stage_status,
-        "test_error": test_error,
+        "test_message": test_message,
         "first_execute_failure": first_execute_failure,
     }
 
 
 def classify(original: dict[str, Any], fixed: dict[str, Any]) -> str:
-    original_ok = original.get("overall_ok")
-    fixed_ok = fixed.get("overall_ok")
-    if original_ok is False and fixed_ok is True:
+    original_verdict = original.get("verdict")
+    fixed_verdict = fixed.get("verdict")
+    if original_verdict == "fail" and fixed_verdict == "pass":
         return "clean_true_positive"
-    if original_ok is False and fixed_ok is False:
+    if original_verdict == "fail" and fixed_verdict == "fail":
         return "fixed_still_fails"
-    if original_ok is True and fixed_ok is True:
+    if original_verdict == "pass" and fixed_verdict == "pass":
         return "miss_buggy_passes"
-    if original_ok is True and fixed_ok is False:
+    if original_verdict == "pass" and fixed_verdict == "fail":
         return "fixed_regression_or_noise"
     return "infra_or_timeout"
 
@@ -496,15 +500,14 @@ def compact_iteration(iteration: dict[str, Any]) -> dict[str, Any]:
     return {
         "name": iteration["name"],
         "counts": iteration["counts"],
-        "slice_counts": iteration.get("slice_counts", {}),
-        "sample_failures": [
+        "problem_rows": [
             {
                 "task_id": row.get("task_id"),
                 "classification": row.get("classification"),
                 "original_failure": (row.get("original") or {}).get("first_execute_failure")
-                or (row.get("original") or {}).get("test_error"),
+                or (row.get("original") or {}).get("test_message"),
                 "fixed_failure": (row.get("fixed") or {}).get("first_execute_failure")
-                or (row.get("fixed") or {}).get("test_error"),
+                or (row.get("fixed") or {}).get("test_message"),
             }
             for row in iteration["rows"]
             if row.get("classification") in {"fixed_still_fails", "fixed_regression_or_noise"}

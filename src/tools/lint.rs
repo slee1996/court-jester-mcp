@@ -628,7 +628,7 @@ fn parse_biome_output(output: &str) -> LintResult {
                 .unwrap_or_default();
             let (runner_diagnostics, diagnostics): (Vec<_>, Vec<_>) = diagnostics
                 .into_iter()
-                .partition(|diagnostic| biome_runner_failure_diagnostic(diagnostic));
+                .partition(biome_runner_failure_diagnostic);
             let error = if runner_diagnostics.is_empty() {
                 None
             } else {

@@ -1,5 +1,6 @@
 pub mod analyze;
 pub mod diff;
+pub mod domain;
 pub mod lint;
 pub mod sandbox;
 pub mod synthesize;

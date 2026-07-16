@@ -5,5 +5,9 @@
   "suite_kind": "external_held_out_pilot",
   "task_ids": [
     "py-swebench-lite-cookiejar-quoted"
-  ]
+  ],
+  "immutable": true,
+  "gate_role": "heldout",
+  "lock_version": 1,
+  "locked_suite_sha256": "1262fcacbc46aaa38b6e0113d2c3fc03403b84a80e32560d2f194f1b66868f29"
 }

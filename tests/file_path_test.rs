@@ -1,4 +1,4 @@
-use court_jester_mcp::resolve_code;
+use court_jester::resolve_code;
 use std::io::Write;
 
 #[test]

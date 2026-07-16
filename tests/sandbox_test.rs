@@ -1,24 +1,32 @@
-use court_jester_mcp::tools::sandbox::execute;
-use court_jester_mcp::types::Language;
+use court_jester::tools::sandbox::{build_instrumentation_overlay, execute};
+use court_jester::types::{
+    InstrumentationMode, Language, RuntimeProfile, SandboxOptions, TestRunner,
+};
 
-fn tsx_loader_from_path() -> Option<String> {
-    let path_env = std::env::var("PATH").ok()?;
-    for dir in path_env.split(':') {
-        let candidate = std::path::Path::new(dir).join("tsx");
-        if candidate.exists() {
-            let canonical = std::fs::canonicalize(candidate).ok()?;
-            let loader = canonical.parent()?.join("loader.mjs");
-            if loader.exists() {
-                return Some(loader.to_string_lossy().to_string());
-            }
-        }
+fn sandbox_options<'a>(
+    timeout_seconds: f64,
+    memory_mb: u64,
+    project_dir: Option<&'a str>,
+    source_file: Option<&'a str>,
+) -> SandboxOptions<'a> {
+    SandboxOptions {
+        timeout_seconds,
+        memory_mb,
+        runtime_profile: RuntimeProfile::LocalTrusted,
+        docker_image: None,
+        project_dir,
+        source_file,
     }
-    None
 }
 
 #[tokio::test]
 async fn python_hello_world() {
-    let r = execute("print('hello')", &Language::Python, 10.0, 128, None, None).await;
+    let r = execute(
+        "print('hello')",
+        &Language::Python,
+        sandbox_options(10.0, 128, None, None),
+    )
+    .await;
     assert_eq!(r.exit_code, Some(0), "stderr: {}", r.stderr);
     assert_eq!(r.stdout.trim(), "hello");
     assert!(!r.timed_out);
@@ -27,7 +35,12 @@ async fn python_hello_world() {
 
 #[tokio::test]
 async fn python_syntax_error() {
-    let r = execute("def foo(:", &Language::Python, 10.0, 128, None, None).await;
+    let r = execute(
+        "def foo(:",
+        &Language::Python,
+        sandbox_options(10.0, 128, None, None),
+    )
+    .await;
     assert_ne!(r.exit_code, Some(0));
     assert!(!r.stderr.is_empty());
 }
@@ -37,10 +50,7 @@ async fn python_timeout() {
     let r = execute(
         "import time\ntime.sleep(100)",
         &Language::Python,
-        2.0,
-        128,
-        None,
-        None,
+        sandbox_options(2.0, 128, None, None),
     )
     .await;
     assert!(r.timed_out, "expected timeout, got: {:?}", r);
@@ -50,7 +60,12 @@ async fn python_timeout() {
 async fn python_no_env_leak() {
     // USER, API keys should not be available (HOME is set for npx compat)
     let code = "import os\nprint(os.environ.get('USER', 'NONE'))\nprint(os.environ.get('OPENAI_API_KEY', 'NONE'))";
-    let r = execute(code, &Language::Python, 10.0, 128, None, None).await;
+    let r = execute(
+        code,
+        &Language::Python,
+        sandbox_options(10.0, 128, None, None),
+    )
+    .await;
     assert_eq!(r.exit_code, Some(0), "stderr: {}", r.stderr);
     assert!(
         r.stdout.contains("NONE"),
@@ -61,7 +76,12 @@ async fn python_no_env_leak() {
 
 #[tokio::test]
 async fn project_dir_none_unchanged() {
-    let r = execute("print(1+1)", &Language::Python, 10.0, 128, None, None).await;
+    let r = execute(
+        "print(1+1)",
+        &Language::Python,
+        sandbox_options(10.0, 128, None, None),
+    )
+    .await;
     assert_eq!(r.exit_code, Some(0));
     assert_eq!(r.stdout.trim(), "2");
 }
@@ -76,10 +96,7 @@ async fn python_project_dir_imports_local_module() {
     let r = execute(
         code,
         &Language::Python,
-        10.0,
-        128,
-        Some(dir.path().to_str().unwrap()),
-        None,
+        sandbox_options(10.0, 128, Some(dir.path().to_str().unwrap()), None),
     )
     .await;
     assert_eq!(r.exit_code, Some(0), "stderr: {}", r.stderr);
@@ -96,10 +113,7 @@ async fn python_source_file_executes_original_file_when_code_matches_disk() {
     let r = execute(
         code,
         &Language::Python,
-        10.0,
-        128,
-        None,
-        Some(source_path.to_str().unwrap()),
+        sandbox_options(10.0, 128, None, Some(source_path.to_str().unwrap())),
     )
     .await;
 
@@ -113,10 +127,7 @@ async fn project_dir_still_has_resource_limits() {
     let r = execute(
         "import time\ntime.sleep(100)",
         &Language::Python,
-        2.0,
-        128,
-        Some(dir.path().to_str().unwrap()),
-        None,
+        sandbox_options(2.0, 128, Some(dir.path().to_str().unwrap()), None),
     )
     .await;
     assert!(
@@ -144,10 +155,7 @@ async fn source_file_resolves_relative_imports() {
     let r = execute(
         code,
         &Language::Python,
-        10.0,
-        128,
-        None,
-        Some(source_path.to_str().unwrap()),
+        sandbox_options(10.0, 128, None, Some(source_path.to_str().unwrap())),
     )
     .await;
     assert_eq!(r.exit_code, Some(0), "stderr: {}", r.stderr);
@@ -169,10 +177,7 @@ async fn python_relative_import_source_file_executes_original_module_when_code_m
     let r = execute(
         code,
         &Language::Python,
-        10.0,
-        128,
-        None,
-        Some(source_path.to_str().unwrap()),
+        sandbox_options(10.0, 128, None, Some(source_path.to_str().unwrap())),
     )
     .await;
 
@@ -197,10 +202,7 @@ async fn source_file_cleanup() {
     let r = execute(
         code,
         &Language::Python,
-        10.0,
-        128,
-        None,
-        Some(source_path.to_str().unwrap()),
+        sandbox_options(10.0, 128, None, Some(source_path.to_str().unwrap())),
     )
     .await;
     assert_eq!(r.exit_code, Some(0), "stderr: {}", r.stderr);
@@ -235,7 +237,12 @@ spawn(
 
 setInterval(() => {}, 1000);
 "#;
-    let r = execute(code, &Language::TypeScript, 5.0, 64, None, None).await;
+    let r = execute(
+        code,
+        &Language::TypeScript,
+        sandbox_options(5.0, 64, None, None),
+    )
+    .await;
     assert!(
         r.memory_error,
         "expected child-process RSS to trip memory limit, got: {:?}",
@@ -269,15 +276,12 @@ console.log(`${mode}:${String(pick({ timezone: "UTC" }, "timezone"))}`);
     let result = execute(
         code,
         &Language::TypeScript,
-        10.0,
-        128,
-        None,
-        Some(source_path.to_str().unwrap()),
+        sandbox_options(10.0, 128, None, Some(source_path.to_str().unwrap())),
     )
     .await;
 
     assert_eq!(result.exit_code, Some(0), "stderr: {}", result.stderr);
-    assert_eq!(result.stdout.trim(), "loader:UTC");
+    assert_eq!(result.stdout.trim(), "transform:UTC");
 }
 
 #[tokio::test]
@@ -314,25 +318,16 @@ console.log(`${mode}:${String(pick({ timezone: "UTC" }, "timezone"))}`);
     let result = execute(
         code,
         &Language::TypeScript,
-        10.0,
-        128,
-        None,
-        Some(source_path.to_str().unwrap()),
+        sandbox_options(10.0, 128, None, Some(source_path.to_str().unwrap())),
     )
     .await;
 
     assert_eq!(result.exit_code, Some(0), "stderr: {}", result.stderr);
-    assert_eq!(result.stdout.trim(), "loader:UTC");
+    assert_eq!(result.stdout.trim(), "transform:UTC");
 }
 
 #[tokio::test]
 async fn typescript_source_file_prefers_node_transform_over_bun_for_plain_relative_imports() {
-    let tsx_loader = tsx_loader_from_path();
-    assert!(
-        tsx_loader.is_some(),
-        "tsx loader must be available for this regression test"
-    );
-
     let dir = tempfile::tempdir().unwrap();
     let helper_path = dir.path().join("helper.ts");
     let source_path = dir.path().join("main.ts");
@@ -350,10 +345,7 @@ console.log(`${mode}:${runtime}:${value}`);
     let result = execute(
         code,
         &Language::TypeScript,
-        10.0,
-        128,
-        None,
-        Some(source_path.to_str().unwrap()),
+        sandbox_options(10.0, 128, None, Some(source_path.to_str().unwrap())),
     )
     .await;
 
@@ -375,10 +367,12 @@ console.log(hasLoader ? "loader" : "transform");
     let result = execute(
         code,
         &Language::TypeScript,
-        10.0,
-        128,
-        Some(dir.path().to_str().unwrap()),
-        Some(source_path.to_str().unwrap()),
+        sandbox_options(
+            10.0,
+            128,
+            Some(dir.path().to_str().unwrap()),
+            Some(source_path.to_str().unwrap()),
+        ),
     )
     .await;
 
@@ -399,10 +393,7 @@ console.log(process.argv[1]);
     let result = execute(
         code,
         &Language::TypeScript,
-        10.0,
-        128,
-        None,
-        Some(source_path.to_str().unwrap()),
+        sandbox_options(10.0, 128, None, Some(source_path.to_str().unwrap())),
     )
     .await;
 
@@ -438,10 +429,12 @@ console.log(value);
     let result = execute(
         code,
         &Language::TypeScript,
-        10.0,
-        128,
-        Some(dir.path().to_str().unwrap()),
-        Some(source_path.to_str().unwrap()),
+        sandbox_options(
+            10.0,
+            128,
+            Some(dir.path().to_str().unwrap()),
+            Some(source_path.to_str().unwrap()),
+        ),
     )
     .await;
 
@@ -472,13 +465,109 @@ console.log(`${typeof process.versions.bun === "string" ? "bun" : "node"}:${valu
     let result = execute(
         code,
         &Language::TypeScript,
-        10.0,
-        128,
-        Some(dir.path().to_str().unwrap()),
-        Some(source_path.to_str().unwrap()),
+        sandbox_options(
+            10.0,
+            128,
+            Some(dir.path().to_str().unwrap()),
+            Some(source_path.to_str().unwrap()),
+        ),
     )
     .await;
 
     assert_eq!(result.exit_code, Some(0), "stderr: {}", result.stderr);
     assert_eq!(result.stdout.trim(), "bun:9");
+}
+#[test]
+fn sandbox_options_reject_invalid_limits_and_profile_overrides() {
+    let invalid_timeout = SandboxOptions {
+        timeout_seconds: f64::NAN,
+        memory_mb: 128,
+        runtime_profile: RuntimeProfile::LocalTrusted,
+        docker_image: None,
+        project_dir: None,
+        source_file: None,
+    };
+    assert!(invalid_timeout.validate().is_err());
+    let invalid_image = SandboxOptions {
+        timeout_seconds: 1.0,
+        memory_mb: 1,
+        runtime_profile: RuntimeProfile::LocalTrusted,
+        docker_image: Some("-bad:image"),
+        project_dir: None,
+        source_file: None,
+    };
+    assert!(invalid_image.validate().is_err());
+    let isolated_without_image = SandboxOptions {
+        timeout_seconds: 1.0,
+        memory_mb: 1,
+        runtime_profile: RuntimeProfile::Isolated,
+        docker_image: None,
+        project_dir: None,
+        source_file: None,
+    };
+    assert!(isolated_without_image.validate().is_err());
+}
+
+#[test]
+fn authoritative_test_overlay_is_language_and_runner_specific() {
+    let python = build_instrumentation_overlay(
+        &Language::Python,
+        TestRunner::Auto,
+        "src/main.py",
+        &["f:1".into()],
+    );
+    assert_eq!(python.mode, InstrumentationMode::PythonSitecustomize);
+    assert!(python.supported);
+    let node = build_instrumentation_overlay(
+        &Language::TypeScript,
+        TestRunner::Node,
+        "src/main.ts",
+        &["f:1".into()],
+    );
+    assert_eq!(node.mode, InstrumentationMode::NodeModuleRegister);
+    assert!(node.supported);
+    let native = build_instrumentation_overlay(
+        &Language::TypeScript,
+        TestRunner::RepoNative,
+        "src/main.ts",
+        &[],
+    );
+    assert_eq!(native.mode, InstrumentationMode::Unsupported);
+    assert!(!native.supported);
+    assert_eq!(
+        native.reason.as_deref(),
+        Some("repo-native runner does not expose a module transform hook")
+    );
+}
+
+#[tokio::test]
+async fn isolated_python_execution_is_guarded_and_uses_selected_image() {
+    let docker_available = std::process::Command::new("docker")
+        .arg("info")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if !docker_available {
+        return;
+    }
+    let image_available = std::process::Command::new("docker")
+        .args(["image", "inspect", "python:3.12-slim"])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if !image_available {
+        return;
+    }
+    let options = SandboxOptions {
+        timeout_seconds: 10.0,
+        memory_mb: 128,
+        runtime_profile: RuntimeProfile::Isolated,
+        docker_image: Some("python:3.12-slim"),
+        project_dir: None,
+        source_file: None,
+    };
+    let result = execute("print('isolated')", &Language::Python, options).await;
+    assert_eq!(result.exit_code, Some(0), "stderr: {}", result.stderr);
+    assert_eq!(result.stdout.trim(), "isolated");
+    assert!(!result.timed_out);
 }

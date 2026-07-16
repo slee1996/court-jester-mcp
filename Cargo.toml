@@ -1,8 +1,13 @@
 [package]
-name = "court-jester-mcp"
-version = "0.1.16"
+name = "court-jester"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
+description = "Confidence-calibrated verification for changed Python and TypeScript code"
+repository = "https://github.com/slee1996/court-jester-mcp"
+readme = "README.md"
+keywords = ["verification", "python", "typescript", "code-quality"]
+categories = ["development-tools", "command-line-utilities"]
 
 [[bin]]
 name = "court-jester"
@@ -19,5 +24,6 @@ nix = { version = "0.29", features = ["resource"] }
 libc = "0.2"
 tempfile = "3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+tar = "0.4"
 
 [dev-dependencies]

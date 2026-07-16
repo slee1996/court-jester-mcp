@@ -1,7 +1,9 @@
-use court_jester_mcp::tools::synthesize::{
-    synthesize_calls, synthesize_plan, synthesize_plan_for_with_seeds,
+use court_jester::tools::domain::build_verification_plan;
+use court_jester::tools::synthesize::{
+    synthesize_calls, synthesize_plan, synthesize_plan_for_verification,
+    synthesize_plan_for_with_seeds,
 };
-use court_jester_mcp::types::*;
+use court_jester::types::*;
 use std::collections::{BTreeMap, HashMap};
 
 fn make_analysis(functions: Vec<FunctionInfo>, classes: Vec<ClassInfo>) -> AnalysisResult {
@@ -84,6 +86,89 @@ fn kwonly_func(
         invocation_target: None,
         returned_callables: vec![],
     }
+}
+
+fn synthesize_with_advisory_contract(
+    analysis: &AnalysisResult,
+    language: &Language,
+    function_name: &str,
+    contract_id: &str,
+) -> (VerificationPlan, String) {
+    let function = analysis
+        .functions
+        .iter()
+        .find(|function| function.name == function_name)
+        .unwrap_or_else(|| panic!("missing test function {function_name}"));
+    let inferred = [InferredProperty {
+        target_surface_id: format!("{}:{}", function.name, function.line),
+        contract_id: contract_id.to_string(),
+        source_file: Some("context-contract.txt".to_string()),
+        line: Some(1),
+        evidence: CallerEvidence::StaticSyntax,
+    }];
+    let plan = build_verification_plan(
+        &analysis.functions,
+        &analysis.classes,
+        &analysis.aliases,
+        language,
+        &[],
+        &[],
+        &inferred,
+    );
+    let code = synthesize_plan_for_verification(
+        &analysis.functions,
+        &analysis.classes,
+        &analysis.aliases,
+        language,
+        &plan,
+    )
+    .code;
+    (plan, code)
+}
+
+fn assert_advisory_contract(plan: &VerificationPlan, function_name: &str, contract_id: &str) {
+    let contract = plan
+        .contracts
+        .iter()
+        .find(|contract| {
+            contract.id == contract_id
+                && plan.surfaces.iter().any(|surface| {
+                    surface.id == contract.target_surface_id && surface.symbol == function_name
+                })
+        })
+        .unwrap_or_else(|| panic!("missing {contract_id} contract for {function_name}"));
+    assert_eq!(contract.oracle_kind, OracleKind::InferredSemantic);
+    assert_eq!(contract.provenance, OracleProvenance::NameHeuristic);
+    assert_eq!(contract.confidence, FindingConfidence::Low);
+}
+
+fn assert_advisory_semantic_probe(code: &str, function_name: &str) {
+    let python_prefix = format!("_emit_finding(\"{function_name}\"");
+    let typescript_prefix = format!("_emitFinding(\"{function_name}\"");
+    let emission = code
+        .lines()
+        .find(|line| line.contains(&python_prefix) || line.contains(&typescript_prefix))
+        .unwrap_or_else(|| panic!("missing semantic finding emission for {function_name}"));
+    assert!(
+        emission.contains("\"inferred_semantic\", \"name_heuristic\", \"low\""),
+        "semantic probe must remain a low-confidence name-heuristic advisory: {emission}"
+    );
+    assert!(
+        code.contains("oracle_id = f\"{oracle_kind}:{_sanitize_symbol(function)}\"")
+            || code.contains("id: `${oracleKind}:${_sanitizeSymbol(name)}`"),
+        "generated finding protocol must derive the stable inferred_semantic:<symbol> oracle id"
+    );
+}
+
+fn assert_property_is_not_gating(plan: &VerificationPlan, property: &str) {
+    assert!(
+        plan.contracts.iter().all(|contract| {
+            contract.id != property
+                || (contract.oracle_kind != OracleKind::DeclaredProperty
+                    && contract.confidence == FindingConfidence::Low)
+        }),
+        "{property} must not become an authoritative/declared gating contract"
+    );
 }
 
 // ── Python fuzz harness generation ──────────────────────────────────────────
@@ -210,10 +295,31 @@ fn python_no_idempotency_from_name_only() {
         vec![func("clean_text", vec![("s", Some("str"))], Some("str"))],
         vec![],
     );
-    let code = synthesize_calls(&a, &Language::Python);
+    let plan = build_verification_plan(
+        &a.functions,
+        &a.classes,
+        &a.aliases,
+        &Language::Python,
+        &[],
+        &[],
+        &[],
+    );
+    let code = synthesize_plan_for_verification(
+        &a.functions,
+        &a.classes,
+        &a.aliases,
+        &Language::Python,
+        &plan,
+    )
+    .code;
+    assert_property_is_not_gating(&plan, "idempotent");
     assert!(
-        !code.contains("idempotent"),
-        "name alone should NOT check idempotency, got: {code}"
+        code.contains("_result_b = _materialize_if_iterator(clean_text(_repeat_args[0]))"),
+        "clean_text should retain the runtime consistency oracle, got: {code}"
+    );
+    assert!(
+        !code.contains("_result2 = clean_text(_result)"),
+        "a function name alone must not activate the idempotency oracle, got: {code}"
     );
 }
 
@@ -244,22 +350,25 @@ fn python_query_string_serializer_gets_semantic_examples() {
         )],
         vec![],
     );
-    let code = synthesize_calls(&a, &Language::Python);
-    assert!(
-        code.contains("_parse_qsl"),
-        "query-string harness should parse query output, got: {code}"
+    let (plan, code) = synthesize_with_advisory_contract(
+        &a,
+        &Language::Python,
+        "canonical_query",
+        "query_string_serializer",
     );
+    assert_advisory_contract(&plan, "canonical_query", "query_string_serializer");
+    assert_advisory_semantic_probe(&code, "canonical_query");
     assert!(
-        code.contains("query semantics:{_query_label}"),
-        "query-string harness should label semantic failures, got: {code}"
+        code.contains("_query_pairs = _parse_qsl(_query_result, keep_blank_values=True)"),
+        "query-string probe must parse the serialized output, got: {code}"
     );
     assert!(
         code.contains("_ascii_fold(\"naïve café\")"),
-        "query-string harness should check accent folding, got: {code}"
+        "query-string probe must check accent folding, got: {code}"
     );
     assert!(
         code.contains("{\"filters\": [{\"label\": \"pro\"}, None, \" beta \"]}"),
-        "query-string harness should cover nested non-scalars, got: {code}"
+        "query-string probe must cover nested non-scalars, got: {code}"
     );
 }
 
@@ -272,14 +381,17 @@ fn python_pep440_version_ordering_property_gets_semantic_examples() {
     );
     compare_versions.declared_properties = vec!["pep440_version_ordering".into()];
     let a = make_analysis(vec![compare_versions], vec![]);
-    let code = synthesize_calls(&a, &Language::Python);
-    assert!(
-        code.contains("pep440 version ordering:{_pep440_label}"),
-        "PEP 440 ordering harness should label failures, got: {code}"
+    let (plan, code) = synthesize_with_advisory_contract(
+        &a,
+        &Language::Python,
+        "compare_versions",
+        "pep440_version_ordering",
     );
+    assert_advisory_contract(&plan, "compare_versions", "pep440_version_ordering");
+    assert_advisory_semantic_probe(&code, "compare_versions");
     assert!(
         code.contains("\"1.0rc1\", \"1.0\", -1"),
-        "PEP 440 ordering harness should check rc before final, got: {code}"
+        "PEP 440 ordering probe must check rc before final, got: {code}"
     );
 }
 
@@ -292,14 +404,17 @@ fn python_pep440_specifier_property_gets_semantic_examples() {
     );
     allows.declared_properties = vec!["pep440_specifier_membership".into()];
     let a = make_analysis(vec![allows], vec![]);
-    let code = synthesize_calls(&a, &Language::Python);
-    assert!(
-        code.contains("pep440 specifier membership:{_specifier_label}"),
-        "PEP 440 specifier harness should label failures, got: {code}"
+    let (plan, code) = synthesize_with_advisory_contract(
+        &a,
+        &Language::Python,
+        "allows",
+        "pep440_specifier_membership",
     );
+    assert_advisory_contract(&plan, "allows", "pep440_specifier_membership");
+    assert_advisory_semantic_probe(&code, "allows");
     assert!(
         code.contains("\"1.5.0\", \"~=1.4.5\", False"),
-        "PEP 440 specifier harness should check compatible upper bound, got: {code}"
+        "PEP 440 specifier probe must check the compatible upper bound, got: {code}"
     );
 }
 
@@ -315,14 +430,17 @@ fn python_pep440_filter_property_gets_semantic_examples() {
     );
     filter_versions.declared_properties = vec!["pep440_filter_prerelease".into()];
     let a = make_analysis(vec![filter_versions], vec![]);
-    let code = synthesize_calls(&a, &Language::Python);
-    assert!(
-        code.contains("pep440 filter prerelease:{_filter_label}"),
-        "PEP 440 filter harness should label failures, got: {code}"
+    let (plan, code) = synthesize_with_advisory_contract(
+        &a,
+        &Language::Python,
+        "filter_versions",
+        "pep440_filter_prerelease",
     );
+    assert_advisory_contract(&plan, "filter_versions", "pep440_filter_prerelease");
+    assert_advisory_semantic_probe(&code, "filter_versions");
     assert!(
         code.contains("[\"1.2\", \"1.5a1\"], \">=1.5\", [\"1.5a1\"]"),
-        "PEP 440 filter harness should check prerelease fallback, got: {code}"
+        "PEP 440 filter probe must check prerelease-only fallback, got: {code}"
     );
 }
 
@@ -335,14 +453,17 @@ fn python_cookie_value_quote_property_gets_semantic_examples() {
     );
     format_cookie_value.declared_properties = vec!["cookie_value_quote".into()];
     let a = make_analysis(vec![format_cookie_value], vec![]);
-    let code = synthesize_calls(&a, &Language::Python);
-    assert!(
-        code.contains("cookie value quote:{_cookie_value_label}"),
-        "cookie value harness should label failures, got: {code}"
+    let (plan, code) = synthesize_with_advisory_contract(
+        &a,
+        &Language::Python,
+        "format_cookie_value",
+        "cookie_value_quote",
     );
+    assert_advisory_contract(&plan, "format_cookie_value", "cookie_value_quote");
+    assert_advisory_semantic_probe(&code, "format_cookie_value");
     assert!(
         code.contains("'\"two words\"', '\"two words\"'"),
-        "cookie value harness should preserve already-quoted values, got: {code}"
+        "cookie-value probe must preserve already-quoted values, got: {code}"
     );
 }
 
@@ -355,14 +476,17 @@ fn python_cookie_header_quote_property_gets_semantic_examples() {
     );
     build_cookie_header.declared_properties = vec!["cookie_header_quote".into()];
     let a = make_analysis(vec![build_cookie_header], vec![]);
-    let code = synthesize_calls(&a, &Language::Python);
-    assert!(
-        code.contains("cookie header quote:{_cookie_header_label}"),
-        "cookie header harness should label failures, got: {code}"
+    let (plan, code) = synthesize_with_advisory_contract(
+        &a,
+        &Language::Python,
+        "build_cookie_header",
+        "cookie_header_quote",
     );
+    assert_advisory_contract(&plan, "build_cookie_header", "cookie_header_quote");
+    assert_advisory_semantic_probe(&code, "build_cookie_header");
     assert!(
         code.contains("'session=\"two words\"'"),
-        "cookie header harness should preserve already-quoted values, got: {code}"
+        "cookie-header probe must preserve already-quoted values, got: {code}"
     );
 }
 
@@ -414,10 +538,31 @@ fn python_no_idempotency_for_different_types() {
         )],
         vec![],
     );
-    let code = synthesize_calls(&a, &Language::Python);
+    let plan = build_verification_plan(
+        &a.functions,
+        &a.classes,
+        &a.aliases,
+        &Language::Python,
+        &[],
+        &[],
+        &[],
+    );
+    let code = synthesize_plan_for_verification(
+        &a.functions,
+        &a.classes,
+        &a.aliases,
+        &Language::Python,
+        &plan,
+    )
+    .code;
+    assert_property_is_not_gating(&plan, "idempotent");
     assert!(
-        !code.contains("idempotent"),
-        "str→int should NOT check idempotency, got: {code}"
+        code.contains("_result_b = _materialize_if_iterator(normalize_text(_repeat_args[0]))"),
+        "str→int should retain runtime consistency checking, got: {code}"
+    );
+    assert!(
+        !code.contains("_result2 = normalize_text(_result)"),
+        "str→int cannot feed its result back into the str input as an idempotency oracle, got: {code}"
     );
 }
 
@@ -434,12 +579,16 @@ fn python_keyword_only_in_fuzz() {
     );
     let code = synthesize_calls(&a, &Language::Python);
     assert!(
-        code.contains("mode=_call_args[1]"),
-        "keyword-only should use name=, got: {code}"
+        code.contains("process(_call_args[0], mode=_call_args[1])"),
+        "initial invocation must bind mode by keyword, got: {code}"
     );
     assert!(
-        !code.contains("text="),
-        "positional should NOT use name=, got: {code}"
+        code.contains("process(_repeat_args[0], mode=_repeat_args[1])"),
+        "consistency invocation must preserve keyword-only binding, got: {code}"
+    );
+    assert!(
+        code.contains("process(_candidate[0], mode=_candidate[1])"),
+        "minimized repro invocation must preserve keyword-only binding, got: {code}"
     );
 }
 
@@ -751,7 +900,7 @@ fn typescript_uses_interface_fields() {
             },
             FieldInfo {
                 name: "email".into(),
-                type_annotation: Some("string".into()),
+                type_annotation: Some("string | null".into()),
                 optional: true,
                 has_default: false,
             },
@@ -759,18 +908,56 @@ fn typescript_uses_interface_fields() {
     }];
     let funcs = vec![func("process", vec![("u", Some("User"))], None)];
     let a = make_analysis(funcs, classes);
-    let code = synthesize_calls(&a, &Language::TypeScript);
+    let plan = build_verification_plan(
+        &a.functions,
+        &a.classes,
+        &a.aliases,
+        &Language::TypeScript,
+        &[],
+        &[],
+        &[],
+    );
+    let user_domain = &plan.parameter_domains[0].domain;
+    assert_eq!(
+        user_domain,
+        &DomainNode::Object(vec![
+            DomainField {
+                name: "id".into(),
+                domain: DomainNode::Float,
+                optional: false,
+            },
+            DomainField {
+                name: "name".into(),
+                domain: DomainNode::String,
+                optional: false,
+            },
+            DomainField {
+                name: "email".into(),
+                domain: DomainNode::Nullable(Box::new(DomainNode::String)),
+                optional: true,
+            },
+        ]),
+        "resolved interface fields must define the generated object domain"
+    );
+    let code = synthesize_plan_for_verification(
+        &a.functions,
+        &a.classes,
+        &a.aliases,
+        &Language::TypeScript,
+        &plan,
+    )
+    .code;
     assert!(
         code.contains("id: _fuzzNum()"),
-        "should generate id field, got: {code}"
+        "number field must use the numeric domain generator, got: {code}"
     );
     assert!(
-        code.contains("name: _fuzzStr()"),
-        "should generate name field, got: {code}"
+        code.contains("name: [_fuzzStr(), \"\", \"   \"][_fuzzIntRange(0, 2)]"),
+        "required string name must use string-domain edge values, got: {code}"
     );
     assert!(
-        code.contains("email: _fuzzBool()"),
-        "optional should use random null, got: {code}"
+        code.contains("email: _fuzzBool() ? null : [[_fuzzStr(), null][_fuzzIntRange(0, 1)], \"\", \"   \"][_fuzzIntRange(0, 2)]"),
+        "optional nullable email must sample null and string-domain edge values, got: {code}"
     );
 }
 
@@ -783,26 +970,25 @@ fn typescript_query_string_serializer_gets_semantic_examples() {
     );
     stringify.declared_properties = vec!["query_nested_brackets".into()];
     let a = make_analysis(vec![stringify], vec![]);
-    let code = synthesize_calls(&a, &Language::TypeScript);
-    assert!(
-        code.contains("new URLSearchParams"),
-        "query-string harness should decode query output, got: {code}"
+    let (plan, code) = synthesize_with_advisory_contract(
+        &a,
+        &Language::TypeScript,
+        "stringifyQuery",
+        "query_nested_brackets",
     );
+    assert_advisory_contract(&plan, "stringifyQuery", "query_nested_brackets");
+    assert_advisory_semantic_probe(&code, "stringifyQuery");
     assert!(
-        code.contains("query semantics:${_queryLabel}"),
-        "query-string harness should label semantic failures, got: {code}"
-    );
-    assert!(
-        code.contains("top-level repeated array"),
-        "query-string harness should check repeated array encoding, got: {code}"
+        code.contains("Array.from(new URLSearchParams(_queryResult).entries())"),
+        "query-string probe must decode the serialized output, got: {code}"
     );
     assert!(
         code.contains("filter[tags][]"),
-        "query-string harness should check nested array bracket encoding, got: {code}"
+        "declared nested-bracket contract must probe nested array encoding, got: {code}"
     );
     assert!(
-        !code.contains("_asciiFold(\"naïve café\")"),
-        "qs-style stringification should not inherit canonical accent folding, got: {code}"
+        !code.contains("[\"accent fold\", { q: \"naïve café\" }"),
+        "nested-bracket serialization must not inherit canonical accent folding, got: {code}"
     );
 }
 
@@ -836,18 +1022,21 @@ fn typescript_query_string_parser_gets_semantic_examples() {
     );
     parse.declared_properties = vec!["query_nested_brackets".into()];
     let a = make_analysis(vec![parse], vec![]);
-    let code = synthesize_calls(&a, &Language::TypeScript);
-    assert!(
-        code.contains("query parse semantics:${_queryParseLabel}"),
-        "query parser harness should label semantic failures, got: {code}"
+    let (plan, code) = synthesize_with_advisory_contract(
+        &a,
+        &Language::TypeScript,
+        "parseQuery",
+        "query_nested_brackets",
     );
+    assert_advisory_contract(&plan, "parseQuery", "query_nested_brackets");
+    assert_advisory_semantic_probe(&code, "parseQuery");
     assert!(
         code.contains("tag=pro&tag=beta"),
-        "query parser harness should check repeated keys, got: {code}"
+        "query parser probe must check repeated keys, got: {code}"
     );
     assert!(
-        code.contains("filter[tags][]=pro"),
-        "query parser harness should check nested array bracket parsing, got: {code}"
+        code.contains("filter[city]=Paris&filter[tags][]=pro&filter[tags][]=beta"),
+        "query parser probe must check nested array bracket parsing, got: {code}"
     );
 }
 
@@ -882,18 +1071,21 @@ fn typescript_same_value_zero_exact_standard_name_gets_semantic_examples() {
         Some("boolean"),
     );
     let a = make_analysis(vec![same_value_zero], vec![]);
-    let code = synthesize_calls(&a, &Language::TypeScript);
+    let (plan, code) = synthesize_with_advisory_contract(
+        &a,
+        &Language::TypeScript,
+        "sameValueZero",
+        "same_value_zero",
+    );
+    assert_advisory_contract(&plan, "sameValueZero", "same_value_zero");
+    assert_advisory_semantic_probe(&code, "sameValueZero");
     assert!(
-        code.contains("sameValueZero semantics:${_sameValueLabel}"),
-        "same-value-zero harness should label semantic failures, got: {code}"
+        code.contains("[\"NaN equals NaN\", NaN, NaN, true]"),
+        "SameValueZero probe must check NaN reflexivity, got: {code}"
     );
     assert!(
-        code.contains("NaN, NaN, true"),
-        "same-value-zero harness should check NaN reflexivity, got: {code}"
-    );
-    assert!(
-        code.contains("0, -0, true"),
-        "same-value-zero harness should check signed zero equivalence, got: {code}"
+        code.contains("[\"zero sign ignored\", 0, -0, true]"),
+        "SameValueZero probe must check signed-zero equivalence, got: {code}"
     );
 }
 
@@ -1036,18 +1228,21 @@ fn typescript_feature_flag_resolver_gets_explicit_false_semantics() {
         )],
         classes,
     );
-    let code = synthesize_calls(&a, &Language::TypeScript);
+    let (plan, code) = synthesize_with_advisory_contract(
+        &a,
+        &Language::TypeScript,
+        "betaCheckoutEnabled",
+        "feature_flag_override",
+    );
+    assert_advisory_contract(&plan, "betaCheckoutEnabled", "feature_flag_override");
+    assert_advisory_semantic_probe(&code, "betaCheckoutEnabled");
     assert!(
-        code.contains("feature flag semantics:${_flagLabel}"),
-        "feature-flag harness should label semantic failures, got: {code}"
+        code.contains("const _explicitFalse = Boolean((betaCheckoutEnabled as Function)({ flags: { [_flagKey]: false } }))"),
+        "feature-flag probe must preserve an explicit false override, got: {code}"
     );
     assert!(
-        code.contains("_explicitFalse !== false"),
-        "feature-flag harness should preserve explicit false overrides, got: {code}"
-    );
-    assert!(
-        code.contains("flags: { [_flagKey]: null }"),
-        "feature-flag harness should compare nested null to fallback, got: {code}"
+        code.contains("const _nullFlagValue = Boolean((betaCheckoutEnabled as Function)({ flags: { [_flagKey]: null } }))"),
+        "feature-flag probe must compare a nested null with fallback behavior, got: {code}"
     );
 }
 
@@ -1061,18 +1256,21 @@ fn typescript_semver_compare_gets_prerelease_semantics() {
         )],
         vec![],
     );
-    let code = synthesize_calls(&a, &Language::TypeScript);
+    let (plan, code) = synthesize_with_advisory_contract(
+        &a,
+        &Language::TypeScript,
+        "compareVersions",
+        "semver_compare",
+    );
+    assert_advisory_contract(&plan, "compareVersions", "semver_compare");
+    assert_advisory_semantic_probe(&code, "compareVersions");
     assert!(
-        code.contains("semver compare semantics:${_semverLabel}"),
-        "semver compare harness should label semantic failures, got: {code}"
+        code.contains("[\"1.0.0-beta.1\", \"1.0.0\", -1]"),
+        "semver comparison probe must check prerelease-vs-release ordering, got: {code}"
     );
     assert!(
-        code.contains("\"1.0.0-beta.1\", \"1.0.0\", -1"),
-        "semver compare harness should check prerelease-vs-release ordering, got: {code}"
-    );
-    assert!(
-        code.contains("\"1.0.0+build.1\", \"1.0.0+build.9\", 0"),
-        "semver compare harness should ignore build metadata, got: {code}"
+        code.contains("[\"1.0.0+build.1\", \"1.0.0+build.9\", 0]"),
+        "semver comparison probe must ignore build metadata, got: {code}"
     );
 }
 
@@ -1086,22 +1284,25 @@ fn typescript_semver_caret_gets_zero_major_semantics() {
         )],
         vec![],
     );
-    let code = synthesize_calls(&a, &Language::TypeScript);
+    let (plan, code) = synthesize_with_advisory_contract(
+        &a,
+        &Language::TypeScript,
+        "matchesCaret",
+        "semver_caret",
+    );
+    assert_advisory_contract(&plan, "matchesCaret", "semver_caret");
+    assert_advisory_semantic_probe(&code, "matchesCaret");
     assert!(
-        code.contains("semver caret semantics:${_caretLabel}"),
-        "semver caret harness should label semantic failures, got: {code}"
+        code.contains("[\"1.3.0-beta.1\", \"^1.2.3\", false]"),
+        "semver caret probe must exclude prereleases, got: {code}"
     );
     assert!(
-        code.contains("\"1.3.0-beta.1\", \"^1.2.3\", false"),
-        "semver caret harness should exclude prereleases, got: {code}"
+        code.contains("[\"1.0.2-beta.3\", \"^1.0.2\", false]"),
+        "semver caret probe must exclude prereleases at a stable same-core range, got: {code}"
     );
     assert!(
-        code.contains("\"1.0.2-beta.3\", \"^1.0.2\", false"),
-        "semver caret harness should exclude prereleases for stable same-core ranges, got: {code}"
-    );
-    assert!(
-        code.contains("\"0.3.0\", \"^0.2.3\", false"),
-        "semver caret harness should enforce zero-major upper bounds, got: {code}"
+        code.contains("[\"0.3.0\", \"^0.2.3\", false]"),
+        "semver caret probe must enforce zero-major upper bounds, got: {code}"
     );
 }
 
@@ -1118,26 +1319,29 @@ fn typescript_defaults_gets_null_and_inherited_semantics() {
         )],
         vec![],
     );
-    let code = synthesize_calls(&a, &Language::TypeScript);
+    let (plan, code) = synthesize_with_advisory_contract(
+        &a,
+        &Language::TypeScript,
+        "defaults",
+        "defaults_semantics",
+    );
+    assert_advisory_contract(&plan, "defaults", "defaults_semantics");
+    assert_advisory_semantic_probe(&code, "defaults");
     assert!(
-        code.contains("_fuzzOne(\"defaults\""),
-        "defaults should become fuzzable despite a generic target, got: {code}"
+        code.contains("_fuzzOne(\"defaults\", 30, () => [_fuzzObject(), Array.from"),
+        "defaults must retain runtime checking with object-shaped generated input, got: {code}"
     );
     assert!(
-        code.contains("_fuzzObject()"),
-        "defaults should use object-shaped fuzz inputs, got: {code}"
+        code.contains("(defaults as Function)({ a: null }, { a: 1 })"),
+        "defaults probe must preserve null target values, got: {code}"
     );
     assert!(
-        code.contains("defaults semantics:${_defaultsLabel}"),
-        "defaults harness should label semantic failures, got: {code}"
-    );
-    assert!(
-        code.contains("({ a: null }, { a: 1 })"),
-        "defaults harness should preserve null targets, got: {code}"
+        code.contains("(defaults as Function)({ a: undefined }, { a: 1 })"),
+        "defaults probe must fill undefined target values, got: {code}"
     );
     assert!(
         code.contains("Object.create(_defaultsProto)"),
-        "defaults harness should exercise inherited enumerable keys, got: {code}"
+        "defaults probe must exercise inherited enumerable keys, got: {code}"
     );
 }
 
@@ -1593,10 +1797,31 @@ fn python_no_boundedness_for_non_matching_name() {
         vec![func("transform", vec![("s", Some("str"))], Some("str"))],
         vec![],
     );
-    let code = synthesize_calls(&a, &Language::Python);
+    let plan = build_verification_plan(
+        &a.functions,
+        &a.classes,
+        &a.aliases,
+        &Language::Python,
+        &[],
+        &[],
+        &[],
+    );
+    let code = synthesize_plan_for_verification(
+        &a.functions,
+        &a.classes,
+        &a.aliases,
+        &Language::Python,
+        &plan,
+    )
+    .code;
+    assert_property_is_not_gating(&plan, "bounded");
     assert!(
-        !code.contains("bounded"),
-        "transform should NOT check boundedness, got: {code}"
+        code.contains("_result_b = _materialize_if_iterator(transform(_repeat_args[0]))"),
+        "transform should retain runtime consistency checking, got: {code}"
+    );
+    assert!(
+        !code.contains("assert len(_result) <= len(_args[0])"),
+        "transform must not acquire boundedness from a name heuristic, got: {code}"
     );
 }
 
@@ -1841,7 +2066,7 @@ fn python_fuzz_emits_json_sentinel() {
     );
     let code = synthesize_calls(&a, &Language::Python);
     assert!(
-        code.contains("__COURT_JESTER_FUZZ_JSON__"),
+        code.contains("__COURT_JESTER_FINDINGS_JSON__"),
         "should contain JSON sentinel, got: {code}"
     );
     assert!(
@@ -1866,7 +2091,7 @@ fn typescript_fuzz_emits_json_sentinel() {
     );
     let code = synthesize_calls(&a, &Language::TypeScript);
     assert!(
-        code.contains("__COURT_JESTER_FUZZ_JSON__"),
+        code.contains("__COURT_JESTER_FINDINGS_JSON__"),
         "should contain JSON sentinel, got: {code}"
     );
     assert!(
@@ -2057,7 +2282,7 @@ fn typescript_set_param_is_no_longer_skipped_as_unsupported() {
         .iter()
         .find(|entry| entry.function == "uniqueName")
         .expect("coverage entry for uniqueName");
-    assert_eq!(coverage.status, FuzzFunctionStatus::Fuzzed);
+    assert_eq!(coverage.status, FuzzFunctionStatus::CheckedDirect);
 }
 
 #[test]
@@ -2071,4 +2296,49 @@ fn python_callable_generator() {
         code.contains("lambda"),
         "Callable should generate lambda, got: {code}"
     );
+}
+#[test]
+fn generated_harness_contains_replayable_minimization_protocol() {
+    let analysis = make_analysis(
+        vec![func(
+            "normalize_display_name",
+            vec![("value", Some("str"))],
+            Some("str"),
+        )],
+        vec![],
+    );
+    let code = synthesize_calls(&analysis, &Language::Python);
+    assert!(code.contains("__COURT_JESTER_FINDINGS_JSON__"));
+    assert!(code.contains("__COURT_JESTER_REPLAY_JSON__"));
+    assert!(code.contains("_minimize_failure"));
+    assert!(
+        code.contains("0.250"),
+        "shrinking must carry the bounded time budget"
+    );
+    assert!(
+        code.contains("\\xa0"),
+        "the whitespace regression corpus must include NBSP"
+    );
+}
+
+#[test]
+fn generated_domains_do_not_use_removed_business_field_pools() {
+    let analysis = make_analysis(
+        vec![func(
+            "transform",
+            vec![("value", Some("object"))],
+            Some("object"),
+        )],
+        vec![],
+    );
+    let python = synthesize_calls(&analysis, &Language::Python);
+    let typescript = synthesize_plan(&analysis, &Language::TypeScript).code;
+    for source in [python, typescript] {
+        for removed in ["beta_checkout", "support_email", "billing", "preferences"] {
+            assert!(
+                !source.contains(removed),
+                "generic object generation must not embed {removed}"
+            );
+        }
+    }
 }

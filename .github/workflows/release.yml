@@ -7,14 +7,24 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing tag to build and upload (e.g. v0.1.8). Used to backfill a release.'
+        description: 'Existing v0.2.0-or-newer tag to build and upload.'
         required: true
 
 permissions:
   contents: write
 
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
 jobs:
+  quality:
+    name: quality
+    uses: ./.github/workflows/quality.yml
+    with:
+      ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
   build:
+    needs: quality
     name: build-${{ matrix.platform }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -30,39 +40,66 @@ jobs:
           - platform: linux-arm64
             runner: ubuntu-24.04-arm
     steps:
-      - name: Resolve tag
-        id: tag
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            tag="${{ inputs.tag }}"
-          else
-            tag="${GITHUB_REF#refs/tags/}"
-          fi
-          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/checkout@v4
+      - name: Check out release tag
+        uses: actions/checkout@v4
         with:
-          ref: ${{ steps.tag.outputs.tag }}
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Validate tag and release metadata
+        run: python3 scripts/check_release.py --tag "${RELEASE_TAG}"
 
       - name: Build release binary
         run: cargo build --release --locked
 
-      - name: Package tarball
+      - name: Package tarball and checksum
         shell: bash
         run: |
-          tag="${{ steps.tag.outputs.tag }}"
-          asset="court-jester-${tag}-${{ matrix.platform }}.tar.gz"
+          asset="court-jester-${RELEASE_TAG}-${{ matrix.platform }}.tar.gz"
           tar -czf "${asset}" -C target/release court-jester
+          shasum -a 256 "${asset}" > "${asset}.sha256"
           echo "ASSET=${asset}" >> "$GITHUB_ENV"
 
-      - name: Upload to release
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: court-jester-${{ matrix.platform }}
+          path: |
+            court-jester-*.tar.gz
+            court-jester-*.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    name: publish-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Validate tag and release metadata
+        run: python3 scripts/check_release.py --tag "${RELEASE_TAG}"
+
+      - name: Download platform assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: court-jester-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify checksums
+        working-directory: dist
+        run: shasum -a 256 --check *.sha256
+
+      - name: Create release and upload assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
-          tag="${{ steps.tag.outputs.tag }}"
-          if ! gh release view "${tag}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release create "${tag}" --repo "${{ github.repository }}" --title "${tag}" --notes "Automated release build."
+          version="${RELEASE_TAG#v}"
+          notes="docs/release-notes-${version}.md"
+          if ! gh release view "${RELEASE_TAG}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release create "${RELEASE_TAG}" --repo "${{ github.repository }}" --title "${RELEASE_TAG}" --notes-file "${notes}" --verify-tag
           fi
-          gh release upload "${tag}" "${ASSET}" --clobber --repo "${{ github.repository }}"
+          gh release upload "${RELEASE_TAG}" dist/*.tar.gz dist/*.sha256 --clobber --repo "${{ github.repository }}"

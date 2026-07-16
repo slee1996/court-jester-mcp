@@ -1443,23 +1443,33 @@ function showDetail(run) {
       html += `<div style="margin-bottom:12px"><strong style="font-family:var(--mono); font-size:12px">${escapeHtml(item.path)}</strong>`;
       const response = item.response;
       if (response && response.stages) {
+        html += `<div style="font-size:12px; color:var(--text-dim); margin:4px 0">verdict: ${escapeHtml(response.verdict || 'unknown')}</div>`;
         response.stages.forEach(stage => {
-          const icon = stage.ok ? '\u2713' : '\u2717';
-          const cls = stage.ok ? 'ok' : 'fail';
+          const status = stage.status || 'inconclusive';
+          const passed = status === 'passed' || status === 'advisory';
+          const skipped = status === 'skipped';
+          const icon = passed ? '\u2713' : skipped ? '\u2013' : status === 'inconclusive' ? '?' : '\u2717';
+          const cls = passed ? 'ok' : skipped ? 'skip' : status === 'inconclusive' ? 'skip' : 'fail';
           const time = stage.duration_ms != null ? `${stage.duration_ms}ms` : '';
-          html += `<div class="stage-row ${cls}"><span class="stage-icon">${icon}</span><span class="stage-name">${stage.name}</span><span class="stage-time">${time}</span></div>`;
-          if (stage.detail?.fuzz_failures?.length) {
-            stage.detail.fuzz_failures.forEach(ff => {
-              html += `<div class="fuzz-failure">
-                <strong>${escapeHtml(ff.function || '')}</strong>(${escapeHtml(ff.input || '?')})
-                &rarr; <code>${escapeHtml(ff.error_type || ff.severity || '')}</code>
-                ${ff.message ? '<br>' + escapeHtml(ff.message) : ''}
-              </div>`;
-            });
+          html += `<div class="stage-row ${cls}"><span class="stage-icon">${icon}</span><span class="stage-name">${escapeHtml(stage.name || '')}</span><span class="stage-time">${time}</span></div>`;
+          if (stage.message) {
+            html += `<div style="font-size:12px; color:var(--text-dim)">${escapeHtml(stage.message)}</div>`;
           }
+          const findings = stage.detail?.findings || [];
+          findings.forEach(finding => {
+            const location = finding.location || {};
+            const repro = finding.repro || {};
+            const functionName = location.function || finding.function || '';
+            const input = repro.snippet || repro.arguments || finding.input || '?';
+            html += `<div class="fuzz-failure">
+              <strong>${escapeHtml(functionName)}</strong>(${escapeHtml(String(input))})
+              &rarr; <code>${escapeHtml(finding.error_type || finding.severity || '')}</code>
+              ${finding.message ? '<br>' + escapeHtml(finding.message) : ''}
+            </div>`;
+          });
         });
       } else if (response) {
-        html += `<div style="font-size:12px; color:var(--text-dim)">overall_ok: ${response.overall_ok}</div>`;
+        html += `<div style="font-size:12px; color:var(--text-dim)">verdict: ${escapeHtml(response.verdict || 'unknown')}</div>`;
       }
       html += '</div>';
     });

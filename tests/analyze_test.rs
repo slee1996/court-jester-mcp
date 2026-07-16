@@ -1,10 +1,11 @@
-use court_jester_mcp::tools::analyze;
-use court_jester_mcp::tools::analyze::{
+use court_jester::tools::analyze;
+use court_jester::tools::analyze::{
     analyze, check_complexity_threshold, filter_changed_functions, source_declared_properties,
     source_directive_suppresses_complexity,
 };
-use court_jester_mcp::tools::diff::parse_changed_lines;
-use court_jester_mcp::types::Language;
+use court_jester::tools::diff::parse_changed_lines;
+use court_jester::tools::domain::{build_verification_plan, classify_input, domain_for_annotation};
+use court_jester::types::Language;
 
 #[test]
 fn python_function_with_types() {
@@ -1058,4 +1059,117 @@ fn filter_changed_functions_no_overlap() {
     let ranges = parse_changed_lines(diff);
     let filtered = filter_changed_functions(&r, &ranges);
     assert!(filtered.is_empty(), "no functions should overlap");
+}
+#[test]
+fn domain_ir_classifies_literal_boundary_inputs() {
+    let domain = domain_for_annotation(
+        Some("Literal[\"draft\", \"published\"]"),
+        &[],
+        &[],
+        &Language::Python,
+    );
+    assert!(
+        matches!(domain, court_jester::types::DomainNode::Literal(ref values) if values.len() == 2)
+    );
+
+    let domains = vec![court_jester::types::ParameterDomain {
+        surface_id: "status:1".into(),
+        parameter: "status".into(),
+        index: 0,
+        closed: true,
+        domain: domain.clone(),
+        sources: vec![],
+    }];
+    let valid = court_jester::types::PlannedArguments {
+        positional: vec![court_jester::types::DomainLiteral {
+            expression: "\"draft\"".into(),
+            json_value: Some(serde_json::json!("draft")),
+        }],
+        named: std::collections::BTreeMap::new(),
+    };
+    let invalid = court_jester::types::PlannedArguments {
+        positional: vec![court_jester::types::DomainLiteral {
+            expression: "\"archived\"".into(),
+            json_value: Some(serde_json::json!("archived")),
+        }],
+        named: std::collections::BTreeMap::new(),
+    };
+    assert_eq!(
+        classify_input(&valid, &domains),
+        court_jester::types::InputClassification::Valid
+    );
+    assert_eq!(
+        classify_input(&invalid, &domains),
+        court_jester::types::InputClassification::Invalid
+    );
+}
+
+#[test]
+fn domain_ir_resolves_enum_alias_and_recursive_alias_without_fabricating_objects() {
+    let analysis = analyze(
+        "enum Channel { Email = 'email', Sms = 'sms' }\ntype Loop = Loop;",
+        &Language::TypeScript,
+    );
+    let channel = domain_for_annotation(
+        Some("Channel"),
+        &analysis.aliases,
+        &analysis.classes,
+        &Language::TypeScript,
+    );
+    assert!(matches!(channel, court_jester::types::DomainNode::Union(values) if values.len() == 2));
+    let loop_domain = domain_for_annotation(
+        Some("Loop"),
+        &analysis.aliases,
+        &analysis.classes,
+        &Language::TypeScript,
+    );
+    assert_eq!(
+        loop_domain,
+        court_jester::types::DomainNode::Opaque("recursive_or_depth_limit".into())
+    );
+}
+
+#[test]
+fn verification_plan_exhausts_closed_literal_product_deterministically() {
+    let analysis = analyze(
+        "export function choose(channel: 'email' | 'sms', priority: 1 | 2): string { return channel + priority; }",
+        &Language::TypeScript,
+    );
+    let first = build_verification_plan(
+        &analysis.functions,
+        &analysis.classes,
+        &analysis.aliases,
+        &Language::TypeScript,
+        &[],
+        &[],
+        &[],
+    );
+    let second = build_verification_plan(
+        &analysis.functions,
+        &analysis.classes,
+        &analysis.aliases,
+        &Language::TypeScript,
+        &[],
+        &[],
+        &[],
+    );
+    assert_eq!(first, second);
+    let rows: Vec<Vec<String>> = first
+        .inputs
+        .iter()
+        .filter(|row| row.surface_id.starts_with("choose:"))
+        .map(|row| {
+            row.arguments
+                .positional
+                .iter()
+                .map(|value| value.expression.clone())
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        rows.len(),
+        4,
+        "both closed parameters must be exhaustively scheduled"
+    );
+    assert!(rows.iter().all(|row| row.len() == 2));
 }

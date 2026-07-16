@@ -8,6 +8,73 @@ from typing import Any
 
 BENCH_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = BENCH_ROOT.parent
+ARTIFACT_SCHEMA_VERSION = 1
+VERIFY_SCHEMA_VERSION_REQUIRED = 3
+
+class ArtifactVersionError(ValueError):
+    """Raised when benchmark artifacts are missing or have mixed schema versions."""
+
+def canonical_json(value: Any) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+def sha256_bytes(value: bytes) -> str:
+    import hashlib
+    return hashlib.sha256(value).hexdigest()
+
+def sha256_file(path: Path) -> str:
+    return sha256_bytes(path.read_bytes())
+
+def validate_artifact_metadata(payload: dict[str, Any], *, allow_legacy: bool = False) -> None:
+    artifact = payload.get("artifact_schema_version")
+    verify = payload.get("verify_schema_version_required")
+    if artifact != ARTIFACT_SCHEMA_VERSION or verify != VERIFY_SCHEMA_VERSION_REQUIRED:
+        if allow_legacy:
+            return
+        raise ArtifactVersionError(f"artifact schema mismatch: artifact_schema_version={artifact!r}, verify_schema_version_required={verify!r}")
+
+def iter_closure_files(root: Path) -> list[Path]:
+    ignored = {".git", ".venv", "__pycache__", "node_modules", ".pytest_cache", ".mypy_cache"}
+    if not root.exists():
+        return []
+    files: list[Path] = []
+    for path in root.rglob("*"):
+        rel = path.relative_to(root)
+        if not path.is_file() or any(part.startswith(".") for part in rel.parts) or any(part in ignored for part in rel.parts):
+            continue
+        files.append(path)
+    return sorted(files, key=lambda p: p.relative_to(root).as_posix())
+
+def suite_lock_projection(task_set: "TaskSetManifest", tasks: list["TaskManifest"]) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    closure: list[dict[str, str]] = []
+    for task in sorted(tasks, key=lambda t: t.id):
+        manifest_path = BENCH_ROOT / "tasks" / f"{task.id}.json"
+        if manifest_path.exists():
+            closure.append({"path": manifest_path.relative_to(REPO_ROOT).as_posix(), "sha256": sha256_file(manifest_path)})
+        fixture = BENCH_ROOT / "repos" / task.repo_fixture
+        for path in iter_closure_files(fixture):
+            closure.append({"path": path.relative_to(REPO_ROOT).as_posix(), "sha256": sha256_file(path)})
+        declared = list(task.verify_paths) + list(task.expected_files)
+        if task.verify_test_path:
+            declared.append(task.verify_test_path)
+        if task.gold_patch_path:
+            declared.append(task.gold_patch_path)
+        for raw in declared:
+            path = (fixture / raw) if not Path(raw).is_absolute() else Path(raw)
+            if path.is_file():
+                try:
+                    rel = path.relative_to(REPO_ROOT).as_posix()
+                except ValueError:
+                    rel = f"external:{path.as_posix()}"
+                entry = {"path": rel, "sha256": sha256_file(path)}
+                if entry not in closure:
+                    closure.append(entry)
+    closure.sort(key=lambda item: item["path"])
+    projection = {"task_set": {"id": task_set.id, "title": task_set.title, "task_ids": sorted(task_set.task_ids), "goal": task_set.goal, "suite_kind": task_set.suite_kind, "immutable": task_set.immutable, "gate_role": task_set.gate_role, "lock_version": task_set.lock_version}, "tasks": [task.id for task in sorted(tasks, key=lambda t: t.id)], "closure": closure}
+    return projection, closure
+
+def suite_lock_digest(task_set: "TaskSetManifest", tasks: list["TaskManifest"]) -> str:
+    projection, _ = suite_lock_projection(task_set, tasks)
+    return sha256_bytes(canonical_json(projection))
 
 
 @dataclass(slots=True)
@@ -94,7 +161,10 @@ class TaskSetManifest:
     task_ids: list[str]
     goal: str | None = None
     suite_kind: str | None = None
-
+    immutable: bool = False
+    gate_role: str | None = None
+    lock_version: int = 1
+    locked_suite_sha256: str | None = None
 
 def read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text())

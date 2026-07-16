@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::tools::domain;
 use crate::types::*;
 
 /// Number of random inputs to generate per function.
@@ -57,10 +58,85 @@ pub fn synthesize_plan_for(
     aliases: &[TypeAliasInfo],
     language: &Language,
 ) -> FuzzPlan {
-    synthesize_plan_for_with_seeds(functions, classes, aliases, language, &HashMap::new())
+    let plan =
+        domain::build_verification_plan(functions, classes, aliases, language, &[], &[], &[]);
+    synthesize_plan_for_verification(functions, classes, aliases, language, &plan)
 }
 
+/// Render one repository-derived verification plan.  All public synthesis
+/// entry points eventually call this function; no independent seed renderer
+/// exists.
+pub fn synthesize_plan_for_verification(
+    functions: &[FunctionInfo],
+    classes: &[ClassInfo],
+    aliases: &[TypeAliasInfo],
+    language: &Language,
+    plan: &VerificationPlan,
+) -> FuzzPlan {
+    let mut seed_inputs: HashMap<String, Vec<Vec<String>>> = HashMap::new();
+    for input in &plan.inputs {
+        if input.classification == InputClassification::Invalid {
+            continue;
+        }
+        seed_inputs
+            .entry(
+                input
+                    .surface_id
+                    .split(':')
+                    .next()
+                    .unwrap_or(&input.surface_id)
+                    .to_string(),
+            )
+            .or_default()
+            .push(
+                input
+                    .arguments
+                    .positional
+                    .iter()
+                    .map(|item| item.expression.clone())
+                    .collect(),
+            );
+    }
+    synthesize_plan_legacy(functions, classes, aliases, language, &seed_inputs)
+}
+
+/// Compatibility constructor for callers that already extracted literal
+/// seeds. It still builds the shared plan before rendering.
 pub fn synthesize_plan_for_with_seeds(
+    functions: &[FunctionInfo],
+    classes: &[ClassInfo],
+    aliases: &[TypeAliasInfo],
+    language: &Language,
+    seed_inputs: &HashMap<String, Vec<Vec<String>>>,
+) -> FuzzPlan {
+    let mut plan =
+        domain::build_verification_plan(functions, classes, aliases, language, &[], &[], &[]);
+    plan.inputs.clear();
+    for (name, rows) in seed_inputs {
+        if let Some(surface) = plan.surfaces.iter().find(|surface| surface.symbol == *name) {
+            for row in rows {
+                plan.inputs.push(PlannedInput {
+                    surface_id: surface.id.clone(),
+                    arguments: PlannedArguments {
+                        positional: row
+                            .iter()
+                            .map(|expression| DomainLiteral {
+                                expression: expression.clone(),
+                                json_value: None,
+                            })
+                            .collect(),
+                        named: std::collections::BTreeMap::new(),
+                    },
+                    classification: InputClassification::Valid,
+                    sources: vec![],
+                });
+            }
+        }
+    }
+    synthesize_plan_for_verification(functions, classes, aliases, language, &plan)
+}
+
+fn synthesize_plan_legacy(
     functions: &[FunctionInfo],
     classes: &[ClassInfo],
     aliases: &[TypeAliasInfo],
@@ -69,7 +145,6 @@ pub fn synthesize_plan_for_with_seeds(
 ) -> FuzzPlan {
     let class_defs: HashMap<&str, &ClassInfo> =
         classes.iter().map(|c| (c.name.as_str(), c)).collect();
-
     let pseudo_analysis = AnalysisResult {
         functions: functions.to_vec(),
         classes: classes.to_vec(),
@@ -81,13 +156,13 @@ pub fn synthesize_plan_for_with_seeds(
         complexity_breakdown: std::collections::BTreeMap::new(),
         parse_error: false,
     };
-
     match language {
         Language::Python => synthesize_python(&pseudo_analysis, &class_defs, seed_inputs),
-        Language::TypeScript => {
-            let named_types = build_ts_named_types(classes, aliases);
-            synthesize_typescript(&pseudo_analysis, &named_types, seed_inputs)
-        }
+        Language::TypeScript => synthesize_typescript(
+            &pseudo_analysis,
+            &build_ts_named_types(classes, aliases),
+            seed_inputs,
+        ),
     }
 }
 
@@ -211,7 +286,7 @@ fn likely_simple_helper(name: &str) -> bool {
         .any(|cue| lower.contains(cue))
 }
 
-fn synth_candidate_functions<'a>(functions: &'a [FunctionInfo]) -> Vec<&'a FunctionInfo> {
+fn synth_candidate_functions(functions: &[FunctionInfo]) -> Vec<&FunctionInfo> {
     functions
         .iter()
         .filter(|func| is_synth_top_level_candidate(func))
@@ -228,14 +303,51 @@ fn coverage_entry(
         line: func.line,
         end_line: func.end_line,
         status,
+        required: func.is_exported,
+        invocation_path: InvocationPath::Direct,
         is_exported: func.is_exported,
         reason,
     }
 }
 
+fn factory_callable_declaration<'a>(
+    analysis: &'a AnalysisResult,
+    factory: &FunctionInfo,
+    callable: &str,
+) -> Option<&'a FunctionInfo> {
+    analysis
+        .functions
+        .iter()
+        .filter(|candidate| {
+            candidate.is_nested
+                && candidate.name == callable
+                && candidate.line >= factory.line
+                && candidate.end_line <= factory.end_line
+        })
+        .max_by_key(|candidate| candidate.line)
+}
+
+fn known_factory_callable<'a>(
+    analysis: &'a AnalysisResult,
+    factory: &FunctionInfo,
+    callable: &str,
+    type_defs: &TsNamedTypes<'_>,
+) -> Option<&'a FunctionInfo> {
+    factory_callable_declaration(analysis, factory, callable).filter(|candidate| {
+        let params = candidate
+            .params
+            .iter()
+            .filter(|param| !param.name.starts_with('*'))
+            .collect::<Vec<_>>();
+        params.iter().all(|param| param.type_annotation.is_some())
+            && ts_params_are_fuzzable(candidate, &params, type_defs)
+    })
+}
+
 fn factory_callable_coverage(
     analysis: &AnalysisResult,
     selected_functions: &[&FunctionInfo],
+    type_defs: &TsNamedTypes<'_>,
 ) -> Vec<FuzzFunctionCoverage> {
     let mut coverage = Vec::new();
     for func in selected_functions {
@@ -243,21 +355,39 @@ fn factory_callable_coverage(
             continue;
         }
         for callable in &func.returned_callables {
-            let nested = analysis.functions.iter().find(|candidate| {
-                candidate.name == *callable
-                    && candidate.line >= func.line
-                    && candidate.end_line <= func.end_line
-            });
+            // Match by returned property name inside the factory source range.
+            // Prefer the declaration nearest the returned object so shadowed
+            // shorthand names and object methods retain a stable source line.
+            let nested = factory_callable_declaration(analysis, func, callable);
+            let known = known_factory_callable(analysis, func, callable, type_defs).is_some();
+            let status = if known {
+                FuzzFunctionStatus::CheckedViaFactory
+            } else {
+                FuzzFunctionStatus::ReachedViaFactory
+            };
+            let reason = if known {
+                Some(format!(
+                    "planned typed invocation through factory return surface of {}; runtime target proof is required",
+                    func.name
+                ))
+            } else {
+                Some(format!(
+                    "factory returned callable {} but its signature/domain is unknown",
+                    callable
+                ))
+            };
             coverage.push(FuzzFunctionCoverage {
                 function: format!("{}().{}", func.name, callable),
                 line: nested.map(|entry| entry.line).unwrap_or(func.line),
                 end_line: nested.map(|entry| entry.end_line).unwrap_or(func.end_line),
-                status: FuzzFunctionStatus::FuzzedViaFactory,
-                is_exported: true,
-                reason: Some(format!(
-                    "exercised through factory return surface of {}",
-                    func.name
-                )),
+                status,
+                required: func.is_exported,
+                invocation_path: InvocationPath::Factory {
+                    factory: func.name.clone(),
+                    callable: callable.clone(),
+                },
+                is_exported: func.is_exported,
+                reason,
             });
         }
     }
@@ -502,7 +632,11 @@ fn synthesize_python(
             ));
             continue;
         }
-        coverage.push(coverage_entry(func, FuzzFunctionStatus::Fuzzed, None));
+        coverage.push(coverage_entry(
+            func,
+            FuzzFunctionStatus::CheckedDirect,
+            None,
+        ));
         selected_functions.push(func);
 
         // Build the call with keyword args where needed
@@ -532,6 +666,24 @@ fn synthesize_python(
         let gen_list = generators.join(", ");
         let call = call_args.join(", ");
         let ret_type = func.return_type.as_deref().unwrap_or("");
+        let candidate_call_args: Vec<String> = callable_params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                if p.keyword_only {
+                    format!("{}=_candidate[{}]", p.name, i)
+                } else {
+                    format!("_candidate[{}]", i)
+                }
+            })
+            .collect();
+        let candidate_call = candidate_call_args.join(", ");
+        let declared_properties = func
+            .declared_properties
+            .iter()
+            .map(|property| format!("\"{}\"", property.replace('"', "\\\"")))
+            .collect::<Vec<_>>()
+            .join(", ");
         let edge_case_setup = if should_inject_python_edge_cases(func, &callable_params) {
             let param_type_list: String = callable_params
                 .iter()
@@ -567,6 +719,7 @@ _crash = 0
 for _args in _all_inputs:
     try:
         _call_args = _copy.deepcopy(_args)
+        _target_entered("{name}:{line}")
         _result = _materialize_if_iterator({name}({call}))
         _pass += 1
 {type_check}
@@ -584,9 +737,7 @@ for _args in _all_inputs:
     except Exception as _e:
         if _is_crash(_e):
             _crash += 1
-            _FUZZ_RESULTS.append({{"function": "{name}", "input": _short_repr(_args),
-                "error_type": type(_e).__name__, "message": _clip_text(str(_e)),
-                "severity": "crash" if isinstance(_e, _CRASH_TYPES) else "property_violation"}})
+            _emit_error("{name}", _args, _e, [{declared_properties}], lambda _candidate: _reproduces_python(_candidate, _e, lambda: {name}({candidate_call})), invocation_path="direct")
             if _crash == 1:
                 print(f"  CRASH {name}({{_short_repr(_args)}}): {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
         else:
@@ -608,9 +759,12 @@ else:
     print(f"FUZZ {name}: {{_pass}} passed, {{_reject}} rejected (of {{_total}})")
 "#,
             name = func.name,
+            candidate_call = candidate_call,
+            declared_properties = declared_properties,
             edge_case_setup = edge_case_setup,
             seed_rows = python_seed_rows_expr(func, seed_inputs),
             type_check = python_type_check(ret_type, type_defs),
+            line = func.line,
             idempotency_check = python_idempotency_check(func, &callable_params, type_defs),
             consistency_check = python_consistency_check(func, &repeat_call_args),
             boundedness_check = python_boundedness_check(func, &callable_params),
@@ -659,6 +813,35 @@ else:
             .iter()
             .map(|p| python_generator(p.type_annotation.as_deref(), type_defs))
             .collect();
+        let known_nested_names: Vec<&str> = analysis
+            .functions
+            .iter()
+            .filter(|candidate| {
+                candidate.is_nested
+                    && candidate.line >= func.line
+                    && candidate.end_line <= func.end_line
+            })
+            .filter(|candidate| {
+                !candidate
+                    .params
+                    .iter()
+                    .any(|param| !param.name.starts_with('*') && param.type_annotation.is_none())
+            })
+            .map(|candidate| candidate.name.as_str())
+            .filter(|name| {
+                func.returned_callables
+                    .iter()
+                    .any(|callable| callable == *name)
+            })
+            .collect();
+        let known_nested_expr = format!(
+            "{{{}}}",
+            known_nested_names
+                .iter()
+                .map(|name| format!("\"{}\"", name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         let gen_list = generators.join(", ");
         let nested_names: Vec<&str> = func.returned_callables.iter().map(String::as_str).collect();
         code.push_str(&format!(
@@ -666,28 +849,25 @@ else:
 # Factory exercise: {name} -> test returned callables
 _factory_pass = 0
 _factory_crash = 0
+_known_factory_callables = {known_nested_expr}
 for _fi in range({iters}):
-    try:
         _factory_result = {name}({gen_list})
+        _target_entered("{name}:{func_line}")
         if callable(_factory_result):
-            try:
-                _factory_result({gen_list})
-            except Exception:
-                pass
+            if len(_known_factory_callables) == 1:
+                _factory_callable_name = next(iter(_known_factory_callables))
+                _target_entered("{name}()." + _factory_callable_name)
+                _factory_result(_fuzz_any())
         elif hasattr(_factory_result, '__dict__'):
             for _attr in dir(_factory_result):
-                if not _attr.startswith('_') and callable(getattr(_factory_result, _attr, None)):
-                    try:
-                        getattr(_factory_result, _attr)({gen_list})
-                    except Exception:
-                        pass
+                if _attr in _known_factory_callables and callable(getattr(_factory_result, _attr, None)):
+                    _target_entered("{name}()." + _attr)
+                    getattr(_factory_result, _attr)(_fuzz_any())
         _factory_pass += 1
     except Exception as _e:
         if _is_crash(_e):
             _factory_crash += 1
-            _FUZZ_RESULTS.append({{"function": "{name} (factory)", "input": "factory call",
-                "error_type": type(_e).__name__, "message": _clip_text(str(_e)),
-                "severity": "crash"}})
+            _emit_finding("{name} (factory)", [], _e, "crash", "runtime_contract", "language_runtime", "high", "exception", invocation_path={{"factory": {{"factory": "{name}", "callable": "unknown"}}}})
             if _factory_crash == 1:
                 print(f"  CRASH {name}(factory): {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
 _factory_total = _factory_pass + _factory_crash
@@ -697,7 +877,9 @@ if _factory_crash > 0:
 else:
     print(f"FUZZ {name} (factory->nested): {{_factory_pass}} passed (of {{_factory_total}}) [exercises: {nested}]")
 "#,
+            func_line = func.line,
             name = func.name,
+            known_nested_expr = known_nested_expr,
             iters = FUZZ_ITERATIONS,
             nested = nested_names.join(", "),
         ));
@@ -933,7 +1115,7 @@ fn has_same_value_zero_contract(func: &FunctionInfo) -> bool {
     if has_declared_property(func, "same_value_zero") {
         return true;
     }
-    func.name.to_lowercase().replace('_', "").replace('-', "") == "samevaluezero"
+    func.name.to_lowercase().replace(['_', '-'], "") == "samevaluezero"
 }
 
 fn has_http_request_metadata_contract(func: &FunctionInfo) -> bool {
@@ -1385,9 +1567,7 @@ fn python_query_string_semantic_check(func: &FunctionInfo, params: &[&ParamInfo]
 except Exception as _e:
     if _is_crash(_e):
         _crash += 1
-        _FUZZ_RESULTS.append({{"function": "{name}", "input": f"query semantics:{{_query_label}}",
-            "error_type": type(_e).__name__, "message": _clip_text(str(_e)),
-            "severity": "crash" if isinstance(_e, _CRASH_TYPES) else "property_violation"}})
+        _emit_finding("{name}", [_query_input], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", case_label=_query_label)
         if _crash == 1:
             print(f"  CRASH {name}(query semantics): {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
 "#,
@@ -1432,9 +1612,7 @@ fn python_pep440_version_ordering_check(func: &FunctionInfo, params: &[&ParamInf
 except Exception as _e:
     if _is_crash(_e):
         _crash += 1
-        _FUZZ_RESULTS.append({{"function": "{name}", "input": f"pep440 version ordering:{{_pep440_label}}",
-            "error_type": type(_e).__name__, "message": _clip_text(str(_e)),
-            "severity": "crash" if isinstance(_e, _CRASH_TYPES) else "property_violation"}})
+        _emit_finding("{name}", [_left, _right], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", case_label=_pep440_label)
         if _crash == 1:
             print(f"  CRASH {name}(pep440 version ordering): {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
 "#,
@@ -1472,9 +1650,7 @@ fn python_pep440_specifier_membership_check(func: &FunctionInfo, params: &[&Para
 except Exception as _e:
     if _is_crash(_e):
         _crash += 1
-        _FUZZ_RESULTS.append({{"function": "{name}", "input": f"pep440 specifier membership:{{_specifier_label}}",
-            "error_type": type(_e).__name__, "message": _clip_text(str(_e)),
-            "severity": "crash" if isinstance(_e, _CRASH_TYPES) else "property_violation"}})
+        _emit_finding("{name}", [_left, _right], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", case_label=_specifier_label)
         if _crash == 1:
             print(f"  CRASH {name}(pep440 specifier membership): {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
 "#,
@@ -1513,9 +1689,7 @@ fn python_pep440_filter_prerelease_check(func: &FunctionInfo, params: &[&ParamIn
 except Exception as _e:
     if _is_crash(_e):
         _crash += 1
-        _FUZZ_RESULTS.append({{"function": "{name}", "input": f"pep440 filter prerelease:{{_filter_label}}",
-            "error_type": type(_e).__name__, "message": _clip_text(str(_e)),
-            "severity": "crash" if isinstance(_e, _CRASH_TYPES) else "property_violation"}})
+        _emit_finding("{name}", [_value, _filter], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", case_label=_filter_label)
         if _crash == 1:
             print(f"  CRASH {name}(pep440 filter prerelease): {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
 "#,
@@ -1545,9 +1719,7 @@ fn python_cookie_value_quote_check(func: &FunctionInfo, params: &[&ParamInfo]) -
 except Exception as _e:
     if _is_crash(_e):
         _crash += 1
-        _FUZZ_RESULTS.append({{"function": "{name}", "input": f"cookie value quote:{{_cookie_value_label}}",
-            "error_type": type(_e).__name__, "message": _clip_text(str(_e)),
-            "severity": "crash" if isinstance(_e, _CRASH_TYPES) else "property_violation"}})
+        _emit_finding("{name}", [_cookie_value], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", case_label=_cookie_value_label)
         if _crash == 1:
             print(f"  CRASH {name}(cookie value quote): {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
 "#,
@@ -1580,9 +1752,7 @@ fn python_cookie_header_quote_check(func: &FunctionInfo, params: &[&ParamInfo]) 
 except Exception as _e:
     if _is_crash(_e):
         _crash += 1
-        _FUZZ_RESULTS.append({{"function": "{name}", "input": f"cookie header quote:{{_cookie_header_label}}",
-            "error_type": type(_e).__name__, "message": _clip_text(str(_e)),
-            "severity": "crash" if isinstance(_e, _CRASH_TYPES) else "property_violation"}})
+        _emit_finding("{name}", [_cookie_header], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", case_label=_cookie_header_label)
         if _crash == 1:
             print(f"  CRASH {name}(cookie header quote): {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
 "#,
@@ -1625,10 +1795,133 @@ import json as _json
 import copy as _copy
 import unicodedata as _unicodedata
 from urllib.parse import parse_qsl as _parse_qsl
+import sys as _sys
 _rng.seed(42)
 _fuzz_failures = 0
 _FUZZ_RESULTS = []
+def _target_entered(surface_id):
+    print(_json.dumps({"event": "target_entered", "surface_id": str(surface_id)}), file=_sys.stderr, flush=True)
 _FUZZ_TEXT_LIMIT = 240
+_FINDING_ORDINALS = {}
+def _sanitize_symbol(value):
+    return "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in str(value))
+def _finding_id(function):
+    symbol = _sanitize_symbol(function)
+    ordinal = _FINDING_ORDINALS.get(symbol, 0) + 1
+    _FINDING_ORDINALS[symbol] = ordinal
+    return f"fuzz:{symbol}:{ordinal}"
+def _json_value(value):
+    try:
+        _json.dumps(value, ensure_ascii=False, allow_nan=False)
+        return value
+    except Exception:
+        return None
+def _repro_case(args, input_text=None):
+    values = list(args) if isinstance(args, (list, tuple)) else [args]
+    return {"arguments": [{"expression": _short_repr(value), "json_value": _json_value(value)} for value in values], "input_text": input_text}
+def _shrink_candidates(value):
+    seen = set()
+    def add(candidate):
+        try: key = _json.dumps(candidate, sort_keys=True, default=repr, ensure_ascii=False)
+        except Exception: key = repr(candidate)
+        if key not in seen:
+            seen.add(key); yield candidate
+    if isinstance(value, str):
+        for candidate in ("", value[:1], value.strip(), "\u00a0" if any(char == "\u00a0" for char in value) else value.strip()): yield from add(candidate)
+        step = len(value) // 2
+        while step > 0:
+            for start in range(0, len(value), step): yield from add(value[:start] + value[start + step:])
+            step //= 2
+    elif isinstance(value, bool):
+        yield from add(False)
+    elif isinstance(value, int) and not isinstance(value, bool):
+        for candidate in (0, 1, -1): yield from add(candidate)
+        current = value
+        while current:
+            current = int(current / 2); yield from add(current)
+    elif isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")): yield from add(value)
+        else:
+            for candidate in (0.0, 1.0, -1.0): yield from add(candidate)
+            current = value
+            while current and abs(current) > 1e-15:
+                current /= 2; yield from add(current)
+    elif isinstance(value, (list, tuple)):
+        yield from add([] if isinstance(value, list) else ())
+        for item in value: yield from add([item] if isinstance(value, list) else (item,))
+        step = len(value) // 2
+        while step > 0:
+            for start in range(0, len(value), step): yield from add(value[:start] + value[start + step:])
+            step //= 2
+        for index, item in enumerate(value):
+            for shrunk in _shrink_candidates(item):
+                candidate = list(value); candidate[index] = shrunk
+                yield from add(candidate if isinstance(value, list) else tuple(candidate))
+    elif isinstance(value, dict):
+        yield from add({})
+        for key in list(value):
+            candidate = dict(value); candidate.pop(key, None); yield from add(candidate)
+        for key, item in value.items():
+            for shrunk in _shrink_candidates(item):
+                candidate = dict(value); candidate[key] = shrunk; yield from add(candidate)
+    elif value is not None:
+        yield from add(None)
+def _minimize_failure(original, reproduce, severity, oracle_id):
+    import time as _time
+    current = _copy.deepcopy(original); attempts = 0; deadline = _time.monotonic() + 0.250
+    for index, candidate in enumerate(_shrink_candidates(current)):
+        if index >= 100 or _time.monotonic() >= deadline: break
+        attempts += 1
+        try:
+            if reproduce(candidate): current = _copy.deepcopy(candidate)
+        except Exception: pass
+    if isinstance(current, list):
+        nb_space_candidate = ["\u00a0" if isinstance(value, str) and "\u00a0" in value else value for value in current]
+        if nb_space_candidate != current:
+            try:
+                if reproduce(nb_space_candidate):
+                    current = nb_space_candidate
+            except Exception:
+                pass
+    try: preserved = bool(reproduce(current))
+    except Exception: preserved = False
+    return ("preserved" if preserved else "failed", attempts, current if preserved else original)
+def _replay_snippet(function, args, severity, oracle_kind, category, error_type):
+    rendered = ", ".join(_short_repr(value) for value in (args if isinstance(args, (list, tuple)) else [args]))
+    payload = {"severity": severity, "oracle_kind": oracle_kind, "category": category}
+    return ("import json as _replay_json\n_reproduced = False\ntry:\n"
+            + f"    {function}({rendered})\n"
+            + "except Exception as _replay_error:\n"
+            + f"    _reproduced = type(_replay_error).__name__ == {error_type!r}\n"
+            + "print('__COURT_JESTER_REPLAY_JSON__')\n"
+            + f"print(_replay_json.dumps(dict({payload!r}, reproduced=_reproduced), ensure_ascii=False))")
+def _emit_finding(function, args, error, severity="crash", oracle_kind="runtime_contract", oracle_provenance="language_runtime", confidence="high", category="exception", expected=None, actual=None, input_classification="valid", case_label=None, minimize=None, invocation_path="direct"):
+    oracle_id = f"{oracle_kind}:{_sanitize_symbol(function)}"
+    status, attempts, minimized = ("not_needed", 0, args) if minimize is None else minimize
+    original_case = _repro_case(args, case_label)
+    minimized_case = None if status in ("not_needed", "failed") else _repro_case(minimized, case_label)
+    repro_args = minimized if minimized_case is not None else args
+    expectation = {"severity": severity, "oracle_kind": oracle_kind, "category": category}
+    repro = {"kind": "function_call", "function": str(function), "arguments": original_case["arguments"], "input_text": original_case["input_text"], "case_label": case_label, "snippet": _replay_snippet(function, repro_args, severity, oracle_kind, category, type(error).__name__), "command": None, "expectation": expectation}
+    _FUZZ_RESULTS.append({"id": _finding_id(function), "severity": severity, "confidence": confidence, "category": category, "location": {"source_file": "", "function": str(function), "line": 0, "invocation_path": invocation_path}, "oracle": {"id": oracle_id, "kind": oracle_kind, "provenance": oracle_provenance, "confidence": confidence, "expected": expected, "actual": actual if actual is not None else _clip_text(error)}, "input_classification": input_classification, "repro": repro, "minimization": {"status": status, "attempts": attempts, "original": original_case, "minimized": minimized_case}, "error_type": type(error).__name__, "message": _clip_text(error), "suppressed": False})
+def _emit_error(function, args, error, properties=(), reproduce=None, case_label=None, invocation_path="direct"):
+    is_property = isinstance(error, AssertionError)
+    declared = any(name in properties for name in ("idempotent", "bounded", "nonneg", "sorted", "permutation", "clamped", "symmetric", "no_nullish_string", "antisymmetric"))
+    kind = "declared_property" if is_property and declared else ("generic_property" if is_property else "runtime_contract")
+    provenance = "source_directive" if kind == "declared_property" else "language_runtime"
+    confidence = "authoritative" if kind == "declared_property" else ("medium" if is_property else "high")
+    category = "property" if is_property else "exception"
+    severity = "property_violation" if is_property else "crash"
+    minimized = _minimize_failure(args, reproduce, severity, f"{kind}:{function}") if reproduce is not None else None
+    _emit_finding(function, args, error, severity, kind, provenance, confidence, category,
+                  actual=_clip_text(error), case_label=case_label, minimize=minimized,
+                  invocation_path=invocation_path)
+def _reproduces_python(candidate, original, invoke):
+    try:
+        invoke()
+    except Exception as error:
+        return type(error) is type(original) and _clip_text(error).split(":", 1)[0] == _clip_text(original).split(":", 1)[0]
+    return False
 
 # Crash detection: these exception types indicate real bugs, not validation.
 _CRASH_TYPES = (TypeError, AttributeError, KeyError, IndexError, RecursionError, MemoryError, ValueError, ZeroDivisionError, UnicodeError)
@@ -1688,105 +1981,28 @@ def _fuzz_str():
 def _fuzz_any():
     return _rng.choice([_fuzz_int(), _fuzz_float(), _fuzz_str(), _fuzz_bool(), None, [], _fuzz_dict()])
 
-def _is_sorted_numeric_list(value):
-    return isinstance(value, list) and all(isinstance(item, (int, float)) and not isinstance(item, bool) for item in value) and value == sorted(value)
+def _fuzz_dict():
+    # Open mappings have no repository shape; concrete objects are generated
+    # from DomainNode::Object by the planner.
+    return {}
 
 def _fuzz_like_seed(value):
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, int) and not isinstance(value, bool):
-        return value
-    if isinstance(value, float):
-        return value
-    if isinstance(value, str):
-        return value
-    if value is None:
-        return None
-    if isinstance(value, list):
-        if not value:
-            return []
-        if _is_sorted_numeric_list(value):
-            delta = _rng.choice([-1, 0, 1])
-            return [item + delta for item in value]
-        return [_fuzz_like_seed(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_fuzz_like_seed(item) for item in value)
-    if isinstance(value, dict):
-        return {key: _fuzz_like_seed(item) for key, item in value.items()}
+    if isinstance(value, bool): return value
+    if isinstance(value, (int, float, str)) or value is None: return value
+    if isinstance(value, list): return [_fuzz_like_seed(item) for item in value]
+    if isinstance(value, tuple): return tuple(_fuzz_like_seed(item) for item in value)
+    if isinstance(value, dict): return {key: _fuzz_like_seed(item) for key, item in value.items()}
     return _copy.deepcopy(value)
 
 def _fuzz_seed_row(seed_rows):
     row = _copy.deepcopy(_rng.choice(seed_rows))
-    if _rng.random() < 0.65:
-        return row
-    return [_fuzz_like_seed(item) for item in row]
-
-def _fuzz_dict():
-    return _rng.choice([
-        {},
-        {"value": None},
-        {"preferences": None},
-        {"preferences": {"timezone": _fuzz_str()}},
-        {"flags": None},
-        {"flags": {"beta_checkout": None}},
-        {"flags": {"beta_checkout": False}},
-        {"flags": {"beta_checkout": True}},
-        {"billing": None},
-        {"billing": {"country": _fuzz_str()}},
-        {"contacts": None},
-        {"contacts": {"support_email": _fuzz_str()}},
-        {"contacts": {"emails": [_fuzz_str()]}},
-        {"contacts": {"emails": [_fuzz_str(), _fuzz_str()]}},
-        {"profile": None},
-        {"profile": {"handle": _fuzz_str()}},
-        {"username": _fuzz_str()},
-        {"titles": []},
-        {"titles": [_fuzz_str()]},
-        {"segments": []},
-        {"segments": [_fuzz_str()]},
-        {"plans": []},
-        {"plans": [_fuzz_str()]},
-        {"plans": [None, _fuzz_str()]},
-        {"tag": ["pro", None, " beta "]},
-        {"q": "  ", "page": 2},
-        {"q": "naïve café"},
-    ])
-
+    return row if _rng.random() < 0.65 else [_fuzz_like_seed(item) for item in row]
 _EDGE_INTS = [0, 1, -1, 2**53, -(2**53), 2**53 + 1]
 _EDGE_FLOATS = [0.0, -0.0, float('inf'), float('-inf'), float('nan'), 1e-300, 1e300]
 _EDGE_STRS = ["", "\0", "\uFFFF", "a" * 10000, "true", "null", "0", "-1",
               "\r\n", "\u200F", "\u200D", "${...}", "<script>"]
 _EDGE_BYTES = [b"", b"\x00", b"\xff" * 100, bytes(range(256))]
-_EDGE_DICTS = [
-    {},
-    {"preferences": None},
-    {"preferences": {"timezone": "   "}},
-    {"flags": None},
-    {"flags": {"beta_checkout": None}},
-    {"flags": {"beta_checkout": False}},
-    {"flags": {"beta_checkout": True}},
-    {"billing": None},
-    {"billing": {"country": "   "}},
-    {"contacts": None},
-    {"contacts": {"support_email": "ops"}},
-    {"contacts": {"support_email": "   "}},
-    {"contacts": {"emails": ["owner@example.com"]}},
-    {"contacts": {"emails": ["owner@example.com", "   "]}},
-    {"profile": None},
-    {"profile": {"handle": "   "}},
-    {"username": "   "},
-    {"titles": []},
-    {"titles": ["   "]},
-    {"segments": []},
-    {"segments": ["   "]},
-    {"segments": ["   ", "Growth"]},
-    {"plans": []},
-    {"plans": ["   "]},
-    {"plans": [None, " team "]},
-    {"tag": ["pro", None, " beta "]},
-    {"q": "  ", "page": 2},
-    {"q": "naïve café"},
-]
+_EDGE_DICTS = [{}]
 
 def _edge_cases_for(type_name):
     m = {"int": _EDGE_INTS, "float": _EDGE_FLOATS, "str": _EDGE_STRS, "bytes": _EDGE_BYTES, "dict": _EDGE_DICTS}
@@ -1843,8 +2059,8 @@ def _is_palindrome_sequence(value):
 
 const PYTHON_FUZZ_EPILOGUE: &str = r#"
 if _FUZZ_RESULTS:
-    print("__COURT_JESTER_FUZZ_JSON__")
-    print(_json.dumps(_FUZZ_RESULTS))
+    print("__COURT_JESTER_FINDINGS_JSON__")
+    print(_json.dumps(_FUZZ_RESULTS, ensure_ascii=False, allow_nan=False))
 if _fuzz_failures > 0:
     raise AssertionError(f"Fuzz testing failed: {_fuzz_failures} function(s) had failures")
 else:
@@ -1927,7 +2143,11 @@ fn synthesize_typescript(
             ));
             continue;
         }
-        coverage.push(coverage_entry(func, FuzzFunctionStatus::Fuzzed, None));
+        coverage.push(coverage_entry(
+            func,
+            FuzzFunctionStatus::CheckedDirect,
+            None,
+        ));
         selected_functions.push(func);
         let ret_type = func.return_type.as_deref().unwrap_or("");
         let param_types: Vec<String> = callable_params
@@ -2032,6 +2252,12 @@ fn synthesize_typescript(
             .map(|p| format!("\"{}\"", p))
             .collect::<Vec<_>>()
             .join(", ");
+        let declared_properties_list = func
+            .declared_properties
+            .iter()
+            .map(|property| format!("\"{}\"", property.replace('"', "\\\"")))
+            .collect::<Vec<_>>()
+            .join(", ");
 
         let param_type_list: String = if should_inject_ts_edge_cases(
             func,
@@ -2081,7 +2307,7 @@ fn synthesize_typescript(
         code.push_str(&format!(
             r#"
 {{
-  const _fuzzOk = _fuzzOne("{name}", {iters}, () => [{gen_list}], (args: unknown[]) => {call_expr}, {typecheck}, [{param_type_list}], [{properties_list}], [{seed_rows}]);
+  const _fuzzOk = _fuzzOne("{name}", {iters}, () => [{gen_list}], (args: unknown[]) => {call_expr}, {typecheck}, [{param_type_list}], [{properties_list}], [{seed_rows}], [{declared_properties_list}], {source_line});
 {query_string_semantic_check}
 {query_string_parser_semantic_check}
 {defaults_semantic_check}
@@ -2109,6 +2335,8 @@ fn synthesize_typescript(
             request_metadata_semantic_check = request_metadata_semantic_check,
             response_helpers_semantic_check = response_helpers_semantic_check,
             static_file_semantic_check = static_file_semantic_check,
+            declared_properties_list = declared_properties_list,
+            source_line = func.line,
         ));
 
         any_synthesized = true;
@@ -2123,7 +2351,11 @@ fn synthesize_typescript(
 
     // Factory exercise: for functions that contain nested functions,
     // call the factory and fuzz the returned object's methods
-    coverage.extend(factory_callable_coverage(analysis, &selected_functions));
+    coverage.extend(factory_callable_coverage(
+        analysis,
+        &selected_functions,
+        type_defs,
+    ));
     code.push_str(&synthesize_typescript_factory_exercise(
         analysis,
         &selected_functions,
@@ -2152,84 +2384,98 @@ fn synthesize_typescript_factory_exercise(
     let mut code = String::new();
 
     for func in selected_functions {
-        // Check if this function contains nested functions
-        let has_nested = analysis
-            .functions
-            .iter()
-            .any(|f| f.is_nested && f.line >= func.line && f.end_line <= func.end_line);
-        if !has_nested {
+        if func.returned_callables.is_empty() {
             continue;
         }
 
-        // Build args for the factory call
         let callable_params: Vec<&ParamInfo> = func
             .params
             .iter()
-            .filter(|p| !p.name.starts_with('*'))
+            .filter(|param| !param.name.starts_with('*'))
             .collect();
         if !ts_params_are_fuzzable(func, &callable_params, type_defs) {
             continue;
         }
-        let generators: Vec<String> = callable_params
+        let factory_args = callable_params
             .iter()
-            .map(|p| ts_generator(p.type_annotation.as_deref(), type_defs))
-            .collect();
-        let gen_list = generators.join(", ");
+            .map(|param| ts_generator(param.type_annotation.as_deref(), type_defs))
+            .collect::<Vec<_>>()
+            .join(", ");
 
-        // Collect the nested function names for reporting
-        let nested_names: Vec<&str> = analysis
-            .functions
+        let known_specs = func
+            .returned_callables
             .iter()
-            .filter(|f| f.is_nested && f.line >= func.line && f.end_line <= func.end_line)
-            .map(|f| f.name.as_str())
-            .collect();
+            .filter_map(|callable| {
+                let declaration = known_factory_callable(analysis, func, callable, type_defs)?;
+                let args = declaration
+                    .params
+                    .iter()
+                    .filter(|param| !param.name.starts_with('*'))
+                    .map(|param| ts_generator(param.type_annotation.as_deref(), type_defs))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let key = serde_json::to_string(callable).ok()?;
+                let surface =
+                    serde_json::to_string(&format!("{}().{}", func.name, callable)).ok()?;
+                Some(format!(
+                    "{key}: {{ surface: {surface}, line: {line}, args: () => [{args}] }}",
+                    line = declaration.line,
+                ))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let known_specs_expr = format!("{{{known_specs}}}");
+        let returned_names = func.returned_callables.join(", ");
 
         code.push_str(&format!(
             r#"
 // Factory exercise: {name} -> test returned methods
 {{
   let _factoryPass = 0, _factoryCrash = 0;
+  const _knownFactoryCallables: Record<string, {{surface: string; line: number; args: () => unknown[]}}> = {known_specs_expr};
   for (let _fi = 0; _fi < {iters}; _fi++) {{
+    let _activeFactoryCallable = "unknown";
+    let _activeFactorySurface = "{name} (factory)";
+    let _activeFactoryLine = {factory_line};
+    let _activeFactoryArgs: unknown[] = [];
     try {{
-      const _factory = ({name} as Function)({gen_list});
+      const _factory = ({name} as Function)({factory_args});
       if (_factory && typeof _factory === "object") {{
-        for (const _key of Object.keys(_factory)) {{
-          if (typeof _factory[_key] === "function") {{
-            try {{
-              _factory[_key]({gen_list});
-            }} catch (_inner) {{
-              // inner method errors are expected (we're passing random args)
-            }}
-          }}
+        for (const [_key, _spec] of Object.entries(_knownFactoryCallables)) {{
+          const _candidate = (_factory as Record<string, unknown>)[_key];
+          if (typeof _candidate !== "function") continue;
+          _activeFactoryCallable = _key;
+          _activeFactorySurface = _spec.surface;
+          _activeFactoryLine = _spec.line;
+          _activeFactoryArgs = _spec.args();
+          _targetEntered(_activeFactorySurface);
+          (_candidate as Function)(..._activeFactoryArgs);
         }}
-      }}
-      if (typeof _factory === "function") {{
-        try {{ _factory({gen_list}); }} catch (_inner) {{}}
       }}
       _factoryPass++;
     }} catch (_e: unknown) {{
       if (_isCrash(_e)) {{
         _factoryCrash++;
-        _fuzzResults.push({{function: "{name} (factory)", input: "factory call",
-          error_type: _e instanceof Error ? _e.constructor.name : "unknown",
-          message: _clipText(_e instanceof Error ? _e.message : String(_e)),
-          severity: "crash"}});
-        if (_factoryCrash === 1) console.log(`  CRASH {name}(factory): ${{_clipText(_e)}}`);
+        _emitFinding(_activeFactorySurface, _activeFactoryArgs, _e, "crash", "runtime_contract", "observed_call", "high", "exception", null, {{factory: {{factory: "{name}", callable: _activeFactoryCallable}}}}, null, _activeFactoryLine);
+        if (_factoryCrash === 1) console.log(`  CRASH ${{_activeFactorySurface}}: ${{_clipText(_e)}}`);
       }}
     }}
   }}
   const _ftotal = _factoryPass + _factoryCrash;
   if (_factoryCrash > 0) {{
-    console.log(`FUZZ {name} (factory->nested): ${{_factoryPass}} passed, ${{_factoryCrash}} CRASHED (of ${{_ftotal}}) [exercises: {nested}]`);
+    console.log(`FUZZ {name} (factory->nested): ${{_factoryPass}} passed, ${{_factoryCrash}} CRASHED (of ${{_ftotal}}) [returns: {returned_names}]`);
     _fuzzTotalFailures++;
   }} else {{
-    console.log(`FUZZ {name} (factory->nested): ${{_factoryPass}} passed (of ${{_ftotal}}) [exercises: {nested}]`);
+    console.log(`FUZZ {name} (factory->nested): ${{_factoryPass}} passed (of ${{_ftotal}}) [returns: {returned_names}]`);
   }}
 }}
 "#,
             name = func.name,
+            factory_line = func.line,
+            factory_args = factory_args,
+            known_specs_expr = known_specs_expr,
             iters = FUZZ_ITERATIONS,
-            nested = nested_names.join(", "),
+            returned_names = returned_names,
         ));
     }
 
@@ -2695,10 +2941,7 @@ fn ts_query_string_semantic_check(
         }}
       }}
     }} catch (_e: unknown) {{
-      _fuzzResults.push({{function: "{name}", input: `query semantics:${{_queryLabel}}`,
-        error_type: _e instanceof Error ? _e.constructor.name : "unknown",
-        message: _clipText(_e instanceof Error ? _e.message : String(_e)),
-        severity: "property_violation"}});
+      _emitFinding("{name}", [], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", null, "direct", _queryLabel);
       console.log(`  CRASH {name}(query semantics): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
       _fuzzTotalFailures++;
     }}
@@ -2746,10 +2989,7 @@ fn ts_query_string_parser_semantic_check(
         }}
       }}
     }} catch (_e: unknown) {{
-      _fuzzResults.push({{function: "{name}", input: `query parse semantics:${{_queryParseLabel}}`,
-        error_type: _e instanceof Error ? _e.constructor.name : "unknown",
-        message: _clipText(_e instanceof Error ? _e.message : String(_e)),
-        severity: "property_violation"}});
+      _emitFinding("{name}", [], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", null, "direct", _queryParseLabel);
       console.log(`  CRASH {name}(query parse semantics): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
       _fuzzTotalFailures++;
     }}
@@ -2794,10 +3034,7 @@ fn ts_defaults_semantic_check(
         throw new Error(`Defaults semantics (${{_defaultsLabel}}): ${{JSON.stringify(_inheritedTarget.inherited)}} !== 7`);
       }}
     }} catch (_e: unknown) {{
-      _fuzzResults.push({{function: "{name}", input: `defaults semantics:${{_defaultsLabel}}`,
-        error_type: _e instanceof Error ? _e.constructor.name : "unknown",
-        message: _clipText(_e instanceof Error ? _e.message : String(_e)),
-        severity: "property_violation"}});
+      _emitFinding("{name}", [], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", null, "direct", _defaultsLabel);
       console.log(`  CRASH {name}(defaults semantics): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
       _fuzzTotalFailures++;
     }}
@@ -2858,10 +3095,7 @@ fn ts_feature_flag_override_check(
         throw new Error(`Feature flag semantics (explicit false): ${{JSON.stringify(_explicitFalse)}} !== false`);
       }}
     }} catch (_e: unknown) {{
-      _fuzzResults.push({{function: "{name}", input: `feature flag semantics:${{_flagLabel}}`,
-        error_type: _e instanceof Error ? _e.constructor.name : "unknown",
-        message: _clipText(_e instanceof Error ? _e.message : String(_e)),
-        severity: "property_violation"}});
+      _emitFinding("{name}", [], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", null, "direct", _flagLabel);
       console.log(`  CRASH {name}(feature flag semantics): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
       _fuzzTotalFailures++;
     }}
@@ -2919,10 +3153,7 @@ fn ts_semver_compare_semantic_check(
         }}
       }}
     }} catch (_e: unknown) {{
-      _fuzzResults.push({{function: "{name}", input: `semver compare semantics:${{_semverLabel}}`,
-        error_type: _e instanceof Error ? _e.constructor.name : "unknown",
-        message: _clipText(_e instanceof Error ? _e.message : String(_e)),
-        severity: "property_violation"}});
+      _emitFinding("{name}", [], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", null, "direct", _semverLabel);
       console.log(`  CRASH {name}(semver compare semantics): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
       _fuzzTotalFailures++;
     }}
@@ -2970,10 +3201,7 @@ fn ts_semver_caret_semantic_check(
         }}
       }}
     }} catch (_e: unknown) {{
-      _fuzzResults.push({{function: "{name}", input: `semver caret semantics:${{_caretLabel}}`,
-        error_type: _e instanceof Error ? _e.constructor.name : "unknown",
-        message: _clipText(_e instanceof Error ? _e.message : String(_e)),
-        severity: "property_violation"}});
+      _emitFinding("{name}", [], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", null, "direct", _caretLabel);
       console.log(`  CRASH {name}(semver caret semantics): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
       _fuzzTotalFailures++;
     }}
@@ -3018,10 +3246,7 @@ fn ts_same_value_zero_semantic_check(
         }}
       }}
     }} catch (_e: unknown) {{
-      _fuzzResults.push({{function: "{name}", input: `sameValueZero semantics:${{_sameValueLabel}}`,
-        error_type: _e instanceof Error ? _e.constructor.name : "unknown",
-        message: _clipText(_e instanceof Error ? _e.message : String(_e)),
-        severity: "property_violation"}});
+      _emitFinding("{name}", [], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", null, "direct", _sameValueLabel);
       console.log(`  CRASH {name}(sameValueZero semantics): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
       _fuzzTotalFailures++;
     }}
@@ -3075,10 +3300,7 @@ fn ts_http_request_metadata_semantic_check(func: &FunctionInfo, param_types: &[S
         throw new Error(`HTTP request metadata (${{_requestMetaLabel}}): ${{JSON.stringify(_request.query)}} !== ${{JSON.stringify(_expectedQuery)}}`);
       }}
     }} catch (_e: unknown) {{
-      _fuzzResults.push({{function: "{name}", input: `http request metadata:${{_requestMetaLabel}}`,
-        error_type: _e instanceof Error ? _e.constructor.name : "unknown",
-        message: _clipText(_e instanceof Error ? _e.message : String(_e)),
-        severity: "property_violation"}});
+      _emitFinding("{name}", [], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", null, "direct", _requestMetaLabel);
       console.log(`  CRASH {name}(http request metadata): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
       _fuzzTotalFailures++;
     }}
@@ -3133,10 +3355,7 @@ fn ts_http_response_helpers_semantic_check(func: &FunctionInfo, param_types: &[S
         throw new Error(`HTTP response helpers (${{_responseHelperLabel}}): ${{JSON.stringify({{ statusCode: _response.statusCode, body: _response.__body }})}}`);
       }}
     }} catch (_e: unknown) {{
-      _fuzzResults.push({{function: "{name}", input: `http response helpers:${{_responseHelperLabel}}`,
-        error_type: _e instanceof Error ? _e.constructor.name : "unknown",
-        message: _clipText(_e instanceof Error ? _e.message : String(_e)),
-        severity: "property_violation"}});
+      _emitFinding("{name}", [], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", null, "direct", _responseHelperLabel);
       console.log(`  CRASH {name}(http response helpers): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
       _fuzzTotalFailures++;
     }}
@@ -3182,10 +3401,7 @@ fn ts_http_static_file_semantic_check(func: &FunctionInfo, param_types: &[String
         throw new Error(`HTTP static file middleware (${{_staticLabel}}): ${{JSON.stringify({{ headersSent: _response.headersSent, nextCalled: _nextCalled, body: _body }})}}`);
       }}
     }} catch (_e: unknown) {{
-      _fuzzResults.push({{function: "{name}", input: `http static file middleware:${{_staticLabel}}`,
-        error_type: _e instanceof Error ? _e.constructor.name : "unknown",
-        message: _clipText(_e instanceof Error ? _e.message : String(_e)),
-        severity: "property_violation"}});
+      _emitFinding("{name}", [], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", null, "direct", _staticLabel);
       console.log(`  CRASH {name}(http static file middleware): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
       _fuzzTotalFailures++;
     }}
@@ -3403,6 +3619,7 @@ fn ts_type_check_fn(ret_type: &str) -> &str {
 
 const TYPESCRIPT_FUZZ_PRELUDE: &str = r#"
 let _seed = 42;
+function _targetEntered(surfaceId: string): void { console.error(JSON.stringify({ event: "target_entered", surface_id: surfaceId })); }
 function _fuzzRand(): number { _seed = (_seed * 1103515245 + 12345) & 0x7fffffff; return _seed / 0x7fffffff; }
 function _fuzzIntRange(lo: number, hi: number): number { return lo + Math.floor(_fuzzRand() * (hi - lo + 1)); }
 function _fuzzNum(): number { return (_fuzzRand() - 0.5) * 2000; }
@@ -3422,13 +3639,17 @@ function _fuzzSemverVersion(): { major: number; minor: number; patch: number; pr
 }
 function _fuzzBool(): boolean { return _fuzzRand() > 0.5; }
 function _fuzzUndef(): undefined { return undefined; }
+function _fuzzUnicodeScalar(): string {
+  const value = _fuzzIntRange(0, 0xF7FF);
+  return String.fromCodePoint(value >= 0xD800 ? value + 0x800 : value);
+}
 function _fuzzStr(): string {
   const pools = [
     "", "hello world", "café résumé", "  whitespace  ", "\t\nnewlines",
     "UPPER", "lower", "MiXeD", "special!@#$%^&*()", "12345", "-1.5",
     "a".repeat(200), "\xa0\xa0\xa0", "with\nnewlines\n",
     String.fromCharCode(...Array.from({length: _fuzzIntRange(0,20)}, () => _fuzzIntRange(32, 126))),
-    String.fromCharCode(...Array.from({length: _fuzzIntRange(0,10)}, () => _fuzzIntRange(0, 0xFFFF))),
+    Array.from({length: _fuzzIntRange(0,10)}, _fuzzUnicodeScalar).join(""),
   ];
   return pools[_fuzzIntRange(0, pools.length - 1)];
 }
@@ -3437,23 +3658,8 @@ function _fuzzAny(): unknown {
   return v[_fuzzIntRange(0, v.length - 1)];
 }
 function _fuzzObject(): unknown {
-  const pools = [
-    {},
-    { preferences: null },
-    { preferences: { timezone: _fuzzStr() } },
-    { billing: null },
-    { billing: { country: _fuzzStr() } },
-    { contacts: null },
-    { contacts: { support_email: _fuzzStr() } },
-    { contacts: { emails: [_fuzzStr()] } },
-    { contacts: { emails: [_fuzzStr(), _fuzzStr()] } },
-    { profile: null, username: _fuzzStr() },
-    { profile: { handle: _fuzzStr() }, username: _fuzzStr() },
-    { titles: [_fuzzStr()] },
-    { segments: [_fuzzStr()] },
-    { plans: [null, _fuzzStr()] },
-  ];
-  return pools[_fuzzIntRange(0, pools.length - 1)];
+  // Concrete object shapes come from the repository-derived domain plan.
+  return {};
 }
 
 function _fuzzHeaders(): Headers {
@@ -3512,24 +3718,10 @@ const _EDGE_STR_ARRAYS = [
   ["primary", ""],
   ["primary", "   "],
   ["primary", "Secondary"],
+  ["zulu", "alpha"],
+  ["secondary", "primary", "tertiary"],
 ];
-const _EDGE_OBJECTS = [
-  {},
-  { preferences: null },
-  { preferences: { timezone: "   " } },
-  { billing: null },
-  { billing: { country: "   " } },
-  { contacts: null },
-  { contacts: { support_email: "   " } },
-  { contacts: { emails: ["owner@example.com"] } },
-  { contacts: { emails: ["owner@example.com", "   "] } },
-  { profile: null, username: " Admin " },
-  { profile: { handle: "   " }, username: " Admin " },
-  { segments: [] },
-  { segments: ["   ", "Growth"] },
-  { plans: [] },
-  { plans: [null, " team "] },
-];
+const _EDGE_OBJECTS = [{}];
 const _EDGE_SEMVER_OBJECTS = [
   { major: 0, minor: 0, patch: 0, prerelease: null },
   { major: 1, minor: 2, patch: 3, prerelease: [] },
@@ -3662,11 +3854,19 @@ function _isMalformedUriError(e: unknown): boolean {
   return e instanceof URIError && /malformed uri|uri malformed/i.test(e.message);
 }
 
+function _isEngineTypeError(e: TypeError): boolean {
+  return /Cannot (read|set) propert(y|ies) of |Cannot convert undefined or null to object| is not a function| is not iterable| is not a constructor|Cannot destructure property|Cannot use 'in' operator|Assignment to constant variable|Cannot assign to read only property|cannot be invoked without 'new'|Right-hand side of 'instanceof' is not|Reduce of empty array with no initial value/i.test(e.message);
+}
+
+function _isEngineRangeError(e: RangeError): boolean {
+  return /Maximum call stack|Invalid array length|Array buffer allocation failed|Invalid typed array length/i.test(e.message);
+}
+
 function _isCrash(e: unknown): boolean {
-  if (e instanceof TypeError) return true;
-  if (e instanceof RangeError) return true;
-  if (e instanceof ReferenceError) return true;
   if (_isMalformedUriError(e)) return false;
+  if (e instanceof TypeError) return _isEngineTypeError(e);
+  if (e instanceof RangeError) return _isEngineRangeError(e);
+  if (e instanceof ReferenceError) return true;
   if (e instanceof URIError) return true;
   // Property check violations (type, idempotency, consistency)
   if (e instanceof Error && (
@@ -3691,7 +3891,50 @@ function _isCrash(e: unknown): boolean {
 }
 
 let _fuzzTotalFailures = 0;
-const _fuzzResults: {function: string, input: string, error_type: string, message: string, severity: string}[] = [];
+const _fuzzResults: Array<Record<string, unknown>> = [];
+const _findingOrdinals = new Map<string, number>();
+function _sanitizeSymbol(value: unknown): string { return String(value).replace(/[^A-Za-z0-9._-]/g, "_"); }
+function _findingId(name: string): string {
+  const symbol = _sanitizeSymbol(name); const ordinal = (_findingOrdinals.get(symbol) ?? 0) + 1; _findingOrdinals.set(symbol, ordinal);
+  return `fuzz:${symbol}:${ordinal}`;
+}
+function _reproCase(args: unknown[], inputText: string | null = null): Record<string, unknown> {
+  return { arguments: args.map((value) => ({ expression: _shortJson(value), json_value: (() => { try { JSON.stringify(value); return value; } catch { return null; } })() })), input_text: inputText };
+}
+function _shrinkCandidates(value: unknown): unknown[] {
+  const out: unknown[] = []; const seen = new Set<string>();
+  const add = (candidate: unknown): void => { let key: string; try { key = JSON.stringify(candidate); } catch { key = String(candidate); } if (!seen.has(key)) { seen.add(key); out.push(candidate); } };
+  if (typeof value === "string") { add(""); add(value.slice(0, 1)); add(value.trim()); for (let step = Math.floor(value.length / 2); step > 0; step = Math.floor(step / 2)) for (let start = 0; start < value.length; start += step) add(value.slice(0, start) + value.slice(start + step)); }
+  else if (typeof value === "number") { if (Number.isNaN(value) || !Number.isFinite(value)) add(value); else { add(0); add(1); add(-1); for (let current = value; current && Math.abs(current) > Number.EPSILON; current /= 2) add(current); } }
+  else if (Array.isArray(value)) { add([]); for (const item of value) add([item]); for (let step = Math.floor(value.length / 2); step > 0; step = Math.floor(step / 2)) for (let start = 0; start < value.length; start += step) add(value.slice(0, start).concat(value.slice(start + step))); value.forEach((item, index) => _shrinkCandidates(item).forEach((shrunk) => { const copy = value.slice(); copy[index] = shrunk; add(copy); })); }
+  else if (value && typeof value === "object") { add({}); const objectValue = value as Record<string, unknown>; for (const key of Object.keys(objectValue)) { const copy = { ...objectValue }; delete copy[key]; add(copy); _shrinkCandidates(objectValue[key]).forEach((shrunk) => { const nested = { ...objectValue, [key]: shrunk }; add(nested); }); } }
+  else if (value !== null && value !== undefined) add(null);
+  return out;
+}
+function _minimizeFailure(original: unknown[], reproduce: (candidate: unknown[]) => boolean): [string, number, unknown[]] {
+  let current = _cloneSeed(original); let attempts = 0; const deadline = Date.now() + 250;
+  for (const candidateValue of _shrinkCandidates(current)) { if (attempts >= 100 || Date.now() >= deadline) break; attempts++; const candidate = Array.isArray(candidateValue) ? candidateValue : [candidateValue]; if (reproduce(candidate)) current = _cloneSeed(candidate); }
+  return [reproduce(current) ? "preserved" : "failed", attempts, current];
+}
+function _emitFinding(name: string, args: unknown[], error: unknown, severity = "crash", oracleKind = "runtime_contract", provenance = "language_runtime", confidence = "high", category = "exception", minimize: [string, number, unknown[]] | null = null, invocationPath: unknown = "direct", caseLabel: string | null = null, sourceLine = 0): void {
+  const status = minimize?.[0] ?? "not_needed"; const attempts = minimize?.[1] ?? 0; const minimized = status === "not_needed" || status === "failed" ? null : _reproCase(minimize![2], caseLabel); const reproArgs = minimized ? minimize![2] : args;
+  const expectation = { severity, oracle_kind: oracleKind, category }; const message = error instanceof Error ? error.message : String(error);
+  const errorType = error instanceof Error ? error.constructor.name : "unknown";
+  const snippet = `// Court Jester replay snippet\nlet _reproduced = false;\ntry { (${name} as Function)(${reproArgs.map((value) => _shortJson(value)).join(", ")}); } catch (_replayError) { _reproduced = _replayError instanceof Error && _replayError.constructor.name === ${JSON.stringify(errorType)}; }\nconsole.log("__COURT_JESTER_REPLAY_JSON__");\nconsole.log(JSON.stringify({reproduced:_reproduced,severity:${JSON.stringify(severity)},oracle_kind:${JSON.stringify(oracleKind)},category:${JSON.stringify(category)}}));`;
+  _fuzzResults.push({ id: _findingId(name), severity, confidence, category, location: { source_file: "", function: name, line: sourceLine, invocation_path: invocationPath }, oracle: { id: `${oracleKind}:${_sanitizeSymbol(name)}`, kind: oracleKind, provenance, confidence, actual: message }, input_classification: "valid", repro: { kind: "function_call", function: name, arguments: _reproCase(args, caseLabel).arguments, case_label: caseLabel, snippet, command: null, expectation }, minimization: { status, attempts, original: _reproCase(args, caseLabel), minimized }, error_type: errorType, message, suppressed: false });
+}
+function _declaredPropertyForFailure(error: unknown): string | null {
+  if (!(error instanceof Error)) return null;
+  const mappings: Array<[string, string]> = [
+    ["Not idempotent", "idempotent"], ["Not bounded", "bounded"],
+    ["Non-negative", "nonneg"], ["Blank string output", "nonempty_string"],
+    ["Nullish string leak", "no_nullish_string"], ["Not symmetric", "symmetric"],
+    ["Not sorted", "sorted"], ["Permutation violated", "permutation"],
+    ["Clamp bounds violated", "clamped"], ["Clamp passthrough violated", "clamped"],
+    ["Comparator", "antisymmetric"],
+  ];
+  return mappings.find(([prefix]) => error.message.startsWith(prefix))?.[1] ?? null;
+}
 function _fuzzOne(
   name: string,
   iters: number,
@@ -3701,6 +3944,8 @@ function _fuzzOne(
   paramTypes: string[] = [],
   properties: string[] = [],
   seedRows: unknown[][] = [],
+  declaredProperties: string[] = [],
+  sourceLine = 0,
 ): boolean {
   let pass = 0, reject = 0, crash = 0;
   let firstCrash = "";
@@ -3718,8 +3963,8 @@ function _fuzzOne(
   }
   for (const args of allInputs) {
     try {
+      _targetEntered(`${name}:${sourceLine}`);
       const result = fn(args);
-      pass++;
       // Type check
       if (expectedType !== null && typeof result !== expectedType) {
         throw new Error(`Return type mismatch: expected ${expectedType}, got ${typeof result}`);
@@ -3802,13 +4047,19 @@ function _fuzzOne(
           throw new Error(`Comparator antisymmetry violated: ${JSON.stringify(result)} vs ${JSON.stringify(resultRev)}`);
         }
       }
+      pass++;
     } catch (e: unknown) {
       if (_isCrash(e)) {
         crash++;
-        _fuzzResults.push({function: name, input: _shortJson(args),
-          error_type: e instanceof Error ? e.constructor.name : "unknown",
-          message: _clipText(e instanceof Error ? e.message : String(e)),
-          severity: (e instanceof TypeError || e instanceof RangeError || e instanceof ReferenceError || e instanceof URIError) ? "crash" : "property_violation"});
+        const propertyFailure = e instanceof Error && !(e instanceof TypeError || e instanceof RangeError || e instanceof ReferenceError || e instanceof URIError);
+        const failedProperty = _declaredPropertyForFailure(e);
+        const declared = propertyFailure && failedProperty !== null && declaredProperties.includes(failedProperty);
+        const oracleKind = declared ? "declared_property" : (propertyFailure ? "generic_property" : "runtime_contract");
+        const provenance = declared ? "source_directive" : (propertyFailure ? "language_runtime" : "observed_call");
+        const confidence = declared ? "authoritative" : (propertyFailure ? "medium" : "high");
+        const severity = propertyFailure ? "property_violation" : "crash";
+        const minimized = _minimizeFailure(args, (candidate) => { try { fn(candidate); return false; } catch (candidateError) { return _isCrash(candidateError) && (candidateError instanceof Error ? candidateError.constructor.name : "unknown") === (e instanceof Error ? e.constructor.name : "unknown"); } });
+        _emitFinding(name, args, e, severity, oracleKind, provenance, confidence, propertyFailure ? "property" : "exception", minimized, "direct", null, sourceLine);
         if (crash === 1) firstCrash = `  CRASH ${name}(${_shortJson(args)}): ${_clipText(e)}`;
       } else {
         reject++;
@@ -3831,10 +4082,9 @@ function _fuzzOne(
   }
 }
 "#;
-
 const TYPESCRIPT_FUZZ_EPILOGUE: &str = r#"
 if (_fuzzResults.length > 0) {
-  console.log("__COURT_JESTER_FUZZ_JSON__");
+  console.log("__COURT_JESTER_FINDINGS_JSON__");
   console.log(JSON.stringify(_fuzzResults));
 }
 if (_fuzzTotalFailures > 0) {

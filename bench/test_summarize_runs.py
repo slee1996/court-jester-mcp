@@ -1,6 +1,9 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
-from bench.summarize_runs import iter_lift_rows, summarize_items
+from bench.summarize_runs import build_summary, evaluate_gate, iter_lift_rows, resolve_shadow_outcomes, summarize_items
 
 
 class SummarizeRunsTest(unittest.TestCase):
@@ -178,6 +181,308 @@ class SummarizeRunsTest(unittest.TestCase):
         self.assertAlmostEqual(row["product_successes_per_hour_lift"], 20.0)
         self.assertAlmostEqual(row["marginal_product_minutes_per_saved_task"], 0.5)
 
+
+    def test_build_summary_excludes_operational_abstentions_from_seeded_pairs(self) -> None:
+        def artifact(**values: object) -> dict[str, object]:
+            return {
+                "artifact_schema_version": 1,
+                "verify_schema_version_required": 3,
+                **values,
+            }
+
+        def report(verdict: str, status: str) -> dict[str, object]:
+            return {
+                "schema_version": 3,
+                "verdict": verdict,
+                "strength": "property_checked",
+                "summary": {},
+                "stages": [{"name": "execute", "status": status, "duration_ms": 1}],
+            }
+
+        rows = [
+            artifact(
+                task_id="semantic",
+                model_id="model",
+                policy_id="baseline",
+                repeat_index=0,
+                hidden_seed_sha256="semantic-seed",
+                success=False,
+                verify_report=report("fail", "failed"),
+                task_metadata={"expected_verify_outcome": "fail"},
+            ),
+            artifact(
+                task_id="semantic",
+                model_id="model",
+                policy_id="candidate",
+                repeat_index=0,
+                hidden_seed_sha256="semantic-seed",
+                success=True,
+                verify_report=report("pass", "passed"),
+                task_metadata={"expected_verify_outcome": "fail"},
+            ),
+        ]
+        operational_cases = [
+            ("provider", {"failure_category": "provider_timeout"}),
+            ("setup", {"failure_category": "setup_error"}),
+            ("gold", {"failure_category": "gold_patch_apply_error"}),
+            (
+                "verifier-timeout",
+                {
+                    "verifier_observation": {
+                        "outcome": "abstain",
+                        "reason": "verify_tool_timeout",
+                        "failure_stage": None,
+                        "failure_path": "app.py",
+                        "report_schema_version": None,
+                    }
+                },
+            ),
+        ]
+        for task_id, terminal_fields in operational_cases:
+            rows.extend(
+                [
+                    artifact(
+                        task_id=task_id,
+                        model_id="model",
+                        policy_id="baseline",
+                        repeat_index=0,
+                        hidden_seed_sha256=f"{task_id}-seed",
+                        success=False,
+                        task_metadata={"expected_verify_outcome": "pass"},
+                        **terminal_fields,
+                    ),
+                    artifact(
+                        task_id=task_id,
+                        model_id="model",
+                        policy_id="candidate",
+                        repeat_index=0,
+                        hidden_seed_sha256=f"{task_id}-seed",
+                        success=True,
+                        verify_report=report("pass", "passed"),
+                        task_metadata={"expected_verify_outcome": "pass"},
+                    ),
+                ]
+            )
+        rows.extend(
+            [
+                artifact(
+                    task_id="seed-mismatch",
+                    model_id="model",
+                    policy_id="baseline",
+                    repeat_index=0,
+                    hidden_seed_sha256="base-seed",
+                    success=False,
+                    verify_report=report("fail", "failed"),
+                    task_metadata={"expected_verify_outcome": "fail"},
+                ),
+                artifact(
+                    task_id="seed-mismatch",
+                    model_id="model",
+                    policy_id="candidate",
+                    repeat_index=0,
+                    hidden_seed_sha256="candidate-seed",
+                    success=True,
+                    verify_report=report("pass", "passed"),
+                    task_metadata={"expected_verify_outcome": "fail"},
+                ),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "matrix.json").write_text(
+                json.dumps(artifact(expected_total=len(rows))), encoding="utf-8"
+            )
+            for index, row in enumerate(rows):
+                cell = root / f"cell-{index}"
+                cell.mkdir()
+                (cell / "result.json").write_text(json.dumps(row), encoding="utf-8")
+            summary = build_summary(root, "baseline", "candidate", bootstrap_samples=100)
+
+        self.assertEqual(summary["artifact_schema_version"], 1)
+        self.assertEqual(summary["verify_schema_version_required"], 3)
+        self.assertEqual(summary["confusion"]["abstentions"], 4)
+        self.assertEqual(
+            summary["confusion"]["reason_counts"],
+            {
+                "gold_patch_apply_error": 1,
+                "provider_timeout": 1,
+                "setup_error": 1,
+                "verify_tool_timeout": 1,
+            },
+        )
+        self.assertEqual(summary["paired"]["candidate_only"], 1)
+        self.assertEqual(summary["paired"]["both_success"], 0)
+        self.assertEqual(summary["paired"]["ineligible"], 5)
+        self.assertEqual(summary["paired"]["eligible"], 1)
+        self.assertEqual(summary["paired"]["paired_lift"], 1.0)
+
+    def test_current_artifact_rows_without_valid_reports_abstain(self) -> None:
+        def artifact(**values: object) -> dict[str, object]:
+            return {
+                "artifact_schema_version": 1,
+                "verify_schema_version_required": 3,
+                "task_metadata": {"expected_verify_outcome": "pass"},
+                **values,
+            }
+
+        malformed_report = {
+            "schema_version": 3,
+            "verdict": "pass",
+            "strength": "property_checked",
+            "summary": {},
+            "stages": [{}],
+        }
+        rows = [
+            artifact(task_id="missing-report"),
+            artifact(task_id="malformed-report", verify_report=malformed_report),
+            artifact(task_id="bare-verdict", verify_verdict="pass"),
+            artifact(task_id="bare-failed-flag", verify_failed=False),
+        ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "matrix.json").write_text(
+                json.dumps(artifact(expected_total=len(rows))), encoding="utf-8"
+            )
+            for index, row in enumerate(rows):
+                cell = root / f"cell-{index}"
+                cell.mkdir()
+                (cell / "result.json").write_text(json.dumps(row), encoding="utf-8")
+            summary = build_summary(root, "baseline", "candidate", bootstrap_samples=0)
+
+        self.assertEqual(summary["confusion"]["labeled"], 4)
+        self.assertEqual(summary["confusion"]["abstentions"], 4)
+        self.assertEqual(summary["confusion"]["tn"], 0)
+        self.assertEqual(summary["confusion"]["fp"], 0)
+        self.assertEqual(
+            summary["confusion"]["reason_counts"],
+            {"missing_verifier_observation": 4},
+        )
+
+    def test_build_summary_fail_dominates_inconclusive_reports(self) -> None:
+        def report(verdict: str, status: str) -> dict[str, object]:
+            return {
+                "schema_version": 3,
+                "verdict": verdict,
+                "strength": "property_checked",
+                "summary": {},
+                "stages": [{"name": "execute", "status": status, "duration_ms": 1}],
+            }
+
+        artifact = {
+            "artifact_schema_version": 1,
+            "verify_schema_version_required": 3,
+            "task_id": "mixed-verdicts",
+            "model_id": "model",
+            "policy_id": "baseline",
+            "task_metadata": {"expected_verify_outcome": "fail"},
+            "court_jester": {
+                "results": [
+                    {
+                        "path": "uncertain.py",
+                        "response": report("inconclusive", "inconclusive"),
+                    },
+                    {"path": "broken.py", "response": report("fail", "failed")},
+                ]
+            },
+            "verifier_observation": {
+                "outcome": "fail",
+                "reason": "stage_failure",
+                "failure_stage": "execute",
+                "failure_path": "broken.py",
+                "report_schema_version": 3,
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "matrix.json").write_text(
+                json.dumps(
+                    {
+                        "artifact_schema_version": 1,
+                        "verify_schema_version_required": 3,
+                        "expected_total": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cell = root / "cell"
+            cell.mkdir()
+            (cell / "result.json").write_text(json.dumps(artifact), encoding="utf-8")
+            summary = build_summary(root, "baseline", "candidate", bootstrap_samples=0)
+
+        self.assertEqual(summary["confusion"]["tp"], 1)
+        self.assertEqual(summary["confusion"]["abstentions"], 0)
+
+    def test_build_summary_requires_matrix_unless_legacy_escape_is_explicit(self) -> None:
+        from bench.summarize_runs import _build_summary
+
+        artifact = {
+            "artifact_schema_version": 1,
+            "verify_schema_version_required": 3,
+            "task_id": "task",
+            "model_id": "model",
+            "policy_id": "baseline",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cell = root / "cell"
+            cell.mkdir()
+            (cell / "result.json").write_text(json.dumps(artifact), encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                ValueError, r"artifact validation failed: matrix\.json: missing_matrix"
+            ):
+                build_summary(root, "baseline", "candidate", bootstrap_samples=0)
+
+            legacy_summary = _build_summary(
+                root,
+                "baseline",
+                "candidate",
+                bootstrap_samples=0,
+                allow_legacy=True,
+            )
+
+        self.assertEqual(legacy_summary["rows"], 1)
+        self.assertEqual(
+            legacy_summary["validation"]["invalid_artifacts"],
+            [{"path": "matrix.json", "reason": "missing_matrix"}],
+        )
+
+    def test_shadow_outcomes_use_precedence_then_newest_timestamp(self) -> None:
+        records = [{"key": "k1"}, {"key": "k2"}, {"key": "k3"}]
+        outcomes = [
+            {"key": "k1", "outcome": "success", "timestamp": "2026-01-01T00:00:00Z"},
+            {"key": "k1", "outcome": "public_failure", "timestamp": "2026-01-01T00:01:00Z"},
+            {"key": "k1", "outcome": "revert", "timestamp": "2026-01-01T00:02:00Z"},
+            {"key": "k2", "outcome": "success", "timestamp": "2026-01-02T00:00:00Z"},
+            {"key": "k2", "outcome": "success", "timestamp": "2026-01-03T00:00:00Z"},
+        ]
+        resolved = resolve_shadow_outcomes(records, outcomes)
+        self.assertEqual(resolved["resolved"], 2)
+        self.assertEqual(resolved["unresolved"], 1)
+        self.assertEqual(resolved["outcome_counts"], {"revert": 1, "success": 1, "unresolved": 1})
+
+    def test_gate_rejects_dry_run_and_requires_known_good_false_positive_free_summary(self) -> None:
+        dry = evaluate_gate({"dry_run": True, "slo": {}}, "private-beta-default", [])
+        self.assertFalse(dry["eligible"])
+        self.assertIn("dry_run_input", dry["failures"])
+        summary = {
+            "slo": {
+                "completion_rate": 1.0,
+                "provider_error_rate": 0.0,
+                "timeout_rate": 0.0,
+                "setup_gold_patch_rate": 0.0,
+                "abstention_rate": 0.0,
+                "schema_mismatch_rate": 0.0,
+            },
+            "paired": {"eligible": 1, "unmatched": 0, "ineligible": 0, "paired_lift": 1.0, "bootstrap_lower": 0.1},
+            "validation": {},
+        }
+        blocked = evaluate_gate(summary, "private-beta-default", [{"confusion": {"fp": 1}}])
+        self.assertFalse(blocked["passed"])
+        self.assertIn("known_good_false_positives", blocked["failures"])
 
 if __name__ == "__main__":
     unittest.main()

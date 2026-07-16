@@ -1,13 +1,20 @@
 //! False negative tests: verify the fuzzer catches known bugs.
 //! Each test writes a buggy function, runs verify, and asserts the fuzz stage fails.
 
-use court_jester_mcp::tools::verify::{verify, VerifyOptions};
-use court_jester_mcp::types::{ComplexityMetric, ExecuteGate, Language, ReportLevel, TestRunner};
+use court_jester::tools::verify::{verify, VerifyOptions};
+use court_jester::types::{
+    ComplexityMetric, CoverageGate, ExecuteGate, InferredOracleGate, Language, ReportLevel,
+    RuntimeProfile, StageStatus, TestRunner, DEFAULT_PYTHON_DOCKER_IMAGE,
+    DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+};
 
 fn opts() -> VerifyOptions<'static> {
     VerifyOptions {
         test_code: None,
         test_source_file: None,
+        base_code: None,
+        base_source_file: None,
+        base_project_dir: None,
         test_runner: TestRunner::Auto,
         tests_only: false,
         complexity_threshold: None,
@@ -23,6 +30,11 @@ fn opts() -> VerifyOptions<'static> {
         output_dir: None,
         report_level: ReportLevel::Full,
         execute_gate: ExecuteGate::All,
+        coverage_gate: CoverageGate::ChangedExports,
+        inferred_oracle_gate: InferredOracleGate::Advisory,
+        runtime_profile: RuntimeProfile::LocalTrusted,
+        python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
+        typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
     }
 }
 
@@ -31,7 +43,7 @@ async fn fuzz_catches_bug(code: &str, language: &Language) -> bool {
     let report = verify(code, language, opts()).await;
     let exec_stage = report.stages.iter().find(|s| s.name == "execute");
     match exec_stage {
-        Some(stage) => !stage.ok,
+        Some(stage) => stage.status == StageStatus::Failed,
         None => false, // no execute stage = no functions found
     }
 }

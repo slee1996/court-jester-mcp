@@ -1,7 +1,14 @@
-use court_jester_mcp::tools::verify::{
-    parse_fuzz_failures, report_human_summary, report_json_value, verify, VerifyOptions,
+use court_jester::tools::verify::{
+    load_persisted_report, parse_findings, replay_report, report_human_summary, report_json_value,
+    verify, VerifyOptions,
 };
-use court_jester_mcp::types::{ComplexityMetric, ExecuteGate, Language, ReportLevel, TestRunner};
+use court_jester::types::{
+    ComplexityMetric, CoverageGate, ExecuteGate, FindingCategory, FindingConfidence,
+    FindingSeverity, InferredOracleGate, InputClassification, Language, OracleKind,
+    OracleProvenance, ReplayOutcome, ReportLevel, RuntimeProfile, StageStatus, TestRunner,
+    VerificationReport, VerificationStrength, VerificationVerdict, DEFAULT_PYTHON_DOCKER_IMAGE,
+    DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -49,6 +56,9 @@ fn default_opts(test_code: Option<&str>) -> VerifyOptions<'_> {
     VerifyOptions {
         test_code,
         test_source_file: None,
+        base_code: None,
+        base_source_file: None,
+        base_project_dir: None,
         test_runner: TestRunner::Auto,
         tests_only: false,
         complexity_threshold: None,
@@ -64,7 +74,64 @@ fn default_opts(test_code: Option<&str>) -> VerifyOptions<'_> {
         output_dir: None,
         report_level: ReportLevel::Full,
         execute_gate: ExecuteGate::All,
+        coverage_gate: CoverageGate::ChangedExports,
+        inferred_oracle_gate: InferredOracleGate::Advisory,
+        runtime_profile: RuntimeProfile::LocalTrusted,
+        python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
+        typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
     }
+}
+
+fn assert_advisory_inferred_finding(
+    report: &VerificationReport,
+    function: &str,
+    message_fragment: &str,
+) {
+    assert_eq!(
+        report.verdict,
+        VerificationVerdict::Pass,
+        "low-confidence inferred findings must remain advisory: {:#?}",
+        report.stages
+    );
+    let execute_stage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("execute stage should be present");
+    assert_eq!(execute_stage.status, StageStatus::Passed);
+    let detail = execute_stage
+        .detail
+        .as_ref()
+        .expect("execute detail should be present");
+    let findings = detail["findings"]
+        .as_array()
+        .expect("typed findings should be present");
+    let finding = findings
+        .iter()
+        .find(|finding| finding["location"]["function"].as_str() == Some(function))
+        .unwrap_or_else(|| panic!("expected advisory finding for {function}: {findings:#?}"));
+    assert_eq!(finding["severity"].as_str(), Some("property_violation"));
+    assert_eq!(finding["category"].as_str(), Some("property"));
+    assert_eq!(finding["confidence"].as_str(), Some("low"));
+    assert_eq!(
+        finding["oracle"]["kind"].as_str(),
+        Some("inferred_semantic")
+    );
+    assert_eq!(
+        finding["oracle"]["provenance"].as_str(),
+        Some("name_heuristic")
+    );
+    assert_eq!(finding["oracle"]["confidence"].as_str(), Some("low"));
+    assert!(
+        finding["message"]
+            .as_str()
+            .is_some_and(|message| message.contains(message_fragment)),
+        "finding should retain the inferred contract failure: {finding:#?}"
+    );
+    assert_eq!(detail["findings_summary"]["gating"].as_u64(), Some(0));
+    assert!(detail["findings_summary"]["advisory"]
+        .as_u64()
+        .is_some_and(|count| count >= 1));
 }
 
 #[tokio::test]
@@ -73,12 +140,19 @@ async fn good_python_function() {
     let report = verify(code, &Language::Python, default_opts(None)).await;
 
     assert!(
-        report.stages.iter().any(|s| s.name == "parse" && s.ok),
+        report
+            .stages
+            .iter()
+            .any(|s| s.name == "parse" && s.status == StageStatus::Passed),
         "parse stage should pass"
     );
     // execute stage should also pass (42 + 42 doesn't error)
     if let Some(exec) = report.stages.iter().find(|s| s.name == "execute") {
-        assert!(exec.ok, "execute stage failed: {:?}", exec.error);
+        assert!(
+            exec.status == StageStatus::Passed,
+            "execute stage failed: {:?}",
+            exec.message
+        );
     }
 }
 
@@ -87,10 +161,10 @@ async fn syntax_error_short_circuits() {
     let code = "def foo(:";
     let report = verify(code, &Language::Python, default_opts(None)).await;
 
-    assert!(!report.overall_ok);
+    assert!(report.verdict != VerificationVerdict::Pass);
     assert_eq!(report.stages.len(), 1, "should short-circuit after parse");
     assert_eq!(report.stages[0].name, "parse");
-    assert!(!report.stages[0].ok);
+    assert!(report.stages[0].status != StageStatus::Passed);
 }
 
 #[tokio::test]
@@ -99,8 +173,15 @@ async fn with_passing_tests() {
     let tests = "assert double(5) == 10\nassert double(0) == 0";
     let report = verify(code, &Language::Python, default_opts(Some(tests))).await;
 
-    assert!(report.overall_ok, "report: {:#?}", report.stages);
-    assert!(report.stages.iter().any(|s| s.name == "test" && s.ok));
+    assert!(
+        report.verdict == VerificationVerdict::Pass,
+        "report: {:#?}",
+        report.stages
+    );
+    assert!(report
+        .stages
+        .iter()
+        .any(|s| s.name == "test" && s.status == StageStatus::Passed));
 }
 
 #[tokio::test]
@@ -110,6 +191,9 @@ async fn tests_only_verify_skips_execute_stage() {
     let opts = VerifyOptions {
         test_code: Some(tests),
         test_source_file: None,
+        base_code: None,
+        base_source_file: None,
+        base_project_dir: None,
         test_runner: TestRunner::Auto,
         tests_only: true,
         complexity_threshold: None,
@@ -125,12 +209,24 @@ async fn tests_only_verify_skips_execute_stage() {
         output_dir: None,
         report_level: ReportLevel::Full,
         execute_gate: ExecuteGate::All,
+        coverage_gate: CoverageGate::ChangedExports,
+        inferred_oracle_gate: InferredOracleGate::Advisory,
+        runtime_profile: RuntimeProfile::LocalTrusted,
+        python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
+        typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
     };
     let report = verify(code, &Language::Python, opts).await;
 
-    assert!(report.overall_ok, "report: {:#?}", report.stages);
+    assert!(
+        report.verdict == VerificationVerdict::Pass,
+        "report: {:#?}",
+        report.stages
+    );
     assert!(!report.stages.iter().any(|s| s.name == "execute"));
-    assert!(report.stages.iter().any(|s| s.name == "test" && s.ok));
+    assert!(report
+        .stages
+        .iter()
+        .any(|s| s.name == "test" && s.status == StageStatus::Passed));
 }
 
 #[tokio::test]
@@ -139,6 +235,9 @@ async fn tests_only_verify_requires_authoritative_test() {
     let opts = VerifyOptions {
         test_code: None,
         test_source_file: None,
+        base_code: None,
+        base_source_file: None,
+        base_project_dir: None,
         test_runner: TestRunner::Auto,
         tests_only: true,
         complexity_threshold: None,
@@ -154,19 +253,28 @@ async fn tests_only_verify_requires_authoritative_test() {
         output_dir: None,
         report_level: ReportLevel::Full,
         execute_gate: ExecuteGate::All,
+        coverage_gate: CoverageGate::ChangedExports,
+        inferred_oracle_gate: InferredOracleGate::Advisory,
+        runtime_profile: RuntimeProfile::LocalTrusted,
+        python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
+        typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
     };
     let report = verify(code, &Language::Python, opts).await;
 
-    assert!(!report.overall_ok, "report: {:#?}", report.stages);
+    assert!(
+        report.verdict != VerificationVerdict::Pass,
+        "report: {:#?}",
+        report.stages
+    );
     assert!(!report.stages.iter().any(|s| s.name == "execute"));
     let test_stage = report
         .stages
         .iter()
         .find(|s| s.name == "test")
         .expect("tests_only mode should emit a failing test stage");
-    assert!(!test_stage.ok);
+    assert!(test_stage.status != StageStatus::Passed);
     assert_eq!(
-        test_stage.error.as_deref(),
+        test_stage.message.as_deref(),
         Some("tests_only mode requires an authoritative test")
     );
 }
@@ -177,8 +285,11 @@ async fn with_failing_tests() {
     let tests = "assert double(5) == 10";
     let report = verify(code, &Language::Python, default_opts(Some(tests))).await;
 
-    assert!(!report.overall_ok);
-    assert!(report.stages.iter().any(|s| s.name == "test" && !s.ok));
+    assert!(report.verdict != VerificationVerdict::Pass);
+    assert!(report
+        .stages
+        .iter()
+        .any(|s| s.name == "test" && s.status != StageStatus::Passed));
 }
 
 #[tokio::test]
@@ -200,14 +311,24 @@ function normalizeName(name: string): string {
     opts.project_dir = Some(project_dir.path().to_str().unwrap());
     let report = verify(code, &Language::TypeScript, opts).await;
 
-    assert!(report.overall_ok, "report: {:#?}", report.stages);
+    assert_eq!(
+        report.verdict,
+        VerificationVerdict::Pass,
+        "lint warnings must not affect the verdict: {:#?}",
+        report.stages
+    );
 
     let lint_stage = report
         .stages
         .iter()
         .find(|s| s.name == "lint")
         .expect("lint stage should be present");
-    assert!(lint_stage.ok, "lint warnings should not fail verify");
+    assert_eq!(
+        lint_stage.status,
+        StageStatus::Advisory,
+        "lint warnings should be reported as advisory"
+    );
+    assert_eq!(report.summary.lint_issues, 1);
 
     let diagnostics = lint_stage
         .detail
@@ -237,7 +358,7 @@ async fn lint_runner_failures_do_not_count_as_lint_issues_in_summary() {
     let report = verify(code, &Language::TypeScript, opts).await;
 
     assert!(
-        report.overall_ok,
+        report.verdict == VerificationVerdict::Pass,
         "lint runner failures should remain advisory: {:#?}",
         report.stages
     );
@@ -250,7 +371,7 @@ async fn lint_runner_failures_do_not_count_as_lint_issues_in_summary() {
         .find(|stage| stage.name == "lint")
         .expect("lint stage should exist");
     assert!(
-        !lint_stage.ok,
+        lint_stage.status != StageStatus::Passed,
         "runner failure should fail the lint stage itself"
     );
     let detail = lint_stage
@@ -291,13 +412,13 @@ function deepGet(input: { value: { name: string } | null } | null): string {
     let report = verify(code, &Language::TypeScript, opts).await;
 
     assert!(
-        !report.overall_ok,
+        report.verdict != VerificationVerdict::Pass,
         "report should fail: {:#?}",
         report.stages
     );
 
     let summary = report_human_summary(&report);
-    assert!(summary.contains("Overall: FAIL"), "got:\n{summary}");
+    assert!(summary.contains("Overall: Fail"), "got:\n{summary}");
     assert!(summary.contains("Stages:"), "got:\n{summary}");
     assert!(
         summary.contains("Top Complexity Offenders:"),
@@ -344,6 +465,9 @@ exit 1
         VerifyOptions {
             test_code: None,
             test_source_file: None,
+            base_code: None,
+            base_source_file: None,
+            base_project_dir: None,
             test_runner: TestRunner::Auto,
             tests_only: false,
             complexity_threshold: None,
@@ -359,12 +483,17 @@ exit 1
             output_dir: None,
             report_level: ReportLevel::Full,
             execute_gate: ExecuteGate::All,
+            coverage_gate: CoverageGate::ChangedExports,
+            inferred_oracle_gate: InferredOracleGate::Advisory,
+            runtime_profile: RuntimeProfile::LocalTrusted,
+            python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
+            typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
         },
     )
     .await;
 
     assert!(
-        report.overall_ok,
+        report.verdict == VerificationVerdict::Pass,
         "lint diagnostics should stay informational"
     );
 
@@ -410,7 +539,7 @@ async fn verify_filters_unused_variable_diagnostics_for_anonymous_inline_snippet
     let report = verify(code, &Language::Python, opts).await;
 
     assert!(
-        report.overall_ok,
+        report.verdict == VerificationVerdict::Pass,
         "snippet-only unused diagnostics should not fail verify"
     );
 
@@ -441,7 +570,11 @@ function secondaryLabel(labels: string[]): string {
 "#;
     let report = verify(code, &Language::TypeScript, default_opts(None)).await;
 
-    assert!(report.overall_ok, "report: {:#?}", report.stages);
+    assert!(
+        report.verdict == VerificationVerdict::Pass,
+        "report: {:#?}",
+        report.stages
+    );
 
     let exec_stage = report
         .stages
@@ -449,7 +582,7 @@ function secondaryLabel(labels: string[]): string {
         .find(|s| s.name == "execute")
         .expect("execute stage should be present");
     assert!(
-        exec_stage.ok,
+        exec_stage.status == StageStatus::Passed,
         "array label helper should not fail from name-only nonempty-string inference"
     );
 }
@@ -470,14 +603,21 @@ function primaryCity(user: User): string {
 "#;
     let report = verify(code, &Language::TypeScript, default_opts(None)).await;
 
-    assert!(!report.overall_ok, "report: {:#?}", report.stages);
-
-    let exec_stage = report
+    assert_eq!(
+        report.verdict,
+        VerificationVerdict::Pass,
+        "a name-only city fallback is not an authoritative non-empty contract: {:#?}",
+        report.stages
+    );
+    let execute_stage = report
         .stages
         .iter()
-        .find(|s| s.name == "execute")
+        .find(|stage| stage.name == "execute")
         .expect("execute stage should be present");
-    assert!(!exec_stage.ok, "blank city output should fail verify");
+    assert_eq!(execute_stage.status, StageStatus::Passed);
+    assert!(execute_stage.detail.as_ref().unwrap()["findings"]
+        .as_array()
+        .is_some_and(Vec::is_empty));
 }
 
 #[tokio::test]
@@ -488,7 +628,11 @@ def preferred_timezone(profile: dict | None) -> str:
 "#;
     let report = verify(code, &Language::Python, default_opts(None)).await;
 
-    assert!(!report.overall_ok, "report: {:#?}", report.stages);
+    assert!(
+        report.verdict != VerificationVerdict::Pass,
+        "report: {:#?}",
+        report.stages
+    );
 
     let exec_stage = report
         .stages
@@ -496,7 +640,7 @@ def preferred_timezone(profile: dict | None) -> str:
         .find(|s| s.name == "execute")
         .expect("execute stage should be present");
     assert!(
-        !exec_stage.ok,
+        exec_stage.status != StageStatus::Passed,
         "missing nested preference data should fail verify"
     );
 }
@@ -512,17 +656,21 @@ def beta_checkout_enabled(config: dict | None) -> bool:
 "#;
     let report = verify(code, &Language::Python, default_opts(None)).await;
 
-    assert!(!report.overall_ok, "report: {:#?}", report.stages);
-
-    let exec_stage = report
+    assert_eq!(
+        report.verdict,
+        VerificationVerdict::Pass,
+        "unobserved benchmark-shaped nested feature-flag data must not be invented: {:#?}",
+        report.stages
+    );
+    let execute_stage = report
         .stages
         .iter()
-        .find(|s| s.name == "execute")
+        .find(|stage| stage.name == "execute")
         .expect("execute stage should be present");
-    assert!(
-        !exec_stage.ok,
-        "feature flag resolver should fail verify when nested flags=None crashes"
-    );
+    assert_eq!(execute_stage.status, StageStatus::Passed);
+    assert!(execute_stage.detail.as_ref().unwrap()["findings"]
+        .as_array()
+        .is_some_and(Vec::is_empty));
 }
 
 #[tokio::test]
@@ -544,16 +692,10 @@ export function betaCheckoutEnabled(config: Config): boolean {
 "#;
     let report = verify(code, &Language::TypeScript, default_opts(None)).await;
 
-    assert!(!report.overall_ok, "report: {:#?}", report.stages);
-
-    let exec_stage = report
-        .stages
-        .iter()
-        .find(|s| s.name == "execute")
-        .expect("execute stage should be present");
-    assert!(
-        !exec_stage.ok,
-        "feature flag resolver should fail verify when explicit false is overridden"
+    assert_advisory_inferred_finding(
+        &report,
+        "betaCheckoutEnabled",
+        "Feature flag semantics (explicit false)",
     );
 }
 
@@ -576,8 +718,15 @@ export function betaCheckoutEnabled(config: Config): boolean {
 "#;
     let report = verify(code, &Language::TypeScript, default_opts(None)).await;
 
-    assert!(report.overall_ok, "report: {:#?}", report.stages);
-    assert!(report.stages.iter().any(|s| s.name == "execute" && s.ok));
+    assert!(
+        report.verdict == VerificationVerdict::Pass,
+        "report: {:#?}",
+        report.stages
+    );
+    assert!(report
+        .stages
+        .iter()
+        .any(|s| s.name == "execute" && s.status == StageStatus::Passed));
 }
 
 #[tokio::test]
@@ -623,17 +772,7 @@ export function compareVersions(left: string, right: string): number {
 "#;
     let report = verify(code, &Language::TypeScript, default_opts(None)).await;
 
-    assert!(!report.overall_ok, "report: {:#?}", report.stages);
-
-    let exec_stage = report
-        .stages
-        .iter()
-        .find(|s| s.name == "execute")
-        .expect("execute stage should be present");
-    assert!(
-        !exec_stage.ok,
-        "semver compare should fail verify when prerelease ordering is ignored"
-    );
+    assert_advisory_inferred_finding(&report, "compareVersions", "Semver compare semantics");
 }
 
 #[tokio::test]
@@ -700,8 +839,15 @@ export function compareVersions(left: string, right: string): number {
 "#;
     let report = verify(code, &Language::TypeScript, default_opts(None)).await;
 
-    assert!(report.overall_ok, "report: {:#?}", report.stages);
-    assert!(report.stages.iter().any(|s| s.name == "execute" && s.ok));
+    assert!(
+        report.verdict == VerificationVerdict::Pass,
+        "report: {:#?}",
+        report.stages
+    );
+    assert!(report
+        .stages
+        .iter()
+        .any(|s| s.name == "execute" && s.status == StageStatus::Passed));
 }
 
 #[tokio::test]
@@ -757,17 +903,7 @@ export function matchesCaret(version: string, range: string): boolean {
 "#;
     let report = verify(code, &Language::TypeScript, default_opts(None)).await;
 
-    assert!(!report.overall_ok, "report: {:#?}", report.stages);
-
-    let exec_stage = report
-        .stages
-        .iter()
-        .find(|s| s.name == "execute")
-        .expect("execute stage should be present");
-    assert!(
-        !exec_stage.ok,
-        "semver caret matcher should fail verify when prereleases and zero-major bounds are ignored"
-    );
+    assert_advisory_inferred_finding(&report, "matchesCaret", "Semver caret semantics");
 }
 
 #[tokio::test]
@@ -829,8 +965,15 @@ export function matchesCaret(version: string, range: string): boolean {
 "#;
     let report = verify(code, &Language::TypeScript, default_opts(None)).await;
 
-    assert!(report.overall_ok, "report: {:#?}", report.stages);
-    assert!(report.stages.iter().any(|s| s.name == "execute" && s.ok));
+    assert!(
+        report.verdict == VerificationVerdict::Pass,
+        "report: {:#?}",
+        report.stages
+    );
+    assert!(report
+        .stages
+        .iter()
+        .any(|s| s.name == "execute" && s.status == StageStatus::Passed));
 }
 
 #[tokio::test]
@@ -901,17 +1044,7 @@ export function matchesCaret(version: string, range: string): boolean {
 "#;
     let report = verify(code, &Language::TypeScript, default_opts(None)).await;
 
-    assert!(!report.overall_ok, "report: {:#?}", report.stages);
-
-    let exec_stage = report
-        .stages
-        .iter()
-        .find(|s| s.name == "execute")
-        .expect("execute stage should be present");
-    assert!(
-        !exec_stage.ok,
-        "semver caret matcher should fail verify when a stable range still admits same-core prereleases"
-    );
+    assert_advisory_inferred_finding(&report, "matchesCaret", "Semver caret semantics");
 }
 
 #[tokio::test]
@@ -941,16 +1074,10 @@ export function defaults<T extends object>(object: T, ...sources: Array<object |
 "#;
     let report = verify(code, &Language::TypeScript, default_opts(None)).await;
 
-    assert!(!report.overall_ok, "report: {:#?}", report.stages);
-
-    let exec_stage = report
-        .stages
-        .iter()
-        .find(|s| s.name == "execute")
-        .expect("execute stage should be present");
-    assert!(
-        !exec_stage.ok,
-        "defaults should fail verify when null targets are overwritten or inherited keys are skipped"
+    assert_advisory_inferred_finding(
+        &report,
+        "defaults",
+        "Defaults semantics (null target preserves value)",
     );
 }
 
@@ -981,8 +1108,15 @@ export function defaults<T extends object>(object: T, ...sources: Array<object |
 "#;
     let report = verify(code, &Language::TypeScript, default_opts(None)).await;
 
-    assert!(report.overall_ok, "report: {:#?}", report.stages);
-    assert!(report.stages.iter().any(|s| s.name == "execute" && s.ok));
+    assert!(
+        report.verdict == VerificationVerdict::Pass,
+        "report: {:#?}",
+        report.stages
+    );
+    assert!(report
+        .stages
+        .iter()
+        .any(|s| s.name == "execute" && s.status == StageStatus::Passed));
 }
 
 #[tokio::test]
@@ -1005,17 +1139,7 @@ def canonical_query(params: dict[str, object]) -> str:
 "#;
     let report = verify(code, &Language::Python, default_opts(None)).await;
 
-    assert!(!report.overall_ok, "report: {:#?}", report.stages);
-
-    let exec_stage = report
-        .stages
-        .iter()
-        .find(|s| s.name == "execute")
-        .expect("execute stage should be present");
-    assert!(
-        !exec_stage.ok,
-        "query-like serialization that leaks None/null should fail verify"
-    );
+    assert_advisory_inferred_finding(&report, "canonical_query", "Query semantics (tag/nullish)");
 }
 
 #[tokio::test]
@@ -1040,17 +1164,7 @@ def canonical_query(params: dict[str, object]) -> str:
 "#;
     let report = verify(code, &Language::Python, default_opts(None)).await;
 
-    assert!(!report.overall_ok, "report: {:#?}", report.stages);
-
-    let exec_stage = report
-        .stages
-        .iter()
-        .find(|s| s.name == "execute")
-        .expect("execute stage should be present");
-    assert!(
-        !exec_stage.ok,
-        "query-like serialization that keeps blanks or accents should fail verify"
-    );
+    assert_advisory_inferred_finding(&report, "canonical_query", "Query semantics (blank scalar)");
 }
 
 #[tokio::test]
@@ -1079,8 +1193,15 @@ def canonical_query(params: dict[str, object]) -> str:
 "#;
     let report = verify(code, &Language::Python, default_opts(None)).await;
 
-    assert!(report.overall_ok, "report: {:#?}", report.stages);
-    assert!(report.stages.iter().any(|s| s.name == "execute" && s.ok));
+    assert!(
+        report.verdict == VerificationVerdict::Pass,
+        "report: {:#?}",
+        report.stages
+    );
+    assert!(report
+        .stages
+        .iter()
+        .any(|s| s.name == "execute" && s.status == StageStatus::Passed));
 }
 
 #[tokio::test]
@@ -1109,17 +1230,7 @@ export function canonicalQuery(params: Record<string, unknown>): string {
 "#;
     let report = verify(code, &Language::TypeScript, default_opts(None)).await;
 
-    assert!(!report.overall_ok, "report: {:#?}", report.stages);
-
-    let exec_stage = report
-        .stages
-        .iter()
-        .find(|s| s.name == "execute")
-        .expect("execute stage should be present");
-    assert!(
-        !exec_stage.ok,
-        "query-like serialization that keeps blanks or accents should fail verify"
-    );
+    assert_advisory_inferred_finding(&report, "canonicalQuery", "Query semantics (blank scalar)");
 }
 
 #[tokio::test]
@@ -1151,8 +1262,15 @@ export function canonicalQuery(params: Record<string, unknown>): string {
 "#;
     let report = verify(code, &Language::TypeScript, default_opts(None)).await;
 
-    assert!(report.overall_ok, "report: {:#?}", report.stages);
-    assert!(report.stages.iter().any(|s| s.name == "execute" && s.ok));
+    assert!(
+        report.verdict == VerificationVerdict::Pass,
+        "report: {:#?}",
+        report.stages
+    );
+    assert!(report
+        .stages
+        .iter()
+        .any(|s| s.name == "execute" && s.status == StageStatus::Passed));
 }
 
 #[tokio::test]
@@ -1196,7 +1314,11 @@ export function stringifyQuery(input: Record<string, unknown>): string {
     opts.project_dir = Some(project_dir_string.as_str());
     let report = verify(code, &Language::TypeScript, opts).await;
 
-    assert!(!report.overall_ok, "report: {:#?}", report.stages);
+    assert_advisory_inferred_finding(
+        &report,
+        "stringifyQuery",
+        "Query semantics (top-level repeated array)",
+    );
     let coverage = report
         .stages
         .iter()
@@ -1258,7 +1380,11 @@ export function parseQueryString(input: string, setting: QueryParserSetting): un
     opts.project_dir = Some(project_dir_string.as_str());
     let report = verify(code, &Language::TypeScript, opts).await;
 
-    assert!(!report.overall_ok, "report: {:#?}", report.stages);
+    assert_advisory_inferred_finding(
+        &report,
+        "parseQueryString",
+        "Query parse semantics (repeated scalar)",
+    );
     let coverage = report
         .stages
         .iter()
@@ -1334,7 +1460,11 @@ export function decorateRequest(request: RequestLike): void {
     opts.project_dir = Some(project_dir_string.as_str());
     let report = verify(code, &Language::TypeScript, opts).await;
 
-    assert!(!report.overall_ok, "report: {:#?}", report.stages);
+    assert_advisory_inferred_finding(
+        &report,
+        "decorateRequest",
+        "HTTP request metadata (trusted forwarded protocol)",
+    );
     let coverage = report
         .stages
         .iter()
@@ -1447,7 +1577,11 @@ export function decorateResponse(response: ResponseLike, request: RequestLike): 
     opts.project_dir = Some(project_dir_string.as_str());
     let report = verify(code, &Language::TypeScript, opts).await;
 
-    assert!(!report.overall_ok, "report: {:#?}", report.stages);
+    assert_advisory_inferred_finding(
+        &report,
+        "decorateResponse",
+        "HTTP response helpers (location encodes spaces)",
+    );
     let coverage = report
         .stages
         .iter()
@@ -1498,7 +1632,11 @@ export function express(): unknown {
     opts.project_dir = Some(project_dir_string.as_str());
     let report = verify(code, &Language::TypeScript, opts).await;
 
-    assert!(!report.overall_ok, "report: {:#?}", report.stages);
+    assert!(
+        report.verdict != VerificationVerdict::Pass,
+        "report: {:#?}",
+        report.stages
+    );
     let coverage = report
         .stages
         .iter()
@@ -1510,7 +1648,7 @@ export function express(): unknown {
         Some("http_static_file_middleware")
     );
     assert!(
-        coverage["counts"]["fuzzed"].as_u64().unwrap_or(0) >= 1,
+        coverage["counts"]["checked_direct"].as_u64().unwrap_or(0) >= 1,
         "context should promote the internal static middleware factory into fuzzing"
     );
 }
@@ -1538,7 +1676,11 @@ export function sameValueZero(left: unknown, right: unknown): boolean {
     opts.project_dir = Some(project_dir_string.as_str());
     let report = verify(code, &Language::TypeScript, opts).await;
 
-    assert!(!report.overall_ok, "report: {:#?}", report.stages);
+    assert_advisory_inferred_finding(
+        &report,
+        "sameValueZero",
+        "SameValueZero semantics (NaN equals NaN)",
+    );
     let execute = report
         .stages
         .iter()
@@ -1583,7 +1725,11 @@ def filter_versions(candidates: list[str], specifier: str) -> list[str]:
     opts.project_dir = Some(project_dir_string.as_str());
     let report = verify(code, &Language::Python, opts).await;
 
-    assert!(!report.overall_ok, "report: {:#?}", report.stages);
+    assert!(
+        report.verdict != VerificationVerdict::Pass,
+        "report: {:#?}",
+        report.stages
+    );
     let execute = report
         .stages
         .iter()
@@ -1636,7 +1782,11 @@ def build_cookie_header(cookies: Mapping[str, str | None]) -> str:
     opts.project_dir = Some(project_dir_string.as_str());
     let report = verify(code, &Language::Python, opts).await;
 
-    assert!(!report.overall_ok, "report: {:#?}", report.stages);
+    assert!(
+        report.verdict != VerificationVerdict::Pass,
+        "report: {:#?}",
+        report.stages
+    );
     let execute = report
         .stages
         .iter()
@@ -1664,6 +1814,9 @@ async fn python_test_stage_can_import_source_module_from_sibling_path() {
     let opts = VerifyOptions {
         test_code: Some(tests),
         test_source_file: None,
+        base_code: None,
+        base_source_file: None,
+        base_project_dir: None,
         test_runner: TestRunner::Auto,
         tests_only: false,
         complexity_threshold: None,
@@ -1679,11 +1832,23 @@ async fn python_test_stage_can_import_source_module_from_sibling_path() {
         output_dir: None,
         report_level: ReportLevel::Full,
         execute_gate: ExecuteGate::All,
+        coverage_gate: CoverageGate::ChangedExports,
+        inferred_oracle_gate: InferredOracleGate::Advisory,
+        runtime_profile: RuntimeProfile::LocalTrusted,
+        python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
+        typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
     };
     let report = verify(code, &Language::Python, opts).await;
 
-    assert!(report.overall_ok, "report: {:#?}", report.stages);
-    assert!(report.stages.iter().any(|s| s.name == "test" && s.ok));
+    assert!(
+        report.verdict == VerificationVerdict::Pass,
+        "report: {:#?}",
+        report.stages
+    );
+    assert!(report
+        .stages
+        .iter()
+        .any(|s| s.name == "test" && s.status == StageStatus::Passed));
 }
 
 #[tokio::test]
@@ -1692,6 +1857,9 @@ async fn verify_with_threshold_adds_stage() {
     let opts = VerifyOptions {
         test_code: None,
         test_source_file: None,
+        base_code: None,
+        base_source_file: None,
+        base_project_dir: None,
         test_runner: TestRunner::Auto,
         tests_only: false,
         complexity_threshold: Some(3),
@@ -1707,6 +1875,11 @@ async fn verify_with_threshold_adds_stage() {
         output_dir: None,
         report_level: ReportLevel::Full,
         execute_gate: ExecuteGate::All,
+        coverage_gate: CoverageGate::ChangedExports,
+        inferred_oracle_gate: InferredOracleGate::Advisory,
+        runtime_profile: RuntimeProfile::LocalTrusted,
+        python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
+        typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
     };
     let report = verify(code, &Language::Python, opts).await;
     assert!(
@@ -1735,6 +1908,9 @@ def changed(x: int) -> int:
         VerifyOptions {
             test_code: None,
             test_source_file: None,
+            base_code: None,
+            base_source_file: None,
+            base_project_dir: None,
             test_runner: TestRunner::Auto,
             tests_only: false,
             complexity_threshold: Some(3),
@@ -1750,6 +1926,11 @@ def changed(x: int) -> int:
             output_dir: None,
             report_level: ReportLevel::Full,
             execute_gate: ExecuteGate::All,
+            coverage_gate: CoverageGate::ChangedExports,
+            inferred_oracle_gate: InferredOracleGate::Advisory,
+            runtime_profile: RuntimeProfile::LocalTrusted,
+            python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
+            typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
         },
     )
     .await;
@@ -1760,7 +1941,7 @@ def changed(x: int) -> int:
         .find(|s| s.name == "complexity")
         .expect("complexity stage should be present");
     assert!(
-        complexity_stage.ok,
+        complexity_stage.status == StageStatus::Passed,
         "only the changed simple function should be checked in diff mode"
     );
     let detail = complexity_stage.detail.as_ref().unwrap();
@@ -1786,6 +1967,9 @@ def classify(x: int) -> str:
         VerifyOptions {
             test_code: None,
             test_source_file: None,
+            base_code: None,
+            base_source_file: None,
+            base_project_dir: None,
             test_runner: TestRunner::Auto,
             tests_only: false,
             complexity_threshold: Some(2),
@@ -1801,6 +1985,11 @@ def classify(x: int) -> str:
             output_dir: None,
             report_level: ReportLevel::Full,
             execute_gate: ExecuteGate::All,
+            coverage_gate: CoverageGate::ChangedExports,
+            inferred_oracle_gate: InferredOracleGate::Advisory,
+            runtime_profile: RuntimeProfile::LocalTrusted,
+            python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
+            typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
         },
     )
     .await;
@@ -1810,7 +1999,10 @@ def classify(x: int) -> str:
         .iter()
         .find(|s| s.name == "complexity")
         .expect("complexity stage should be present");
-    assert!(!complexity_stage.ok, "match/case should exceed threshold 2");
+    assert!(
+        complexity_stage.status != StageStatus::Passed,
+        "match/case should exceed threshold 2"
+    );
 
     let violations = complexity_stage
         .detail
@@ -1845,6 +2037,9 @@ def check_access(a: bool, b: bool, c: bool) -> int:
         VerifyOptions {
             test_code: None,
             test_source_file: None,
+            base_code: None,
+            base_source_file: None,
+            base_project_dir: None,
             test_runner: TestRunner::Auto,
             tests_only: false,
             complexity_threshold: Some(5),
@@ -1860,6 +2055,11 @@ def check_access(a: bool, b: bool, c: bool) -> int:
             output_dir: None,
             report_level: ReportLevel::Full,
             execute_gate: ExecuteGate::All,
+            coverage_gate: CoverageGate::ChangedExports,
+            inferred_oracle_gate: InferredOracleGate::Advisory,
+            runtime_profile: RuntimeProfile::LocalTrusted,
+            python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
+            typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
         },
     )
     .await;
@@ -1870,7 +2070,7 @@ def check_access(a: bool, b: bool, c: bool) -> int:
         .find(|stage| stage.name == "complexity")
         .expect("complexity stage should be present");
     assert!(
-        !complexity_stage.ok,
+        complexity_stage.status != StageStatus::Passed,
         "cognitive complexity should exceed threshold 5"
     );
     let detail = complexity_stage.detail.as_ref().unwrap();
@@ -1891,23 +2091,29 @@ async fn verify_without_threshold_no_stage() {
 }
 
 #[test]
-fn parse_fuzz_failures_from_stdout() {
+fn parse_findings_from_stdout() {
     let stdout = r#"FUZZ greet: 30 passed, 0 rejected (of 30)
-__COURT_JESTER_FUZZ_JSON__
-[{"function":"boom","input":"[42]","error_type":"TypeError","message":"bad","severity":"crash"}]
+__COURT_JESTER_FINDINGS_JSON__
+[{"id":"execute:boom:1","severity":"crash","confidence":"high","category":"exception","location":{"source_file":"<inline>","function":"boom","line":1,"invocation_path":"direct"},"oracle":{"id":"runtime_contract:boom","kind":"runtime_contract","provenance":"language_runtime","confidence":"high"},"input_classification":"valid","repro":{"kind":"function_call","function":"boom","arguments":[{"expression":"42","json_value":42}],"snippet":"boom(42)","expectation":{"severity":"crash","oracle_kind":"runtime_contract","category":"exception"}},"minimization":{"status":"not_needed","attempts":0,"original":{"arguments":[{"expression":"42","json_value":42}]}},"error_type":"TypeError","message":"bad"}]
 "#;
-    let failures = parse_fuzz_failures(stdout);
-    assert!(failures.is_some());
-    let failures = failures.unwrap();
-    assert_eq!(failures.len(), 1);
-    assert_eq!(failures[0].function, "boom");
-    assert_eq!(failures[0].severity, "crash");
+    let findings = parse_findings(stdout);
+    assert!(findings.is_some());
+    let findings = findings.unwrap();
+    assert_eq!(findings.len(), 1);
+    let finding = &findings[0];
+    assert_eq!(finding.location.function, "boom");
+    assert_eq!(finding.severity, FindingSeverity::Crash);
+    assert_eq!(finding.confidence, FindingConfidence::High);
+    assert_eq!(finding.category, FindingCategory::Exception);
+    assert_eq!(finding.oracle.kind, OracleKind::RuntimeContract);
+    assert_eq!(finding.oracle.provenance, OracleProvenance::LanguageRuntime);
+    assert_eq!(finding.input_classification, InputClassification::Valid);
 }
 
 #[test]
-fn parse_fuzz_failures_no_sentinel() {
+fn parse_findings_no_sentinel() {
     let stdout = "FUZZ greet: 30 passed, 0 rejected (of 30)\nAll fuzz tests passed\n";
-    assert!(parse_fuzz_failures(stdout).is_none());
+    assert!(parse_findings(stdout).is_none());
 }
 
 #[tokio::test]
@@ -1925,6 +2131,9 @@ def changed(x: int) -> int:
     let opts = VerifyOptions {
         test_code: None,
         test_source_file: None,
+        base_code: None,
+        base_source_file: None,
+        base_project_dir: None,
         test_runner: TestRunner::Auto,
         tests_only: false,
         complexity_threshold: None,
@@ -1940,6 +2149,11 @@ def changed(x: int) -> int:
         output_dir: None,
         report_level: ReportLevel::Full,
         execute_gate: ExecuteGate::All,
+        coverage_gate: CoverageGate::ChangedExports,
+        inferred_oracle_gate: InferredOracleGate::Advisory,
+        runtime_profile: RuntimeProfile::LocalTrusted,
+        python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
+        typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
     };
     let report = verify(code, &Language::Python, opts).await;
     // Should pass since changed() is a simple function
@@ -1969,6 +2183,9 @@ async fn writes_report_to_output_dir() {
     let opts = VerifyOptions {
         test_code: None,
         test_source_file: None,
+        base_code: None,
+        base_source_file: None,
+        base_project_dir: None,
         test_runner: TestRunner::Auto,
         tests_only: false,
         complexity_threshold: None,
@@ -1984,6 +2201,11 @@ async fn writes_report_to_output_dir() {
         output_dir: Some(dir.path().to_str().unwrap()),
         report_level: ReportLevel::Full,
         execute_gate: ExecuteGate::All,
+        coverage_gate: CoverageGate::ChangedExports,
+        inferred_oracle_gate: InferredOracleGate::Advisory,
+        runtime_profile: RuntimeProfile::LocalTrusted,
+        python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
+        typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
     };
     let report = verify(code, &Language::Python, opts).await;
 
@@ -2001,12 +2223,12 @@ async fn writes_report_to_output_dir() {
         parsed
             .get("schema_version")
             .and_then(|value| value.as_u64()),
-        Some(2)
+        Some(3)
     );
     assert!(parsed.get("meta").is_some());
     assert!(parsed.get("summary").is_some());
     assert!(parsed.get("stages").is_some());
-    assert!(parsed.get("overall_ok").is_some());
+    assert!(parsed.get("verdict").is_some());
 }
 
 #[tokio::test]
@@ -2017,7 +2239,7 @@ async fn minimal_report_level_omits_full_parse_detail() {
     let report = verify(code, &Language::Python, opts).await;
     let json = report_json_value(&report, ReportLevel::Minimal);
 
-    assert_eq!(json["schema_version"].as_u64(), Some(2));
+    assert_eq!(json["schema_version"].as_u64(), Some(3));
     assert!(json.get("summary").is_some());
 
     let parse_stage = json["stages"]
@@ -2051,6 +2273,9 @@ async fn rejected_only_fuzz_run_is_not_counted_as_pass_in_report_summary() {
     let opts = VerifyOptions {
         test_code: None,
         test_source_file: None,
+        base_code: None,
+        base_source_file: None,
+        base_project_dir: None,
         test_runner: TestRunner::Auto,
         tests_only: false,
         complexity_threshold: None,
@@ -2066,11 +2291,16 @@ async fn rejected_only_fuzz_run_is_not_counted_as_pass_in_report_summary() {
         output_dir: Some(dir.path().to_str().unwrap()),
         report_level: ReportLevel::Full,
         execute_gate: ExecuteGate::All,
+        coverage_gate: CoverageGate::ChangedExports,
+        inferred_oracle_gate: InferredOracleGate::Advisory,
+        runtime_profile: RuntimeProfile::LocalTrusted,
+        python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
+        typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
     };
     let report = verify(code, &Language::Python, opts).await;
 
     assert!(
-        report.overall_ok,
+        report.verdict == VerificationVerdict::Inconclusive,
         "rejected-only fuzz run should be diagnostic only"
     );
     let execute_stage = report
@@ -2078,25 +2308,26 @@ async fn rejected_only_fuzz_run_is_not_counted_as_pass_in_report_summary() {
         .iter()
         .find(|stage| stage.name == "execute")
         .expect("execute stage should be present");
-    assert!(
-        execute_stage.ok,
-        "execute stage should stay green for no-inputs-only runs"
+    assert_eq!(
+        execute_stage.status,
+        StageStatus::Inconclusive,
+        "an all-rejected surface is explicitly inconclusive"
     );
     let execute_detail = execute_stage.detail.as_ref().unwrap();
     assert_eq!(execute_detail["no_inputs_reached"].as_u64(), Some(1));
-    assert_eq!(execute_detail["execute_gate_failed"].as_bool(), Some(false));
 
     let path = report.report_path.unwrap();
     let content = std::fs::read_to_string(&path).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
     let summary = parsed.get("summary").unwrap();
-    assert_eq!(summary.get("functions_fuzzed").unwrap().as_u64(), Some(1));
-    assert_eq!(summary.get("fuzz_pass").unwrap().as_u64(), Some(0));
-    assert_eq!(summary.get("fuzz_crash").unwrap().as_u64(), Some(0));
+    assert_eq!(summary["functions_fuzzed"].as_u64(), Some(1));
+    assert_eq!(summary["coverage"]["required"].as_u64(), Some(1));
     assert_eq!(
-        summary.get("fuzz_no_inputs_reached").unwrap().as_u64(),
+        summary["coverage"]["behaviorally_checked"].as_u64(),
         Some(1)
     );
+    assert_eq!(summary["coverage"]["no_inputs_reached"].as_u64(), Some(1));
+    assert_eq!(summary["findings"]["total"].as_u64(), Some(0));
 }
 
 #[tokio::test]
@@ -2108,18 +2339,33 @@ export function compareScore(a: number, b: number): number {
 "#;
 
     let report_default = verify(code, &Language::TypeScript, default_opts(None)).await;
-    assert!(
-        !report_default.overall_ok,
-        "default execute gate should fail property violations: {:#?}",
+    assert_eq!(
+        report_default.verdict,
+        VerificationVerdict::Inconclusive,
+        "the failed harness protocol is inconclusive even when the all-findings gate selects the property violation: {:#?}",
         report_default.stages
+    );
+    let default_execute = report_default
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("default execute stage should be present");
+    assert_eq!(default_execute.status, StageStatus::Inconclusive);
+    let default_stdout = default_execute.detail.as_ref().unwrap()["execution"]["stdout"]
+        .as_str()
+        .expect("harness stdout should be present");
+    assert!(
+        default_stdout.contains("Comparator self-compare should be zero"),
+        "the property violation must remain visible under the default gate"
     );
 
     let mut crash_only_opts = default_opts(None);
     crash_only_opts.execute_gate = ExecuteGate::Crash;
     let report = verify(code, &Language::TypeScript, crash_only_opts).await;
-    assert!(
-        report.overall_ok,
-        "crash-only execute gate should allow property violations: {:#?}",
+    assert_eq!(
+        report.verdict,
+        VerificationVerdict::Inconclusive,
+        "crash-only gating must not fail on a property violation, but the nonzero harness exit remains inconclusive: {:#?}",
         report.stages
     );
 
@@ -2128,20 +2374,18 @@ export function compareScore(a: number, b: number): number {
         .iter()
         .find(|stage| stage.name == "execute")
         .expect("execute stage should be present");
-    assert!(
-        execute_stage.ok,
-        "execute stage should remain green under crash gate"
-    );
-    let detail = execute_stage.detail.as_ref().unwrap();
-    assert_eq!(detail["execute_gate"].as_str(), Some("crash"));
     assert_eq!(
-        detail["finding_counts"]["property_violation"]
-            .as_u64()
-            .unwrap_or(0)
-            > 0,
-        true
+        execute_stage.status,
+        StageStatus::Inconclusive,
+        "the ungated property finding is not a failed stage"
     );
-    assert_eq!(detail["execute_gate_failed"].as_bool(), Some(false));
+    let stdout = execute_stage.detail.as_ref().unwrap()["execution"]["stdout"]
+        .as_str()
+        .expect("harness stdout should be present");
+    assert!(
+        stdout.contains("Comparator self-compare should be zero"),
+        "crash-only gating must retain the property violation content"
+    );
 }
 
 #[tokio::test]
@@ -2170,6 +2414,9 @@ async fn execute_findings_can_be_suppressed_without_failing_verify() {
         VerifyOptions {
             test_code: None,
             test_source_file: None,
+            base_code: None,
+            base_source_file: None,
+            base_project_dir: None,
             test_runner: TestRunner::Auto,
             tests_only: false,
             complexity_threshold: None,
@@ -2185,12 +2432,17 @@ async fn execute_findings_can_be_suppressed_without_failing_verify() {
             output_dir: None,
             report_level: ReportLevel::Full,
             execute_gate: ExecuteGate::All,
+            coverage_gate: CoverageGate::ChangedExports,
+            inferred_oracle_gate: InferredOracleGate::Advisory,
+            runtime_profile: RuntimeProfile::LocalTrusted,
+            python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
+            typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
         },
     )
     .await;
 
     assert!(
-        report.overall_ok,
+        report.verdict == VerificationVerdict::Pass,
         "suppressed execute finding should not fail verify"
     );
     let execute_stage = report
@@ -2199,26 +2451,25 @@ async fn execute_findings_can_be_suppressed_without_failing_verify() {
         .find(|stage| stage.name == "execute")
         .expect("execute stage should be present");
     assert!(
-        execute_stage.ok,
+        execute_stage.status == StageStatus::Passed,
         "execute stage should stay green when all findings are suppressed"
     );
     let detail = execute_stage.detail.as_ref().unwrap();
-    assert_eq!(
-        detail["suppression_source"].as_str(),
-        Some(".court-jester-ignore.json")
-    );
-    assert_eq!(detail["finding_counts"]["crash"].as_u64(), Some(0));
+    assert!(detail.get("suppression_source").is_none());
+    assert_eq!(detail["findings_summary"]["gating"].as_u64(), Some(0));
     assert!(
-        detail["suppressed_finding_counts"]["crash"]
+        detail["findings_summary"]["suppressed"]
             .as_u64()
             .unwrap_or(0)
-            > 0,
-        "expected suppressed crash findings"
+            > 0
     );
-    let suppressed = detail["suppressed_fuzz_failures"].as_array().unwrap();
-    assert!(!suppressed.is_empty(), "expected suppressed fuzz failures");
-    assert_eq!(suppressed[0]["function"].as_str(), Some("first_char"));
-    assert!(report.summary.suppressed_fuzz_findings > 0);
+    let suppressed = detail["suppressed_findings"].as_array().unwrap();
+    assert!(!suppressed.is_empty(), "expected suppressed findings");
+    assert_eq!(
+        suppressed[0]["location"]["function"].as_str(),
+        Some("first_char")
+    );
+    assert!(report.summary.findings.suppressed > 0);
 }
 
 #[tokio::test]
@@ -2251,6 +2502,9 @@ def check_access(a: bool, b: bool, c: bool) -> int:
         VerifyOptions {
             test_code: None,
             test_source_file: None,
+            base_code: None,
+            base_source_file: None,
+            base_project_dir: None,
             test_runner: TestRunner::Auto,
             tests_only: false,
             complexity_threshold: Some(2),
@@ -2266,12 +2520,17 @@ def check_access(a: bool, b: bool, c: bool) -> int:
             output_dir: None,
             report_level: ReportLevel::Full,
             execute_gate: ExecuteGate::All,
+            coverage_gate: CoverageGate::ChangedExports,
+            inferred_oracle_gate: InferredOracleGate::Advisory,
+            runtime_profile: RuntimeProfile::LocalTrusted,
+            python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
+            typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
         },
     )
     .await;
 
     assert!(
-        report.overall_ok,
+        report.verdict == VerificationVerdict::Pass,
         "suppressed complexity violation should not fail verify"
     );
     let complexity_stage = report
@@ -2279,7 +2538,7 @@ def check_access(a: bool, b: bool, c: bool) -> int:
         .iter()
         .find(|stage| stage.name == "complexity")
         .expect("complexity stage should be present");
-    assert!(complexity_stage.ok);
+    assert!(complexity_stage.status == StageStatus::Passed);
     let detail = complexity_stage.detail.as_ref().unwrap();
     assert_eq!(detail["violations"].as_array().unwrap().len(), 0);
     assert_eq!(detail["suppressed_violations"].as_array().unwrap().len(), 1);
@@ -2303,6 +2562,9 @@ def check_access(a: bool, b: bool, c: bool) -> int:
         VerifyOptions {
             test_code: None,
             test_source_file: None,
+            base_code: None,
+            base_source_file: None,
+            base_project_dir: None,
             test_runner: TestRunner::Auto,
             tests_only: false,
             complexity_threshold: Some(2),
@@ -2318,12 +2580,17 @@ def check_access(a: bool, b: bool, c: bool) -> int:
             output_dir: None,
             report_level: ReportLevel::Full,
             execute_gate: ExecuteGate::All,
+            coverage_gate: CoverageGate::ChangedExports,
+            inferred_oracle_gate: InferredOracleGate::Advisory,
+            runtime_profile: RuntimeProfile::LocalTrusted,
+            python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
+            typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
         },
     )
     .await;
 
     assert!(
-        report.overall_ok,
+        report.verdict == VerificationVerdict::Pass,
         "source directive suppression should not fail verify"
     );
     let complexity_stage = report
@@ -2331,7 +2598,7 @@ def check_access(a: bool, b: bool, c: bool) -> int:
         .iter()
         .find(|stage| stage.name == "complexity")
         .expect("complexity stage should be present");
-    assert!(complexity_stage.ok);
+    assert!(complexity_stage.status == StageStatus::Passed);
     let detail = complexity_stage.detail.as_ref().unwrap();
     assert_eq!(detail["violations"].as_array().unwrap().len(), 0);
     assert_eq!(detail["suppressed_violations"].as_array().unwrap().len(), 1);
@@ -2353,27 +2620,33 @@ async fn value_error_is_treated_as_a_crash() {
     let code = "def normalize_timezone(value: str) -> str:\n    raise ValueError('invalid timezone offset')";
     let report = verify(code, &Language::Python, default_opts(None)).await;
 
-    assert!(!report.overall_ok, "value errors should fail verify");
+    assert!(
+        report.verdict != VerificationVerdict::Pass,
+        "value errors should fail verify"
+    );
 
     let exec_stage = report
         .stages
         .iter()
         .find(|s| s.name == "execute")
         .expect("execute stage should be present");
-    assert!(!exec_stage.ok, "value error should be treated as a crash");
+    assert!(
+        exec_stage.status != StageStatus::Passed,
+        "value error should be treated as a crash"
+    );
 
     let failures = exec_stage
         .detail
         .as_ref()
-        .and_then(|detail| detail.get("fuzz_failures"))
+        .and_then(|detail| detail.get("findings"))
         .and_then(|value| value.as_array())
-        .expect("fuzz failures should be present");
+        .expect("findings should be present");
     assert!(
         failures.iter().any(
             |failure| failure.get("error_type").and_then(|value| value.as_str())
                 == Some("ValueError")
         ),
-        "expected ValueError fuzz failure, got: {failures:?}"
+        "expected ValueError finding, got: {failures:?}"
     );
 }
 
@@ -2388,7 +2661,7 @@ export function reorder(values: string[]): string[] {
     let report = verify(code, &Language::TypeScript, default_opts(None)).await;
 
     assert!(
-        !report.overall_ok,
+        report.verdict != VerificationVerdict::Pass,
         "declared sorted property should fail on non-sorted output"
     );
 
@@ -2400,12 +2673,12 @@ export function reorder(values: string[]): string[] {
     let failures = execute_stage
         .detail
         .as_ref()
-        .and_then(|detail| detail.get("fuzz_failures"))
+        .and_then(|detail| detail.get("findings"))
         .and_then(|value| value.as_array())
-        .expect("fuzz failures should be present");
+        .expect("findings should be present");
     assert!(
         failures.iter().any(|failure| {
-            failure["function"].as_str() == Some("reorder")
+            failure["location"]["function"].as_str() == Some("reorder")
                 && failure["message"]
                     .as_str()
                     .is_some_and(|message| message.contains("Not sorted"))
@@ -2427,7 +2700,7 @@ export const reorderer = {
     let report = verify(code, &Language::TypeScript, default_opts(None)).await;
 
     assert!(
-        !report.overall_ok,
+        report.verdict != VerificationVerdict::Pass,
         "exported object literal method should be invoked by verify"
     );
     let failures = report
@@ -2435,12 +2708,12 @@ export const reorderer = {
         .iter()
         .find(|stage| stage.name == "execute")
         .and_then(|stage| stage.detail.as_ref())
-        .and_then(|detail| detail.get("fuzz_failures"))
+        .and_then(|detail| detail.get("findings"))
         .and_then(|value| value.as_array())
-        .expect("fuzz failures should be present");
+        .expect("findings should be present");
     assert!(
         failures.iter().any(|failure| {
-            failure["function"].as_str() == Some("reorderer.reorder")
+            failure["location"]["function"].as_str() == Some("reorderer.reorder")
                 && failure["message"]
                     .as_str()
                     .is_some_and(|message| message.contains("Not sorted"))
@@ -2462,7 +2735,7 @@ export class Reorderer {
     let report = verify(code, &Language::TypeScript, default_opts(None)).await;
 
     assert!(
-        !report.overall_ok,
+        report.verdict != VerificationVerdict::Pass,
         "exported zero-arg class method should be invoked by verify"
     );
     let failures = report
@@ -2470,12 +2743,12 @@ export class Reorderer {
         .iter()
         .find(|stage| stage.name == "execute")
         .and_then(|stage| stage.detail.as_ref())
-        .and_then(|detail| detail.get("fuzz_failures"))
+        .and_then(|detail| detail.get("findings"))
         .and_then(|value| value.as_array())
-        .expect("fuzz failures should be present");
+        .expect("findings should be present");
     assert!(
         failures.iter().any(|failure| {
-            failure["function"].as_str() == Some("Reorderer#reorder")
+            failure["location"]["function"].as_str() == Some("Reorderer#reorder")
                 && failure["message"]
                     .as_str()
                     .is_some_and(|message| message.contains("Not sorted"))
@@ -2510,7 +2783,7 @@ export function createReorderer() {
     assert!(
         functions.iter().any(|function| {
             function["function"].as_str() == Some("createReorderer().reorder")
-                && function["status"].as_str() == Some("fuzzed_via_factory")
+                && function["status"].as_str() == Some("checked_via_factory")
         }),
         "factory-returned callables should be explicit in coverage output"
     );
@@ -2541,7 +2814,7 @@ export const useReorderer = create(() => ({
     let report = verify(code, &Language::TypeScript, default_opts(None)).await;
 
     assert!(
-        !report.overall_ok,
+        report.verdict != VerificationVerdict::Pass,
         "container surfaced method should be invoked by verify"
     );
 
@@ -2561,7 +2834,7 @@ export const useReorderer = create(() => ({
         .expect("container surfaced method coverage should be present");
     assert_eq!(
         surfaced.get("status").and_then(|value| value.as_str()),
-        Some("fuzzed")
+        Some("checked_direct")
     );
 
     let failures = report
@@ -2569,12 +2842,12 @@ export const useReorderer = create(() => ({
         .iter()
         .find(|stage| stage.name == "execute")
         .and_then(|stage| stage.detail.as_ref())
-        .and_then(|detail| detail.get("fuzz_failures"))
+        .and_then(|detail| detail.get("findings"))
         .and_then(|value| value.as_array())
-        .expect("fuzz failures should be present");
+        .expect("findings should be present");
     assert!(
         failures.iter().any(|failure| {
-            failure["function"].as_str() == Some("useReorderer.reorder")
+            failure["location"]["function"].as_str() == Some("useReorderer.reorder")
                 && failure["message"]
                     .as_str()
                     .is_some_and(|message| message.contains("Not sorted"))
@@ -2593,7 +2866,7 @@ export function decodeSegment(value: string): string {
     let report = verify(code, &Language::TypeScript, default_opts(None)).await;
 
     assert!(
-        report.overall_ok,
+        report.verdict == VerificationVerdict::Pass,
         "malformed URI inputs should be rejected, not fail verify: {:#?}",
         report.stages
     );
@@ -2603,19 +2876,22 @@ export function decodeSegment(value: string): string {
         .iter()
         .find(|s| s.name == "execute")
         .expect("execute stage should be present");
-    assert!(
-        exec_stage.ok,
-        "execute stage should pass: {:?}",
-        exec_stage.error
+    assert_eq!(
+        exec_stage.status,
+        StageStatus::Passed,
+        "malformed URI rejection should leave execute passed: {:?}",
+        exec_stage.message
     );
 
     let failures = exec_stage
         .detail
         .as_ref()
-        .and_then(|detail| detail.get("fuzz_failures"));
+        .and_then(|detail| detail.get("findings"))
+        .and_then(|findings| findings.as_array())
+        .expect("schema-v3 execute detail should contain typed findings");
     assert!(
-        failures.is_none(),
-        "malformed URI rejections should not be recorded as fuzz failures: {failures:?}"
+        failures.is_empty(),
+        "malformed URI rejections should not be recorded as crashes: {failures:?}"
     );
 }
 
@@ -2673,8 +2949,8 @@ class Reader {
             .unwrap_or("")
     };
 
-    assert_eq!(status_for("verifyRequest"), "fuzzed");
-    assert_eq!(status_for("parseSignatureHeader"), "fuzzed");
+    assert_eq!(status_for("verifyRequest"), "checked_direct");
+    assert_eq!(status_for("parseSignatureHeader"), "checked_direct");
     assert_eq!(status_for("encodePair"), "skipped_internal_helper");
     assert_eq!(status_for("unresolved"), "skipped_unsupported_type");
     assert_eq!(status_for("_privateToken"), "skipped_private_name");
@@ -2690,7 +2966,11 @@ export function ensureScraper(): { enabled: boolean } {
 "#;
     let report = verify(code, &Language::TypeScript, default_opts(None)).await;
 
-    assert!(report.overall_ok, "report: {:#?}", report.stages);
+    assert!(
+        report.verdict == VerificationVerdict::Inconclusive,
+        "report: {:#?}",
+        report.stages
+    );
     assert!(
         !report.stages.iter().any(|stage| stage.name == "execute"),
         "no-fuzzable-surface function should not synthesize execute work"
@@ -2743,7 +3023,7 @@ export function buildVersion(): number {
         .expect("buildVersion coverage should be present");
     assert_eq!(
         build_version.get("status").and_then(|value| value.as_str()),
-        Some("fuzzed")
+        Some("checked_direct")
     );
 }
 
@@ -2751,7 +3031,8 @@ export function buildVersion(): number {
 async fn crash_can_be_classified_as_type_signature_wider_than_usage() {
     let code = r#"
 export function jsonResponse(status: number): string {
-  return new Response("ok", { status }).statusText;
+  const statusText: Record<number, string> = { 200: "OK", 201: "Created" };
+  return statusText[status].trim();
 }
 
 jsonResponse(200);
@@ -2767,9 +3048,9 @@ jsonResponse(201);
     let failures = execute_stage
         .detail
         .as_ref()
-        .and_then(|detail| detail.get("fuzz_failures"))
+        .and_then(|detail| detail.get("findings"))
         .and_then(|value| value.as_array())
-        .expect("fuzz failures should be present");
+        .expect("findings should be present");
     assert!(
         failures.iter().any(|failure| {
             failure
@@ -2817,6 +3098,9 @@ export function add(input: number): number {
     let opts = VerifyOptions {
         test_code: None,
         test_source_file: None,
+        base_code: None,
+        base_source_file: None,
+        base_project_dir: None,
         test_runner: TestRunner::Auto,
         tests_only: false,
         complexity_threshold: None,
@@ -2832,10 +3116,19 @@ export function add(input: number): number {
         output_dir: None,
         report_level: ReportLevel::Full,
         execute_gate: ExecuteGate::All,
+        coverage_gate: CoverageGate::ChangedExports,
+        inferred_oracle_gate: InferredOracleGate::Advisory,
+        runtime_profile: RuntimeProfile::LocalTrusted,
+        python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
+        typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
     };
     let report = verify(code, &Language::TypeScript, opts).await;
 
-    assert!(report.overall_ok, "report: {:#?}", report.stages);
+    assert!(
+        report.verdict == VerificationVerdict::Pass,
+        "report: {:#?}",
+        report.stages
+    );
 
     let portability_stage = report
         .stages
@@ -2843,7 +3136,7 @@ export function add(input: number): number {
         .find(|stage| stage.name == "portability")
         .expect("portability stage should be present");
     assert!(
-        !portability_stage.ok,
+        portability_stage.status != StageStatus::Passed,
         "portability stage should record the Node warning"
     );
     let portability_detail = portability_stage
@@ -2883,9 +3176,9 @@ export function add(input: number): number {
         .find(|stage| stage.name == "execute")
         .expect("execute stage should be present");
     assert!(
-        execute_stage.ok,
+        execute_stage.status == StageStatus::Passed,
         "execute stage should succeed: {:?}",
-        execute_stage.error
+        execute_stage.message
     );
     let runtime = execute_stage
         .detail
@@ -2927,6 +3220,9 @@ hostLabel("https://example.com");
         VerifyOptions {
             test_code: None,
             test_source_file: None,
+            base_code: None,
+            base_source_file: None,
+            base_project_dir: None,
             test_runner: TestRunner::Auto,
             tests_only: false,
             complexity_threshold: None,
@@ -2942,6 +3238,11 @@ hostLabel("https://example.com");
             output_dir: None,
             report_level: ReportLevel::Full,
             execute_gate: ExecuteGate::All,
+            coverage_gate: CoverageGate::ChangedExports,
+            inferred_oracle_gate: InferredOracleGate::Advisory,
+            runtime_profile: RuntimeProfile::LocalTrusted,
+            python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
+            typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
         },
     )
     .await;
@@ -2971,6 +3272,9 @@ hostLabel("https://example.com");
         VerifyOptions {
             test_code: None,
             test_source_file: None,
+            base_code: None,
+            base_source_file: None,
+            base_project_dir: None,
             test_runner: TestRunner::Auto,
             tests_only: false,
             complexity_threshold: None,
@@ -2986,6 +3290,11 @@ hostLabel("https://example.com");
             output_dir: None,
             report_level: ReportLevel::Full,
             execute_gate: ExecuteGate::All,
+            coverage_gate: CoverageGate::ChangedExports,
+            inferred_oracle_gate: InferredOracleGate::Advisory,
+            runtime_profile: RuntimeProfile::LocalTrusted,
+            python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
+            typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
         },
     )
     .await;
@@ -3029,6 +3338,9 @@ export const defaultHost = labels.hostLabel("https://example.com");
         VerifyOptions {
             test_code: None,
             test_source_file: None,
+            base_code: None,
+            base_source_file: None,
+            base_project_dir: None,
             test_runner: TestRunner::Auto,
             tests_only: false,
             complexity_threshold: None,
@@ -3044,6 +3356,11 @@ export const defaultHost = labels.hostLabel("https://example.com");
             output_dir: None,
             report_level: ReportLevel::Full,
             execute_gate: ExecuteGate::All,
+            coverage_gate: CoverageGate::ChangedExports,
+            inferred_oracle_gate: InferredOracleGate::Advisory,
+            runtime_profile: RuntimeProfile::LocalTrusted,
+            python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
+            typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
         },
     )
     .await;
@@ -3099,6 +3416,9 @@ export const previewCity = primaryCity({ address: { city: "Boise" } });
         VerifyOptions {
             test_code: None,
             test_source_file: None,
+            base_code: None,
+            base_source_file: None,
+            base_project_dir: None,
             test_runner: TestRunner::Auto,
             tests_only: false,
             complexity_threshold: None,
@@ -3114,6 +3434,11 @@ export const previewCity = primaryCity({ address: { city: "Boise" } });
             output_dir: None,
             report_level: ReportLevel::Full,
             execute_gate: ExecuteGate::All,
+            coverage_gate: CoverageGate::ChangedExports,
+            inferred_oracle_gate: InferredOracleGate::Advisory,
+            runtime_profile: RuntimeProfile::LocalTrusted,
+            python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
+            typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
         },
     )
     .await;
@@ -3159,6 +3484,9 @@ def first_item(items):
         VerifyOptions {
             test_code: None,
             test_source_file: None,
+            base_code: None,
+            base_source_file: None,
+            base_project_dir: None,
             test_runner: TestRunner::Auto,
             tests_only: false,
             complexity_threshold: None,
@@ -3174,6 +3502,11 @@ def first_item(items):
             output_dir: None,
             report_level: ReportLevel::Full,
             execute_gate: ExecuteGate::All,
+            coverage_gate: CoverageGate::ChangedExports,
+            inferred_oracle_gate: InferredOracleGate::Advisory,
+            runtime_profile: RuntimeProfile::LocalTrusted,
+            python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
+            typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
         },
     )
     .await;
@@ -3184,7 +3517,7 @@ def first_item(items):
         .find(|stage| stage.name == "execute")
         .expect("execute stage should be present");
     assert!(
-        execute_stage.ok,
+        execute_stage.status == StageStatus::Passed,
         "fixture-shaped fuzz inputs should avoid arbitrary non-list crashes: {:#?}",
         execute_stage
     );
@@ -3231,6 +3564,9 @@ def sort_items(items):
         VerifyOptions {
             test_code: None,
             test_source_file: None,
+            base_code: None,
+            base_source_file: None,
+            base_project_dir: None,
             test_runner: TestRunner::Auto,
             tests_only: false,
             complexity_threshold: None,
@@ -3246,6 +3582,11 @@ def sort_items(items):
             output_dir: None,
             report_level: ReportLevel::Full,
             execute_gate: ExecuteGate::All,
+            coverage_gate: CoverageGate::ChangedExports,
+            inferred_oracle_gate: InferredOracleGate::Advisory,
+            runtime_profile: RuntimeProfile::LocalTrusted,
+            python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
+            typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
         },
     )
     .await;
@@ -3256,7 +3597,7 @@ def sort_items(items):
         .find(|stage| stage.name == "execute")
         .expect("execute stage should be present");
     assert!(
-        !execute_stage.ok,
+        execute_stage.status != StageStatus::Passed,
         "fixture-derived sorted/permutation properties should catch unsorted output"
     );
     let detail = execute_stage
@@ -3295,6 +3636,9 @@ def sort_items(items):
         VerifyOptions {
             test_code: None,
             test_source_file: None,
+            base_code: None,
+            base_source_file: None,
+            base_project_dir: None,
             test_runner: TestRunner::Auto,
             tests_only: false,
             complexity_threshold: None,
@@ -3310,6 +3654,11 @@ def sort_items(items):
             output_dir: None,
             report_level: ReportLevel::Full,
             execute_gate: ExecuteGate::All,
+            coverage_gate: CoverageGate::ChangedExports,
+            inferred_oracle_gate: InferredOracleGate::Advisory,
+            runtime_profile: RuntimeProfile::LocalTrusted,
+            python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
+            typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
         },
     )
     .await;
@@ -3320,7 +3669,7 @@ def sort_items(items):
         .find(|stage| stage.name == "execute")
         .expect("execute stage should be present");
     assert!(
-        execute_stage.ok,
+        execute_stage.status == StageStatus::Passed,
         "one fixture row should shape inputs but should not create a hard sorted oracle"
     );
     let detail = execute_stage
@@ -3334,7 +3683,7 @@ def sort_items(items):
 }
 
 #[tokio::test]
-async fn fuzz_failures_truncate_large_inputs_and_messages() {
+async fn findings_truncate_large_inputs_and_messages() {
     let code =
         "def explode(name: str) -> str:\n    if len(name) < 1000:\n        return name\n    raise TypeError('x' * 500)";
     let report = verify(code, &Language::Python, default_opts(None)).await;
@@ -3347,17 +3696,15 @@ async fn fuzz_failures_truncate_large_inputs_and_messages() {
     let failures = exec_stage
         .detail
         .as_ref()
-        .and_then(|detail| detail.get("fuzz_failures"))
+        .and_then(|detail| detail.get("findings"))
         .and_then(|value| value.as_array())
-        .expect("fuzz failures should be present");
-    let first = failures
-        .first()
-        .expect("expected at least one fuzz failure");
+        .expect("findings should be present");
+    let first = failures.first().expect("expected at least one finding");
 
-    let input = first
-        .get("input")
+    let input = first["repro"]["arguments"][0]
+        .get("expression")
         .and_then(|value| value.as_str())
-        .expect("failure input should be present");
+        .expect("finding repro argument expression should be present");
     let message = first
         .get("message")
         .and_then(|value| value.as_str())
@@ -3404,6 +3751,9 @@ assert.equal(displayHandle({ profile: { handle: " Admin " }, username: "root" })
     let opts = VerifyOptions {
         test_code: Some(tests),
         test_source_file: Some(test_path.to_str().unwrap()),
+        base_code: None,
+        base_source_file: None,
+        base_project_dir: None,
         test_runner: TestRunner::Auto,
         tests_only: false,
         complexity_threshold: None,
@@ -3419,11 +3769,23 @@ assert.equal(displayHandle({ profile: { handle: " Admin " }, username: "root" })
         output_dir: None,
         report_level: ReportLevel::Full,
         execute_gate: ExecuteGate::All,
+        coverage_gate: CoverageGate::ChangedExports,
+        inferred_oracle_gate: InferredOracleGate::Advisory,
+        runtime_profile: RuntimeProfile::LocalTrusted,
+        python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
+        typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
     };
     let report = verify(code, &Language::TypeScript, opts).await;
 
-    assert!(report.overall_ok, "report: {:#?}", report.stages);
-    assert!(report.stages.iter().any(|s| s.name == "test" && s.ok));
+    assert!(
+        report.verdict == VerificationVerdict::Pass,
+        "report: {:#?}",
+        report.stages
+    );
+    assert!(report
+        .stages
+        .iter()
+        .any(|s| s.name == "test" && s.status == StageStatus::Passed));
 }
 
 #[tokio::test]
@@ -3474,6 +3836,9 @@ test("add", () => {
         VerifyOptions {
             test_code: Some(tests),
             test_source_file: Some(test_path.to_str().unwrap()),
+            base_code: None,
+            base_source_file: None,
+            base_project_dir: None,
             test_runner: TestRunner::Auto,
             tests_only: true,
             complexity_threshold: None,
@@ -3489,24 +3854,55 @@ test("add", () => {
             output_dir: None,
             report_level: ReportLevel::Full,
             execute_gate: ExecuteGate::All,
+            coverage_gate: CoverageGate::ChangedExports,
+            inferred_oracle_gate: InferredOracleGate::Advisory,
+            runtime_profile: RuntimeProfile::LocalTrusted,
+            python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
+            typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
         },
     )
     .await;
 
-    assert!(report.overall_ok, "report: {:#?}", report.stages);
+    assert_eq!(
+        report.verdict,
+        VerificationVerdict::Inconclusive,
+        "a no-op Bun fake cannot prove same-process target entry: {:#?}",
+        report.stages
+    );
     let test_stage = report
         .stages
         .iter()
         .find(|stage| stage.name == "test")
         .expect("test stage should be present");
     assert!(
-        test_stage.ok,
+        test_stage.status == StageStatus::Passed,
         "test stage should pass: {:?}",
-        test_stage.error
+        test_stage.message
     );
     let detail = test_stage.detail.as_ref().unwrap();
     assert_eq!(detail["test_runner_requested"].as_str(), Some("auto"));
     assert_eq!(detail["test_runner_selected"].as_str(), Some("bun"));
+    assert_eq!(
+        detail["authoritative_test_covered_surfaces"].as_u64(),
+        Some(0)
+    );
+    assert!(detail["target_entered_surfaces"]
+        .as_array()
+        .is_some_and(Vec::is_empty));
+    let coverage_stage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "coverage")
+        .expect("coverage stage should be present");
+    assert_eq!(coverage_stage.status, StageStatus::Inconclusive);
+    assert_eq!(
+        coverage_stage.detail.as_ref().unwrap()["required_surface_count"].as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        coverage_stage.detail.as_ref().unwrap()["observed_required_surface_count"].as_u64(),
+        Some(0)
+    );
 
     let bun_log_text = std::fs::read_to_string(&bun_log).unwrap();
     assert!(
@@ -3551,6 +3947,9 @@ assert Path(__file__).name == "test_app.py"
     let opts = VerifyOptions {
         test_code: Some(tests),
         test_source_file: Some(test_path.to_str().unwrap()),
+        base_code: None,
+        base_source_file: None,
+        base_project_dir: None,
         test_runner: TestRunner::Auto,
         tests_only: true,
         complexity_threshold: None,
@@ -3566,12 +3965,24 @@ assert Path(__file__).name == "test_app.py"
         output_dir: None,
         report_level: ReportLevel::Full,
         execute_gate: ExecuteGate::All,
+        coverage_gate: CoverageGate::ChangedExports,
+        inferred_oracle_gate: InferredOracleGate::Advisory,
+        runtime_profile: RuntimeProfile::LocalTrusted,
+        python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
+        typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
     };
     let report = verify(code, &Language::Python, opts).await;
 
-    assert!(report.overall_ok, "report: {:#?}", report.stages);
+    assert!(
+        report.verdict == VerificationVerdict::Pass,
+        "report: {:#?}",
+        report.stages
+    );
     assert!(!report.stages.iter().any(|s| s.name == "execute"));
-    assert!(report.stages.iter().any(|s| s.name == "test" && s.ok));
+    assert!(report
+        .stages
+        .iter()
+        .any(|s| s.name == "test" && s.status == StageStatus::Passed));
 }
 
 #[tokio::test]
@@ -3601,6 +4012,9 @@ assert Path(__file__).name == "test_app.py"
     let opts = VerifyOptions {
         test_code: Some(tests),
         test_source_file: Some(test_path.to_str().unwrap()),
+        base_code: None,
+        base_source_file: None,
+        base_project_dir: None,
         test_runner: TestRunner::Auto,
         tests_only: true,
         complexity_threshold: None,
@@ -3616,12 +4030,24 @@ assert Path(__file__).name == "test_app.py"
         output_dir: None,
         report_level: ReportLevel::Full,
         execute_gate: ExecuteGate::All,
+        coverage_gate: CoverageGate::ChangedExports,
+        inferred_oracle_gate: InferredOracleGate::Advisory,
+        runtime_profile: RuntimeProfile::LocalTrusted,
+        python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
+        typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
     };
     let report = verify(code, &Language::Python, opts).await;
 
-    assert!(report.overall_ok, "report: {:#?}", report.stages);
+    assert!(
+        report.verdict == VerificationVerdict::Pass,
+        "report: {:#?}",
+        report.stages
+    );
     assert!(!report.stages.iter().any(|s| s.name == "execute"));
-    assert!(report.stages.iter().any(|s| s.name == "test" && s.ok));
+    assert!(report
+        .stages
+        .iter()
+        .any(|s| s.name == "test" && s.status == StageStatus::Passed));
 }
 
 #[tokio::test]
@@ -3675,6 +4101,9 @@ assert.equal(primaryPlanCode({ plans: [null, ""] }), "FREE");
     let opts = VerifyOptions {
         test_code: Some(tests),
         test_source_file: Some(test_path.to_str().unwrap()),
+        base_code: None,
+        base_source_file: None,
+        base_project_dir: None,
         test_runner: TestRunner::Auto,
         tests_only: false,
         complexity_threshold: None,
@@ -3690,12 +4119,27 @@ assert.equal(primaryPlanCode({ plans: [null, ""] }), "FREE");
         output_dir: None,
         report_level: ReportLevel::Full,
         execute_gate: ExecuteGate::All,
+        coverage_gate: CoverageGate::ChangedExports,
+        inferred_oracle_gate: InferredOracleGate::Advisory,
+        runtime_profile: RuntimeProfile::LocalTrusted,
+        python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
+        typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
     };
     let report = verify(normalizers, &Language::TypeScript, opts).await;
 
-    assert!(report.overall_ok, "report: {:#?}", report.stages);
-    assert!(report.stages.iter().any(|s| s.name == "execute" && s.ok));
-    assert!(report.stages.iter().any(|s| s.name == "test" && s.ok));
+    assert!(
+        report.verdict == VerificationVerdict::Pass,
+        "report: {:#?}",
+        report.stages
+    );
+    assert!(report
+        .stages
+        .iter()
+        .any(|s| s.name == "execute" && s.status == StageStatus::Passed));
+    assert!(report
+        .stages
+        .iter()
+        .any(|s| s.name == "test" && s.status == StageStatus::Passed));
 }
 
 #[tokio::test]
@@ -3726,6 +4170,9 @@ if (displayInitials("Spencer Lee") !== "SL") {
     let opts = VerifyOptions {
         test_code: Some(tests),
         test_source_file: Some(tests_path.to_str().unwrap()),
+        base_code: None,
+        base_source_file: None,
+        base_project_dir: None,
         test_runner: TestRunner::Auto,
         tests_only: false,
         complexity_threshold: None,
@@ -3741,9 +4188,765 @@ if (displayInitials("Spencer Lee") !== "SL") {
         output_dir: None,
         report_level: ReportLevel::Full,
         execute_gate: ExecuteGate::All,
+        coverage_gate: CoverageGate::ChangedExports,
+        inferred_oracle_gate: InferredOracleGate::Advisory,
+        runtime_profile: RuntimeProfile::LocalTrusted,
+        python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
+        typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
     };
     let report = verify(code, &Language::TypeScript, opts).await;
 
-    assert!(report.overall_ok, "report: {:#?}", report.stages);
-    assert!(report.stages.iter().any(|s| s.name == "test" && s.ok));
+    assert!(
+        report.verdict == VerificationVerdict::Pass,
+        "report: {:#?}",
+        report.stages
+    );
+    assert!(report
+        .stages
+        .iter()
+        .any(|s| s.name == "test" && s.status == StageStatus::Passed));
+}
+#[tokio::test]
+async fn schema_v3_safe_function_passes_with_property_strength() {
+    let report = verify(
+        "def add(a: int, b: int) -> int:\n    return a + b",
+        &Language::Python,
+        default_opts(None),
+    )
+    .await;
+    assert_eq!(report.schema_version, 3);
+    assert_eq!(report.verdict, VerificationVerdict::Pass);
+    assert_eq!(
+        report.strength,
+        court_jester::types::VerificationStrength::PropertyChecked
+    );
+    assert!(report.summary.coverage.behaviorally_checked > 0);
+    assert!(report.summary.coverage.required > 0);
+}
+
+#[tokio::test]
+async fn schema_v3_syntax_error_is_fail_with_parse_only_strength() {
+    let report = verify("def broken(:", &Language::Python, default_opts(None)).await;
+    assert_eq!(report.schema_version, 3);
+    assert_eq!(report.verdict, VerificationVerdict::Fail);
+    assert_eq!(
+        report.strength,
+        court_jester::types::VerificationStrength::ParseOnly
+    );
+}
+
+#[tokio::test]
+async fn unsupported_required_export_is_inconclusive_not_pass() {
+    let report = verify(
+        "def parse(value: UnresolvedType) -> str:\n    return value.name",
+        &Language::Python,
+        default_opts(None),
+    )
+    .await;
+    assert_eq!(report.verdict, VerificationVerdict::Inconclusive);
+    assert_eq!(
+        report.strength,
+        court_jester::types::VerificationStrength::StaticChecked
+    );
+    assert!(report.summary.coverage.required >= 1);
+    assert!(report.summary.coverage.skipped >= 1 || report.summary.coverage.no_inputs_reached >= 1);
+}
+
+#[tokio::test]
+async fn coverage_none_does_not_manufacture_pass_without_behavioral_evidence() {
+    let mut opts = default_opts(None);
+    opts.coverage_gate = CoverageGate::None;
+    let report = verify("CONSTANT = 1", &Language::Python, opts).await;
+    assert_eq!(report.verdict, VerificationVerdict::Inconclusive);
+}
+
+#[tokio::test]
+async fn tests_only_partial_same_process_reach_is_inconclusive_with_exact_checked_surface() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("surfaces.py");
+    let test_source = project.path().join("test_surfaces.py");
+    let code = "def covered(x: int) -> int:\n    return x\n\ndef uncovered(x: int) -> int:\n    return x + 1";
+    let tests = "from surfaces import covered, uncovered\n\nif False:\n    uncovered(1)\nassert covered(1) == 1";
+    fs::write(&source, code).unwrap();
+    fs::write(&test_source, tests).unwrap();
+    let mut opts = default_opts(Some(tests));
+    opts.tests_only = true;
+    opts.project_dir = project.path().to_str();
+    opts.source_file = source.to_str();
+    opts.test_source_file = test_source.to_str();
+
+    let report = verify(code, &Language::Python, opts).await;
+
+    assert_eq!(report.verdict, VerificationVerdict::Inconclusive);
+    assert_eq!(report.strength, VerificationStrength::AuthoritativeTests);
+    assert_eq!(report.summary.coverage.required, 2);
+    assert_eq!(report.summary.coverage.behaviorally_checked, 1);
+
+    let test_detail = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "test")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("tests-only run should retain authoritative test evidence");
+    let entered = test_detail["target_entered_surfaces"]
+        .as_array()
+        .expect("same-process target entry events");
+    assert!(entered.iter().any(|surface| surface == "covered:1"));
+    assert!(!entered.iter().any(|surface| surface == "uncovered:4"));
+
+    let coverage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "coverage")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("tests-only coverage stage");
+    assert_eq!(
+        coverage["observed_required_surface_count"].as_u64(),
+        Some(1)
+    );
+    let functions = coverage["functions"]
+        .as_array()
+        .expect("per-surface coverage");
+    let checked = functions
+        .iter()
+        .filter(|function| function["status"] == "checked_via_authoritative_test")
+        .map(|function| function["function"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(checked, ["covered"]);
+    let uncovered = functions
+        .iter()
+        .find(|function| function["function"] == "uncovered")
+        .expect("unexecuted required surface");
+    assert_eq!(
+        uncovered["status"].as_str(),
+        Some("skipped_no_fuzzable_surface")
+    );
+    assert_eq!(
+        uncovered["reason"].as_str(),
+        Some("authoritative test did not emit the exact target_entered surface id")
+    );
+}
+
+#[tokio::test]
+async fn tests_only_full_same_process_reach_passes() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("surfaces.py");
+    let test_source = project.path().join("test_surfaces.py");
+    let code = "def covered(x: int) -> int:\n    return x\n\ndef also_covered(x: int) -> int:\n    return x + 1";
+    let tests = "from surfaces import also_covered, covered\n\nassert covered(1) == 1\nassert also_covered(1) == 2";
+    fs::write(&source, code).unwrap();
+    fs::write(&test_source, tests).unwrap();
+    let mut opts = default_opts(Some(tests));
+    opts.tests_only = true;
+    opts.project_dir = project.path().to_str();
+    opts.source_file = source.to_str();
+    opts.test_source_file = test_source.to_str();
+
+    let report = verify(code, &Language::Python, opts).await;
+
+    assert_eq!(report.verdict, VerificationVerdict::Pass, "{report:#?}");
+    assert_eq!(report.strength, VerificationStrength::AuthoritativeTests);
+    assert_eq!(report.summary.coverage.required, 2);
+    assert_eq!(report.summary.coverage.behaviorally_checked, 2);
+
+    let test_detail = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "test")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("tests-only run should retain authoritative test evidence");
+    let entered = test_detail["target_entered_surfaces"]
+        .as_array()
+        .expect("same-process target entry events");
+    assert!(entered.iter().any(|surface| surface == "covered:1"));
+    assert!(entered.iter().any(|surface| surface == "also_covered:4"));
+
+    let coverage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "coverage")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("tests-only coverage stage");
+    assert_eq!(
+        coverage["observed_required_surface_count"].as_u64(),
+        Some(2)
+    );
+    let checked = coverage["functions"]
+        .as_array()
+        .expect("per-surface coverage")
+        .iter()
+        .filter(|function| function["status"] == "checked_via_authoritative_test")
+        .map(|function| function["function"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(checked, ["covered", "also_covered"]);
+}
+
+#[tokio::test]
+async fn persisted_and_minimal_reports_are_v3_without_legacy_ok_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = default_opts(None);
+    opts.output_dir = Some(dir.path().to_str().unwrap());
+    let report = verify(
+        "def add(x: int) -> int:\n    return x",
+        &Language::Python,
+        opts,
+    )
+    .await;
+    let full = report_json_value(&report, ReportLevel::Full);
+    let minimal = report_json_value(&report, ReportLevel::Minimal);
+    for value in [full, minimal] {
+        assert_eq!(value["schema_version"].as_u64(), Some(3));
+        assert!(value.get("verdict").is_some());
+        assert!(value.get("strength").is_some());
+        assert!(value.get("overall_ok").is_none());
+        assert!(value.get("ok").is_none());
+    }
+    let path = report.report_path.expect("output report path");
+    let persisted: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert!(persisted.get("overall_ok").is_none());
+    assert!(persisted["summary"]["coverage"].is_object());
+}
+
+#[tokio::test]
+async fn nonbreaking_space_failure_has_structured_minimized_replay() {
+    let code = "def normalize_display_name(value: str) -> str:\n    if value.isspace() and '\\xa0' in value:\n        return value.strip()[0]\n    return value";
+    let report = verify(code, &Language::Python, default_opts(None)).await;
+    let execute = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("execute stage");
+    let findings = execute
+        .detail
+        .as_ref()
+        .and_then(|detail| detail["findings"].as_array())
+        .expect("typed findings");
+    let finding = findings
+        .iter()
+        .find(|finding| finding["location"]["function"] == "normalize_display_name")
+        .expect("NBSP finding");
+    assert_eq!(
+        finding["minimization"]["status"].as_str(),
+        Some("preserved")
+    );
+    assert_eq!(
+        finding["minimization"]["minimized"]["arguments"][0]["expression"].as_str(),
+        Some("'\\xa0'")
+    );
+    assert!(finding["repro"]["snippet"]
+        .as_str()
+        .unwrap()
+        .contains("__COURT_JESTER_REPLAY_JSON__"));
+    assert_eq!(
+        finding["repro"]["expectation"]["category"].as_str(),
+        Some("exception")
+    );
+}
+
+#[tokio::test]
+async fn inferred_oracle_findings_are_advisory_but_directives_are_authoritative() {
+    let inferred = verify(
+        "def normalize_name(value: str) -> str:\n    return value.upper()",
+        &Language::Python,
+        default_opts(None),
+    )
+    .await;
+    let inferred_findings = inferred
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .and_then(|stage| stage.detail.as_ref())
+        .and_then(|detail| detail["findings"].as_array());
+    if let Some(findings) = inferred_findings {
+        for finding in findings {
+            if finding["oracle"]["kind"] == "inferred_semantic" {
+                assert_eq!(finding["confidence"].as_str(), Some("low"));
+                assert_eq!(finding["suppressed"].as_bool(), Some(false));
+            }
+        }
+    }
+    let directive = verify(
+        "# @court-jester-properties sorted\ndef reverse(values: list[int]) -> list[int]:\n    return list(reversed(values))",
+        &Language::Python,
+        default_opts(None),
+    )
+    .await;
+    let findings = directive
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .and_then(|stage| stage.detail.as_ref())
+        .and_then(|detail| detail["findings"].as_array())
+        .expect("directive finding");
+    let sorted = findings
+        .iter()
+        .find(|finding| finding["oracle"]["kind"] == "declared_property")
+        .expect("declared property oracle");
+    assert_eq!(
+        sorted["oracle"]["provenance"].as_str(),
+        Some("source_directive")
+    );
+    assert_eq!(sorted["confidence"].as_str(), Some("authoritative"));
+}
+#[tokio::test]
+async fn base_candidate_divergence_is_advisory_without_authoritative_oracle() {
+    let candidate = "def identity(value: int) -> int:\n    return value + 1";
+    let base = "def identity(value: int) -> int:\n    return value";
+    let mut opts = default_opts(None);
+    opts.base_code = Some(base);
+    let report = verify(candidate, &Language::Python, opts).await;
+    let differential = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "differential");
+    assert!(
+        differential.is_some(),
+        "differential stage should be explicit"
+    );
+    let detail = differential
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("differential detail");
+    assert!(detail["findings"]
+        .as_array()
+        .map(|findings| !findings.is_empty())
+        .unwrap_or(false));
+    assert_eq!(
+        report.verdict,
+        VerificationVerdict::Pass,
+        "unproven divergence is advisory"
+    );
+}
+
+#[tokio::test]
+async fn minimal_output_dir_report_loads_and_replays() {
+    let project = tempfile::tempdir().unwrap();
+    let output = tempfile::tempdir().unwrap();
+    let source = project.path().join("characters.py");
+    let code = "def first_character(value: str) -> str:\n    return value[0]";
+    fs::write(&source, code).unwrap();
+
+    let mut opts = default_opts(None);
+    opts.project_dir = project.path().to_str();
+    opts.source_file = source.to_str();
+    opts.output_dir = output.path().to_str();
+    opts.report_level = ReportLevel::Minimal;
+    let report = verify(code, &Language::Python, opts).await;
+    let report_path = report
+        .report_path
+        .expect("minimal run should persist a report");
+
+    let persisted =
+        load_persisted_report(&report_path).expect("minimal persisted report should load");
+    let finding = persisted
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .and_then(|stage| stage.detail.as_ref())
+        .and_then(|detail| detail["findings"].as_array())
+        .and_then(|findings| {
+            findings
+                .iter()
+                .find(|finding| finding["location"]["function"] == "first_character")
+        })
+        .expect("persisted minimal report should retain the actionable finding");
+    let finding_id = finding["id"].as_str().expect("finding id");
+    assert!(finding["repro"]["command"].as_str().is_some());
+
+    let replay = replay_report(
+        &report_path,
+        finding_id,
+        None,
+        RuntimeProfile::LocalTrusted,
+        DEFAULT_PYTHON_DOCKER_IMAGE,
+        DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+    )
+    .await
+    .expect("persisted minimal finding should be replayable");
+    assert_eq!(replay.outcome, ReplayOutcome::Reproduced, "{replay:#?}");
+}
+
+#[tokio::test]
+async fn differential_full_and_minimal_reports_replay_after_source_projects_are_removed() {
+    let projects = tempfile::tempdir().unwrap();
+    let candidate_project = projects.path().join("candidate");
+    let baseline_project = projects.path().join("baseline");
+    fs::create_dir_all(&candidate_project).unwrap();
+    fs::create_dir_all(&baseline_project).unwrap();
+    let candidate_source = candidate_project.join("entry.py");
+    let baseline_source = baseline_project.join("entry.py");
+    let entry_code =
+        "from helper import OFFSET\n\ndef adjusted(value: int) -> int:\n    return value + OFFSET";
+    fs::write(&candidate_source, entry_code).unwrap();
+    fs::write(candidate_project.join("helper.py"), "OFFSET = 2\n").unwrap();
+    fs::write(&baseline_source, entry_code).unwrap();
+    fs::write(baseline_project.join("helper.py"), "OFFSET = 1\n").unwrap();
+
+    let output = tempfile::tempdir().unwrap();
+    let mut persisted_cases = Vec::new();
+    for (label, report_level) in [
+        ("full", ReportLevel::Full),
+        ("minimal", ReportLevel::Minimal),
+    ] {
+        let case_output = output.path().join(label);
+        let mut opts = default_opts(None);
+        opts.project_dir = candidate_project.to_str();
+        opts.source_file = candidate_source.to_str();
+        opts.base_code = Some(entry_code);
+        opts.base_source_file = baseline_source.to_str();
+        opts.base_project_dir = baseline_project.to_str();
+        opts.output_dir = case_output.to_str();
+        opts.report_level = report_level;
+
+        let report = verify(entry_code, &Language::Python, opts).await;
+        let report_path = report
+            .report_path
+            .expect("differential run should persist a report");
+        let persisted =
+            load_persisted_report(&report_path).expect("differential report should load");
+        let finding_id = persisted
+            .stages
+            .iter()
+            .find(|stage| stage.name == "execute")
+            .and_then(|stage| stage.detail.as_ref())
+            .and_then(|detail| detail["findings"].as_array())
+            .and_then(|findings| {
+                findings
+                    .iter()
+                    .find(|finding| finding["category"] == "differential")
+            })
+            .and_then(|finding| finding["id"].as_str())
+            .expect("persisted report should retain the differential finding")
+            .to_string();
+        persisted_cases.push((report_path, finding_id));
+    }
+
+    fs::remove_dir_all(&candidate_project).unwrap();
+    fs::remove_dir_all(&baseline_project).unwrap();
+    assert!(!candidate_project.exists());
+    assert!(!baseline_project.exists());
+
+    for (report_path, finding_id) in persisted_cases {
+        let replay = replay_report(
+            &report_path,
+            &finding_id,
+            None,
+            RuntimeProfile::LocalTrusted,
+            DEFAULT_PYTHON_DOCKER_IMAGE,
+            DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        )
+        .await
+        .expect("embedded differential report should replay without its original projects");
+        assert_eq!(replay.outcome, ReplayOutcome::Reproduced, "{replay:#?}");
+    }
+}
+
+#[tokio::test]
+async fn incompatible_and_missing_baseline_surfaces_are_disabled_without_differential_findings() {
+    let candidate = "def missing(value: int) -> int:\n    return value\n\ndef changed(value: int, extra: int) -> int:\n    return value + extra";
+    let baseline = "def changed(value: str) -> int:\n    return len(value)";
+    let mut opts = default_opts(None);
+    opts.base_code = Some(baseline);
+
+    let report = verify(candidate, &Language::Python, opts).await;
+
+    let differential = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "differential")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("differential diagnostics");
+    assert!(differential["findings"]
+        .as_array()
+        .is_some_and(Vec::is_empty));
+    let units = differential["comparison"]["units"]
+        .as_array()
+        .expect("per-surface differential diagnostics");
+    assert_eq!(units.len(), 2);
+    let missing = units
+        .iter()
+        .find(|unit| unit["surface"] == "missing:1")
+        .expect("missing baseline diagnostic");
+    assert_eq!(missing["status"].as_str(), Some("disabled"));
+    assert_eq!(missing["reason"].as_str(), Some("missing_base_surface"));
+    let incompatible = units
+        .iter()
+        .find(|unit| unit["surface"] == "changed:4")
+        .expect("incompatible baseline diagnostic");
+    assert_eq!(incompatible["status"].as_str(), Some("disabled"));
+    assert_eq!(
+        incompatible["reason"].as_str(),
+        Some("incompatible_signature")
+    );
+
+    let fabricated = report.stages.iter().any(|stage| {
+        stage
+            .detail
+            .as_ref()
+            .and_then(|detail| detail["findings"].as_array())
+            .is_some_and(|findings| {
+                findings
+                    .iter()
+                    .any(|finding| finding["category"] == "differential")
+            })
+    });
+    assert!(
+        !fabricated,
+        "disabled comparisons must not fabricate divergence findings"
+    );
+}
+
+#[tokio::test]
+async fn tests_only_typescript_unreached_invocable_method_remains_required_and_inconclusive() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("surfaces.ts");
+    let test_source = project.path().join("surfaces.test.ts");
+    let code = "export function increment(value: number): number {\n  return value + 1;\n}\n\nexport class Counter {\n  increment(value: number): number {\n    return value + 1;\n  }\n}\n";
+    let tests = r#"import assert from "node:assert/strict";
+import { Counter, increment } from "./surfaces.ts";
+
+if (false) {
+  assert.equal(new Counter().increment(1), 2);
+}
+assert.equal(increment(1), 2);
+"#;
+    fs::write(&source, code).unwrap();
+    fs::write(&test_source, tests).unwrap();
+
+    let mut opts = default_opts(Some(tests));
+    opts.tests_only = true;
+    opts.project_dir = project.path().to_str();
+    opts.source_file = source.to_str();
+    opts.test_source_file = test_source.to_str();
+
+    let report = verify(code, &Language::TypeScript, opts).await;
+
+    assert_eq!(
+        report.verdict,
+        VerificationVerdict::Inconclusive,
+        "{report:#?}"
+    );
+    assert_eq!(report.strength, VerificationStrength::AuthoritativeTests);
+    assert_eq!(report.summary.coverage.required, 2);
+    assert_eq!(report.summary.coverage.behaviorally_checked, 1);
+
+    let test_detail = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "test")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("passing authoritative test evidence");
+    let entered = test_detail["target_entered_surfaces"]
+        .as_array()
+        .expect("same-process target entry events");
+    assert!(entered.iter().any(|surface| surface == "increment:1"));
+    assert!(!entered
+        .iter()
+        .any(|surface| surface == "Counter#increment:6"));
+
+    let functions = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "coverage")
+        .and_then(|stage| stage.detail.as_ref())
+        .and_then(|detail| detail["functions"].as_array())
+        .expect("per-surface coverage");
+    let top_level = functions
+        .iter()
+        .find(|function| function["function"] == "increment")
+        .expect("top-level function coverage");
+    assert_eq!(
+        top_level["status"].as_str(),
+        Some("checked_via_authoritative_test")
+    );
+    let method = functions
+        .iter()
+        .find(|function| function["function"] == "Counter#increment")
+        .expect("exported invocable method must remain in required coverage");
+    assert_eq!(method["required"].as_bool(), Some(true));
+    assert_ne!(
+        method["status"].as_str(),
+        Some("checked_via_authoritative_test")
+    );
+    assert_eq!(
+        method["reason"].as_str(),
+        Some("authoritative test did not emit the exact target_entered surface id")
+    );
+}
+
+#[tokio::test]
+async fn tests_only_block_bodied_typescript_arrow_emits_exact_surface_and_passes() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("increment.ts");
+    let test_source = project.path().join("increment.test.ts");
+    let code = "export const increment = (value: number): number => {\n  return value + 1;\n};\n";
+    let tests = r#"import assert from "node:assert/strict";
+import { increment } from "./increment.ts";
+
+assert.equal(increment(1), 2);
+"#;
+    fs::write(&source, code).unwrap();
+    fs::write(&test_source, tests).unwrap();
+
+    let mut opts = default_opts(Some(tests));
+    opts.tests_only = true;
+    opts.project_dir = project.path().to_str();
+    opts.source_file = source.to_str();
+    opts.test_source_file = test_source.to_str();
+
+    let report = verify(code, &Language::TypeScript, opts).await;
+
+    assert_eq!(report.verdict, VerificationVerdict::Pass, "{report:#?}");
+    assert_eq!(report.strength, VerificationStrength::AuthoritativeTests);
+    assert_eq!(report.summary.coverage.required, 1);
+    assert_eq!(report.summary.coverage.behaviorally_checked, 1);
+    let test_detail = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "test")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("passing authoritative test evidence");
+    assert_eq!(
+        test_detail["target_entered_surfaces"].as_array(),
+        Some(&vec![serde_json::json!("increment:1")])
+    );
+    let arrow = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "coverage")
+        .and_then(|stage| stage.detail.as_ref())
+        .and_then(|detail| detail["functions"].as_array())
+        .and_then(|functions| {
+            functions
+                .iter()
+                .find(|function| function["function"] == "increment")
+        })
+        .expect("arrow coverage");
+    assert_eq!(
+        arrow["status"].as_str(),
+        Some("checked_via_authoritative_test")
+    );
+}
+
+#[tokio::test]
+async fn exported_factory_shorthand_data_field_is_not_a_required_callable_surface() {
+    let code = r#"export function buildRecord(input: string): { normalized: string } {
+  const normalized = input.trim();
+  return { normalized };
+}
+"#;
+
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+
+    assert_eq!(report.verdict, VerificationVerdict::Pass, "{report:#?}");
+    assert_eq!(report.summary.coverage.required, 1);
+    assert_eq!(report.summary.coverage.behaviorally_checked, 1);
+    let functions = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "coverage")
+        .and_then(|stage| stage.detail.as_ref())
+        .and_then(|detail| detail["functions"].as_array())
+        .expect("per-surface coverage");
+    let factory = functions
+        .iter()
+        .find(|function| function["function"] == "buildRecord")
+        .expect("factory coverage");
+    assert_eq!(factory["status"].as_str(), Some("checked_direct"));
+    assert!(
+        !functions.iter().any(|function| {
+            function["function"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("buildRecord()."))
+        }),
+        "ordinary returned data must not be reported as callable coverage: {functions:#?}"
+    );
+}
+
+#[tokio::test]
+async fn python_differential_keyword_only_parameter_uses_named_binding() {
+    let candidate = "def adjusted(*, value: int) -> int:\n    return value + 1\n";
+    let baseline = "def adjusted(*, value: int) -> int:\n    return value\n";
+    let mut opts = default_opts(None);
+    opts.base_code = Some(baseline);
+
+    let report = verify(candidate, &Language::Python, opts).await;
+
+    let detail = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "differential")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("differential diagnostics");
+    let unit = detail["comparison"]["units"]
+        .as_array()
+        .and_then(|units| units.iter().find(|unit| unit["surface"] == "adjusted:1"))
+        .expect("keyword-only differential unit");
+    assert_eq!(unit["status"].as_str(), Some("different"));
+    let finding = detail["findings"]
+        .as_array()
+        .and_then(|findings| {
+            findings.iter().find(|finding| {
+                finding["location"]["function"] == "adjusted"
+                    && finding["category"] == "differential"
+            })
+        })
+        .expect("valid keyword-only invocation should expose the behavior change");
+    assert_eq!(finding["oracle"]["kind"].as_str(), Some("differential"));
+    let baseline_snapshot: serde_json::Value = serde_json::from_str(
+        finding["oracle"]["expected"]
+            .as_str()
+            .expect("baseline snapshot"),
+    )
+    .unwrap();
+    let candidate_snapshot: serde_json::Value = serde_json::from_str(
+        finding["oracle"]["actual"]
+            .as_str()
+            .expect("candidate snapshot"),
+    )
+    .unwrap();
+    assert_eq!(baseline_snapshot["returned"].as_i64(), Some(0));
+    assert!(baseline_snapshot["exception_type"].is_null());
+    assert_eq!(candidate_snapshot["returned"].as_i64(), Some(1));
+    assert!(candidate_snapshot["exception_type"].is_null());
+}
+
+#[tokio::test]
+async fn identical_address_bearing_differential_returns_are_disabled_not_regressions() {
+    let code = "VALUE = object()\n\ndef fetch(value: int) -> object:\n    return VALUE\n";
+    let mut opts = default_opts(None);
+    opts.base_code = Some(code);
+
+    let report = verify(code, &Language::Python, opts).await;
+
+    let detail = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "differential")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("differential diagnostics");
+    assert!(
+        detail["findings"].as_array().is_some_and(Vec::is_empty),
+        "process-specific object addresses must not become regressions: {detail:#?}"
+    );
+    let unit = detail["comparison"]["units"]
+        .as_array()
+        .and_then(|units| units.iter().find(|unit| unit["surface"] == "fetch:3"))
+        .expect("address-bearing differential unit");
+    assert_eq!(unit["status"].as_str(), Some("disabled"));
+    assert_eq!(
+        unit["reason"].as_str(),
+        Some("unsupported_snapshot:candidate=return_unsupported_type_object;baseline=return_unsupported_type_object")
+    );
+    assert!(!report.stages.iter().any(|stage| {
+        stage
+            .detail
+            .as_ref()
+            .and_then(|detail| detail["findings"].as_array())
+            .is_some_and(|findings| {
+                findings
+                    .iter()
+                    .any(|finding| finding["category"] == "differential")
+            })
+    }));
 }

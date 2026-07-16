@@ -202,6 +202,14 @@ For each cell, the harness does the following:
 8. Decide whether another attempt is allowed and what feedback, if any, the model sees.
 9. Write `run.json`, `result.json`, diffs, and optional trace artifacts.
 
+## Artifact contract and evidence
+
+The benchmark artifact contract is independent of the verifier report contract. Every `matrix.json`, `run.json`, `result.json`, summary, and evidence manifest uses `artifact_schema_version: 1` and requires verifier schema `3`. A cell is normalized to `verifier_observation.outcome: pass|fail|abstain`; provider/setup/gold-patch failures remain operational, while timeouts, missing/mismatched schemas, tool errors, and verifier `inconclusive` results abstain. Abstentions stay in labeled counts and reason rates but are excluded from TP/FN/TN/FP metrics.
+
+`run_matrix` requires a passing schema-v3 `--doctor-report` for every non-dry run and records `--verify-runtime-profile`, resolved runtime/image IDs, and `hidden_seed_sha256`. Pairwise baseline/candidate statistics use the same task/model/repeat key and seed digest; unmatched or operationally ineligible cells are reported rather than silently paired. The shared summarizer emits confusion metrics, SLO rates, paired lift, exact McNemar, and deterministic bootstrap intervals.
+
+Evidence is opt-in via `--evidence-bundle`, with `--evidence-redaction none|transcripts|all-text` (default `transcripts`) and `--strict-evidence`. Bundles contain relative, checksummed artifact paths and never workspaces or hidden files. `--shadow-records` plus summarizer `--shadow-outcomes` provide local, non-blocking outcome linkage; records are artifact-v1 JSONL and shadow mode never changes run success. Legacy artifacts require an explicit allow flag, remain labeled, and are excluded from gates.
+
 That separation is important:
 
 - `verify` is a runtime bug detector and repair trigger

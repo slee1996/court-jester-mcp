@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -363,17 +364,21 @@ class VerifyFeedbackFormattingTest(unittest.TestCase):
                     {
                         "path": "lib/http.ts",
                         "response": {
-                            "overall_ok": False,
+                            "verdict": "inconclusive",
+                            "schema_version": 3,
+                            "strength": "static_checked",
+                            "summary": {},
                             "stages": [
                                 {
                                     "name": "test",
-                                    "ok": False,
+                                    "status": "inconclusive",
+                                    "duration_ms": 1,
                                     "detail": {
                                         "stderr": "Process timed out",
                                         "stdout": "",
                                         "timed_out": True,
                                     },
-                                    "error": "Process timed out",
+                                    "message": "Process timed out",
                                 }
                             ],
                         },
@@ -489,17 +494,21 @@ class AgentTraceEnvIsolationTest(unittest.TestCase):
                     {
                         "path": "lib/http.ts",
                         "response": {
-                            "overall_ok": False,
+                            "verdict": "inconclusive",
+                            "schema_version": 3,
+                            "strength": "static_checked",
+                            "summary": {},
                             "stages": [
                                 {
                                     "name": "test",
-                                    "ok": False,
+                                    "status": "inconclusive",
+                                    "duration_ms": 1,
                                     "detail": {
                                         "stderr": "Process timed out",
                                         "stdout": "",
                                         "timed_out": True,
                                     },
-                                    "error": "Process timed out",
+                                    "message": "Process timed out",
                                 }
                             ],
                         },
@@ -653,16 +662,31 @@ class RepairPolicyTest(unittest.TestCase):
                     {
                         "result": {
                             "parsed": {
-                                "overall_ok": False,
-                                "stages": [{"name": "execute", "ok": False}],
+                                "verdict": "fail",
+                                "schema_version": 3,
+                                "strength": "property_checked",
+                                "summary": {},
+                                "stages": [
+                                    {
+                                        "name": "execute",
+                                        "status": "failed",
+                                        "duration_ms": 1,
+                                        "message": "verification finding",
+                                    }
+                                ],
                             }
                         }
                     },
                     {
                         "result": {
                             "parsed": {
-                                "overall_ok": True,
-                                "stages": [{"name": "execute", "ok": True}],
+                                "verdict": "pass",
+                                "schema_version": 3,
+                                "strength": "property_checked",
+                                "summary": {},
+                                "stages": [
+                                    {"name": "execute", "status": "passed", "duration_ms": 1}
+                                ],
                             }
                         }
                     },
@@ -845,8 +869,13 @@ class RepairPolicyTest(unittest.TestCase):
                     return {
                         "result": {
                             "parsed": {
-                                "overall_ok": True,
-                                "stages": [{"name": "execute", "ok": True}],
+                                "verdict": "pass",
+                                "schema_version": 3,
+                                "strength": "authoritative_tests",
+                                "summary": {},
+                                "stages": [
+                                    {"name": "execute", "status": "passed", "duration_ms": 1}
+                                ],
                             }
                         }
                     }
@@ -1045,8 +1074,13 @@ class RepairPolicyTest(unittest.TestCase):
                     return {
                         "result": {
                             "parsed": {
-                                "overall_ok": True,
-                                "stages": [{"name": "test", "ok": True}],
+                                "verdict": "pass",
+                                "schema_version": 3,
+                                "strength": "authoritative_tests",
+                                "summary": {},
+                                "stages": [
+                                    {"name": "test", "status": "passed", "duration_ms": 1}
+                                ],
                             }
                         }
                     }
@@ -1142,11 +1176,13 @@ class RepairPolicyTest(unittest.TestCase):
 
             self.assertEqual(result["status"], "completed")
             self.assertEqual(result["tool_usage"]["verify_calls"], 1)
-            self.assertTrue(result["attempts"][0]["court_jester"]["verify_failed"])
-            self.assertEqual(
-                result["attempts"][0]["court_jester"]["results"][0]["response"]["stages"][0]["name"],
-                "verify_tool_call",
-            )
+            self.assertTrue(result["attempts"][0]["court_jester"]["verify_inconclusive"])
+            self.assertFalse(result["attempts"][0]["court_jester"]["verify_failed"])
+            tool_result = result["attempts"][0]["court_jester"]["results"][0]
+            self.assertIsNone(tool_result["response"])
+            self.assertEqual(tool_result["tool_error"]["kind"], "error")
+            self.assertEqual(result["verifier_observation"]["outcome"], "abstain")
+            self.assertEqual(result["verifier_observation"]["reason"], "verify_tool_error")
 
 
 class WorkspacePreparationTest(unittest.TestCase):
@@ -1378,5 +1414,276 @@ class GoldPatchReplayTest(unittest.TestCase):
             self.assertEqual(result["changed_files"], ["app.py"])
 
 
+class RunnerArtifactContractTest(unittest.TestCase):
+    def test_verifier_observation_abstains_without_a_valid_completed_v3_report(self) -> None:
+        from bench.runner import verifier_observation
+
+        valid_stage = {"name": "execute", "status": "passed", "duration_ms": 1}
+        cases = [
+            ("verifier_not_run", {}, "verify_not_run", None),
+            ("provider_terminal", {"failure_category": "provider_timeout"}, "provider_timeout", None),
+            (
+                "tool_error",
+                {"court_jester": {"results": [{"path": "app.py", "tool_error": {"kind": "protocol"}}]}},
+                "verify_tool_error",
+                "app.py",
+            ),
+            (
+                "tool_timeout",
+                {"court_jester": {"results": [{"path": "app.py", "tool_error": {"kind": "timeout"}}]}},
+                "verify_tool_timeout",
+                "app.py",
+            ),
+            (
+                "report_missing",
+                {"court_jester": {"results": [{"path": "app.py"}]}},
+                "verify_report_missing",
+                "app.py",
+            ),
+            (
+                "schema_missing",
+                {"court_jester": {"results": [{"path": "app.py", "response": {"verdict": "pass"}}]}},
+                "verify_schema_missing",
+                "app.py",
+            ),
+            (
+                "schema_mismatch",
+                {
+                    "court_jester": {
+                        "results": [
+                            {
+                                "path": "app.py",
+                                "response": {
+                                    "schema_version": 2,
+                                    "verdict": "pass",
+                                    "strength": "property_checked",
+                                    "stages": [valid_stage],
+                                },
+                            }
+                        ]
+                    }
+                },
+                "verify_schema_mismatch",
+                "app.py",
+            ),
+            (
+                "schema_v3_but_invalid_report",
+                {
+                    "court_jester": {
+                        "results": [
+                            {
+                                "path": "app.py",
+                                "response": {
+                                    "schema_version": 3,
+                                    "verdict": "pass",
+                                    "strength": "property_checked",
+                                    "stages": [],
+                                },
+                            }
+                        ]
+                    }
+                },
+                "verify_report_invalid",
+                "app.py",
+            ),
+        ]
+
+        for name, result, expected_reason, expected_path in cases:
+            with self.subTest(name=name):
+                observation = verifier_observation(result)
+                self.assertEqual(observation["outcome"], "abstain")
+                self.assertEqual(observation["reason"], expected_reason)
+                self.assertEqual(observation["failure_path"], expected_path)
+        self.assertEqual(
+            verifier_observation(cases[6][1])["report_schema_version"],
+            2,
+            "the mismatched schema must remain observable without becoming a semantic verdict",
+        )
+
+    def test_report_verdict_rejects_malformed_schema_v3_structure(self) -> None:
+        from bench.runner import report_verdict, verifier_observation
+
+        def valid_report() -> dict[str, object]:
+            return {
+                "schema_version": 3,
+                "verdict": "pass",
+                "strength": "property_checked",
+                "summary": {},
+                "stages": [{"name": "execute", "status": "passed", "duration_ms": 1}],
+            }
+
+        malformed_reports: list[tuple[str, dict[str, object]]] = []
+
+        empty_stage = valid_report()
+        empty_stage["stages"] = [{}]
+        malformed_reports.append(("empty_stage", empty_stage))
+
+        invalid_status = valid_report()
+        invalid_status["stages"] = [
+            {"name": "execute", "status": "success", "duration_ms": 1}
+        ]
+        malformed_reports.append(("invalid_status", invalid_status))
+
+        bool_duration = valid_report()
+        bool_duration["stages"] = [
+            {"name": "execute", "status": "passed", "duration_ms": True}
+        ]
+        malformed_reports.append(("bool_duration", bool_duration))
+
+        negative_duration = valid_report()
+        negative_duration["stages"] = [
+            {"name": "execute", "status": "passed", "duration_ms": -1}
+        ]
+        malformed_reports.append(("negative_duration", negative_duration))
+
+        missing_summary = valid_report()
+        del missing_summary["summary"]
+        malformed_reports.append(("missing_summary", missing_summary))
+
+        for name, report in malformed_reports:
+            with self.subTest(name=name):
+                self.assertIsNone(report_verdict(report))
+                observation = verifier_observation(
+                    {
+                        "court_jester": {
+                            "results": [{"path": "app.py", "response": report}]
+                        }
+                    }
+                )
+                self.assertEqual(observation["outcome"], "abstain")
+                self.assertEqual(observation["reason"], "verify_report_invalid")
+                self.assertEqual(observation["failure_path"], "app.py")
+                self.assertEqual(observation["report_schema_version"], 3)
+
+    def test_verifier_observation_fail_dominates_inconclusive_reports(self) -> None:
+        from bench.runner import verifier_observation
+
+        def report(verdict: str, status: str) -> dict[str, object]:
+            return {
+                "schema_version": 3,
+                "verdict": verdict,
+                "strength": "property_checked",
+                "summary": {},
+                "stages": [{"name": "execute", "status": status, "duration_ms": 1}],
+            }
+
+        observation = verifier_observation(
+            {
+                "court_jester": {
+                    "results": [
+                        {
+                            "path": "uncertain.py",
+                            "response": report("inconclusive", "inconclusive"),
+                        },
+                        {
+                            "path": "broken.py",
+                            "response": report("fail", "failed"),
+                        },
+                    ]
+                }
+            }
+        )
+
+        self.assertEqual(observation["outcome"], "fail")
+        self.assertEqual(observation["reason"], "stage_failure")
+        self.assertEqual(observation["failure_stage"], "execute")
+        self.assertEqual(observation["failure_path"], "broken.py")
+        self.assertEqual(observation["report_schema_version"], 3)
+
+
+    def test_run_single_dry_run_persists_v1_metadata_and_hidden_seed_digest(self) -> None:
+        task = load_task(BENCH_ROOT / "tasks" / "py-billing-country-fallback.json")
+        model = load_model(BENCH_ROOT / "models" / "noop.json")
+        policy = PolicyManifest(id="baseline", title="Baseline", description="", court_jester_mode="none")
+        with tempfile.TemporaryDirectory() as directory:
+            result = run_single(task, model, policy, Path(directory), dry_run=True, hidden_seed="secret-seed")
+            self.assertEqual(result["artifact_schema_version"], 1)
+            self.assertEqual(result["verify_schema_version_required"], 3)
+            self.assertEqual(result["verifier_observation"]["outcome"], "abstain")
+            self.assertNotIn("secret-seed", json.dumps(result, sort_keys=True))
+            result_path = next(Path(directory).glob("*/result.json"))
+            run_path = next(Path(directory).glob("*/run.json"))
+            self.assertEqual(json.loads(result_path.read_text())["hidden_seed_sha256"], result["hidden_seed_sha256"])
+            self.assertEqual(json.loads(run_path.read_text())["verify_schema_version_required"], 3)
+
+    def test_shadow_record_requires_existing_parent_and_emits_non_blocking_record(self) -> None:
+        from bench.runner import append_shadow_record
+
+        result = {"run_id": "run-1", "attempt_count": 1, "verify_path": "app.py", "dry_run": True}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "shadow.jsonl"
+            append_shadow_record(path, result, patch_digest="patch")
+            record = json.loads(path.read_text().strip())
+            self.assertEqual(record["artifact_schema_version"], 1)
+            self.assertEqual(record["verify_schema_version_required"], 3)
+            self.assertEqual(record["blocking_mode"], "shadow")
+            self.assertEqual(record["verifier_observation"]["outcome"], "abstain")
+        with self.assertRaises(FileNotFoundError):
+            append_shadow_record(Path(directory) / "missing" / "shadow.jsonl", result)
+
+    def test_early_terminal_runs_append_exactly_one_shadow_record(self) -> None:
+        class FailedProvider:
+            supports_repair = False
+
+            def apply(
+                self,
+                workspace: Path,
+                task: TaskManifest,
+                *,
+                feedback: str | None = None,
+                attempt: int = 0,
+                history: list[dict[str, object]] | None = None,
+                env_overrides: dict[str, str] | None = None,
+            ) -> ProviderResult:
+                return ProviderResult(failed=True, failure_reason="provider unavailable")
+
+        cases = [
+            ("setup", False, False, "setup_error"),
+            ("provider", True, False, "provider_error"),
+            ("gold", True, True, "gold_patch_apply_error"),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bench_root = root / "bench"
+            (bench_root / "repos").mkdir(parents=True)
+            for name, fixture_exists, use_gold, expected_reason in cases:
+                with self.subTest(path=name):
+                    fixture_name = f"fixture-{name}"
+                    if fixture_exists:
+                        fixture = bench_root / "repos" / fixture_name
+                        fixture.mkdir()
+                        (fixture / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+                    task = TaskManifest(
+                        id=f"terminal-{name}",
+                        title="",
+                        repo_fixture=fixture_name,
+                        prompt="",
+                        language="python",
+                        bucket="test",
+                        verify_paths=["app.py"],
+                    )
+                    model = ModelManifest(id="fake", title="", provider="fake")
+                    policy = PolicyManifest(id="baseline", title="", description="", court_jester_mode="none")
+                    shadow_path = root / f"shadow-{name}.jsonl"
+                    with (
+                        mock.patch("bench.runner.BENCH_ROOT", bench_root),
+                        mock.patch("bench.runner.provider_from_manifest", return_value=FailedProvider()),
+                    ):
+                        result = run_single(
+                            task,
+                            model,
+                            policy,
+                            root / f"output-{name}",
+                            use_task_gold_patches=use_gold,
+                            shadow_records=shadow_path,
+                        )
+
+                    records = [json.loads(line) for line in shadow_path.read_text(encoding="utf-8").splitlines()]
+                    self.assertEqual(len(records), 1)
+                    self.assertEqual(records[0]["run_id"], result["run_id"])
+                    self.assertEqual(records[0]["verifier_observation"]["outcome"], "abstain")
+                    self.assertEqual(records[0]["verifier_observation"]["reason"], expected_reason)
+                    persisted = list((root / f"output-{name}").glob("*/result.json"))
+                    self.assertEqual(len(persisted), 1)
 if __name__ == "__main__":
     unittest.main()

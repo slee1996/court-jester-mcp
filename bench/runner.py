@@ -12,17 +12,138 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 from .agent_trace import prepare_agent_trace, summarize_agent_trace
 from .cli_client import CourtJesterClient
-from .common import BENCH_ROOT, REPO_ROOT, ModelManifest, PolicyManifest, TaskManifest, load_model, slugify
 from .providers import ProviderResult, provider_from_manifest
+from .common import (
+    ARTIFACT_SCHEMA_VERSION,
+    VERIFY_SCHEMA_VERSION_REQUIRED,
+    BENCH_ROOT,
+    REPO_ROOT,
+    ModelManifest,
+    PolicyManifest,
+    TaskManifest,
+    load_model,
+    slugify,
+    sha256_bytes,
+)
 
 
 PROVIDER_RETRYABLE_KINDS = {"capacity_busy", "internal_server_error", "transport_error"}
 DEFAULT_AGENT_TRACE_EVENT_OVERHEAD_MS = 20.0
+_SHADOW_RECORD_LOCK = Lock()
 
+
+def report_schema_version(report: Any) -> int | None:
+    if not isinstance(report, dict):
+        return None
+    version = report.get("schema_version")
+    return version if isinstance(version, int) else None
+
+
+def report_verdict(report: Any) -> str | None:
+    """Return a verdict only from a structurally valid schema-v3 report."""
+    if report_schema_version(report) != VERIFY_SCHEMA_VERSION_REQUIRED:
+        return None
+
+    verdict = report.get("verdict")
+    strength = report.get("strength")
+    stages = report.get("stages")
+    summary = report.get("summary")
+    if not isinstance(verdict, str) or verdict not in {"pass", "fail", "inconclusive"}:
+        return None
+    if not isinstance(strength, str) or strength not in {
+        "none",
+        "parse_only",
+        "static_checked",
+        "runtime_smoke",
+        "property_checked",
+        "authoritative_tests",
+    }:
+        return None
+    if not isinstance(summary, dict):
+        return None
+    if not isinstance(stages, list) or not stages:
+        return None
+    for stage in stages:
+        if not isinstance(stage, dict):
+            return None
+        name = stage.get("name")
+        status = stage.get("status")
+        duration_ms = stage.get("duration_ms")
+        if not isinstance(name, str) or not name.strip():
+            return None
+        if not isinstance(status, str) or status not in {
+            "passed",
+            "failed",
+            "inconclusive",
+            "advisory",
+            "skipped",
+        }:
+            return None
+        if isinstance(duration_ms, bool) or not isinstance(duration_ms, int) or duration_ms < 0:
+            return None
+    return verdict
+
+
+def report_is_failed(report: Any) -> bool:
+    return report_verdict(report) == "fail"
+
+
+def report_is_inconclusive(report: Any) -> bool:
+    return report_verdict(report) == "inconclusive"
+
+
+def stage_status(stage: Any) -> str | None:
+    if not isinstance(stage, dict):
+        return None
+    status = stage.get("status")
+    if not isinstance(status, str):
+        return None
+    return status if status in {"passed", "failed", "inconclusive", "advisory", "skipped"} else None
+
+
+def stage_is_failed(stage: Any) -> bool:
+    return stage_status(stage) == "failed"
+
+
+def stage_message(stage: Any) -> str:
+    if not isinstance(stage, dict):
+        return ""
+    return str(stage.get("message") or "")
+
+
+def stage_findings(stage: Any) -> list[dict[str, Any]]:
+    if not isinstance(stage, dict):
+        return []
+    detail = stage.get("detail")
+    findings = detail.get("findings") if isinstance(detail, dict) else None
+    return [finding for finding in findings if isinstance(finding, dict)] if isinstance(findings, list) else []
+
+
+def finding_function(finding: dict[str, Any]) -> str:
+    location = finding.get("location")
+    if isinstance(location, dict) and location.get("function"):
+        return str(location["function"])
+    return str(finding.get("function") or "")
+
+
+def finding_input(finding: dict[str, Any]) -> str:
+    repro = finding.get("repro")
+    if isinstance(repro, dict):
+        if repro.get("snippet"):
+            return str(repro["snippet"])
+        arguments = repro.get("arguments")
+        if arguments:
+            return str(arguments)
+    return str(finding.get("input") or "")
+
+
+def finding_message(finding: dict[str, Any]) -> str:
+    return str(finding.get("message") or finding.get("error_type") or "")
 
 @dataclass(slots=True)
 class CommandResult:
@@ -113,7 +234,14 @@ def run_single(
     repeat_count: int = 1,
     hidden_seed: str | None = None,
     use_task_gold_patches: bool = False,
+    verify_runtime_profile: str = "local-trusted",
+    python_docker_image: str = "python:3.12-slim",
+    typescript_docker_image: str = "node:24-bookworm-slim",
+    doctor_report: dict[str, Any] | None = None,
+    shadow_records: Path | None = None,
 ) -> dict[str, Any]:
+    hidden_seed = hidden_seed or hashlib.sha256(f"{task.id}::{model.id}::{repeat_index}".encode("utf-8")).hexdigest()
+    hidden_seed_sha256 = sha256_bytes(hidden_seed.encode("utf-8"))
     started_at_ms = int(time.time() * 1000)
     run_id = (
         f"{slugify(task.id)}__{slugify(model.id)}__{slugify(policy.id)}"
@@ -123,9 +251,6 @@ def run_single(
     workspace = run_dir / "workspace"
     run_dir.mkdir(parents=True, exist_ok=True)
     fixture = BENCH_ROOT / "repos" / task.repo_fixture
-    if not fixture.exists():
-        raise FileNotFoundError(f"Task fixture not found: {fixture}")
-    shutil.copytree(fixture, workspace)
 
     result: dict[str, Any] = {
         "run_id": run_id,
@@ -157,6 +282,12 @@ def run_single(
         "repeat_count": repeat_count,
         "dry_run": dry_run,
         "task_gold_patch_mode": use_task_gold_patches,
+        "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+        "verify_schema_version_required": VERIFY_SCHEMA_VERSION_REQUIRED,
+        "verify_runtime_profile": verify_runtime_profile,
+        "runtime_images": {"python": python_docker_image, "typescript": typescript_docker_image},
+        "doctor_report": doctor_report,
+        "hidden_seed_sha256": hidden_seed_sha256,
         "timestamps": {"started_at_epoch_ms": int(time.time() * 1000)},
         "provider": {
             "id": model.provider,
@@ -201,21 +332,42 @@ def run_single(
             "dry_run": dry_run,
             "status": "running",
             "task_gold_patch_mode": use_task_gold_patches,
+            "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+            "verify_schema_version_required": VERIFY_SCHEMA_VERSION_REQUIRED,
+            "verify_runtime_profile": verify_runtime_profile,
+            "runtime_images": {"python": python_docker_image, "typescript": typescript_docker_image},
+            "doctor_report_sha256": sha256_bytes(json.dumps(doctor_report, sort_keys=True).encode("utf-8")) if doctor_report else None,
+            "hidden_seed_sha256": hidden_seed_sha256,
             "timestamps": {"started_at_epoch_ms": started_at_ms},
         },
     )
-
+    if not fixture.exists():
+        result["status"] = "setup_error"
+        result["success"] = False
+        result["failure_category"] = "setup_error"
+        result["failure_details"] = {"failure_reason": f"Task fixture not found: {fixture}"}
+        return finish_run_result(run_dir, result, shadow_records)
+    try:
+        shutil.copytree(fixture, workspace)
+    except OSError as exc:
+        result["status"] = "setup_error"
+        result["success"] = False
+        result["failure_category"] = "setup_error"
+        result["failure_details"] = {"failure_reason": f"Failed to copy task fixture: {exc}"}
+        return finish_run_result(run_dir, result, shadow_records)
     if dry_run:
         result["status"] = "dry_run"
-        write_json(run_dir / "result.json", result)
-        return result
+        return finish_run_result(run_dir, result, shadow_records)
 
-    hidden_seed = hidden_seed or hashlib.sha256(
-        f"{task.id}::{model.id}::{policy.id}::{repeat_index}".encode("utf-8")
-    ).hexdigest()
-    (run_dir / "hidden_seed.txt").write_text(hidden_seed + "\n")
 
-    setup_result = prepare_workspace_for_run(task, workspace, run_dir)
+    try:
+        setup_result = prepare_workspace_for_run(task, workspace, run_dir)
+    except Exception as exc:
+        result["status"] = "setup_error"
+        result["success"] = False
+        result["failure_category"] = "setup_error"
+        result["failure_details"] = {"failure_reason": f"Workspace setup raised {type(exc).__name__}: {exc}"}
+        return finish_run_result(run_dir, result, shadow_records)
     result["setup"] = serialize_setup_result(setup_result)
     result["timings"]["setup_ms"] = setup_result.duration_ms
     if not setup_result.success:
@@ -227,12 +379,17 @@ def run_single(
             "cache_hit": setup_result.cache_hit,
             "cache_dir": setup_result.cache_dir,
         }
-        finalize_result(result)
-        write_json(run_dir / "result.json", result)
-        return result
+        return finish_run_result(run_dir, result, shadow_records)
 
     before = snapshot_tree(workspace)
-    provider = provider_from_manifest(model)
+    try:
+        provider = provider_from_manifest(model)
+    except Exception as exc:
+        result["status"] = "provider_error"
+        result["success"] = False
+        result["failure_category"] = "provider_error"
+        result["failure_details"] = {"failure_reason": f"Provider initialization raised {type(exc).__name__}: {exc}"}
+        return finish_run_result(run_dir, result, shadow_records)
     attempts: list[dict[str, Any]] = []
     provider_result = None
     court_jester_results: list[dict[str, Any]] = []
@@ -280,7 +437,13 @@ def run_single(
             }
         if use_task_gold_patches:
             provider_started = time.time()
-            provider_result, gold_patch_command = apply_task_gold_patch(task, workspace, run_dir, attempt)
+            try:
+                provider_result, gold_patch_command = apply_task_gold_patch(task, workspace, run_dir, attempt)
+            except Exception as exc:
+                provider_result = ProviderResult(
+                    failed=True,
+                    failure_reason=f"Gold patch application raised {type(exc).__name__}: {exc}",
+                )
             provider_apply_ms = int((time.time() - provider_started) * 1000)
             provider_call_count = 1
         else:
@@ -290,14 +453,20 @@ def run_single(
                 if max_provider_retries > 0 and provider_call_count <= max_provider_retries:
                     snapshot_workspace_for_retry(workspace, backup_dir)
                 provider_started = time.time()
-                provider_candidate = provider.apply(
-                    workspace,
-                    task,
-                    feedback=feedback,
-                    attempt=attempt,
-                    history=attempt_history if policy.replay_attempt_history else None,
-                    env_overrides=trace_environment.env_updates if trace_environment is not None else None,
-                )
+                try:
+                    provider_candidate = provider.apply(
+                        workspace,
+                        task,
+                        feedback=feedback,
+                        attempt=attempt,
+                        history=attempt_history if policy.replay_attempt_history else None,
+                        env_overrides=trace_environment.env_updates if trace_environment is not None else None,
+                    )
+                except Exception as exc:
+                    provider_candidate = ProviderResult(
+                        failed=True,
+                        failure_reason=f"Provider execution raised {type(exc).__name__}: {exc}",
+                    )
                 provider_apply_ms += int((time.time() - provider_started) * 1000)
                 provider_call_count += 1
                 provider_error_kind = (
@@ -392,6 +561,7 @@ def run_single(
             attempt_record["court_jester"] = {
                 "results": [],
                 "verify_failed": False,
+                "verify_inconclusive": False,
                 "total_ms": 0,
                 "skipped": True,
             }
@@ -424,6 +594,7 @@ def run_single(
 
         attempt_cj_results: list[dict[str, Any]] = []
         verify_failed = False
+        verify_inconclusive = False
         attempt_cj_total_ms = 0
         if policy.court_jester_mode != "none":
             verify_output_dir = run_dir / "court_jester"
@@ -437,6 +608,9 @@ def run_single(
                     }
                     if task.verify_tests_only:
                         arguments["tests_only"] = True
+                    arguments["runtime_profile"] = verify_runtime_profile
+                    arguments["python_docker_image"] = python_docker_image
+                    arguments["typescript_docker_image"] = typescript_docker_image
                     materialized_verify_paths: list[Path] = []
                     if task.verify_tests_only:
                         if promoted_verify_test_path is not None:
@@ -472,21 +646,13 @@ def run_single(
                                 "path": rel_path,
                                 "tool_name": "verify",
                                 "duration_ms": 120000,
-                                "response": {
-                                    "overall_ok": False,
-                                    "stages": [
-                                        {
-                                            "name": "verify_tool_call",
-                                            "ok": False,
-                                            "error": str(exc),
-                                        }
-                                    ],
-                                },
+                                "response": None,
+                                "tool_error": {"kind": "timeout", "message": str(exc)},
                             }
                         )
                         result["tool_usage"]["verify_calls"] += 1
                         attempt_cj_total_ms += 120000
-                        verify_failed = True
+                        verify_inconclusive = True
                         cleanup_materialized_paths(materialized_verify_paths)
                         break
                     except Exception as exc:
@@ -496,26 +662,22 @@ def run_single(
                                 "path": rel_path,
                                 "tool_name": "verify",
                                 "duration_ms": tool_duration_ms,
-                                "response": {
-                                    "overall_ok": False,
-                                    "stages": [
-                                        {
-                                            "name": "verify_tool_call",
-                                            "ok": False,
-                                            "error": str(exc),
-                                        }
-                                    ],
-                                },
+                                "response": None,
+                                "tool_error": {"kind": "error", "message": str(exc)},
                             }
                         )
                         result["tool_usage"]["verify_calls"] += 1
                         attempt_cj_total_ms += tool_duration_ms
-                        verify_failed = True
+                        verify_inconclusive = True
                         cleanup_materialized_paths(materialized_verify_paths)
                         break
                     finally:
                         cleanup_materialized_paths(materialized_verify_paths)
-                    parsed = response["result"].get("parsed")
+                    parsed = None
+                    if isinstance(response, dict):
+                        result_payload = response.get("result")
+                        if isinstance(result_payload, dict):
+                            parsed = result_payload.get("parsed")
                     item = {
                         "path": rel_path,
                         "tool_name": "verify",
@@ -525,11 +687,16 @@ def run_single(
                     attempt_cj_results.append(item)
                     result["tool_usage"]["verify_calls"] += 1
                     attempt_cj_total_ms += tool_duration_ms
-                    if isinstance(parsed, dict) and not parsed.get("overall_ok", False):
+                    if report_verdict(parsed) is None:
+                        verify_inconclusive = True
+                    if report_is_failed(parsed):
                         verify_failed = True
+                    elif report_is_inconclusive(parsed):
+                        verify_inconclusive = True
         attempt_record["court_jester"] = {
             "results": attempt_cj_results,
             "verify_failed": verify_failed,
+            "verify_inconclusive": verify_inconclusive,
             "total_ms": attempt_cj_total_ms,
         }
         result["timings"]["court_jester_total_ms"] += attempt_cj_total_ms
@@ -706,9 +873,7 @@ def run_single(
         result["repair_feedback_style"] = prior_repair_feedback_style
         result["repair_feedback_styles"] = prior_repair_feedback_styles
         result["failure_provenance"] = prior_repair_trigger_sources
-        finalize_result(result)
-        write_json(run_dir / "result.json", result)
-        return result
+        return finish_run_result(run_dir, result, shadow_records)
     if provider_result.failed:
         if use_task_gold_patches:
             result["status"] = "gold_patch_apply_error"
@@ -726,9 +891,7 @@ def run_single(
             result["repair_feedback_style"] = prior_repair_feedback_style
             result["repair_feedback_styles"] = prior_repair_feedback_styles
             result["failure_provenance"] = prior_repair_trigger_sources + ["gold_patch"]
-            finalize_result(result)
-            write_json(run_dir / "result.json", result)
-            return result
+            return finish_run_result(run_dir, result, shadow_records)
         provider_error_kind = classify_provider_failure(provider_result)
         result["status"] = "provider_auth_error" if provider_error_kind == "auth_required" else "provider_error"
         result["provider_error_kind"] = provider_error_kind
@@ -758,9 +921,7 @@ def run_single(
         result["repair_feedback_style"] = prior_repair_feedback_style
         result["repair_feedback_styles"] = prior_repair_feedback_styles
         result["failure_provenance"] = prior_repair_trigger_sources + ["provider"]
-        finalize_result(result)
-        write_json(run_dir / "result.json", result)
-        return result
+        return finish_run_result(run_dir, result, shadow_records)
 
     after = snapshot_tree(workspace)
     changed_files = sorted(compute_changed_files(before, after))
@@ -774,6 +935,7 @@ def run_single(
         "mode": policy.court_jester_mode,
         "results": court_jester_results,
         "verify_failed": attempts[-1].get("court_jester", {}).get("verify_failed", False),
+        "verify_inconclusive": attempts[-1].get("court_jester", {}).get("verify_inconclusive", False),
     }
 
     public_results = final_public_results
@@ -804,7 +966,8 @@ def run_single(
 
     hidden_ok = all(item.exit_code == 0 for item in hidden_results) if hidden_results else True
     verify_failed = attempts[-1].get("court_jester", {}).get("verify_failed", False)
-    verify_gate_ok = not (policy.block_on_failed_verify and verify_failed)
+    verify_inconclusive = attempts[-1].get("court_jester", {}).get("verify_inconclusive", False)
+    verify_gate_ok = not (policy.block_on_failed_verify and (verify_failed or verify_inconclusive))
     success = public_ok and hidden_ok and verify_gate_ok
     attempt_count = len(attempts)
     verify_failed_attempts = sum(
@@ -850,6 +1013,7 @@ def run_single(
     result["hidden_checks_skipped"] = hidden_checks_requested and not hidden_checks_ran
     result["hidden_checks_sampled_on_public_failure"] = hidden_checks_sampled
     result["verify_failed"] = verify_failed
+    result["verify_inconclusive"] = verify_inconclusive
     result["public_failed"] = not public_ok
     result["hidden_failed"] = hidden_failed
     result["success"] = success
@@ -882,9 +1046,8 @@ def run_single(
     result["failure_category"] = failure_category
     result["failure_details"] = failure_details
     result["status"] = "completed"
-    finalize_result(result)
-    write_json(run_dir / "result.json", result)
-    return result
+    patch_digest = sha256_bytes(diff_text.encode("utf-8"))
+    return finish_run_result(run_dir, result, shadow_records, patch_digest=patch_digest)
 
 
 def run_commands(
@@ -1183,7 +1346,23 @@ def infer_changed_files_from_patch(patch_text: str) -> list[str]:
     return changed
 
 
+def finish_run_result(
+    run_dir: Path,
+    result: dict[str, Any],
+    shadow_records: Path | None,
+    *,
+    patch_digest: str = "",
+) -> dict[str, Any]:
+    """Finalize, persist, and shadow-record one terminal run exactly once."""
+
+    finalize_result(result)
+    write_json(run_dir / "result.json", result)
+    append_shadow_record(shadow_records, result, patch_digest=patch_digest)
+    return result
+
+
 def finalize_result(result: dict[str, Any]) -> None:
+    result.setdefault("verifier_observation", verifier_observation(result))
     finished_at_ms = int(time.time() * 1000)
     result["timestamps"]["finished_at_epoch_ms"] = finished_at_ms
     started_at_ms = int(result["timestamps"].get("started_at_epoch_ms", finished_at_ms))
@@ -1315,6 +1494,8 @@ def classify_outcome(
         "verify_failure_path": verify_failure_path,
     }
 
+    if verify_failure_kind == "inconclusive":
+        return "verify_inconclusive", details
     if verify_failed:
         if verify_failure_kind == "timeout":
             return "verify_infra_timeout", details
@@ -1336,40 +1517,53 @@ def classify_outcome(
 def classify_verify_failure(
     verify_results: list[dict[str, Any]],
 ) -> tuple[str | None, str | None, str | None]:
+    first_inconclusive_path: str | None = None
+    saw_inconclusive = False
     for item in verify_results:
         parsed = item.get("response")
         if not isinstance(parsed, dict):
             continue
-        if parsed.get("overall_ok", False):
+        verdict = report_verdict(parsed)
+        if verdict == "inconclusive":
+            saw_inconclusive = True
+            if first_inconclusive_path is None:
+                first_inconclusive_path = item.get("path")
             continue
-        for stage in parsed.get("stages", []):
-            if stage.get("ok", True):
+        if verdict != "fail":
+            continue
+        for stage in parsed["stages"]:
+            if not stage_is_failed(stage):
                 continue
             detail = stage.get("detail") if isinstance(stage.get("detail"), dict) else {}
-            error = (stage.get("error") or "").lower()
+            message = stage_message(stage).lower()
             stdout = str(detail.get("stdout", "")).lower()
             stderr = str(detail.get("stderr", "")).lower()
-            haystack = "\n".join([error, stdout, stderr])
+            haystack = "\n".join([message, stdout, stderr])
             if "timed out" in haystack:
-                return "timeout", stage.get("name"), item.get("path")
-            return "stage_failure", stage.get("name"), item.get("path")
-        return "overall_failure", None, item.get("path")
+                return "timeout", stage["name"], item.get("path")
+            return "stage_failure", stage["name"], item.get("path")
+        return "report_failure", None, item.get("path")
+    if saw_inconclusive:
+        return "inconclusive", None, first_inconclusive_path
     return None, None, None
-
 
 def summarize_verify_results(verify_results: list[dict[str, Any]]) -> dict[str, Any]:
     failed_paths: list[str] = []
+    inconclusive_paths: list[str] = []
     failed_stages: dict[str, int] = {}
     stage_durations_ms: dict[str, int] = {}
-    fuzz_failure_count = 0
+    finding_count = 0
 
     for item in verify_results:
         parsed = item.get("response")
         path = item.get("path")
         if not isinstance(parsed, dict):
             continue
-        if not parsed.get("overall_ok", False) and isinstance(path, str):
+        verdict = report_verdict(parsed)
+        if verdict == "fail" and isinstance(path, str):
             failed_paths.append(path)
+        elif verdict == "inconclusive" and isinstance(path, str):
+            inconclusive_paths.append(path)
         for stage in parsed.get("stages", []):
             if not isinstance(stage, dict):
                 continue
@@ -1380,20 +1574,115 @@ def summarize_verify_results(verify_results: list[dict[str, Any]]) -> dict[str, 
                 )
             except (TypeError, ValueError):
                 pass
-            if not stage.get("ok", True):
+            if stage_is_failed(stage):
                 failed_stages[stage_name] = failed_stages.get(stage_name, 0) + 1
-            detail = stage.get("detail")
-            if isinstance(detail, dict):
-                fuzz_failures = detail.get("fuzz_failures")
-                if isinstance(fuzz_failures, list):
-                    fuzz_failure_count += len(fuzz_failures)
+            finding_count += len(stage_findings(stage))
 
     return {
         "failed_paths": failed_paths,
+        "inconclusive_paths": inconclusive_paths,
         "failed_stage_counts": failed_stages,
         "stage_durations_ms": stage_durations_ms,
-        "fuzz_failure_count": fuzz_failure_count,
+        "finding_count": finding_count,
     }
+def _observation(
+    outcome: str,
+    reason: str,
+    *,
+    failure_stage: str | None = None,
+    failure_path: str | None = None,
+    report_schema_version: int | None = None,
+) -> dict[str, Any]:
+    return {
+        "outcome": outcome,
+        "reason": reason,
+        "failure_stage": failure_stage,
+        "failure_path": failure_path,
+        "report_schema_version": report_schema_version,
+    }
+
+
+def verifier_observation(result: dict[str, Any]) -> dict[str, Any]:
+    if result.get("dry_run"):
+        return _observation("abstain", "dry_run")
+
+    failure_category = result.get("failure_category")
+    if isinstance(failure_category, str) and (
+        failure_category.startswith("provider_")
+        or failure_category in {"setup_error", "gold_patch_apply_error"}
+    ):
+        return _observation("abstain", failure_category)
+
+    court_jester = result.get("court_jester")
+    verify_results = court_jester.get("results") if isinstance(court_jester, dict) else None
+    if not isinstance(verify_results, list) or not verify_results:
+        return _observation("abstain", "verify_not_run")
+
+    valid_reports: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for item in verify_results:
+        if not isinstance(item, dict):
+            return _observation("abstain", "verify_tool_error")
+        path = item.get("path") if isinstance(item.get("path"), str) else None
+        tool_error = item.get("tool_error")
+        if isinstance(tool_error, dict):
+            kind = tool_error.get("kind")
+            reason = "verify_tool_timeout" if kind == "timeout" else "verify_tool_error"
+            return _observation("abstain", reason, failure_path=path)
+        report = item.get("response")
+        if not isinstance(report, dict):
+            return _observation("abstain", "verify_report_missing", failure_path=path)
+        schema_version = report_schema_version(report)
+        if schema_version is None:
+            return _observation("abstain", "verify_schema_missing", failure_path=path)
+        if schema_version != VERIFY_SCHEMA_VERSION_REQUIRED:
+            return _observation(
+                "abstain",
+                "verify_schema_mismatch",
+                failure_path=path,
+                report_schema_version=schema_version,
+            )
+        if report_verdict(report) is None:
+            return _observation(
+                "abstain",
+                "verify_report_invalid",
+                failure_path=path,
+                report_schema_version=schema_version,
+            )
+        valid_reports.append((item, report))
+
+    failure_kind, failure_stage, failure_path = classify_verify_failure(verify_results)
+    if any(report_verdict(report) == "fail" for _, report in valid_reports):
+        return _observation(
+            "fail",
+            failure_kind or "verify_failed",
+            failure_stage=failure_stage,
+            failure_path=failure_path,
+            report_schema_version=VERIFY_SCHEMA_VERSION_REQUIRED,
+        )
+    for item, report in valid_reports:
+        if report_verdict(report) == "inconclusive":
+            return _observation(
+                "abstain",
+                "verify_inconclusive",
+                failure_path=item.get("path"),
+                report_schema_version=VERIFY_SCHEMA_VERSION_REQUIRED,
+            )
+    return _observation(
+        "pass",
+        "verify_passed",
+        report_schema_version=VERIFY_SCHEMA_VERSION_REQUIRED,
+    )
+
+def append_shadow_record(path: Path | None, result: dict[str, Any], *, patch_digest: str = "") -> None:
+    if path is None:
+        return
+    if not path.parent.exists():
+        raise FileNotFoundError(f"shadow records parent does not exist: {path.parent}")
+    key_material = "|".join(str(result.get(field, "")) for field in ("run_id", "attempt_count", "verify_path")) + "|" + patch_digest
+    record = {"artifact_schema_version": ARTIFACT_SCHEMA_VERSION, "verify_schema_version_required": VERIFY_SCHEMA_VERSION_REQUIRED, "key": sha256_bytes(key_material.encode("utf-8")), "run_id": result.get("run_id"), "attempt": result.get("attempt_count", 0), "verifier_observation": result.get("verifier_observation") or verifier_observation(result), "blocking_mode": "shadow"}
+    with _SHADOW_RECORD_LOCK:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
 
 
 def is_text_file(path: Path) -> bool:
@@ -1440,6 +1729,8 @@ def normalize_for_json(value: Any) -> Any:
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
+    payload.setdefault("artifact_schema_version", ARTIFACT_SCHEMA_VERSION)
+    payload.setdefault("verify_schema_version_required", VERIFY_SCHEMA_VERSION_REQUIRED)
     path.write_text(json.dumps(normalize_for_json(payload), indent=2, sort_keys=True) + "\n")
 
 
@@ -1628,7 +1919,7 @@ def format_verify_feedback(
             lines.append(f"- {item}")
     for item in items:
         response = item.get("response")
-        if not isinstance(response, dict) or response.get("overall_ok", False):
+        if not isinstance(response, dict) or report_verdict(response) not in {"fail", "inconclusive"}:
             continue
         for scope_line in verify_feedback_scope_lines(
             item,
@@ -1646,24 +1937,22 @@ def collect_promoted_verify_repros(language: str, items: list[dict[str, Any]]) -
     seen: set[str] = set()
     for item in items:
         response = item.get("response")
-        if not isinstance(response, dict):
+        if not isinstance(response, dict) or report_verdict(response) != "fail":
             continue
         for stage in response.get("stages", []):
-            if stage.get("ok", True):
+            if not stage_is_failed(stage):
                 continue
             detail = stage.get("detail") if isinstance(stage.get("detail"), dict) else {}
-            error = str(stage.get("error") or "").strip()
-            assertion_repro = extract_assertion_repro(error, detail)
+            message = stage_message(stage).strip()
+            assertion_repro = extract_assertion_repro(message, detail)
             if assertion_repro and assertion_repro not in seen:
                 seen.add(assertion_repro)
                 repros.append(assertion_repro)
-            fuzz_failures = detail.get("fuzz_failures")
-            if isinstance(fuzz_failures, list):
-                for failure in fuzz_failures[:3]:
-                    assertion = build_fuzz_repro_assertion(language, failure)
-                    if assertion and assertion not in seen:
-                        seen.add(assertion)
-                        repros.append(assertion)
+            for finding in stage_findings(stage)[:3]:
+                assertion = build_fuzz_repro_assertion(language, finding)
+                if assertion and assertion not in seen:
+                    seen.add(assertion)
+                    repros.append(assertion)
             if len(repros) >= 3:
                 return repros[:3]
     return repros[:3]
@@ -1710,22 +1999,19 @@ def collect_verify_haystack(items: list[dict[str, Any]]) -> str:
             if not isinstance(stage, dict):
                 continue
             detail = stage.get("detail") if isinstance(stage.get("detail"), dict) else {}
-            chunks.append(str(stage.get("error") or ""))
+            chunks.append(stage_message(stage))
             chunks.append(str(detail.get("stderr") or ""))
             chunks.append(str(detail.get("stdout") or ""))
-            fuzz_failures = detail.get("fuzz_failures")
-            if isinstance(fuzz_failures, list):
-                for failure in fuzz_failures:
-                    chunks.append(str(failure))
-    return "\n".join(chunks)
+            for finding in stage_findings(stage):
+                chunks.append(str(finding))
 
 
 def build_fuzz_repro_assertion(language: str, failure: Any) -> str | None:
     if not isinstance(failure, dict):
         return None
-    function = str(failure.get("function") or "").strip()
-    input_value = str(failure.get("input") or "").strip()
-    message = str(failure.get("message") or "").strip()
+    function = finding_function(failure).strip()
+    input_value = finding_input(failure).strip()
+    message = finding_message(failure).strip()
     if not function or not input_value:
         return None
     observed_output = extract_observed_output(message)
@@ -1734,7 +2020,7 @@ def build_fuzz_repro_assertion(language: str, failure: Any) -> str | None:
     if language == "python":
         return f"assert {function}(*{input_value}) != {json.dumps(observed_output)}"
     if language == "typescript":
-        return f"assert.notEqual({function}(...{input_value}), {json.dumps(observed_output)});"
+        return f"expect({function}(...{input_value})).not.toBe({json.dumps(observed_output)});"
     return None
 
 
@@ -1825,34 +2111,29 @@ def summarize_verify_failures(
 ) -> list[str]:
     lines: list[str] = []
     for stage in response.get("stages", []):
-        if stage.get("ok", True):
+        if stage_status(stage) not in {"failed", "inconclusive"}:
             continue
         stage_name = stage.get("name", "unknown")
         detail = stage.get("detail") if isinstance(stage.get("detail"), dict) else {}
-        error = str(stage.get("error") or "").strip()
+        message = stage_message(stage).strip()
         lines.append(f"Stage: {stage_name}")
 
-        assertion_repro = extract_assertion_repro(error, detail)
+        assertion_repro = extract_assertion_repro(message, detail)
         if assertion_repro:
             lines.append(f"Counterexample: {assertion_repro}")
 
-        fuzz_failures = detail.get("fuzz_failures")
-        if isinstance(fuzz_failures, list) and fuzz_failures:
-            for failure in fuzz_failures[:3]:
-                if not isinstance(failure, dict):
-                    continue
-                function = failure.get("function", "<unknown>")
-                severity = failure.get("severity", "failure")
-                input_value = failure.get("input", "<unknown>")
-                message = str(failure.get("message") or "").strip()
-                lines.append(
-                    f"Repro: {function}{input_value} -> {severity}"
-                )
-                if message:
-                    lines.append(f"Message: {message}")
+        findings = stage_findings(stage)
+        for finding in findings[:3]:
+            function = finding_function(finding) or "<unknown>"
+            severity = finding.get("severity", "failure")
+            input_value = finding_input(finding) or "<unknown>"
+            finding_text = finding_message(finding).strip()
+            lines.append(f"Repro: {function}{input_value} -> {severity}")
+            if finding_text:
+                lines.append(f"Message: {finding_text}")
 
         snippet = first_nonempty_text(
-            error,
+            message,
             str(detail.get("stderr") or ""),
             str(detail.get("stdout") or ""),
         )

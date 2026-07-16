@@ -29,15 +29,21 @@ That implies three separate release gates:
 2. False-positive control
 3. Operational reliability
 
+## Current contract for release evidence
+
+The verifier gate is report schema `3`: automation branches on `verdict` (`pass`, `fail`, `inconclusive`) and `strength`, with default `changed-exports` coverage. A coverage gap, rejected inputs, timeout, module-load block, or missing behavioral evidence is inconclusive—not a clean pass. Findings carry typed severity, confidence, oracle provenance, structured repros, and replay expectations; differential changes remain advisory without an authoritative oracle.
+
+Benchmark artifacts are a separate immutable schema `1` and require `verify_schema_version_required: 3`. Non-dry runs must pass `doctor` for the selected `--verify-runtime-profile`; summaries are abstention-aware and pair baseline/candidate cells by hidden-seed digest. `private-beta-default` and `strict-heldout` gates are ineligible for missing pairs or required metrics. Evidence bundles are checksummed and redaction-aware; optional shadow records are non-blocking.
+
 ## Release Gates
 
 ### 1. Utility Gate
 
 Required evidence:
 
-- `repair-loop` beats `baseline` on a meaningful benchmark suite
+- `repair-loop-verify-only` improves final success over `baseline` on a meaningful benchmark suite
 - the suite is broad enough that the result is not a one-task anecdote
-- the result holds on at least one model that is not already saturating the task set
+- the lift remains visible on at least one model below saturation
 
 Suggested minimum bar:
 
@@ -49,16 +55,16 @@ Suggested minimum bar:
 
 Metrics to report:
 
-- overall `baseline` success rate
-- overall `repair-loop` success rate
-- success delta by model
-- repair conversion rate after verify failure
+- eligible paired `baseline`/`repair-loop-verify-only` success and lift
+- precision/recall and abstention-aware confusion metrics
+- paired-lift confidence interval and exact McNemar result
+- repair conversion after a `fail` verdict, with provider/setup errors reported separately
 
 ### 2. False-Positive Gate
 
 Required evidence:
 
-- known-good implementations pass `verify`
+- known-good implementations produce `verdict: pass` with required coverage
 - known-good implementations pass public and hidden checks
 - `required-final` does not incorrectly block correct code at an unacceptable rate
 
@@ -108,7 +114,7 @@ Court Jester is ready for a private beta when it can be described honestly as:
 Before expanding access beyond a single-user workflow, produce all of:
 
 1. Utility benchmark summary
-- `baseline` vs `repair-loop`
+- `baseline` vs `repair-loop-verify-only`
 - by model
 - by bug class
 
@@ -133,6 +139,14 @@ Before expanding access beyond a single-user workflow, produce all of:
 
 ## Suggested Commands
 
+Before non-dry runs, create and retain a schema-v3 readiness report:
+
+```bash
+court-jester doctor --language all --runtime-profile local-trusted --summary json > /tmp/cj-doctor-local-v3.json
+```
+
+The examples use artifact v1, `--verify-runtime-profile local-trusted`, the doctor digest, and `--gate-policy none` for collection. Add `--evidence-bundle --strict-evidence` for a release bundle; evaluate `private-beta-default` or `strict-heldout` only after supplying complete pairs and known-good summaries.
+
 Utility benchmark:
 
 ```bash
@@ -140,6 +154,13 @@ python -m bench.run_matrix \
   --task-set core-current \
   --models codex-default,claude-default \
   --policies baseline,repair-loop-verify-only \
+  --repeats 3 \
+  --verify-runtime-profile local-trusted \
+  --doctor-report /tmp/cj-doctor-local-v3.json \
+  --baseline-policy baseline \
+  --candidate-policy repair-loop-verify-only \
+  --gate-policy none \
+  --summary-json /tmp/court-jester-core-release/summary.json \
   --output-dir /tmp/court-jester-core-release
 ```
 
@@ -149,7 +170,12 @@ Library-slice benchmark:
 python -m bench.run_matrix \
   --task-set library-slices \
   --models codex-default,claude-default \
-  --policies baseline,repair-loop \
+  --policies baseline,repair-loop-verify-only \
+  --repeats 5 \
+  --verify-runtime-profile local-trusted \
+  --doctor-report /tmp/cj-doctor-local-v3.json \
+  --gate-policy none \
+  --summary-json /tmp/court-jester-library-release/summary.json \
   --output-dir /tmp/court-jester-library-release
 ```
 
@@ -160,6 +186,11 @@ python -m bench.run_matrix \
   --task-set known-good-corpus \
   --models noop \
   --policies required-final \
+  --repeats 10 \
+  --verify-runtime-profile local-trusted \
+  --doctor-report /tmp/cj-doctor-local-v3.json \
+  --gate-policy none \
+  --summary-json /tmp/court-jester-known-good/summary.json \
   --output-dir /tmp/court-jester-known-good
 ```
 
@@ -171,16 +202,21 @@ python -m bench.run_matrix \
   --models noop \
   --policies required-final \
   --use-task-gold-patches \
+  --repeats 10 \
+  --verify-runtime-profile local-trusted \
+  --doctor-report /tmp/cj-doctor-local-v3.json \
+  --gate-policy none \
+  --summary-json /tmp/court-jester-external-known-good/summary.json \
   --output-dir /tmp/court-jester-external-known-good
 ```
 
 Then summarize:
 
 ```bash
-python -m bench.summarize_runs /tmp/court-jester-core-release
-python -m bench.summarize_runs /tmp/court-jester-library-release
-python -m bench.summarize_runs /tmp/court-jester-known-good
-python -m bench.summarize_runs /tmp/court-jester-external-known-good
+python -m bench.summarize_runs /tmp/court-jester-core-release --summary-json /tmp/court-jester-core-release/summary.json --gate-policy none
+python -m bench.summarize_runs /tmp/court-jester-library-release --summary-json /tmp/court-jester-library-release/summary.json --gate-policy none
+python -m bench.summarize_runs /tmp/court-jester-known-good --summary-json /tmp/court-jester-known-good/summary.json --gate-policy none
+python -m bench.summarize_runs /tmp/court-jester-external-known-good --summary-json /tmp/court-jester-external-known-good/summary.json --gate-policy none
 ```
 
 ## Current Read

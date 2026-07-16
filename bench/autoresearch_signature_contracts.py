@@ -99,25 +99,33 @@ def first_execute_failure(report: dict[str, Any] | None) -> dict[str, Any] | Non
     execute = stage_map(report).get("execute")
     if not execute:
         return None
-    failures = (execute.get("detail") or {}).get("fuzz_failures") or []
-    if not failures:
+    detail = execute.get("detail") if isinstance(execute.get("detail"), dict) else {}
+    findings = detail.get("findings") if isinstance(detail, dict) else None
+    if not isinstance(findings, list) or not findings:
         return None
-    first = failures[0]
+    first = findings[0]
     if not isinstance(first, dict):
         return None
+    location = first.get("location") if isinstance(first.get("location"), dict) else {}
+    repro = first.get("repro") if isinstance(first.get("repro"), dict) else {}
     return {
-        "function": first.get("function"),
-        "input": first.get("input"),
+        "function": location.get("function") or first.get("function"),
+        "input": repro.get("snippet") or repro.get("arguments") or first.get("input"),
         "error_type": first.get("error_type"),
         "message": first.get("message"),
         "severity": first.get("severity"),
+        "oracle_kind": (first.get("oracle") or {}).get("kind") if isinstance(first.get("oracle"), dict) else None,
     }
 
 
 def evidence_kind(failure: dict[str, Any] | None, report: dict[str, Any] | None) -> str:
     if not failure:
         stages = stage_map(report)
-        failed = [name for name, stage in stages.items() if stage.get("ok") is False]
+        failed = [
+            name
+            for name, stage in stages.items()
+            if stage.get("status") in {"failed", "inconclusive"}
+        ]
         return failed[0] if failed else "none"
 
     text = " ".join(
@@ -298,20 +306,21 @@ def verify_task(
         ]
         result = run_json_command(command, cwd=workspace, timeout_seconds=timeout_seconds)
         report = result.get("json")
-        failed = None
-        if isinstance(report, dict) and isinstance(report.get("overall_ok"), bool):
-            failed = not report["overall_ok"]
+        verdict = report.get("verdict") if isinstance(report, dict) else None
+        failed = True if verdict == "fail" else False if verdict == "pass" else None
         failure = first_execute_failure(report)
         path_results.append(
             {
                 "path": relative,
                 "failed": failed,
+                "verdict": verdict,
+                "strength": report.get("strength") if isinstance(report, dict) else None,
                 "duration_ms": result["duration_ms"],
                 "timed_out": result["timed_out"],
                 "exit_code": result["exit_code"],
                 "summary": report.get("summary") if isinstance(report, dict) else None,
                 "stages": {
-                    name: stage.get("ok")
+                    name: stage.get("status")
                     for name, stage in stage_map(report).items()
                 },
                 "failure": failure,

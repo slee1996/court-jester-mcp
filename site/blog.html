@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Court Jester — concrete verifier feedback beats blind retry</title>
+  <meta name="description" content="Court Jester benchmark results: verifier-guided repair improves coding-agent task success against matched public-repair, blind-retry, and false-positive controls.">
+  <meta property="og:title" content="Court Jester: concrete verifier feedback beats blind retry">
+  <meta property="og:description" content="Verifier-guided repair improved coding-agent task success from 208/234 to 230/234 while staying clean on 270/270 false-positive controls.">
+  <meta property="og:image" content="./assets/court-jester-scorecard.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <svg aria-hidden="true" class="svg-defs">
+    <defs>
+      <symbol id="mark" viewBox="0 0 240 12" preserveAspectRatio="none">
+        <path d="M2 8 C 30 2, 60 10, 90 6 S 150 2, 180 7 S 220 4, 238 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+      </symbol>
+    </defs>
+  </svg>
+
+  <nav class="nav">
+    <a class="wordmark" href="index.html">
+      <span class="wm-court">Court</span><span class="wm-jester">Jester<svg class="wm-underline" aria-hidden="true"><use href="#mark"/></svg></span>
+    </a>
+    <div class="nav-links">
+      <a href="index.html#what">What it does</a>
+      <a href="index.html#proof">Evidence</a>
+      <a href="index.html#install">Install</a>
+      <a href="https://github.com/slee1996/court-jester-mcp" class="nav-external">Source<span aria-hidden="true"> ↗</span></a>
+    </div>
+  </nav>
+
+  <main class="article-shell">
+    <article class="article">
+      <p class="tag">Benchmark note</p>
+      <h1>Court Jester: concrete verifier feedback beats blind retry for coding agents.</h1>
+      <p class="article-dek">AI coding agents fail in a predictable way: they write code that looks done, sometimes passes the obvious checks, and then fails where nobody explicitly disproved it. Court Jester is built for that moment.</p>
+
+      <figure class="article-figure">
+        <img src="./assets/court-jester-scorecard.png" alt="Court Jester scorecard showing +9.4 percentage point utility lift, 270 out of 270 false-positive controls clean, and 156 out of 156 two-repair robustness result.">
+      </figure>
+
+      <div class="article-card">
+        <div><span>Primary causal matrix</span><strong>208 → 230 / 234</strong></div>
+        <div><span>False-positive controls</span><strong>270 / 270 clean</strong></div>
+        <div><span>Two-repair robustness</span><strong>156 / 156 verify-guided</strong></div>
+      </div>
+
+      <p>Court Jester is not a CI replacement. It is not a universal software-correctness system. It is a hostile verifier that sits in the repair loop and tries to break the patch before the agent declares victory.</p>
+
+      <p>The important part is not just “verification.” It is the kind of feedback. Court Jester tries to turn plausible-but-wrong code into a concrete counterexample the model can repair against.</p>
+
+      <h2>The question</h2>
+      <p>The product question was never “can the verifier fail code?” Any aggressive verifier can fail code. The real question was whether verifier-guided repair improves final task success without buying the gain through false positives, public-test feedback, or extra retries that would have helped anyway.</p>
+
+      <ul>
+        <li><strong>Utility:</strong> does final success improve?</li>
+        <li><strong>Precision:</strong> does the verifier avoid wrongly blocking correct code?</li>
+        <li><strong>Attribution:</strong> is the gain actually coming from verifier feedback?</li>
+      </ul>
+
+      <h2>What was benchmarked</h2>
+      <p>The harness creates a fresh workspace for every run, applies task-specific setup, lets the agent edit code, runs Court Jester when the policy requires it, then runs public and hidden evaluation separately. Hidden checks only score the final output. They do not feed back into the loop.</p>
+
+      <p>The headline suite is <code>core-current</code>: a repeated semantic repair suite built to stress cross-file contract mistakes, canonicalization bugs, spec-like behavior mismatches, and hidden semantic misses that survive happy-path checks.</p>
+
+      <p>Precision is measured separately with <code>known-good-corpus</code> and <code>external-known-good-replay</code>. Mechanism is tested with <code>public-repair-proving-ground</code>, a suite chosen so public-test-guided repair has a fair chance to help.</p>
+
+      <h2>The agent systems</h2>
+      <p>This is a benchmark of CLI agent systems, not raw single-call model APIs: Claude Code through the <code>claude_cli</code> provider as <code>claude-default</code>, and Codex CLI through the <code>codex_cli</code> provider as <code>codex-default</code>. The claims below are about those systems under this harness.</p>
+
+      <h2>The headline result</h2>
+      <p>The primary causal matrix compares four conditions on the repeated <code>core-current</code> suite: one-shot baseline, public-test-guided repair, blind retry, and Court-Jester-guided repair.</p>
+
+      <table>
+        <thead><tr><th>Policy</th><th>Result</th><th>Rate</th></tr></thead>
+        <tbody>
+          <tr><td>Baseline</td><td>208 / 234</td><td>88.9%</td></tr>
+          <tr><td>Public repair x1</td><td>205 / 234</td><td>87.6%</td></tr>
+          <tr><td>Blind retry x1</td><td>216 / 234</td><td>92.3%</td></tr>
+          <tr><td>Verify-only x1</td><td>230 / 234</td><td>98.3%</td></tr>
+        </tbody>
+      </table>
+
+      <p>Verify-only beat baseline by 9.4 percentage points, blind retry by 6.0 points, and public repair by 10.7 points. The gain is not just “more attempts help,” and it is not explained by visible public tests.</p>
+
+      <h2>Precision controls</h2>
+      <table>
+        <thead><tr><th>Suite</th><th>Result</th></tr></thead>
+        <tbody>
+          <tr><td>Local known-good</td><td>80 / 80</td></tr>
+          <tr><td>External upstream replay</td><td>190 / 190</td></tr>
+          <tr><td>Combined false-positive gauntlet</td><td>270 / 270</td></tr>
+        </tbody>
+      </table>
+
+      <p>The claim is not “Court Jester can never false-positive.” The claim is narrower: across the completed known-good and upstream replay controls, the tightened verifier stayed clean.</p>
+
+      <h2>Public repair got a fair chance</h2>
+      <p>The <code>public-repair-proving-ground</code> suite was built so public checks expose a meaningful part of the bug surface and can legitimately trigger repair. Public repair did help there, but verifier-guided repair still won clearly.</p>
+
+      <table>
+        <thead><tr><th>Policy</th><th>Result</th><th>Rate</th></tr></thead>
+        <tbody>
+          <tr><td>Baseline</td><td>11 / 36</td><td>30.6%</td></tr>
+          <tr><td>Public repair x1</td><td>14 / 36</td><td>38.9%</td></tr>
+          <tr><td>Blind retry x1</td><td>19 / 36</td><td>52.8%</td></tr>
+          <tr><td>Verify-only x1</td><td>25 / 36</td><td>69.4%</td></tr>
+        </tbody>
+      </table>
+
+      <h2>More budget did not erase the result</h2>
+      <p>The two-repair <code>core-current</code> robustness matrix gave the controls more budget. They improved, which means they were live comparators rather than strawmen. Verify-guided repair still finished best.</p>
+
+      <table>
+        <thead><tr><th>Policy</th><th>Result</th><th>Rate</th></tr></thead>
+        <tbody>
+          <tr><td>Baseline</td><td>137 / 156</td><td>87.8%</td></tr>
+          <tr><td>Public repair x2</td><td>140 / 156</td><td>89.7%</td></tr>
+          <tr><td>Blind retry x2</td><td>150 / 156</td><td>96.2%</td></tr>
+          <tr><td>Verify-only x2</td><td>156 / 156</td><td>100.0%</td></tr>
+        </tbody>
+      </table>
+
+      <h2>What this actually claims</h2>
+      <p>Not that program repair, iterative feedback, or execution-aware repair are new. Not that Court Jester is broadly ready for arbitrary external repositories. The supported claim is smaller and stronger: concrete verifier-generated counterexamples are a useful repair signal for coding agents, and that claim survives matched comparisons against public-test-guided repair, blind retry, false-positive controls, and a larger retry budget.</p>
+
+      <h2>Reproducibility</h2>
+      <p>The benchmark package is documented in <a href="https://github.com/slee1996/court-jester-mcp/blob/main/docs/benchmark-2026-04-20.md">docs/benchmark-2026-04-20.md</a>, with suite names, policies, repeat counts, and artifact paths.</p>
+
+      <pre><code>python3 -m bench.run_matrix \
+  --task-set core-current \
+  --models claude-default,codex-default \
+  --policies baseline,public-repair-1,retry-once-no-verify,repair-loop-verify-only \
+  --repeats 3 \
+  --schedule blocked-random \
+  --shuffle-seed 7 \
+  --output-dir bench/results/matrix/2026-04-18-paper-core-causal-r3-v2</code></pre>
+
+      <p><a class="btn primary" href="https://github.com/slee1996/court-jester-mcp">Read the source</a></p>
+    </article>
+  </main>
+
+  <footer class="footer">
+    <div class="footer-left">
+      <span class="wm-mini">Court&thinsp;Jester</span>
+      <span class="footer-version">v0.2.0</span>
+    </div>
+    <div class="footer-links">
+      <a href="index.html">Home</a>
+      <a href="https://github.com/slee1996/court-jester-mcp/blob/main/docs/benchmark-2026-04-20.md">Benchmark</a>
+      <a href="https://github.com/slee1996/court-jester-mcp">Source</a>
+    </div>
+  </footer>
+</body>
+</html>

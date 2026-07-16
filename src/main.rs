@@ -1,56 +1,74 @@
 use std::collections::BTreeSet;
 use std::env;
+use std::io::Cursor;
 use std::path::Path;
 use std::process::{Command, ExitCode};
 
-use court_jester_mcp::types::{
-    ComplexityMetric, ExecuteGate, Language, ReportLevel, SummaryFormat, TestRunner,
+use tar::Archive;
+use tempfile::TempDir;
+
+use court_jester::types::{
+    ComplexityMetric, CoverageGate, ExecuteGate, InferredOracleGate, Language, ReportLevel,
+    RuntimeProfile, StageStatus, SummaryFormat, TestRunner, VerificationReport,
+    VerificationVerdict, DEFAULT_PYTHON_DOCKER_IMAGE, DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
 };
-use court_jester_mcp::{detect_project_dir, parse_language, tools};
+use court_jester::{detect_project_dir, parse_language, tools};
 
 const USAGE: &str = "\
 court-jester — code verification CLI for Python and TypeScript
 
-USAGE:
   court-jester verify   [OPTIONS]   Verify a file and print a JSON report
   court-jester ci       [OPTIONS]   Verify changed files for PR/CI workflows
   court-jester analyze  [OPTIONS]   Run tree-sitter analysis
   court-jester lint     [OPTIONS]   Run Ruff or Biome
   court-jester execute  [OPTIONS]   Run code in the sandbox
+  court-jester replay   [OPTIONS]   Replay a persisted finding
+  court-jester doctor   [OPTIONS]   Check runtime and sandbox readiness
   court-jester --help               Print this help
   court-jester --version            Print the version
 
 COMMON OPTIONS:
   --file <PATH>              Source file (required for all subcommands)
-  --language <LANG>          python | typescript (required)
+  --language <LANG>          python | typescript (doctor: all; required otherwise)
   --project-dir <PATH>       venv / node_modules root (auto-detected if omitted)
   --config-path <PATH>       Explicit Ruff/Biome config path for lint + verify
   --virtual-file-path <PATH> Virtual lint path for temp or generated source files
+  --runtime-profile <PROFILE> local-trusted | isolated (default local-trusted)
+  --python-docker-image <IMAGE> Python isolated image (default python:3.12-slim)
+  --typescript-docker-image <IMAGE> TypeScript isolated image (default node:24-bookworm-slim)
 
 VERIFY OPTIONS:
   --test-file <PATH>         Test file to include as an authoritative stage
   --test-runner <MODE>       auto | node | bun | repo-native (default auto)
   --tests-only               Skip fuzz-execute and run only the authoritative test stage
   --output-dir <PATH>        Directory to write persistent JSON reports
+  --base-file <PATH>         Candidate's base source file for differential verification
+  --base-project-dir <PATH>  Read-only project root for the base source tree
   --report-level <LEVEL>     full | minimal (default full)
-  --summary <FORMAT>         json | human (default json)
-  --suppressions-file <PATH> JSON suppression rules for known findings
-  --no-auto-seed             Disable seed extraction from nearby tests and literal call sites
-  --diff-file <PATH>         Unified-diff file — only inspect changed functions
+  --summary <FORMAT>         json | human | repair-json (default json)
   --profile <NAME>           Verification profile preset (currently: security => complexity 20)
   --complexity-metric <NAME> cyclomatic | cognitive (default cyclomatic)
   --complexity-threshold <N> Fail if any function exceeds this complexity (changed functions only when --diff-file is set)
   --execute-gate <MODE>      all | crash | none (default all; no_inputs_reached is always diagnostic)
+  --coverage-gate <MODE>     changed-exports | none (default changed-exports)
+  --inferred-oracle-gate <MODE> advisory | fail (default advisory)
 
 CI OPTIONS:
   --base <REV>               Base revision for changed-file diffing (required for `ci`)
   --head <REV>               Head revision for changed-file diffing (default HEAD)
-  --gate <LIST>              Comma-separated stage gates or all (default parse,lint,portability,execute,test)
+  --gate <LIST>              Comma-separated stage gates or all (default parse,lint,coverage,portability,execute,test)
   --report <FORMAT>          human | github | json (default human)
 
 EXECUTE OPTIONS:
   --timeout-seconds <F>      Sandbox timeout (default 10)
   --memory-mb <N>            Sandbox memory cap MB (default 128)
+REPLAY OPTIONS:
+  --report <PATH>            Persisted schema-v3 report to replay
+  --finding <ID>             Finding id to replay (must be unique)
+  --dependency-project-dir <PATH>  Dependency project root for replay
+DOCTOR OPTIONS:
+  --language <LANG>          python | typescript | all (default all)
+  --summary <FORMAT>         json | human (default json)
 
 ENVIRONMENT:
   COURT_JESTER_VERIFY_PYTHON_TIMEOUT_SECONDS      Python fuzz-exec timeout (default 10)
@@ -74,7 +92,14 @@ const CI_ALL_GATES: [&str; 7] = [
     "execute",
     "test",
 ];
-const CI_DEFAULT_GATES: [&str; 5] = ["parse", "lint", "portability", "execute", "test"];
+const CI_DEFAULT_GATES: [&str; 6] = [
+    "parse",
+    "lint",
+    "coverage",
+    "portability",
+    "execute",
+    "test",
+];
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -94,7 +119,7 @@ async fn main() -> ExitCode {
             println!("court-jester {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        "verify" | "ci" | "analyze" | "lint" | "execute" => {
+        "doctor" | "verify" | "ci" | "analyze" | "lint" | "execute" | "replay" => {
             match run_subcommand(&args[0], &args[1..]).await {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
@@ -113,6 +138,8 @@ async fn main() -> ExitCode {
 
 #[derive(Debug, Default)]
 struct CliArgs {
+    base_file: Option<String>,
+    base_project_dir: Option<String>,
     file: Option<String>,
     language: Option<String>,
     base: Option<String>,
@@ -135,8 +162,16 @@ struct CliArgs {
     complexity_metric: ComplexityMetric,
     complexity_threshold: Option<usize>,
     execute_gate: ExecuteGate,
+    coverage_gate: CoverageGate,
+    inferred_oracle_gate: InferredOracleGate,
     timeout_seconds: Option<f64>,
     memory_mb: Option<u64>,
+    runtime_profile: RuntimeProfile,
+    python_docker_image: Option<String>,
+    typescript_docker_image: Option<String>,
+    report_path: Option<String>,
+    finding_id: Option<String>,
+    dependency_project_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,6 +211,19 @@ fn parse_flags(rest: &[String]) -> Result<CliArgs, String> {
             Ok(rest[*i].clone())
         };
         match flag {
+            "--runtime-profile" => {
+                let raw = take_value(&mut i)?;
+                out.runtime_profile = RuntimeProfile::parse(&raw).ok_or_else(|| {
+                    format!(
+                        "--runtime-profile must be one of: local-trusted, isolated (got '{}')",
+                        raw
+                    )
+                })?;
+            }
+            "--python-docker-image" => out.python_docker_image = Some(take_value(&mut i)?),
+            "--typescript-docker-image" => out.typescript_docker_image = Some(take_value(&mut i)?),
+            "--base-file" => out.base_file = Some(take_value(&mut i)?),
+            "--base-project-dir" => out.base_project_dir = Some(take_value(&mut i)?),
             "--file" => out.file = Some(take_value(&mut i)?),
             "--language" => out.language = Some(take_value(&mut i)?),
             "--base" => out.base = Some(take_value(&mut i)?),
@@ -217,7 +265,10 @@ fn parse_flags(rest: &[String]) -> Result<CliArgs, String> {
             "--summary" => {
                 let raw = take_value(&mut i)?;
                 out.summary_format = SummaryFormat::parse(&raw).ok_or_else(|| {
-                    format!("--summary must be one of: json, human (got '{}')", raw)
+                    format!(
+                        "--summary must be one of: json, human, repair-json (got '{}')",
+                        raw
+                    )
                 })?;
             }
             "--suppressions-file" => out.suppressions_file = Some(take_value(&mut i)?),
@@ -247,6 +298,24 @@ fn parse_flags(rest: &[String]) -> Result<CliArgs, String> {
                 out.execute_gate = ExecuteGate::parse(&raw).ok_or_else(|| {
                     format!(
                         "--execute-gate must be one of: all, crash, none (got '{}')",
+                        raw
+                    )
+                })?;
+            }
+            "--coverage-gate" => {
+                let raw = take_value(&mut i)?;
+                out.coverage_gate = CoverageGate::parse(&raw).ok_or_else(|| {
+                    format!(
+                        "--coverage-gate must be one of: changed-exports, none (got '{}')",
+                        raw
+                    )
+                })?;
+            }
+            "--inferred-oracle-gate" => {
+                let raw = take_value(&mut i)?;
+                out.inferred_oracle_gate = InferredOracleGate::parse(&raw).ok_or_else(|| {
+                    format!(
+                        "--inferred-oracle-gate must be one of: advisory, fail (got '{}')",
                         raw
                     )
                 })?;
@@ -286,6 +355,81 @@ fn parse_flags(rest: &[String]) -> Result<CliArgs, String> {
     Ok(out)
 }
 
+fn parse_replay_flags(rest: &[String]) -> Result<CliArgs, String> {
+    let mut out = CliArgs::default();
+    let mut i = 0;
+    while i < rest.len() {
+        let flag = rest[i].as_str();
+        let value = |index: &mut usize| -> Result<String, String> {
+            if *index + 1 >= rest.len() {
+                return Err(format!("flag {flag} requires a value"));
+            }
+            *index += 1;
+            Ok(rest[*index].clone())
+        };
+        match flag {
+            "--report" => out.report_path = Some(value(&mut i)?),
+            "--finding" => out.finding_id = Some(value(&mut i)?),
+            "--dependency-project-dir" => out.dependency_project_dir = Some(value(&mut i)?),
+            "--runtime-profile" => {
+                out.runtime_profile = RuntimeProfile::parse(&value(&mut i)?).ok_or_else(|| {
+                    "--runtime-profile must be one of: local-trusted, isolated".to_string()
+                })?;
+            }
+            "--python-docker-image" => out.python_docker_image = Some(value(&mut i)?),
+            "--typescript-docker-image" => out.typescript_docker_image = Some(value(&mut i)?),
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                std::process::exit(0);
+            }
+            other => return Err(format!("unknown replay flag '{other}'")),
+        }
+        i += 1;
+    }
+    Ok(out)
+}
+
+fn validate_runtime_flags(cmd: &str, args: &CliArgs) -> Result<(), String> {
+    let runtime_cmd = matches!(cmd, "verify" | "execute" | "ci" | "doctor" | "replay");
+    if !runtime_cmd
+        && (args.runtime_profile != RuntimeProfile::LocalTrusted
+            || args.python_docker_image.is_some()
+            || args.typescript_docker_image.is_some())
+    {
+        return Err(format!(
+            "runtime profile and docker image flags are not supported for `{cmd}`"
+        ));
+    }
+    if args.runtime_profile == RuntimeProfile::LocalTrusted
+        && (args.python_docker_image.is_some() || args.typescript_docker_image.is_some())
+    {
+        return Err("docker image overrides are valid only with --runtime-profile isolated".into());
+    }
+    if matches!(cmd, "verify" | "execute") {
+        if let Some(raw) = args.language.as_deref() {
+            let language = parse_language(raw).map_err(|_| "invalid --language".to_string())?;
+            if matches!(language, Language::Python) && args.typescript_docker_image.is_some() {
+                return Err("--typescript-docker-image is not valid for a Python command".into());
+            }
+            if matches!(language, Language::TypeScript) && args.python_docker_image.is_some() {
+                return Err("--python-docker-image is not valid for a TypeScript command".into());
+            }
+        }
+    }
+    for image in [
+        args.python_docker_image.as_deref(),
+        args.typescript_docker_image.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if image.trim().is_empty() || image.starts_with('-') {
+            return Err("docker image must be non-empty and must not begin with '-'".into());
+        }
+    }
+    Ok(())
+}
+
 fn require_file(args: &CliArgs) -> Result<&str, String> {
     args.file
         .as_deref()
@@ -309,6 +453,45 @@ fn require_base(args: &CliArgs) -> Result<&str, String> {
     args.base
         .as_deref()
         .ok_or_else(|| "--base is required for `court-jester ci`".to_string())
+}
+
+fn validate_base_pair(
+    args: &CliArgs,
+    candidate_file: &str,
+    language: &Language,
+) -> Result<Option<(String, String)>, String> {
+    if args.base_file.is_some() != args.base_project_dir.is_some() {
+        return Err("--base-file and --base-project-dir must be supplied together".into());
+    }
+    let Some(base_file) = args.base_file.as_deref() else {
+        return Ok(None);
+    };
+    let base_root = args.base_project_dir.as_deref().unwrap_or("");
+    let candidate_rel = Path::new(candidate_file)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(candidate_file);
+    let base_rel = Path::new(base_file)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(base_file);
+    if candidate_rel != base_rel {
+        return Err("--base-file must have the same relative filename as --file".into());
+    }
+    let extension_language = |path: &str| match Path::new(path).extension().and_then(|e| e.to_str())
+    {
+        Some("py") => Some(Language::Python),
+        Some("ts") | Some("tsx") => Some(Language::TypeScript),
+        _ => None,
+    };
+    let base_language = extension_language(base_file);
+    if base_language.as_ref() != Some(language) {
+        return Err("--base-file language does not match --language".into());
+    }
+    if !Path::new(base_root).is_dir() {
+        return Err("--base-project-dir must be an existing directory".into());
+    }
+    Ok(Some((base_file.to_string(), base_root.to_string())))
 }
 
 fn read_file(path: &str) -> Result<String, String> {
@@ -341,9 +524,9 @@ fn resolve_complexity_threshold(args: &CliArgs) -> Result<Option<usize>, String>
 struct CiFileResult {
     file: String,
     language: Language,
-    selected_gate_ok: bool,
+    verdict: VerificationVerdict,
     failing_gates: Vec<String>,
-    report: court_jester_mcp::types::VerificationReport,
+    report: VerificationReport,
 }
 
 #[derive(Debug, Clone)]
@@ -355,14 +538,14 @@ struct CiRunResult {
     checked_files: usize,
     skipped_files: Vec<String>,
     files: Vec<CiFileResult>,
-    overall_ok: bool,
+    verdict: VerificationVerdict,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
 struct CiJsonFileResult {
     file: String,
     language: String,
-    selected_gate_ok: bool,
+    verdict: VerificationVerdict,
     failing_gates: Vec<String>,
     report: serde_json::Value,
 }
@@ -395,15 +578,58 @@ fn parse_ci_gates(raw: Option<&str>) -> Result<Vec<String>, String> {
     Ok(gates.into_iter().collect())
 }
 
-fn ci_stage_failures(
-    report: &court_jester_mcp::types::VerificationReport,
-    gates: &[String],
-) -> Vec<String> {
+fn stage_verdict(status: &StageStatus) -> VerificationVerdict {
+    match status {
+        StageStatus::Failed => VerificationVerdict::Fail,
+        StageStatus::Inconclusive | StageStatus::Skipped => VerificationVerdict::Inconclusive,
+        StageStatus::Passed | StageStatus::Advisory => VerificationVerdict::Pass,
+    }
+}
+
+fn aggregate_verdict(
+    current: VerificationVerdict,
+    next: VerificationVerdict,
+) -> VerificationVerdict {
+    match (current, next) {
+        (VerificationVerdict::Fail, _) | (_, VerificationVerdict::Fail) => {
+            VerificationVerdict::Fail
+        }
+        (VerificationVerdict::Inconclusive, _) | (_, VerificationVerdict::Inconclusive) => {
+            VerificationVerdict::Inconclusive
+        }
+        _ => VerificationVerdict::Pass,
+    }
+}
+
+fn ci_selected_verdict(report: &VerificationReport, gates: &[String]) -> VerificationVerdict {
+    let selected: BTreeSet<&str> = gates.iter().map(String::as_str).collect();
+    let mut verdict = VerificationVerdict::Pass;
+    let mut found = false;
+    for stage in &report.stages {
+        if selected.contains(stage.name.as_str()) {
+            found = true;
+            verdict = aggregate_verdict(verdict, stage_verdict(&stage.status));
+        }
+    }
+    if found {
+        verdict
+    } else {
+        VerificationVerdict::Inconclusive
+    }
+}
+
+fn ci_stage_failures(report: &VerificationReport, gates: &[String]) -> Vec<String> {
     let selected: BTreeSet<&str> = gates.iter().map(String::as_str).collect();
     report
         .stages
         .iter()
-        .filter(|stage| selected.contains(stage.name.as_str()) && !stage.ok)
+        .filter(|stage| {
+            selected.contains(stage.name.as_str())
+                && matches!(
+                    stage.status,
+                    StageStatus::Failed | StageStatus::Inconclusive | StageStatus::Skipped
+                )
+        })
         .map(|stage| stage.name.clone())
         .collect()
 }
@@ -478,6 +704,26 @@ fn ci_unified_diff(repo_dir: &Path, base: &str, head: &str) -> Result<String, St
     git_output(repo_dir, &["diff".into(), "--unified=0".into(), range])
 }
 
+fn archive_baseline_tree(repo_dir: &Path, revision: &str) -> Result<TempDir, String> {
+    let output = Command::new("git")
+        .current_dir(repo_dir)
+        .args(["archive", "--format=tar", revision])
+        .output()
+        .map_err(|e| format!("failed to run git archive: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git archive failed for {revision}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let temp =
+        tempfile::tempdir().map_err(|e| format!("failed to create baseline tempdir: {e}"))?;
+    Archive::new(Cursor::new(output.stdout))
+        .unpack(temp.path())
+        .map_err(|e| format!("failed to unpack baseline archive: {e}"))?;
+    Ok(temp)
+}
+
 async fn run_ci_for_repo(repo_dir: &Path, args: &CliArgs) -> Result<CiRunResult, String> {
     if args.file.is_some() || args.language.is_some() {
         return Err("`court-jester ci` does not accept --file or --language".into());
@@ -487,6 +733,7 @@ async fn run_ci_for_repo(repo_dir: &Path, args: &CliArgs) -> Result<CiRunResult,
     }
     let base = require_base(args)?.to_string();
     let head = args.head.clone().unwrap_or_else(|| "HEAD".into());
+    let baseline_temp = archive_baseline_tree(repo_dir, &base)?;
     let gates = parse_ci_gates(args.gate.as_deref())?;
     let changed_files = ci_changed_source_files(repo_dir, &base, &head)?;
     let diff = if changed_files.is_empty() {
@@ -497,9 +744,14 @@ async fn run_ci_for_repo(repo_dir: &Path, args: &CliArgs) -> Result<CiRunResult,
     let complexity_threshold = resolve_complexity_threshold(args)?;
     let mut files = Vec::new();
     let mut skipped_files = Vec::new();
-    let mut overall_ok = true;
+    let mut verdict = VerificationVerdict::Pass;
 
     for (relative_path, language) in &changed_files {
+        let baseline_path = baseline_temp.path().join(relative_path);
+        let baseline_code = baseline_path
+            .is_file()
+            .then(|| read_file(&baseline_path.to_string_lossy()))
+            .transpose()?;
         let absolute = repo_dir.join(relative_path);
         if !absolute.is_file() {
             skipped_files.push(relative_path.clone());
@@ -531,28 +783,43 @@ async fn run_ci_for_repo(repo_dir: &Path, args: &CliArgs) -> Result<CiRunResult,
                 suppressions: None,
                 suppression_source: None,
                 auto_seed: !args.no_auto_seed,
+                base_code: baseline_code.as_deref(),
+                base_source_file: baseline_path.to_str(),
+                base_project_dir: baseline_temp.path().to_str(),
                 source_file: Some(absolute_string.as_str()),
                 output_dir: args.output_dir.as_deref(),
                 report_level: args.report_level,
                 execute_gate: args.execute_gate,
+                coverage_gate: args.coverage_gate,
+                inferred_oracle_gate: args.inferred_oracle_gate,
+                runtime_profile: args.runtime_profile,
+                python_docker_image: args
+                    .python_docker_image
+                    .as_deref()
+                    .unwrap_or(DEFAULT_PYTHON_DOCKER_IMAGE),
+                typescript_docker_image: args
+                    .typescript_docker_image
+                    .as_deref()
+                    .unwrap_or(DEFAULT_TYPESCRIPT_DOCKER_IMAGE),
                 tests_only: false,
             },
         )
         .await;
         let failing_gates = ci_stage_failures(&report, &gates);
-        let selected_gate_ok = failing_gates.is_empty();
-        if !selected_gate_ok {
-            overall_ok = false;
-        }
+        let file_verdict = ci_selected_verdict(&report, &gates);
+        verdict = aggregate_verdict(verdict, file_verdict);
         files.push(CiFileResult {
             file: relative_path.clone(),
             language: language.clone(),
-            selected_gate_ok,
+            verdict: file_verdict,
             failing_gates,
             report,
         });
     }
 
+    if !skipped_files.is_empty() {
+        verdict = VerificationVerdict::Inconclusive;
+    }
     Ok(CiRunResult {
         base,
         head,
@@ -561,11 +828,11 @@ async fn run_ci_for_repo(repo_dir: &Path, args: &CliArgs) -> Result<CiRunResult,
         checked_files: files.len(),
         skipped_files,
         files,
-        overall_ok,
+        verdict,
     })
 }
 
-fn ci_stage_brief(stage: &court_jester_mcp::types::VerificationStage) -> String {
+fn ci_stage_brief(stage: &court_jester::types::VerificationStage) -> String {
     match stage.name.as_str() {
         "complexity" => {
             let count = stage
@@ -578,35 +845,52 @@ fn ci_stage_brief(stage: &court_jester_mcp::types::VerificationStage) -> String 
             format!("{count} violation(s)")
         }
         "execute" => {
-            let crashes = stage
+            let findings = stage
                 .detail
                 .as_ref()
-                .and_then(|detail| detail.get("finding_counts"))
-                .and_then(|counts| counts.get("crash"))
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0);
-            let property = stage
-                .detail
-                .as_ref()
-                .and_then(|detail| detail.get("finding_counts"))
-                .and_then(|counts| counts.get("property_violation"))
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0);
-            format!("{crashes} crash(es), {property} property violation(s)")
+                .and_then(|detail| detail.get("findings"))
+                .and_then(|value| value.as_array());
+            let count_severity = |wanted: &str| {
+                findings
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter(|finding| {
+                                finding.get("severity").and_then(|value| value.as_str())
+                                    == Some(wanted)
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0)
+            };
+            format!(
+                "{} crash(es), {} property violation(s)",
+                count_severity("crash"),
+                count_severity("property_violation")
+            )
         }
-        "test" | "parse" | "portability" | "lint" => {
-            stage.error.clone().unwrap_or_else(|| "stage failed".into())
-        }
-        _ => stage.error.clone().unwrap_or_else(|| "stage failed".into()),
+        "test" | "parse" | "portability" | "lint" | "coverage" => stage
+            .message
+            .clone()
+            .unwrap_or_else(|| "stage did not complete".into()),
+        _ => stage
+            .message
+            .clone()
+            .unwrap_or_else(|| "stage did not complete".into()),
+    }
+}
+
+fn verdict_label(verdict: &VerificationVerdict) -> &'static str {
+    match verdict {
+        VerificationVerdict::Pass => "PASS",
+        VerificationVerdict::Fail => "FAIL",
+        VerificationVerdict::Inconclusive => "INCONCLUSIVE",
     }
 }
 
 fn render_ci_human(result: &CiRunResult) -> String {
     let mut out = String::new();
-    out.push_str(&format!(
-        "CI: {}\n",
-        if result.overall_ok { "PASS" } else { "FAIL" }
-    ));
+    out.push_str(&format!("CI: {}\n", verdict_label(&result.verdict)));
     out.push_str(&format!("Range: {}...{}\n", result.base, result.head));
     out.push_str(&format!(
         "Files: {} changed, {} checked, {} skipped\n",
@@ -618,11 +902,19 @@ fn render_ci_human(result: &CiRunResult) -> String {
     if !result.skipped_files.is_empty() {
         out.push_str(&format!("Skipped: {}\n", result.skipped_files.join(", ")));
     }
-    if result.files.iter().all(|file| file.selected_gate_ok) {
+    if result
+        .files
+        .iter()
+        .all(|file| matches!(file.verdict, VerificationVerdict::Pass))
+    {
         return out;
     }
     out.push_str("\nFailing Files:\n");
-    for file in result.files.iter().filter(|file| !file.selected_gate_ok) {
+    for file in result
+        .files
+        .iter()
+        .filter(|file| !matches!(file.verdict, VerificationVerdict::Pass))
+    {
         out.push_str(&format!(
             "- {} [{}]\n",
             file.file,
@@ -646,7 +938,11 @@ fn github_escape(message: &str) -> String {
 
 fn render_ci_github(result: &CiRunResult) -> String {
     let mut lines = Vec::new();
-    for file in result.files.iter().filter(|file| !file.selected_gate_ok) {
+    for file in result
+        .files
+        .iter()
+        .filter(|file| !matches!(file.verdict, VerificationVerdict::Pass))
+    {
         for gate in &file.failing_gates {
             let Some(stage) = file.report.stages.iter().find(|stage| stage.name == *gate) else {
                 continue;
@@ -689,29 +985,30 @@ fn render_ci_github(result: &CiRunResult) -> String {
                     }
                 }
                 "execute" => {
-                    let failures = stage
+                    let findings = stage
                         .detail
                         .as_ref()
-                        .and_then(|detail| detail.get("fuzz_failures"))
+                        .and_then(|detail| detail.get("findings"))
                         .and_then(|value| value.as_array())
                         .cloned()
                         .unwrap_or_default();
-                    if failures.is_empty() {
+                    if findings.is_empty() {
                         lines.push(format!(
                             "::error file={}::{}",
                             file.file,
                             github_escape(&ci_stage_brief(stage))
                         ));
                     }
-                    for failure in failures {
-                        let function = failure
-                            .get("function")
+                    for finding in findings {
+                        let function = finding
+                            .pointer("/location/function")
                             .and_then(|value| value.as_str())
+                            .or_else(|| finding.get("function").and_then(|value| value.as_str()))
                             .unwrap_or("unknown");
-                        let message = failure
+                        let message = finding
                             .get("message")
                             .and_then(|value| value.as_str())
-                            .unwrap_or("execution failure");
+                            .unwrap_or("execution finding");
                         lines.push(format!(
                             "::error file={}::{}",
                             file.file,
@@ -762,7 +1059,7 @@ fn render_ci_github(result: &CiRunResult) -> String {
     }
     lines.push(format!(
         "court-jester ci: {} ({} checked file(s), gates: {})",
-        if result.overall_ok { "PASS" } else { "FAIL" },
+        verdict_label(&result.verdict),
         result.checked_files,
         result.gates.join(", ")
     ));
@@ -774,22 +1071,295 @@ fn ci_json_value(result: &CiRunResult, report_level: ReportLevel) -> serde_json:
         "base": result.base,
         "head": result.head,
         "gates": result.gates,
-        "overall_ok": result.overall_ok,
+        "verdict": result.verdict,
         "changed_files": result.changed_files,
         "checked_files": result.checked_files,
         "skipped_files": result.skipped_files,
         "files": result.files.iter().map(|file| CiJsonFileResult {
             file: file.file.clone(),
             language: ci_language_name(&file.language).to_string(),
-            selected_gate_ok: file.selected_gate_ok,
+            verdict: file.verdict,
             failing_gates: file.failing_gates.clone(),
             report: tools::verify::report_json_value(&file.report, report_level),
         }).collect::<Vec<_>>(),
     })
 }
 
+fn exit_for_verdict(verdict: &VerificationVerdict) {
+    let code = match verdict {
+        VerificationVerdict::Pass => 0,
+        VerificationVerdict::Fail => 1,
+        VerificationVerdict::Inconclusive => 3,
+    };
+    if code != 0 {
+        std::process::exit(code);
+    }
+}
+
+fn command_version(program: &str, args: &[&str]) -> Result<String, String> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|e| format!("{program} unavailable: {e}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn doctor_check(
+    name: &str,
+    language: Option<Language>,
+    status: StageStatus,
+    detail: serde_json::Value,
+    message: Option<String>,
+) -> court_jester::types::DoctorCheck {
+    court_jester::types::DoctorCheck {
+        name: name.into(),
+        language,
+        status,
+        detail,
+        message,
+    }
+}
+
+async fn run_doctor(args: &CliArgs) -> Result<court_jester::types::DoctorReport, String> {
+    if args.file.is_some() || args.project_dir.is_some() {
+        return Err("doctor does not accept --file or --project-dir".into());
+    }
+    let selected = match args
+        .language
+        .as_deref()
+        .unwrap_or("all")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "all" => vec![Language::Python, Language::TypeScript],
+        "python" | "py" => vec![Language::Python],
+        "typescript" | "ts" => vec![Language::TypeScript],
+        other => {
+            return Err(format!(
+                "--language for doctor must be python, typescript, or all (got '{other}')"
+            ))
+        }
+    };
+    let mut checks = Vec::new();
+    if args.runtime_profile == RuntimeProfile::LocalTrusted {
+        for language in &selected {
+            let (program, version_args) = match language {
+                Language::Python => ("python3", vec!["--version"]),
+                Language::TypeScript => ("node", vec!["--version"]),
+            };
+            match command_version(program, &version_args) {
+                Ok(version) => {
+                    let node_bad = matches!(language, Language::TypeScript)
+                        && version
+                            .split('.')
+                            .next()
+                            .and_then(|v| v.trim_start_matches('v').parse::<u32>().ok())
+                            .is_some_and(|v| v < 24);
+                    checks.push(doctor_check(
+                        "runtime",
+                        Some(language.clone()),
+                        if node_bad {
+                            StageStatus::Failed
+                        } else {
+                            StageStatus::Passed
+                        },
+                        serde_json::json!({"version": version}),
+                        node_bad.then(|| "Node.js >=24 is required".into()),
+                    ));
+                }
+                Err(error) => checks.push(doctor_check(
+                    "runtime",
+                    Some(language.clone()),
+                    StageStatus::Failed,
+                    serde_json::Value::Null,
+                    Some(error),
+                )),
+            }
+            let linter = match language {
+                Language::Python => "ruff",
+                Language::TypeScript => "biome",
+            };
+            let status = if Command::new(linter).arg("--version").output().is_ok() {
+                StageStatus::Passed
+            } else {
+                StageStatus::Advisory
+            };
+            checks.push(doctor_check(
+                "linter",
+                Some(language.clone()),
+                status,
+                serde_json::json!({"program": linter}),
+                (status == StageStatus::Advisory)
+                    .then(|| format!("optional linter {linter} is unavailable")),
+            ));
+        }
+    } else {
+        match tools::sandbox::docker_daemon_ready().await {
+            Ok(()) => checks.push(doctor_check(
+                "docker_daemon",
+                None,
+                StageStatus::Passed,
+                serde_json::json!({"network": "none", "read_only": true}),
+                None,
+            )),
+            Err(error) => checks.push(doctor_check(
+                "docker_daemon",
+                None,
+                StageStatus::Failed,
+                serde_json::Value::Null,
+                Some(error),
+            )),
+        }
+        for language in &selected {
+            let image = match language {
+                Language::Python => args
+                    .python_docker_image
+                    .as_deref()
+                    .unwrap_or(DEFAULT_PYTHON_DOCKER_IMAGE),
+                Language::TypeScript => args
+                    .typescript_docker_image
+                    .as_deref()
+                    .unwrap_or(DEFAULT_TYPESCRIPT_DOCKER_IMAGE),
+            };
+            match tools::sandbox::docker_image_id(image).await {
+                Ok(id) => checks.push(doctor_check(
+                    "docker_image",
+                    Some(language.clone()),
+                    StageStatus::Passed,
+                    serde_json::json!({"image": image, "id": id}),
+                    None,
+                )),
+                Err(error) => checks.push(doctor_check(
+                    "docker_image",
+                    Some(language.clone()),
+                    StageStatus::Failed,
+                    serde_json::json!({"image": image}),
+                    Some(error),
+                )),
+            }
+            let code = match language {
+                Language::Python => "print('court-jester doctor')",
+                Language::TypeScript => "console.log(process.versions.node)",
+            };
+            let options = court_jester::types::SandboxOptions {
+                timeout_seconds: 10.0,
+                memory_mb: 128,
+                runtime_profile: RuntimeProfile::Isolated,
+                docker_image: Some(image),
+                project_dir: None,
+                source_file: None,
+            };
+            let result = tools::sandbox::execute(code, language, options).await;
+            let smoke_ok = result.exit_code == Some(0) && !result.timed_out && !result.memory_error;
+            let node_bad = matches!(language, Language::TypeScript)
+                && result
+                    .stdout
+                    .trim()
+                    .split('.')
+                    .next()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .is_some_and(|v| v < 24);
+            checks.push(doctor_check("runtime_smoke", Some(language.clone()), if smoke_ok && !node_bad { StageStatus::Passed } else { StageStatus::Failed }, serde_json::json!({"image": image, "stdout": result.stdout, "stderr": result.stderr, "network": "none", "read_only": true, "memory_mb": 128}), (!smoke_ok).then(|| "isolated runtime smoke failed".into()).or_else(|| node_bad.then(|| "Node.js >=24 is required".into()))));
+        }
+    }
+    let verdict = if checks
+        .iter()
+        .any(|check| check.status == StageStatus::Failed)
+    {
+        VerificationVerdict::Fail
+    } else {
+        VerificationVerdict::Pass
+    };
+    Ok(court_jester::types::DoctorReport {
+        schema_version: court_jester::types::REPORT_SCHEMA_VERSION,
+        verdict,
+        runtime_profile: args.runtime_profile,
+        checks,
+    })
+}
+
 async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
-    let args = parse_flags(rest)?;
+    let args = if cmd == "replay" {
+        parse_replay_flags(rest)?
+    } else {
+        parse_flags(rest)?
+    };
+    validate_runtime_flags(cmd, &args)?;
+    if cmd == "replay" {
+        let report_path = args
+            .report_path
+            .as_deref()
+            .ok_or_else(|| "--report is required for `court-jester replay`".to_string())?;
+        let finding_id = args
+            .finding_id
+            .as_deref()
+            .ok_or_else(|| "--finding is required for `court-jester replay`".to_string())?;
+        let report = tools::verify::replay_report(
+            report_path,
+            finding_id,
+            args.dependency_project_dir.as_deref(),
+            args.runtime_profile,
+            args.python_docker_image
+                .as_deref()
+                .unwrap_or(DEFAULT_PYTHON_DOCKER_IMAGE),
+            args.typescript_docker_image
+                .as_deref()
+                .unwrap_or(DEFAULT_TYPESCRIPT_DOCKER_IMAGE),
+        )
+        .await?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .map_err(|error| format!("failed to serialize replay report: {error}"))?
+        );
+        match report.outcome {
+            court_jester::types::ReplayOutcome::Reproduced => {}
+            court_jester::types::ReplayOutcome::NotReproduced => std::process::exit(1),
+            court_jester::types::ReplayOutcome::Inconclusive => std::process::exit(3),
+        }
+        return Ok(());
+    }
+    if cmd == "doctor" {
+        let report = run_doctor(&args).await?;
+        match args.summary_format {
+            SummaryFormat::Json => println!(
+                "{}",
+                serde_json::to_string_pretty(&report)
+                    .map_err(|e| format!("failed to serialize doctor report: {e}"))?
+            ),
+            SummaryFormat::Human => {
+                println!(
+                    "doctor: {} ({:?})",
+                    verdict_label(&report.verdict),
+                    report.runtime_profile
+                );
+                for check in &report.checks {
+                    println!(
+                        "- {}: {:?}{}",
+                        check.name,
+                        check.status,
+                        check
+                            .message
+                            .as_deref()
+                            .map(|m| format!(": {m}"))
+                            .unwrap_or_default()
+                    );
+                }
+            }
+            SummaryFormat::RepairJson => println!(
+                "{}",
+                serde_json::to_string_pretty(&report)
+                    .map_err(|e| format!("failed to serialize doctor report: {e}"))?
+            ),
+        }
+        if report.verdict == VerificationVerdict::Fail {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
 
     match cmd {
         "ci" => {
@@ -811,9 +1381,7 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
                     );
                 }
             }
-            if !result.overall_ok {
-                std::process::exit(1);
-            }
+            exit_for_verdict(&result.verdict);
             Ok(())
         }
         "verify" => {
@@ -837,6 +1405,11 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
                 })?;
             }
             let diff = read_optional_file(args.diff_file.as_deref())?;
+            let base_pair = validate_base_pair(&args, &file, &language)?;
+            let base_code = base_pair
+                .as_ref()
+                .map(|(path, _)| read_file(path))
+                .transpose()?;
             let opts = tools::verify::VerifyOptions {
                 test_code: test_code.as_deref(),
                 test_source_file: args.test_file.as_deref(),
@@ -851,9 +1424,23 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
                 suppression_source: args.suppressions_file.as_deref(),
                 auto_seed: !args.no_auto_seed,
                 source_file: Some(file.as_str()),
+                base_code: base_code.as_deref(),
+                base_source_file: base_pair.as_ref().map(|(path, _)| path.as_str()),
+                base_project_dir: base_pair.as_ref().map(|(_, root)| root.as_str()),
                 output_dir: args.output_dir.as_deref(),
                 report_level: args.report_level,
                 execute_gate: args.execute_gate,
+                coverage_gate: args.coverage_gate,
+                inferred_oracle_gate: args.inferred_oracle_gate,
+                runtime_profile: args.runtime_profile,
+                python_docker_image: args
+                    .python_docker_image
+                    .as_deref()
+                    .unwrap_or(DEFAULT_PYTHON_DOCKER_IMAGE),
+                typescript_docker_image: args
+                    .typescript_docker_image
+                    .as_deref()
+                    .unwrap_or(DEFAULT_TYPESCRIPT_DOCKER_IMAGE),
                 tests_only: args.tests_only,
             };
             let report = tools::verify::verify(&code, &language, opts).await;
@@ -869,10 +1456,17 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
                 SummaryFormat::Human => {
                     println!("{}", tools::verify::report_human_summary(&report));
                 }
+                SummaryFormat::RepairJson => {
+                    let summary = tools::verify::repair_summary(&report);
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&summary).map_err(|error| format!(
+                            "failed to serialize repair summary: {error}"
+                        ))?
+                    );
+                }
             }
-            if !report.overall_ok {
-                std::process::exit(1);
-            }
+            exit_for_verdict(&report.verdict);
             Ok(())
         }
         "analyze" => {
@@ -954,15 +1548,30 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
                 .or_else(|| detect_project_dir(&file));
             let timeout = args.timeout_seconds.unwrap_or(10.0);
             let memory = args.memory_mb.unwrap_or(128);
-            let result = tools::sandbox::execute(
-                &code,
-                &language,
-                timeout,
-                memory,
-                project_dir.as_deref(),
-                Some(file.as_str()),
-            )
-            .await;
+            let docker_image = if args.runtime_profile == RuntimeProfile::Isolated {
+                Some(match language {
+                    Language::Python => args
+                        .python_docker_image
+                        .as_deref()
+                        .unwrap_or(DEFAULT_PYTHON_DOCKER_IMAGE),
+                    Language::TypeScript => args
+                        .typescript_docker_image
+                        .as_deref()
+                        .unwrap_or(DEFAULT_TYPESCRIPT_DOCKER_IMAGE),
+                })
+            } else {
+                None
+            };
+            let options = court_jester::types::SandboxOptions {
+                timeout_seconds: timeout,
+                memory_mb: memory,
+                runtime_profile: args.runtime_profile,
+                docker_image,
+                project_dir: project_dir.as_deref(),
+                source_file: Some(file.as_str()),
+            };
+            options.validate()?;
+            let result = tools::sandbox::execute(&code, &language, options).await;
             let json = serde_json::to_string_pretty(&result)
                 .map_err(|e| format!("failed to serialize execute result: {}", e))?;
             println!("{}", json);
@@ -978,7 +1587,7 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{parse_ci_gates, parse_flags, resolve_complexity_threshold, run_ci_for_repo};
-    use court_jester_mcp::types::{
+    use court_jester::types::{
         ComplexityMetric, ExecuteGate, ReportLevel, SummaryFormat, TestRunner,
     };
     use std::fs;
@@ -1088,11 +1697,12 @@ mod tests {
         assert_eq!(
             parse_ci_gates(None).unwrap(),
             vec![
+                "coverage".to_string(),
                 "execute".to_string(),
                 "lint".to_string(),
                 "parse".to_string(),
                 "portability".to_string(),
-                "test".to_string()
+                "test".to_string(),
             ]
         );
         assert_eq!(
@@ -1127,7 +1737,7 @@ mod tests {
         .unwrap();
         let result = run_ci_for_repo(repo, &args).await.unwrap();
 
-        assert!(!result.overall_ok);
+        assert!(matches!(result.verdict, super::VerificationVerdict::Fail));
         assert_eq!(result.changed_files, 1);
         assert_eq!(result.checked_files, 1);
         assert_eq!(result.files.len(), 1);

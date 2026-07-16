@@ -173,5 +173,5 @@ Small stacked bar or table-figure hybrid for verify-only residuals.
 ## What remains
 1. Extract full failure counts for baseline, public repair, and retry policies from run artifacts.
 2. Turn these tables into paper figures.
-3. Decide whether to run the two-step proving-ground matrix or scope it out explicitly.
+3. Keep the two-step proving-ground matrix explicitly scoped out unless a venue-specific reviewer concern makes it worth adding.
 4. Add related work so the paper stops looking like a product memo and starts looking like a paper.

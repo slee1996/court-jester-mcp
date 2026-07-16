@@ -56,7 +56,7 @@ A lot of developer tools are optimized for a human reading a long report. Agents
 3. deterministic machine-readable responses
 4. fast enough runtime that the tool can sit inside an iterative repair loop
 
-That is why Court Jester produces stage-by-stage results and a simple overall pass/fail shape instead of only free-form text.
+That is why Court Jester produces stage-by-stage results, evidence strength, and a typed `pass`, `fail`, or `inconclusive` verdict instead of only free-form text.
 
 ### 2. Combine several weak signals instead of relying on one perfect check
 

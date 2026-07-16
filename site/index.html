@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Court Jester — a small, unkind CLI</title>
+  <meta
+    name="description"
+    content="Court Jester runs right after an AI agent edits your code. It finds the parts the model was winging. Opinions, in the form of failing inputs."
+  >
+  <meta property="og:title" content="Court Jester — a small, unkind CLI">
+  <meta property="og:description" content="Court Jester runs right after an AI agent edits your code and returns concrete failing inputs before the loop declares victory.">
+  <meta property="og:image" content="./assets/cj-hero.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <svg aria-hidden="true" class="svg-defs">
+    <defs>
+      <symbol id="mark" viewBox="0 0 240 12" preserveAspectRatio="none">
+        <path d="M2 8 C 30 2, 60 10, 90 6 S 150 2, 180 7 S 220 4, 238 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+      </symbol>
+    </defs>
+  </svg>
+
+  <nav class="nav">
+    <a class="wordmark" href="/">
+      <span class="wm-court">Court</span><span class="wm-jester">Jester<svg class="wm-underline" aria-hidden="true"><use href="#mark"/></svg></span>
+    </a>
+    <div class="nav-links">
+      <a href="#what">What it does</a>
+      <a href="#proof">Evidence</a>
+      <a href="#catches">What it catches</a>
+      <a href="#watch">Watch</a>
+      <a href="blog.html">Blog</a>
+      <a href="#install">Install</a>
+      <a href="https://github.com/slee1996/court-jester-mcp" class="nav-external">Source<span aria-hidden="true"> ↗</span></a>
+    </div>
+  </nav>
+
+  <header class="hero">
+    <div class="hero-left">
+      <p class="tag">A small, unkind CLI.</p>
+      <h1>
+        Somebody has<br>
+        to <em>read<svg class="h-mark" aria-hidden="true"><use href="#mark"/></svg></em><br>
+        the room.
+      </h1>
+      <p class="lede">
+        Shipping AI-generated code? Court Jester runs right after the edit, throws adversarial inputs at the changed file, and hands back the line the model was winging.
+      </p>
+      <p class="lede-kicker">Opinions, in the form of failing inputs.</p>
+      <div class="hero-actions">
+        <a class="btn primary" href="#install">Install</a>
+        <a class="btn ghost" href="blog.html">Read the benchmark</a>
+      </div>
+      <dl class="signal-strip">
+        <div>
+          <dt>208 &rarr; 230&thinsp;/&thinsp;234</dt>
+          <dd>baseline success &rarr; verify repair</dd>
+        </div>
+        <div>
+          <dt>270&thinsp;/&thinsp;270</dt>
+          <dd>known-good, still clean</dd>
+        </div>
+      </dl>
+    </div>
+
+    <div class="hero-right">
+      <div class="terminal" id="terminal">
+        <header class="term-head">
+          <div class="term-head-left">
+            <span class="term-lang" id="term-lang" data-lang="py">py</span>
+            <span class="term-title" id="term-title">verify — query.py</span>
+          </div>
+          <span class="term-status" id="term-status" data-state="idle">idle</span>
+        </header>
+        <div class="term-rule" aria-hidden="true"></div>
+        <div class="term-prompt">
+          <span class="term-glyph">$</span><span class="term-cmd" id="term-cmd">court-jester verify --file query.py --language python --project-dir .</span>
+        </div>
+        <pre class="term-stream" aria-live="polite"><code id="term-stream"><span class="t-pass">[parse]    ok    0 ms</span><span class="t-pass">[lint]     ok    49 ms</span><span class="t-fail">[execute]  fail  30 ms</span><span>&nbsp;</span><span class="t-meta">  fuzz: 61 inputs &middot; 58 passed &middot; 3 crashed</span><span>&nbsp;</span><span class="t-repro">  repro:</span><span class="t-repro">    canonical_query({"flags": {"beta_checkout": None}})</span><span class="t-repro">      property: nullish string leak</span><span class="t-repro t-marked">      output:   "flags=%7B%27beta_checkout%27%3A+None%7D"</span><span>&nbsp;</span><span class="t-final t-final-fail">  verdict: fail</span></code></pre>
+        <footer class="term-foot">
+          <span>4 real runs on rotation</span>
+          <span>sourced from <code>bench/</code> fixtures</span>
+        </footer>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <section class="section" id="what">
+      <p class="section-num">01</p>
+      <div class="section-grid">
+        <h2>The model writes plausible code. The plausible part is the problem.</h2>
+        <div class="section-body">
+          <p>
+            AI agents are good at sounding finished. They hit the marks. The diff reads clean. The tests they wrote for themselves pass. Then the edit lands on main with a subtle off-by-one, a silent nullish-string leak, a roundtrip that drops data on Unicode.
+          </p>
+          <p>
+            Court Jester runs the moment the edit is written. It parses the changed file, synthesizes a fuzz harness from the AST, runs it in a sandbox, and stops being polite when something contradicts itself. No transport layer. No plugin. One binary that shells out like any other CLI.
+          </p>
+          <p class="aside">
+            Not a CI replacement. CI still gets the last word. Court Jester gets the <em>first</em> one — while the agent is still in the loop and a fix is cheap.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section class="section proof" id="proof">
+      <p class="section-num">02</p>
+      <div class="section-grid">
+        <h2>The repair loop closes the gap the model can&rsquo;t.</h2>
+        <div class="section-body">
+          <p class="proof-intro">
+            39-task benchmark. Two CLI agent systems. Baseline vs. verify-guided repair. Same tasks, same evaluator, same sandbox.
+          </p>
+
+          <div class="proof-rows">
+            <div class="proof-row">
+              <span class="proof-label">Claude</span>
+              <div class="proof-bars">
+                <div class="proof-bar">
+                  <span class="pb-label">baseline</span>
+                  <div class="pb-track"><div class="pb-fill baseline" style="width: 86.3%"></div></div>
+                  <span class="pb-value">101&thinsp;/&thinsp;117</span>
+                </div>
+                <div class="proof-bar">
+                  <span class="pb-label">+ verify repair</span>
+                  <div class="pb-track"><div class="pb-fill lifted" style="width: 98.3%"></div></div>
+                  <span class="pb-value">115&thinsp;/&thinsp;117</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="proof-row">
+              <span class="proof-label">Codex</span>
+              <div class="proof-bars">
+                <div class="proof-bar">
+                  <span class="pb-label">baseline</span>
+                  <div class="pb-track"><div class="pb-fill baseline" style="width: 91.5%"></div></div>
+                  <span class="pb-value">107&thinsp;/&thinsp;117</span>
+                </div>
+                <div class="proof-bar">
+                  <span class="pb-label">+ verify repair</span>
+                  <div class="pb-track"><div class="pb-fill lifted" style="width: 98.3%"></div></div>
+                  <span class="pb-value">115&thinsp;/&thinsp;117</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="proof-control">
+            <p class="pc-label">False-positive control</p>
+            <p class="pc-value">270&thinsp;/&thinsp;270</p>
+            <p class="pc-note">Known-good code passes. 80/80 local, 190/190 external replay. The point is to catch the bluff, not to flag every edit.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section catches" id="catches">
+      <p class="section-num">03</p>
+      <div class="section-grid">
+        <h2>What it catches.</h2>
+        <div class="section-body">
+          <p class="catches-intro">
+            Crashes and contract violations. Treated the same: both fail the run, both come back with a concrete input.
+          </p>
+
+          <dl class="catches-list">
+            <div>
+              <dt>Runtime crashes</dt>
+              <dd><code>TypeError</code>, <code>AttributeError</code>, <code>KeyError</code>, <code>IndexError</code>, <code>RecursionError</code>, <code>MemoryError</code>, <code>ValueError</code>, <code>ZeroDivisionError</code>, <code>UnicodeError</code>, <code>RangeError</code>, <code>ReferenceError</code>, <code>URIError</code>, stack overflow.</dd>
+            </div>
+            <div>
+              <dt>Return-type mismatches</dt>
+              <dd>the declared shape says one thing, the runtime produces another.</dd>
+            </div>
+            <div>
+              <dt>Symmetry &amp; roundtrip</dt>
+              <dd><code>decode(encode(x)) == x</code> fails for an inferable encode/decode pair. Usually a Unicode edge case the model didn&rsquo;t reach for.</dd>
+            </div>
+            <div>
+              <dt>Nullish-string leaks</dt>
+              <dd><code>None</code>, <code>undefined</code>, or <code>null</code> makes it into a user-visible string. Classic agent blindspot.</dd>
+            </div>
+            <div>
+              <dt>Idempotency &amp; boundedness</dt>
+              <dd>a function that should be stable under repetition drifts. A bounded value escapes its bound.</dd>
+            </div>
+            <div>
+              <dt>Comparator violations</dt>
+              <dd>a sort key that isn&rsquo;t transitive. Works on the happy path, corrupts the order elsewhere.</dd>
+            </div>
+            <div>
+              <dt>Blank outputs</dt>
+              <dd>the function runs clean and returns <code>""</code>. The tests don&rsquo;t check.</dd>
+            </div>
+          </dl>
+        </div>
+      </div>
+    </section>
+
+    <section class="section watch" id="watch">
+      <p class="section-num">04</p>
+      <div class="section-grid">
+        <h2>Watch the loop get less gullible.</h2>
+        <div class="section-body">
+          <p class="watch-intro">
+            Twenty-four seconds: visible tests pass, Court Jester finds the edge case, the agent gets a concrete repro, and the rerun earns its exit.
+          </p>
+          <video class="promo-video" controls preload="metadata" poster="./assets/cj-hero.png">
+            <source src="./assets/court-jester-promo.mp4" type="video/mp4">
+          </video>
+        </div>
+      </div>
+    </section>
+
+    <section class="section install" id="install">
+      <p class="section-num">05</p>
+      <div class="section-grid">
+        <h2>Drop it in the loop.</h2>
+        <div class="section-body">
+          <p class="install-intro">One binary. No toolchain. No transport.</p>
+
+          <div class="install-block">
+            <p class="install-label">Install</p>
+            <pre><code>curl -fsSL https://raw.githubusercontent.com/slee1996/court-jester-mcp/main/install.sh | sh</code></pre>
+          </div>
+
+          <div class="install-block">
+            <p class="install-label">Run it after every agent edit</p>
+            <pre><code>court-jester verify \
+  --file &lt;changed-file&gt; \
+  --language &lt;python|typescript&gt; \
+  --project-dir .</code></pre>
+          </div>
+
+          <div class="install-block">
+            <p class="install-label">Agent prompt snippet</p>
+            <pre><code>After every code change, run `court-jester verify`.
+Repair verdict: fail, investigate verdict: inconclusive, and ship only verdict: pass.
+Treat repros as authoritative.</code></pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="closer">
+      <p class="closer-tag">&mdash; end of run &mdash;</p>
+      <p class="closer-line">
+        For teams that would prefer<br>not to merge <em>fan fiction<svg class="h-mark h-mark-sm" aria-hidden="true"><use href="#mark"/></svg></em>.
+      </p>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="footer-left">
+      <span class="wm-mini">Court&thinsp;Jester</span>
+      <span class="footer-version">v0.2.0</span>
+    </div>
+    <div class="footer-links">
+      <a href="https://github.com/slee1996/court-jester-mcp">Source</a>
+      <a href="https://github.com/slee1996/court-jester-mcp/blob/main/README.md">README</a>
+      <a href="https://github.com/slee1996/court-jester-mcp/blob/main/docs/benchmark-2026-04-20.md">Benchmark</a>
+      <a href="https://github.com/slee1996/court-jester-mcp/blob/main/docs/court-jester-overview.md">Overview</a>
+    </div>
+  </footer>
+
+  <script>
+    (function () {
+      var stream = document.getElementById("term-stream");
+      var status = document.getElementById("term-status");
+      var lang   = document.getElementById("term-lang");
+      var title  = document.getElementById("term-title");
+      var cmd    = document.getElementById("term-cmd");
+      if (!stream || !status || !lang || !cmd) return;
+
+      var prefersReducedMotion =
+        window.matchMedia &&
+        window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+      function jitter(base, spread) {
+        var delta = (Math.random() - 0.5) * 2 * spread;
+        return Math.max(1, Math.round(base + delta));
+      }
+
+      // All four sessions are sourced from real verify runs on bench/ fixtures.
+      //
+      // python pair: bench/results/repro-promotion-manyshot-compare/
+      //   py-query-string-canonicalization__codex-default__repair-loop-promoted-manyshot
+      // typescript pair: bench/results/repro-promotion-critic-compare/
+      //   ts-primary-plan-code-cross-file__actual-api-qwen3-vl-30b__repair-loop-promoted
+      function pyFail() {
+        return {
+          lang: "py",
+          title: "verify \u2014 query.py",
+          cmd:  "court-jester verify --file query.py --language python --project-dir .",
+          outcome: "fail",
+          steps: [
+            { type: "stage", name: "parse",   result: "ok",   ms: 0,             pendingMs: 280 },
+            { type: "stage", name: "lint",    result: "ok",   ms: jitter(49, 5), pendingMs: 380 },
+            { type: "stage", name: "execute", result: "fail", ms: jitter(30, 4), pendingMs: 980 },
+            { type: "blank" },
+            { type: "meta",    text: "  fuzz: 61 inputs \u00b7 58 passed \u00b7 3 crashed" },
+            { type: "blank" },
+            { type: "repro", lines: [
+              { text: "  repro:",                                                    marked: false },
+              { text: "    canonical_query({\"flags\": {\"beta_checkout\": None}})", marked: false },
+              { text: "      property: nullish string leak",                         marked: false },
+              { text: "      output:   \"flags=%7B%27beta_checkout%27%3A+None%7D\"", marked: true  }
+            ]},
+            { type: "blank" },
+            { type: "final", text: "  verdict: fail", cls: "t-final t-final-fail" }
+          ]
+        };
+      }
+
+      function pyPass() {
+        return {
+          lang: "py",
+          title: "verify \u2014 query.py",
+          cmd:  "court-jester verify --file query.py --language python --project-dir .",
+          outcome: "pass",
+          steps: [
+            { type: "stage", name: "parse",   result: "ok", ms: jitter(1, 1),  pendingMs: 280 },
+            { type: "stage", name: "lint",    result: "ok", ms: jitter(51, 6), pendingMs: 380 },
+            { type: "stage", name: "execute", result: "ok", ms: jitter(35, 5), pendingMs: 720 },
+            { type: "blank" },
+            { type: "meta",    text: "  fuzz: 58 inputs \u00b7 58 passed \u00b7 0 crashed" },
+            { type: "blank" },
+            { type: "final", text: "  verdict: pass", cls: "t-final t-final-pass" }
+          ]
+        };
+      }
+
+      function tsFail() {
+        return {
+          lang: "ts",
+          title: "verify \u2014 plans.ts",
+          cmd:  "court-jester verify --file plans.ts --language typescript --project-dir .",
+          outcome: "fail",
+          steps: [
+            { type: "stage", name: "parse",   result: "ok",   ms: 0,               pendingMs: 280 },
+            { type: "stage", name: "lint",    result: "ok",   ms: jitter(667, 45), pendingMs: 720 },
+            { type: "stage", name: "execute", result: "fail", ms: jitter(13, 3),   pendingMs: 980 },
+            { type: "blank" },
+            { type: "meta",    text: "  fuzz: 54 inputs \u00b7 45 passed \u00b7 9 crashed" },
+            { type: "blank" },
+            { type: "repro", lines: [
+              { text: "  repro:",                                       marked: false },
+              { text: "    primaryPlanCode({ plans: [null, \" team \"] })", marked: false },
+              { text: "      property: blank string output",            marked: false },
+              { text: "      output:   \"\"",                            marked: true  }
+            ]},
+            { type: "blank" },
+            { type: "final", text: "  verdict: fail", cls: "t-final t-final-fail" }
+          ]
+        };
+      }
+
+      function tsPass() {
+        return {
+          lang: "ts",
+          title: "verify \u2014 plans.ts",
+          cmd:  "court-jester verify --file plans.ts --language typescript --project-dir .",
+          outcome: "pass",
+          steps: [
+            { type: "stage", name: "parse",   result: "ok", ms: 0,               pendingMs: 280 },
+            { type: "stage", name: "lint",    result: "ok", ms: jitter(658, 45), pendingMs: 720 },
+            { type: "stage", name: "execute", result: "ok", ms: jitter(10, 3),   pendingMs: 720 },
+            { type: "blank" },
+            { type: "meta",    text: "  fuzz: 45 inputs \u00b7 45 passed \u00b7 0 crashed" },
+            { type: "blank" },
+            { type: "final", text: "  verdict: pass", cls: "t-final t-final-pass" }
+          ]
+        };
+      }
+
+      var sessionBuilders = [pyFail, pyPass, tsFail, tsPass];
+      var nextSessionIdx  = 0;
+
+      function pad(name) {
+        var target = 11;
+        var out = "[" + name + "]";
+        while (out.length < target) out += " ";
+        return out;
+      }
+
+      function appendLine(text, cls, opts) {
+        var line = document.createElement("span");
+        if (cls) line.className = cls;
+        line.textContent = text || "\u00a0";
+        if (opts && opts.marked) {
+          var mark = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+          mark.setAttribute("class", "t-mark");
+          mark.setAttribute("aria-hidden", "true");
+          var use = document.createElementNS("http://www.w3.org/2000/svg", "use");
+          use.setAttribute("href", "#mark");
+          mark.appendChild(use);
+          line.appendChild(mark);
+        }
+        stream.appendChild(line);
+        return line;
+      }
+
+      function setStatus(state, label) {
+        status.dataset.state = state;
+        status.textContent = label;
+      }
+
+      function clearStream() {
+        while (stream.firstChild) stream.removeChild(stream.firstChild);
+      }
+
+      function wait(ms) {
+        return new Promise(function (resolve) { setTimeout(resolve, ms); });
+      }
+
+      function setHead(session) {
+        if (lang.dataset.lang !== session.lang) {
+          lang.classList.add("t-lang-flip");
+          lang.dataset.lang = session.lang;
+          lang.textContent = session.lang;
+          setTimeout(function () { lang.classList.remove("t-lang-flip"); }, 360);
+        }
+        title.textContent = session.title;
+      }
+
+      function typeOut(el, text, msPerChar) {
+        return new Promise(function (resolve) {
+          el.textContent = "";
+          el.classList.add("t-typing");
+          var i = 0;
+          (function tick() {
+            if (i >= text.length) {
+              el.classList.remove("t-typing");
+              resolve();
+              return;
+            }
+            el.textContent += text.charAt(i);
+            i++;
+            setTimeout(tick, msPerChar);
+          })();
+        });
+      }
+
+      function renderStatic() {
+        var session = pyFail();
+        setHead(session);
+        cmd.textContent = session.cmd;
+        clearStream();
+        session.steps.forEach(function (step) {
+          if (step.type === "stage") {
+            var cls = step.result === "ok" ? "t-pass" : "t-fail";
+            var glyph = step.result === "ok" ? "ok  " : "fail";
+            appendLine(pad(step.name) + glyph + "  " + step.ms + " ms", cls);
+          } else if (step.type === "blank") {
+            appendLine("", null);
+          } else if (step.type === "meta") {
+            appendLine(step.text, "t-meta");
+          } else if (step.type === "repro") {
+            step.lines.forEach(function (l) {
+              appendLine(l.text, "t-repro" + (l.marked ? " t-marked" : ""), { marked: l.marked });
+            });
+          } else if (step.type === "final") {
+            appendLine(step.text, step.cls);
+          }
+        });
+        setStatus(session.outcome === "pass" ? "pass" : "fail",
+                  session.outcome === "pass" ? "clean" : "caught");
+      }
+
+      var hasRunOnce = false;
+
+      async function runSession() {
+        var session = sessionBuilders[nextSessionIdx]();
+        nextSessionIdx = (nextSessionIdx + 1) % sessionBuilders.length;
+
+        if (hasRunOnce) {
+          setStatus("idle", "next");
+          await wait(700);
+          clearStream();
+          setHead(session);
+          await typeOut(cmd, session.cmd, 18);
+          await wait(220);
+        } else {
+          clearStream();
+          setHead(session);
+          cmd.textContent = session.cmd;
+          hasRunOnce = true;
+        }
+
+        setStatus("running", "running");
+
+        for (var i = 0; i < session.steps.length; i++) {
+          var step = session.steps[i];
+
+          if (step.type === "stage") {
+            var pending = document.createElement("span");
+            pending.className = "t-pending";
+            pending.textContent = pad(step.name) + "running";
+            stream.appendChild(pending);
+
+            await wait(step.pendingMs || 320);
+
+            stream.removeChild(pending);
+            var cls = step.result === "ok" ? "t-pass" : "t-fail";
+            var glyph = step.result === "ok" ? "ok  " : "fail";
+            appendLine(pad(step.name) + glyph + "  " + step.ms + " ms", cls);
+            await wait(120);
+          } else if (step.type === "blank") {
+            appendLine("", null);
+            await wait(160);
+          } else if (step.type === "meta") {
+            appendLine(step.text, "t-meta");
+            await wait(220);
+          } else if (step.type === "repro") {
+            for (var j = 0; j < step.lines.length; j++) {
+              var l = step.lines[j];
+              appendLine(l.text, "t-repro" + (l.marked ? " t-marked" : ""), { marked: l.marked });
+              await wait(l.marked ? 260 : 140);
+            }
+          } else if (step.type === "final") {
+            await wait(220);
+            appendLine(step.text, step.cls);
+          }
+        }
+
+        if (session.outcome === "pass") {
+          setStatus("pass", "clean");
+        } else {
+          setStatus("fail", "caught");
+        }
+        await wait(4800);
+      }
+
+      async function loop() {
+        while (true) {
+          await runSession();
+        }
+      }
+
+      if (prefersReducedMotion) {
+        renderStatic();
+        return;
+      }
+
+      clearStream();
+      setStatus("running", "running");
+
+      var hasStarted = false;
+      function start() {
+        if (hasStarted) return;
+        hasStarted = true;
+        loop();
+      }
+
+      if ("IntersectionObserver" in window) {
+        var io = new IntersectionObserver(function (entries) {
+          entries.forEach(function (entry) {
+            if (entry.isIntersecting) {
+              start();
+              io.disconnect();
+            }
+          });
+        }, { threshold: 0.2 });
+        io.observe(document.getElementById("terminal"));
+      } else {
+        start();
+      }
+    })();
+  </script>
+</body>
+</html>

@@ -36,6 +36,14 @@ The core set is already large enough to be meaningful.
 
 The library set is still too small to carry the release case by itself. The known-good controls are now materially better than the original two-task sample, but they are still supporting evidence rather than a standalone release case.
 
+All non-dry matrix runs below use artifact schema `1` and require a passing schema-v3 doctor report for the selected runtime profile. Create the local-trusted prerequisite once:
+
+```bash
+court-jester doctor --language all --runtime-profile local-trusted --summary json > /tmp/cj-doctor-local-v3.json
+```
+
+The commands persist `--verify-runtime-profile local-trusted`, `--doctor-report /tmp/cj-doctor-local-v3.json`, and a summary. Use `--gate-policy none` for evidence collection, or select `private-beta-default`/`strict-heldout` with `--fail-on-gate` only when the required pair and known-good summaries are present. Add `--evidence-bundle --strict-evidence` for a release bundle; use `--shadow-records` only for non-blocking observation.
+
 ## Recommended Run Package
 
 ### 1. Core Utility Run
@@ -44,8 +52,12 @@ The library set is still too small to carry the release case by itself. The know
 python -m bench.run_matrix \
   --task-set core-current \
   --models claude-default,codex-default \
-  --policies baseline,repair-loop \
+  --policies baseline,repair-loop-verify-only \
   --repeats 3 \
+  --verify-runtime-profile local-trusted \
+  --doctor-report /tmp/cj-doctor-local-v3.json \
+  --summary-json /tmp/court-jester-core-big/summary.json \
+  --gate-policy none \
   --output-dir /tmp/court-jester-core-big
 ```
 
@@ -61,8 +73,12 @@ This is the primary release-signal run.
 python -m bench.run_matrix \
   --task-set library-slices \
   --models claude-default,codex-default \
-  --policies baseline,repair-loop \
+  --policies baseline,repair-loop-verify-only \
   --repeats 5 \
+  --verify-runtime-profile local-trusted \
+  --doctor-report /tmp/cj-doctor-local-v3.json \
+  --summary-json /tmp/court-jester-library-big/summary.json \
+  --gate-policy none \
   --output-dir /tmp/court-jester-library-big
 ```
 
@@ -80,6 +96,10 @@ python -m bench.run_matrix \
   --models noop \
   --policies required-final \
   --repeats 10 \
+  --verify-runtime-profile local-trusted \
+  --doctor-report /tmp/cj-doctor-local-v3.json \
+  --summary-json /tmp/court-jester-known-good-big/summary.json \
+  --gate-policy none \
   --output-dir /tmp/court-jester-known-good-big
 ```
 
@@ -98,6 +118,10 @@ python -m bench.run_matrix \
   --policies required-final \
   --use-task-gold-patches \
   --repeats 10 \
+  --verify-runtime-profile local-trusted \
+  --doctor-report /tmp/cj-doctor-local-v3.json \
+  --summary-json /tmp/court-jester-external-known-good-big/summary.json \
+  --gate-policy none \
   --output-dir /tmp/court-jester-external-known-good-big
 ```
 
@@ -107,13 +131,14 @@ Run count:
 
 This is the upstream replay control. Read it by replay success, not `verify_expectation_metrics`, because the underlying task manifests still encode the buggy-state verify expectation.
 
+
 ### 5. Summaries
 
 ```bash
-python -m bench.summarize_runs /tmp/court-jester-core-big
-python -m bench.summarize_runs /tmp/court-jester-library-big
-python -m bench.summarize_runs /tmp/court-jester-known-good-big
-python -m bench.summarize_runs /tmp/court-jester-external-known-good-big
+python -m bench.summarize_runs /tmp/court-jester-core-big --summary-json /tmp/court-jester-core-big/summary.json --gate-policy none
+python -m bench.summarize_runs /tmp/court-jester-library-big --summary-json /tmp/court-jester-library-big/summary.json --gate-policy none
+python -m bench.summarize_runs /tmp/court-jester-known-good-big --summary-json /tmp/court-jester-known-good-big/summary.json --gate-policy none
+python -m bench.summarize_runs /tmp/court-jester-external-known-good-big --summary-json /tmp/court-jester-external-known-good-big/summary.json --gate-policy none
 ```
 
 ## How To Read The Results
@@ -122,15 +147,15 @@ python -m bench.summarize_runs /tmp/court-jester-external-known-good-big
 
 Success criteria:
 
-- `repair-loop` beats `baseline` overall on the core run
+- `repair-loop-verify-only` beats `baseline` overall on the core run
 - the lift is not entirely due to one task or one repeat
 - at least one model below the saturation point shows meaningful lift
 
 Warning signs:
 
-- `repair-loop` is flat or worse overall
+- `repair-loop-verify-only` is flat or worse overall
 - Codex results are dominated by `provider_error`
-- Claude regresses materially under `repair-loop`
+- Claude regresses materially under `repair-loop-verify-only`
 
 ### False-Positive Gate
 
@@ -146,13 +171,15 @@ Warning signs:
 - any failed gold-patch replay on the external lane
 - repeated stage failures on already-correct code
 
+Gate interpretation is abstention-aware: missing or mismatched artifact/verify schemas, incomplete pairs, provider/setup failures, and verifier `inconclusive` observations make a release gate ineligible rather than semantic passes or failures. Use the shared summary's confusion, SLO, paired-lift, and bootstrap fields instead of a single aggregate success number.
+
 ### Reliability Gate
 
 Success criteria:
 
 - low provider timeout rate relative to total runs
 - run completion rate high enough to trust the matrix
-- no obvious MCP instability or temp-file leakage
+- no obvious provider, connector, or temp-file instability
 
 Warning signs:
 

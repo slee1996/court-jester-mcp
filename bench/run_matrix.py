@@ -9,9 +9,12 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Lock
+import sys
 from typing import Any
 
 from .common import (
+    ARTIFACT_SCHEMA_VERSION,
+    VERIFY_SCHEMA_VERSION_REQUIRED,
     BENCH_ROOT,
     ModelManifest,
     PolicyManifest,
@@ -21,9 +24,17 @@ from .common import (
     load_policy,
     load_task,
     load_task_set,
+    canonical_json,
+    suite_lock_digest,
+    suite_lock_projection,
+    sha256_bytes,
+    ArtifactVersionError,
 )
 from .providers import terminate_active_provider_processes
 from .runner import run_single
+
+
+MAX_DOCTOR_REPORT_AGE_SECONDS = 60 * 60
 
 
 def parse_args() -> argparse.Namespace:
@@ -72,6 +83,23 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--dry-run", action="store_true", help="Expand the matrix without executing it.")
+    parser.add_argument("--verify-runtime-profile", choices=["local-trusted", "isolated"], default="local-trusted")
+    parser.add_argument("--doctor-report", type=Path)
+    parser.add_argument("--python-docker-image", default="python:3.12-slim")
+    parser.add_argument("--typescript-docker-image", default="node:24-bookworm-slim")
+    parser.add_argument("--write-heldout-lock", type=Path)
+    parser.add_argument("--enforce-heldout-lock", action="store_true")
+    parser.add_argument("--shadow-records", type=Path)
+    parser.add_argument("--summary-json", type=Path)
+    parser.add_argument("--baseline-policy", default="baseline")
+    parser.add_argument("--candidate-policy", default="repair-loop-verify-only")
+    parser.add_argument("--bootstrap-samples", type=int, default=10000)
+    parser.add_argument("--known-good-summary", action="append", default=[])
+    parser.add_argument("--gate-policy", choices=["none", "private-beta-default", "strict-heldout"], default="none")
+    parser.add_argument("--fail-on-gate", action="store_true")
+    parser.add_argument("--evidence-bundle", action="store_true")
+    parser.add_argument("--evidence-redaction", choices=["none", "transcripts", "all-text"], default="transcripts")
+    parser.add_argument("--strict-evidence", action="store_true")
     return parser.parse_args()
 
 
@@ -81,8 +109,8 @@ def pick(items: list[object], wanted: set[str]) -> list[object]:
     return [item for item in items if getattr(item, "id") in wanted]
 
 
-def hidden_seed_for(task_id: str, repeat_index: int) -> str:
-    return hashlib.sha256(f"{task_id}::repeat::{repeat_index}".encode("utf-8")).hexdigest()
+def hidden_seed_for(task_id: str, model_id: str, repeat_index: int) -> str:
+    return hashlib.sha256(f"{task_id}::{model_id}::repeat::{repeat_index}".encode("utf-8")).hexdigest()
 
 
 def build_run_plan(
@@ -106,7 +134,7 @@ def build_run_plan(
                                 "model": model,
                                 "policy": policy,
                                 "repeat_index": repeat_index,
-                                "hidden_seed": hidden_seed_for(task.id, repeat_index),
+                                "hidden_seed": hidden_seed_for(task.id, model.id, repeat_index),
                             }
                         )
         return plan
@@ -124,7 +152,7 @@ def build_run_plan(
                                 "model": model,
                                 "policy": policy,
                                 "repeat_index": repeat_index,
-                                "hidden_seed": hidden_seed_for(task.id, repeat_index),
+                                "hidden_seed": hidden_seed_for(task.id, model.id, repeat_index),
                             }
                         )
         rng.shuffle(plan)
@@ -142,7 +170,7 @@ def build_run_plan(
                             "model": model,
                             "policy": policy,
                             "repeat_index": repeat_index,
-                            "hidden_seed": hidden_seed_for(task.id, repeat_index),
+                            "hidden_seed": hidden_seed_for(task.id, model.id, repeat_index),
                         }
                     )
             rng.shuffle(block)
@@ -159,6 +187,88 @@ def partition_plan_by_provider(plan: list[dict[str, Any]]) -> OrderedDict[str, l
     return queues
 
 
+def _passed_doctor_check(
+    checks: list[dict[str, Any]],
+    name: str,
+    language: str | None,
+) -> dict[str, Any] | None:
+    matches = [
+        check
+        for check in checks
+        if check.get("name") == name and check.get("language") == language
+    ]
+    if len(matches) != 1 or matches[0].get("status") != "passed":
+        return None
+    return matches[0]
+
+
+def validate_doctor_report(
+    report: Any,
+    *,
+    runtime_profile: str,
+    selected_languages: set[str],
+    python_docker_image: str,
+    typescript_docker_image: str,
+) -> None:
+    if not isinstance(report, dict):
+        raise ValueError("doctor report must be a JSON object")
+    if type(report.get("schema_version")) is not int or report["schema_version"] != VERIFY_SCHEMA_VERSION_REQUIRED:
+        raise ValueError(f"doctor report schema_version must be exactly {VERIFY_SCHEMA_VERSION_REQUIRED}")
+    if report.get("verdict") != "pass":
+        raise ValueError("doctor report verdict must be pass")
+    if report.get("runtime_profile") != runtime_profile:
+        raise ValueError("doctor report runtime_profile does not match the selected profile")
+    checks = report.get("checks")
+    if not isinstance(checks, list) or not checks or not all(isinstance(check, dict) for check in checks):
+        raise ValueError("doctor report must contain structured readiness checks")
+    if any(check.get("status") in {"failed", "inconclusive"} for check in checks):
+        raise ValueError("doctor report pass verdict contradicts a failed readiness check")
+
+    if runtime_profile == "local-trusted":
+        for language in sorted(selected_languages):
+            runtime = _passed_doctor_check(checks, "runtime", language)
+            detail = runtime.get("detail") if runtime else None
+            version = detail.get("version") if isinstance(detail, dict) else None
+            if not isinstance(version, str) or not version.strip():
+                raise ValueError(f"doctor report lacks passed runtime readiness for {language}")
+            if language == "typescript":
+                major_text = version.strip().lstrip("v").split(".", 1)[0]
+                if not major_text.isdigit() or int(major_text) < 24:
+                    raise ValueError("doctor report requires Node.js >=24 readiness")
+        return
+
+    daemon = _passed_doctor_check(checks, "docker_daemon", None)
+    daemon_detail = daemon.get("detail") if daemon else None
+    if not isinstance(daemon_detail, dict) or daemon_detail.get("network") != "none" or daemon_detail.get("read_only") is not True:
+        raise ValueError("doctor report lacks isolated Docker daemon readiness")
+    selected_images = {
+        "python": python_docker_image,
+        "typescript": typescript_docker_image,
+    }
+    for language in sorted(selected_languages):
+        image = selected_images[language]
+        image_check = _passed_doctor_check(checks, "docker_image", language)
+        image_detail = image_check.get("detail") if image_check else None
+        if (
+            not isinstance(image_detail, dict)
+            or image_detail.get("image") != image
+            or not isinstance(image_detail.get("id"), str)
+            or not image_detail["id"].strip()
+        ):
+            raise ValueError(f"doctor report lacks selected image readiness for {language}")
+        smoke = _passed_doctor_check(checks, "runtime_smoke", language)
+        smoke_detail = smoke.get("detail") if smoke else None
+        if (
+            not isinstance(smoke_detail, dict)
+            or smoke_detail.get("image") != image
+            or smoke_detail.get("network") != "none"
+            or smoke_detail.get("read_only") is not True
+            or type(smoke_detail.get("memory_mb")) is not int
+            or smoke_detail["memory_mb"] <= 0
+        ):
+            raise ValueError(f"doctor report lacks isolated runtime smoke readiness for {language}")
+
+
 def execute_cell(
     cell: dict[str, Any],
     *,
@@ -166,6 +276,11 @@ def execute_cell(
     dry_run: bool,
     repeats: int,
     use_task_gold_patches: bool,
+    verify_runtime_profile: str = "local-trusted",
+    python_docker_image: str = "python:3.12-slim",
+    typescript_docker_image: str = "node:24-bookworm-slim",
+    doctor_report: dict[str, Any] | None = None,
+    shadow_records: Path | None = None,
 ) -> tuple[bool, str]:
     task = cell["task"]
     model = cell["model"]
@@ -181,6 +296,11 @@ def execute_cell(
         repeat_count=repeats,
         hidden_seed=str(cell["hidden_seed"]),
         use_task_gold_patches=use_task_gold_patches,
+        verify_runtime_profile=verify_runtime_profile,
+        python_docker_image=python_docker_image,
+        typescript_docker_image=typescript_docker_image,
+        doctor_report=doctor_report,
+        shadow_records=shadow_records,
     )
     status = result["status"]
     success = result.get("success", False)
@@ -189,8 +309,6 @@ def execute_cell(
         f"policy={policy.id} repeat={repeat_index + 1}/{repeats} success={success}"
     )
     return success, line
-
-
 def run_serial_plan(
     plan: list[dict[str, Any]],
     *,
@@ -198,6 +316,11 @@ def run_serial_plan(
     dry_run: bool,
     repeats: int,
     use_task_gold_patches: bool,
+    verify_runtime_profile: str = "local-trusted",
+    python_docker_image: str = "python:3.12-slim",
+    typescript_docker_image: str = "node:24-bookworm-slim",
+    doctor_report: dict[str, Any] | None = None,
+    shadow_records: Path | None = None,
 ) -> tuple[int, int]:
     total = 0
     successes = 0
@@ -209,13 +332,16 @@ def run_serial_plan(
             dry_run=dry_run,
             repeats=repeats,
             use_task_gold_patches=use_task_gold_patches,
+            verify_runtime_profile=verify_runtime_profile,
+            python_docker_image=python_docker_image,
+            typescript_docker_image=typescript_docker_image,
+            doctor_report=doctor_report,
+            shadow_records=shadow_records,
         )
         if success:
             successes += 1
         print(line)
     return total, successes
-
-
 def run_parallel_provider_plan(
     plan: list[dict[str, Any]],
     *,
@@ -223,6 +349,11 @@ def run_parallel_provider_plan(
     dry_run: bool,
     repeats: int,
     use_task_gold_patches: bool,
+    verify_runtime_profile: str = "local-trusted",
+    python_docker_image: str = "python:3.12-slim",
+    typescript_docker_image: str = "node:24-bookworm-slim",
+    doctor_report: dict[str, Any] | None = None,
+    shadow_records: Path | None = None,
 ) -> tuple[int, int]:
     provider_queues = partition_plan_by_provider(plan)
     if len(provider_queues) <= 1:
@@ -232,6 +363,11 @@ def run_parallel_provider_plan(
             dry_run=dry_run,
             repeats=repeats,
             use_task_gold_patches=use_task_gold_patches,
+            verify_runtime_profile=verify_runtime_profile,
+            python_docker_image=python_docker_image,
+            typescript_docker_image=typescript_docker_image,
+            doctor_report=doctor_report,
+            shadow_records=shadow_records,
         )
 
     print_lock = Lock()
@@ -245,6 +381,11 @@ def run_parallel_provider_plan(
                 dry_run=dry_run,
                 repeats=repeats,
                 use_task_gold_patches=use_task_gold_patches,
+                verify_runtime_profile=verify_runtime_profile,
+                python_docker_image=python_docker_image,
+                typescript_docker_image=typescript_docker_image,
+                doctor_report=doctor_report,
+                shadow_records=shadow_records,
             )
             if success:
                 local_successes += 1
@@ -288,8 +429,60 @@ def main() -> int:
     else:
         selected_models = [model for model in models if getattr(model, "enabled_by_default", False)]
     selected_policies = pick(policies, set(filter(None, args.policies.split(","))))
+    if not selected_tasks:
+        raise SystemExit("matrix selection contains no tasks")
+    if not selected_models:
+        raise SystemExit("matrix selection contains no models")
+    if not selected_policies:
+        raise SystemExit("matrix selection contains no policies")
+    doctor_payload: dict[str, Any] | None = None
+    if not args.dry_run:
+        if not args.doctor_report:
+            raise SystemExit("--doctor-report is required for non-dry runs")
+        try:
+            doctor_age = time.time() - args.doctor_report.stat().st_mtime
+            if doctor_age < -300 or doctor_age > MAX_DOCTOR_REPORT_AGE_SECONDS:
+                raise ValueError("doctor report is stale or has an invalid modification time")
+            doctor_payload = json.loads(args.doctor_report.read_text())
+            validate_doctor_report(
+                doctor_payload,
+                runtime_profile=args.verify_runtime_profile,
+                selected_languages={task.language for task in selected_tasks},
+                python_docker_image=args.python_docker_image,
+                typescript_docker_image=args.typescript_docker_image,
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"invalid doctor report: {exc}") from exc
+    elif args.doctor_report:
+        try:
+            doctor_payload = json.loads(args.doctor_report.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"invalid doctor report: {exc}") from exc
+    lock_digest = None
+    lock_closure: list[dict[str, str]] = []
+    if selected_task_set:
+        lock_digest = suite_lock_digest(selected_task_set, selected_tasks)
+        _, lock_closure = suite_lock_projection(selected_task_set, selected_tasks)
+        if args.write_heldout_lock:
+            if not args.dry_run:
+                raise SystemExit("--write-heldout-lock is dry-run-only")
+            args.write_heldout_lock.write_text(json.dumps({"lock_version": selected_task_set.lock_version, "task_set_id": selected_task_set.id, "locked_suite_sha256": lock_digest, "closure": lock_closure}, indent=2, sort_keys=True) + "\n")
+        if args.enforce_heldout_lock and selected_task_set.locked_suite_sha256 != lock_digest:
+            raise SystemExit("held-out suite lock mismatch")
+    if args.shadow_records and not args.shadow_records.parent.exists():
+        raise SystemExit(f"shadow records parent does not exist: {args.shadow_records.parent}")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = args.summary_json or output_dir / "summary.json"
+    gate_payload: dict[str, Any] = {
+        "policy": args.gate_policy,
+        "eligible": False,
+        "passed": False,
+        "failures": ["summary_not_computed"],
+        "metrics": {},
+    }
+    summary_failed = False
+    interrupted = False
     repeats = max(args.repeats, 1)
     plan = build_run_plan(
         selected_tasks,
@@ -305,6 +498,17 @@ def main() -> int:
         "model_ids": [model.id for model in selected_models],
         "policy_ids": [policy.id for policy in selected_policies],
         "task_set_id": args.task_set or None,
+        "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+        "verify_schema_version_required": VERIFY_SCHEMA_VERSION_REQUIRED,
+        "verify_runtime_profile": args.verify_runtime_profile,
+        "runtime_images": {"python": args.python_docker_image, "typescript": args.typescript_docker_image},
+        "doctor_report_sha256": sha256_bytes(args.doctor_report.read_bytes()) if args.doctor_report and args.doctor_report.exists() else None,
+        "expected_suite_digest": lock_digest,
+        "observed_suite_digest": lock_digest,
+        "heldout_closure": lock_closure,
+        "heldout_lock_enforced": args.enforce_heldout_lock,
+        "summary_json": str(summary_path),
+        "gate_policy": args.gate_policy,
         "task_set_title": selected_task_set.title if selected_task_set else None,
         "task_set_goal": selected_task_set.goal if selected_task_set else None,
         "task_set_suite_kind": selected_task_set.suite_kind if selected_task_set else None,
@@ -319,26 +523,73 @@ def main() -> int:
     }
     (output_dir / "matrix.json").write_text(json.dumps(matrix_metadata, indent=2, sort_keys=True) + "\n")
 
+    total = 0
+    successes = 0
     try:
+        common_kwargs = {
+            "verify_runtime_profile": args.verify_runtime_profile,
+            "python_docker_image": args.python_docker_image,
+            "typescript_docker_image": args.typescript_docker_image,
+            "doctor_report": doctor_payload,
+            "shadow_records": args.shadow_records,
+        }
         if args.parallel_by_provider:
-            total, successes = run_parallel_provider_plan(
-                plan,
-                output_dir=output_dir,
-                dry_run=args.dry_run,
-                repeats=repeats,
-                use_task_gold_patches=args.use_task_gold_patches,
-            )
+            total, successes = run_parallel_provider_plan(plan, output_dir=output_dir, dry_run=args.dry_run, repeats=repeats, use_task_gold_patches=args.use_task_gold_patches, **common_kwargs)
         else:
-            total, successes = run_serial_plan(
-                plan,
-                output_dir=output_dir,
-                dry_run=args.dry_run,
-                repeats=repeats,
-                use_task_gold_patches=args.use_task_gold_patches,
-            )
+            total, successes = run_serial_plan(plan, output_dir=output_dir, dry_run=args.dry_run, repeats=repeats, use_task_gold_patches=args.use_task_gold_patches, **common_kwargs)
     except KeyboardInterrupt:
         terminate_active_provider_processes()
-        raise
+        interrupted = True
+    try:
+        from .summarize_runs import build_summary, evaluate_gate
+
+        summary_payload = build_summary(output_dir, args.baseline_policy, args.candidate_policy, args.bootstrap_samples)
+        if not isinstance(summary_payload, dict):
+            raise TypeError("build_summary did not return an object")
+        summary_payload.setdefault("artifact_schema_version", ARTIFACT_SCHEMA_VERSION)
+        summary_payload.setdefault("verify_schema_version_required", VERIFY_SCHEMA_VERSION_REQUIRED)
+        known_good = [json.loads(Path(path).read_text()) for path in args.known_good_summary]
+        gate_payload = evaluate_gate(
+            summary_payload,
+            policy=args.gate_policy,
+            known_good_summaries=known_good,
+        )
+        summary_payload["gate"] = gate_payload
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(json.dumps(summary_payload, indent=2, sort_keys=True) + "\n")
+    except Exception as exc:
+        summary_failed = True
+        gate_payload = {
+            "policy": args.gate_policy,
+            "eligible": False,
+            "passed": False,
+            "failures": [f"summary_error:{type(exc).__name__}:{exc}"],
+            "metrics": {},
+        }
+        failure_summary = {
+            "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+            "verify_schema_version_required": VERIFY_SCHEMA_VERSION_REQUIRED,
+            "gate": gate_payload,
+        }
+        try:
+            summary_path.parent.mkdir(parents=True, exist_ok=True)
+            summary_path.write_text(json.dumps(failure_summary, indent=2, sort_keys=True) + "\n")
+        except OSError as write_exc:
+            print(f"failed to write benchmark summary: {write_exc}", file=sys.stderr)
+        print(f"failed to summarize benchmark matrix: {exc}", file=sys.stderr)
+    if args.evidence_bundle:
+        try:
+            from .evidence import build_evidence_bundle
+            build_evidence_bundle(output_dir, output_dir / "evidence", redaction=args.evidence_redaction, strict=args.strict_evidence)
+        except Exception:
+            if args.strict_evidence:
+                raise
+    if summary_failed:
+        return 1
+    if interrupted:
+        return 130
+    if args.fail_on_gate and (not gate_payload.get("eligible") or not gate_payload.get("passed")):
+        return 1
 
     print(f"matrix complete: {total} runs, {successes} succeeded")
     return 0

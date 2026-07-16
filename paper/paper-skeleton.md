@@ -148,7 +148,7 @@ Then break out by model:
 Interpretation: more budget helped the controls, but verify-only-2 still finished best on both models.
 
 ### 5.5 Remaining robustness scope
-- two-step proving-ground matrix: [PENDING RUN or EXPLICITLY SCOPED OUT]
+- two-step proving-ground matrix: explicitly scoped out as non-essential to the paper's central claim
 
 ### 5.6 Breakdown analyses
 - by model family
@@ -172,7 +172,7 @@ The value is not only bug detection. It is closing the premature-success gap in 
 
 ## 7. Limitations
 - benchmark remains curated
-- two-step proving-ground robustness is still missing unless explicitly scoped out
+- the paper does not exhaust every robustness variant, but the missing two-step proving-ground variant is intentionally scoped out as non-essential to the central claim
 - limited external validity
 - no claim of universal effectiveness across all model tiers or coding environments
 

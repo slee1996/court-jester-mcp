@@ -145,8 +145,8 @@ def main() -> int:
         print(f"Verify output was not valid JSON: {exc}", file=sys.stderr)
         return 1
 
-    print(f"verify overall_ok: {report.get('overall_ok')}")
-    if args.verify_sample and report.get("overall_ok") is not False:
+    print(f"verify verdict: {report.get('verdict')}")
+    if args.verify_sample and report.get("verdict") != "fail":
         print("Expected the bundled sample fixture to fail verify.", file=sys.stderr)
         return 1
     return 0
