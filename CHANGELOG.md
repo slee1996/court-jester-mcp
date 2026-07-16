@@ -6,6 +6,8 @@ This changelog tracks user-visible verifier semantics, report-shape changes, and
 
 ## 0.2.0 - 2026-07-15
 
+Full categorized change log, migration guide, command additions, validation evidence, and source statistics: [docs/release-notes-0.2.0.md](docs/release-notes-0.2.0.md).
+
 ### Report and verification contract
 
 - Verification reports now use schema `3` with typed `pass`, `fail`, and `inconclusive` verdicts, evidence strength, stage statuses, strict changed-export coverage, typed invocation paths, and provenance-rich findings/repros. A coverage or runtime evidence gap is inconclusive rather than a silent pass.
