@@ -242,7 +242,7 @@ fn lint_reports_typescript_internal_error_as_runner_failure() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 #[test]
 fn lint_reports_signal_kill_with_actionable_hint() {
     let _guard = path_lock().lock().unwrap_or_else(|e| e.into_inner());
