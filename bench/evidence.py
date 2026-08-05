@@ -200,6 +200,47 @@ def _find_digest_values(value: Any) -> Iterable[tuple[str, str]]:
             yield from _find_digest_values(child)
 
 
+def _verification_metadata(value: Any) -> dict[str, list[str]]:
+    """Collect typed verification context without parsing human-readable text."""
+    buckets: dict[str, set[str]] = {
+        "source_modes": set(),
+        "network_policies": set(),
+        "termination_kinds": set(),
+        "provenance": set(),
+        "failure_domains": set(),
+        "failure_kinds": set(),
+    }
+
+    def walk(node: Any, parent: str = "") -> None:
+        if isinstance(node, dict):
+            for key, child in node.items():
+                normalized = str(key).lower()
+                if isinstance(child, str):
+                    target = {
+                        "source_mode": "source_modes",
+                        "network_policy": "network_policies",
+                        "network": "network_policies",
+                        "kind": "failure_kinds" if parent in {"diagnostic", "diagnostics"} else None,
+                        "domain": "failure_domains",
+                        "failure_domain": "failure_domains",
+                        "kind": "failure_kinds" if parent in {"diagnostic", "diagnostics", "termination", "process"} else None,
+                        "failure_kind": "failure_kinds",
+                    }.get(normalized)
+                    if target:
+                        buckets[target].add(child)
+                if normalized in {"termination", "process"} and isinstance(child, dict):
+                    kind = child.get("kind")
+                    if isinstance(kind, str):
+                        buckets["termination_kinds"].add(kind)
+                walk(child, normalized)
+        elif isinstance(node, list):
+            for child in node:
+                walk(child, parent)
+
+    walk(value)
+    return {key: sorted(values) for key, values in buckets.items() if values}
+
+
 def _redact_json(value: Any, mode: str) -> Any:
     if mode == "none":
         return value
@@ -339,6 +380,7 @@ def build_evidence_bundle(
     source_files = _iter_source_files(source, destination)
     by_relative = {relative.as_posix(): path for path, relative in source_files}
     errors: list[str] = []
+    verification_metadata: dict[str, set[str]] = {}
     warnings: list[str] = []
 
     matrix_rel = "matrix.json"
@@ -378,6 +420,8 @@ def build_evidence_bundle(
             if relative_text in structured_required:
                 errors.append(f"{relative_text}: invalid JSON ({type(exc).__name__})")
             continue
+        for key, values in _verification_metadata(value).items():
+            verification_metadata.setdefault(key, set()).update(values)
         if relative_text in structured_required:
             errors.extend(_json_artifact_version_errors(value, relative))
         if matrix_digest is not None and relative_text != matrix_rel:
@@ -466,6 +510,11 @@ def build_evidence_bundle(
         "source_matrix_digest": matrix_digest,
         "source_matrix_sha256": matrix_digest,
         "entries": entries,
+        "verification_metadata": {
+            key: sorted(values)
+            for key, values in sorted(verification_metadata.items())
+            if values
+        },
         "warnings": sorted(set(warnings)),
     }
     manifest_hash = _sha256_bytes(_canonical_json(manifest).encode("utf-8"))

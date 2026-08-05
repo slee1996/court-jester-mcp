@@ -21,9 +21,9 @@ class ReleaseContractTest(unittest.TestCase):
         )
 
     def test_current_release_metadata_is_coherent(self) -> None:
-        result = self.run_checker("v0.2.0")
+        result = self.run_checker("v0.2.1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("release metadata valid for v0.2.0", result.stdout)
+        self.assertIn("release metadata valid for v0.2.1", result.stdout)
 
     def test_mismatched_tag_is_rejected(self) -> None:
         result = self.run_checker("v9.9.9")

@@ -250,6 +250,29 @@ class RunMatrixOutputContractTest(unittest.TestCase):
             self.assertEqual(summary["artifact_schema_version"], 1)
             self.assertEqual(summary["verify_schema_version_required"], 3)
             self.assertIn("matrix complete: 1 runs, 0 succeeded", stdout.getvalue())
+    def test_verify_policy_flags_are_persisted_in_matrix_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "matrix-output"
+            with mock.patch.object(
+                sys,
+                "argv",
+                self.matrix_argv(
+                    output,
+                    "--dry-run",
+                    "--verify-memory-mb",
+                    "96",
+                    "--verify-network",
+                    "allow",
+                ),
+            ):
+                self.assertEqual(main(), 0)
+
+            metadata = json.loads((output / "matrix.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["verify_memory_mb"], 96)
+            self.assertEqual(metadata["verify_network"], "allow")
+            self.assertEqual(metadata["verification_policy"]["memory_mb"], 96)
+            self.assertEqual(metadata["verification_policy"]["network_policy"], "allow")
+
 
     def test_summary_failure_writes_failure_artifact_and_returns_nonzero(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

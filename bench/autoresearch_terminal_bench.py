@@ -24,6 +24,73 @@ HEREDOC_RE = re.compile(
 )
 
 
+def _terminal_cause(report: Any) -> dict[str, Any] | None:
+    if not isinstance(report, dict):
+        return None
+    diagnostics: list[dict[str, Any]] = []
+    for diagnostic in report.get("diagnostics", []):
+        if isinstance(diagnostic, dict):
+            diagnostics.append(diagnostic)
+    for stage in report.get("stages", []):
+        detail = stage.get("detail") if isinstance(stage, dict) else None
+        if isinstance(detail, dict):
+            for diagnostic in detail.get("diagnostics", []):
+                if isinstance(diagnostic, dict) and diagnostic not in diagnostics:
+                    diagnostics.append(diagnostic)
+    for diagnostic in diagnostics:
+        if diagnostic.get("domain") == "target_code" and diagnostic.get("impact") == "gating":
+            return {**diagnostic, "classification": "target"}
+    for stage in report.get("stages", []):
+        detail = stage.get("detail") if isinstance(stage, dict) else None
+        findings = detail.get("findings") if isinstance(detail, dict) else None
+        for finding in findings if isinstance(findings, list) else []:
+            if not isinstance(finding, dict) or finding.get("suppressed") is True:
+                continue
+            if finding.get("severity") in {"crash", "property_violation", "behavioral_regression"} and finding.get("category") != "infrastructure":
+                return {"classification": "target", "finding": finding}
+    for diagnostic in diagnostics:
+        if diagnostic.get("impact") == "blocking":
+            return {**diagnostic, "classification": "inconclusive"}
+    if report.get("verdict") == "fail":
+        return {"classification": "legacy"}
+    if report.get("verdict") == "inconclusive":
+        return {"classification": "inconclusive"}
+    return None
+
+
+def _report_metadata(report: Any) -> dict[str, list[str]]:
+    found: dict[str, set[str]] = {
+        "source_modes": set(),
+        "network_policies": set(),
+        "termination_kinds": set(),
+        "provenance": set(),
+    }
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if isinstance(child, str):
+                    target = {
+                        "source_mode": "source_modes",
+                        "network_policy": "network_policies",
+                        "network": "network_policies",
+                        "provenance": "provenance",
+                    }.get(key)
+                    if target:
+                        found[target].add(child)
+                if key in {"termination", "process"} and isinstance(child, dict):
+                    kind = child.get("kind")
+                    if isinstance(kind, str):
+                        found["termination_kinds"].add(kind)
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(report)
+    return {key: sorted(values) for key, values in found.items() if values}
+
+
 @dataclass(slots=True)
 class TaskPaths:
     task_id: str
@@ -272,18 +339,25 @@ def run_cj(
             "command_timeout": True,
             "duration_ms": int((time.time() - started) * 1000),
             "verdict": "inconclusive",
+            "typed_cause": {"classification": "inconclusive", "kind": "timeout"},
+            "metadata": {"termination_kinds": ["timed_out"]},
             "exit_code": None,
             "stderr": str(exc),
             "stage_status": {},
             "test_message": None,
             "first_execute_failure": None,
         }
-
     try:
         report = json.loads(proc.stdout)
     except json.JSONDecodeError:
         report = {"stdout": proc.stdout, "stderr": proc.stderr}
 
+    cause = _terminal_cause(report)
+    effective_verdict = report.get("verdict") if isinstance(report, dict) else "inconclusive"
+    if cause and cause.get("classification") == "target":
+        effective_verdict = "fail"
+    elif cause and cause.get("classification") == "inconclusive":
+        effective_verdict = "inconclusive"
     stages = report.get("stages", []) if isinstance(report, dict) else []
     stage_status = {
         stage.get("name"): stage.get("status")
@@ -292,33 +366,30 @@ def run_cj(
     }
     test_message = None
     first_execute_failure = None
+    if cause and cause.get("classification") == "target":
+        finding = cause.get("finding")
+        if isinstance(finding, dict):
+            location = finding.get("location") if isinstance(finding.get("location"), dict) else {}
+            repro = finding.get("repro") if isinstance(finding.get("repro"), dict) else {}
+            first_execute_failure = {
+                "function": location.get("function") or finding.get("function"),
+                "input": repro.get("snippet") or repro.get("arguments") or finding.get("input"),
+                "error_type": finding.get("error_type"),
+                "message": finding.get("message"),
+                "severity": finding.get("severity"),
+            }
     for stage in stages:
         if not isinstance(stage, dict):
             continue
         if stage.get("name") == "test":
             test_message = stage.get("message")
-        if stage.get("name") == "execute":
-            detail = stage.get("detail") if isinstance(stage.get("detail"), dict) else {}
-            findings = detail.get("findings") if isinstance(detail, dict) else None
-            if isinstance(findings, list) and findings:
-                first = findings[0]
-                if isinstance(first, dict):
-                    location = first.get("location") if isinstance(first.get("location"), dict) else {}
-                    repro = first.get("repro") if isinstance(first.get("repro"), dict) else {}
-                    first_execute_failure = {
-                        "function": location.get("function") or first.get("function"),
-                        "input": repro.get("snippet") or repro.get("arguments") or first.get("input"),
-                        "error_type": first.get("error_type"),
-                        "message": first.get("message"),
-                        "severity": first.get("severity"),
-                    }
-            elif stage.get("status") == "failed":
-                first_execute_failure = {"message": stage.get("message")}
 
     return {
         "command_timeout": False,
         "duration_ms": int((time.time() - started) * 1000),
-        "verdict": report.get("verdict") if isinstance(report, dict) else "inconclusive",
+        "verdict": effective_verdict,
+        "typed_cause": cause,
+        "metadata": _report_metadata(report),
         "exit_code": proc.returncode,
         "stderr": proc.stderr,
         "summary": report.get("summary") if isinstance(report, dict) else None,

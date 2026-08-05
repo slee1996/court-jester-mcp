@@ -1,7 +1,7 @@
 use court_jester::tools::analyze;
 use court_jester::tools::analyze::{
-    analyze, check_complexity_threshold, filter_changed_functions, source_declared_properties,
-    source_directive_suppresses_complexity,
+    analyze, analyze_with_context, check_complexity_threshold, filter_changed_functions,
+    source_declared_properties, source_directive_suppresses_complexity,
 };
 use court_jester::tools::diff::parse_changed_lines;
 use court_jester::tools::domain::{build_verification_plan, classify_input, domain_for_annotation};
@@ -666,7 +666,6 @@ fn resolve_imported_types_from_parent_python_relative_path() {
     let analysis = analyze(&code, &Language::Python);
     let imported =
         analyze::resolve_imported_types(&analysis, main_path.to_str().unwrap(), &Language::Python);
-
     assert_eq!(imported.classes.len(), 1, "should resolve ..models");
     assert_eq!(imported.classes[0].name, "Profile");
     assert_eq!(imported.classes[0].fields.len(), 2);
@@ -1079,6 +1078,9 @@ fn domain_ir_classifies_literal_boundary_inputs() {
         closed: true,
         domain: domain.clone(),
         sources: vec![],
+        keyword_only: false,
+        optional: false,
+        variadic: None,
     }];
     let valid = court_jester::types::PlannedArguments {
         positional: vec![court_jester::types::DomainLiteral {
@@ -1172,4 +1174,55 @@ fn verification_plan_exhausts_closed_literal_product_deterministically() {
         "both closed parameters must be exhaustively scheduled"
     );
     assert!(rows.iter().all(|row| row.len() == 2));
+}
+
+#[test]
+fn tsx_source_context_uses_tsx_grammar() {
+    let analysis = analyze_with_context(
+        "export function Badge() { return <span data-kind=\"ok\">ok</span>; }",
+        &court_jester::types::SourceContext {
+            language: Language::TypeScript,
+            mode: court_jester::types::SourceMode::Tsx,
+            source_file: None,
+            virtual_file_path: Some("Badge.tsx".into()),
+        },
+    );
+    assert!(!analysis.parse_error);
+    assert_eq!(analysis.source_mode, court_jester::types::SourceMode::Tsx);
+    assert!(analysis
+        .functions
+        .iter()
+        .any(|function| function.name == "Badge"));
+}
+
+#[test]
+fn jsx_source_context_uses_tsx_grammar() {
+    let analysis = analyze_with_context(
+        "const view = () => <div className=\"x\" />;",
+        &court_jester::types::SourceContext {
+            language: Language::TypeScript,
+            mode: court_jester::types::SourceMode::Tsx,
+            source_file: None,
+            virtual_file_path: Some("view.jsx".into()),
+        },
+    );
+    assert!(!analysis.parse_error);
+}
+
+#[test]
+fn malformed_tsx_reports_structured_diagnostic() {
+    let analysis = analyze_with_context(
+        "const view = () => <div>",
+        &court_jester::types::SourceContext {
+            language: Language::TypeScript,
+            mode: court_jester::types::SourceMode::Tsx,
+            source_file: None,
+            virtual_file_path: Some("view.tsx".into()),
+        },
+    );
+    assert!(analysis.parse_error);
+    let diagnostic = analysis.parse_diagnostics.first().expect("diagnostic");
+    assert!(diagnostic.start_line >= 1);
+    assert!(diagnostic.start_column >= 1);
+    assert!(diagnostic.message.contains("syntax node"));
 }

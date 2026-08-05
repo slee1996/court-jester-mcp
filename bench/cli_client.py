@@ -86,12 +86,32 @@ class CourtJesterClient:
                 f"court-jester {name} exited rc={completed.returncode} "
                 f"stderr={stderr_tail} stdout={stdout_tail}"
             )
+        execution_metadata: dict[str, Any] = {
+            "argv": list(command),
+            "cwd": str(cwd),
+            "termination": {
+                "kind": "exited",
+                "exit_code": completed.returncode,
+                "signal": None,
+            },
+        }
+        for key in (
+            "source_mode",
+            "network_policy",
+            "runtime_profile",
+            "harness_args",
+            "verify_memory_mb",
+            "verify_network",
+        ):
+            if key in arguments:
+                execution_metadata[key] = arguments[key]
         return {
             "result": {
                 "parsed": parsed,
                 "stdout": completed.stdout,
                 "stderr": completed.stderr,
                 "exit_code": completed.returncode,
+                "metadata": execution_metadata,
             }
         }
 
@@ -117,6 +137,33 @@ class CourtJesterClient:
             command.extend(["--config-path", str(config_path)])
         if virtual_file_path:
             command.extend(["--virtual-file-path", virtual_file_path])
+        if tool in {"verify", "execute"}:
+            runtime_profile = arguments.get("runtime_profile")
+            if runtime_profile:
+                command.extend(["--runtime-profile", str(runtime_profile)])
+                if runtime_profile == "isolated":
+                    image_key = (
+                        "python_docker_image"
+                        if language == "python"
+                        else "typescript_docker_image"
+                    )
+                    image = arguments.get(image_key)
+                    if image:
+                        command.extend([f"--{image_key.replace('_', '-')}", str(image)])
+            network_policy = arguments.get(
+                "verify_network" if tool == "verify" else "network_policy",
+                arguments.get("network"),
+            )
+            if network_policy is not None:
+                command.extend(["--network", str(network_policy)])
+            harness_args = arguments.get("harness_args")
+            if harness_args is not None:
+                command.extend(
+                    [
+                        "--harness-args-json",
+                        json.dumps(harness_args, separators=(",", ":")),
+                    ]
+                )
 
         if tool in {"analyze", "verify"}:
             complexity_threshold = arguments.get("complexity_threshold")
@@ -145,6 +192,12 @@ class CourtJesterClient:
             output_dir = arguments.get("output_dir")
             if output_dir:
                 command.extend(["--output-dir", str(output_dir)])
+            timeout_seconds = arguments.get("verify_timeout_seconds")
+            if timeout_seconds is not None:
+                command.extend(["--timeout-seconds", str(timeout_seconds)])
+            memory_mb = arguments.get("verify_memory_mb")
+            if memory_mb is not None:
+                command.extend(["--memory-mb", str(memory_mb)])
 
         if tool == "execute":
             timeout_seconds = arguments.get("timeout_seconds")
@@ -197,11 +250,15 @@ class CourtJesterClient:
         default_stem: str = "source",
     ) -> Path:
         suffix = ".py" if language == "python" else ".ts"
+        if language == "typescript" and hinted_path:
+            hinted_suffix = Path(hinted_path).suffix.lower()
+            if hinted_suffix in {".tsx", ".jsx", ".ts", ".mts", ".cts"}:
+                suffix = hinted_suffix
         if hinted_path:
             hinted = Path(hinted_path)
             relative = Path(*hinted.parts[1:]) if hinted.is_absolute() else hinted
             target = temp_dir / relative
-            if target.suffix != suffix:
+            if target.suffix.lower() not in {suffix.lower(), ".tsx", ".jsx", ".ts", ".mts", ".cts"}:
                 target = target.with_suffix(suffix)
         else:
             target = temp_dir / f"{default_stem}{suffix}"

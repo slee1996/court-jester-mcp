@@ -392,6 +392,460 @@ pub fn domain_for_annotation(
         0,
     )
 }
+/// Returns true when a parameter represents an injectable dependency rather
+/// than a value domain.  This intentionally examines resolved type structure
+/// and default expressions; parameter names are never used as a signal.
+pub fn is_dependency_shaped(
+    param: &ParamInfo,
+    classes: &[ClassInfo],
+    aliases: &[TypeAliasInfo],
+) -> bool {
+    param.type_annotation.as_deref().is_some_and(|annotation| {
+        annotation_is_dependency(annotation, classes, aliases, &mut Vec::new())
+    }) || param
+        .default_value
+        .as_deref()
+        .is_some_and(is_nonliteral_dependency_default)
+}
+
+fn annotation_is_dependency(
+    annotation: &str,
+    classes: &[ClassInfo],
+    aliases: &[TypeAliasInfo],
+    stack: &mut Vec<String>,
+) -> bool {
+    let text = annotation.trim();
+    if text.is_empty() {
+        return false;
+    }
+    let lower = text.to_ascii_lowercase();
+    if lower == "callable"
+        || lower.starts_with("callable[")
+        || lower == "function"
+        || lower == "functiontype"
+        || lower.contains("=>")
+        || lower.starts_with("(...")
+    {
+        return true;
+    }
+    if let Some(alias) = aliases.iter().find(|alias| alias.name == text) {
+        if stack.iter().any(|name| name == text) {
+            return false;
+        }
+        stack.push(text.to_string());
+        let result = annotation_is_dependency(&alias.type_annotation, classes, aliases, stack);
+        stack.pop();
+        return result;
+    }
+    if text.starts_with('{') && text.ends_with('}') {
+        return split_top_level(text[1..text.len().saturating_sub(1)].trim(), ',')
+            .into_iter()
+            .filter_map(|field| field.split_once(':').map(|(_, value)| value.to_string()))
+            .any(|field| annotation_is_dependency(&field, classes, aliases, stack));
+    }
+    if let Some(class) = classes.iter().find(|class| class.name == text) {
+        if stack.iter().any(|name| name == text) {
+            return false;
+        }
+        stack.push(text.to_string());
+        let result = class.fields.iter().any(|field| {
+            field.type_annotation.as_deref().is_some_and(|annotation| {
+                annotation_is_dependency(annotation, classes, aliases, stack)
+            })
+        });
+        stack.pop();
+        return result;
+    }
+    false
+}
+
+fn is_nonliteral_dependency_default(default_value: &str) -> bool {
+    let value = default_value.trim();
+    if value.is_empty() || literal(value, &Language::TypeScript).is_some() {
+        return false;
+    }
+    let mut body = value;
+    if let Some(stripped) = body.strip_prefix("new ") {
+        body = stripped.trim();
+    }
+    let Some(first) = body.chars().next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    if body.ends_with(')') {
+        return body.contains('(');
+    }
+    body.chars()
+        .all(|ch| ch == '_' || ch == '.' || ch.is_ascii_alphanumeric())
+}
+
+fn resolve_alias_annotation(
+    annotation: &str,
+    aliases: &[TypeAliasInfo],
+    stack: &mut Vec<String>,
+) -> Option<String> {
+    let text = annotation.trim();
+    let alias = aliases.iter().find(|alias| alias.name == text)?;
+    if stack.iter().any(|name| name == text) {
+        return None;
+    }
+    stack.push(text.to_string());
+    let result = resolve_alias_annotation(&alias.type_annotation, aliases, stack)
+        .or_else(|| Some(alias.type_annotation.trim().to_string()));
+    stack.pop();
+    result
+}
+
+fn callable_return_annotation(
+    annotation: &str,
+    aliases: &[TypeAliasInfo],
+) -> Option<(String, bool)> {
+    let mut resolved = annotation.trim().to_string();
+    let mut stack = Vec::new();
+    if let Some(alias) = resolve_alias_annotation(&resolved, aliases, &mut stack) {
+        resolved = alias;
+    }
+    let lower = resolved.to_ascii_lowercase();
+    if lower == "callable" || lower == "function" || lower == "functiontype" {
+        return None;
+    }
+    if lower.starts_with("callable[") {
+        let inner = resolved
+            .split_once('[')
+            .and_then(|(_, value)| value.strip_suffix(']'))
+            .unwrap_or("");
+        let parts = split_top_level(inner, ',');
+        let result = parts.last()?.trim();
+        if result == "..." || result.is_empty() {
+            return None;
+        }
+        return Some((result.to_string(), false));
+    }
+    let arrow = resolved.find("=>")?;
+    let result = resolved[arrow + 2..].trim();
+    if result.is_empty() {
+        return None;
+    }
+    let (is_async, result) = if result.starts_with("Promise<") && result.ends_with('>') {
+        (true, result[8..result.len() - 1].trim())
+    } else {
+        (false, result)
+    };
+    Some((result.to_string(), is_async))
+}
+
+fn strip_outer_parentheses(mut text: &str) -> &str {
+    loop {
+        let bytes = text.as_bytes();
+        if bytes.len() < 2 || bytes[0] != b'(' || bytes[bytes.len() - 1] != b')' {
+            return text;
+        }
+        let mut depth = 0usize;
+        let mut encloses = true;
+        for (index, character) in text.char_indices() {
+            match character {
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 && index + character.len_utf8() < text.len() {
+                        encloses = false;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !encloses || depth != 0 {
+            return text;
+        }
+        text = text[1..text.len() - 1].trim();
+    }
+}
+
+fn dependency_object_fields(
+    annotation: &str,
+    classes: &[ClassInfo],
+    aliases: &[TypeAliasInfo],
+    stack: &mut Vec<String>,
+) -> Option<Vec<(String, String, bool)>> {
+    let text = strip_outer_parentheses(annotation.trim());
+    if let Some(alias) = aliases.iter().find(|alias| alias.name == text) {
+        if stack.iter().any(|name| name == text) {
+            return None;
+        }
+        stack.push(text.to_string());
+        let result = dependency_object_fields(&alias.type_annotation, classes, aliases, stack);
+        stack.pop();
+        return result;
+    }
+    if let Some(class) = classes.iter().find(|class| class.name == text) {
+        if class.fields.is_empty() || stack.iter().any(|name| name == text) {
+            return None;
+        }
+        stack.push(text.to_string());
+        let fields = class
+            .fields
+            .iter()
+            .filter_map(|field| {
+                field
+                    .type_annotation
+                    .as_ref()
+                    .map(|annotation| (field.name.clone(), annotation.clone(), field.optional))
+            })
+            .collect();
+        stack.pop();
+        return Some(fields);
+    }
+    if !(text.starts_with('{') && text.ends_with('}')) {
+        return None;
+    }
+    let body = &text[1..text.len() - 1];
+    let mut members = split_top_level(body, ',');
+    if members.len() == 1 && members[0].trim() == body.trim() {
+        members = split_top_level(body, ';');
+    }
+    let mut fields = Vec::new();
+    for member in members {
+        let member = member.trim();
+        if member.is_empty() {
+            continue;
+        }
+        let (raw_name, annotation) = member.split_once(':')?;
+        let optional = raw_name.trim().ends_with('?');
+        let name = raw_name
+            .trim()
+            .trim_end_matches('?')
+            .trim_matches(['"', '\'', '`'])
+            .to_string();
+        if name.is_empty() {
+            return None;
+        }
+        fields.push((name, annotation.trim().to_string(), optional));
+    }
+    (!fields.is_empty()).then_some(fields)
+}
+
+fn callback_substitute(
+    return_type: &str,
+    is_async: bool,
+    language: &Language,
+    classes: &[ClassInfo],
+    aliases: &[TypeAliasInfo],
+) -> Option<DomainLiteral> {
+    let value = deterministic_domain_literal(return_type, aliases, classes, language)?;
+    let expression = match language {
+        Language::Python => format!("(lambda *args, **kwargs: {})", value.expression),
+        Language::TypeScript if is_async => {
+            format!(
+                "(async (..._args: unknown[]) => Promise.resolve({}))",
+                value.expression
+            )
+        }
+        Language::TypeScript => format!("((..._args: unknown[]) => {})", value.expression),
+    };
+    Some(DomainLiteral {
+        expression,
+        json_value: None,
+    })
+}
+
+fn deterministic_service_literal(
+    annotation: &str,
+    aliases: &[TypeAliasInfo],
+    classes: &[ClassInfo],
+    language: &Language,
+    stack: &mut Vec<String>,
+) -> Option<DomainLiteral> {
+    let fields = dependency_object_fields(annotation, classes, aliases, stack)?;
+    let mut rendered = Vec::new();
+    for (name, annotation, optional) in fields {
+        let value = if let Some((return_type, is_async)) =
+            callable_return_annotation(&annotation, aliases)
+        {
+            callback_substitute(&return_type, is_async, language, classes, aliases)
+        } else if dependency_object_fields(&annotation, classes, aliases, stack).is_some() {
+            deterministic_service_literal(&annotation, aliases, classes, language, stack)
+        } else {
+            deterministic_domain_literal(&annotation, aliases, classes, language)
+        };
+        let Some(value) = value else {
+            if optional {
+                continue;
+            }
+            return None;
+        };
+        let key = serde_json::to_string(&name).ok()?;
+        rendered.push(format!("{key}: {}", value.expression));
+    }
+    if rendered.is_empty() {
+        return None;
+    }
+    let expression = match language {
+        Language::TypeScript => format!("{{{}}}", rendered.join(", ")),
+        Language::Python => format!(
+            "type(\"CourtJesterSafeDependency\", (), {{{}}})()",
+            rendered.join(", ")
+        ),
+    };
+    Some(DomainLiteral {
+        expression,
+        json_value: None,
+    })
+}
+
+fn deterministic_domain_literal(
+    annotation: &str,
+    aliases: &[TypeAliasInfo],
+    classes: &[ClassInfo],
+    language: &Language,
+) -> Option<DomainLiteral> {
+    let normalized = annotation.trim().to_ascii_lowercase();
+    if matches!(normalized.as_str(), "void" | "none" | "undefined") {
+        return Some(DomainLiteral {
+            expression: match language {
+                Language::Python => "None".into(),
+                Language::TypeScript => "undefined".into(),
+            },
+            json_value: None,
+        });
+    }
+    let domain = domain_for_annotation(Some(annotation), aliases, classes, language);
+    domain_literals(&domain, language)
+        .into_iter()
+        .next()
+        .or_else(|| {
+            let (expression, json_value) = match domain {
+                DomainNode::Boolean => (
+                    render_json_literal(&serde_json::Value::Bool(false), language),
+                    Some(serde_json::Value::Bool(false)),
+                ),
+                DomainNode::Integer | DomainNode::Float => {
+                    ("0".to_string(), Some(serde_json::Value::from(0)))
+                }
+                DomainNode::String => (
+                    render_json_literal(&serde_json::Value::String(String::new()), language),
+                    Some(serde_json::Value::String(String::new())),
+                ),
+                DomainNode::Array(_) | DomainNode::Tuple(_) | DomainNode::Set(_) => {
+                    ("[]".to_string(), Some(serde_json::Value::Array(Vec::new())))
+                }
+                DomainNode::Object(_) => ("{}".to_string(), Some(serde_json::json!({}))),
+                _ => return None,
+            };
+            Some(DomainLiteral {
+                expression,
+                json_value,
+            })
+        })
+}
+
+/// Build a deterministic, no-I/O replacement for an omitted dependency
+/// argument.  Callable values retain their callable shape and async
+/// TypeScript callbacks resolve a generated return-domain value.
+pub fn safe_dependency_substitute(
+    param: &ParamInfo,
+    language: &Language,
+    classes: &[ClassInfo],
+    aliases: &[TypeAliasInfo],
+) -> Result<DomainLiteral, UnsafeDefaultReason> {
+    let annotation = param
+        .type_annotation
+        .as_deref()
+        .ok_or(UnsafeDefaultReason::Untyped)?;
+    if !is_dependency_shaped(param, classes, aliases) {
+        return Err(UnsafeDefaultReason::Unsynthesizable);
+    }
+    if let Some((return_type, is_async)) = callable_return_annotation(annotation, aliases) {
+        return callback_substitute(&return_type, is_async, language, classes, aliases)
+            .ok_or(UnsafeDefaultReason::SubstituteUnavailable);
+    }
+    let mut stack = Vec::new();
+    if dependency_object_fields(annotation, classes, aliases, &mut stack).is_some() {
+        return deterministic_service_literal(
+            annotation,
+            aliases,
+            classes,
+            language,
+            &mut Vec::new(),
+        )
+        .ok_or(UnsafeDefaultReason::SubstituteUnavailable);
+    }
+    deterministic_domain_literal(annotation, aliases, classes, language)
+        .map(|mut value| {
+            if matches!(language, Language::Python)
+                && annotation.to_ascii_lowercase().contains("callable")
+            {
+                value.expression = format!("(lambda *args, **kwargs: {})", value.expression);
+                value.json_value = None;
+            }
+            value
+        })
+        .ok_or(UnsafeDefaultReason::SubstituteUnavailable)
+}
+
+/// Normalize omitted/default-activating dependency slots before input
+/// classification.  The returned sources identify substitutions so callers
+/// can preserve provenance in the plan.
+pub fn normalize_dependency_arguments(
+    params: &[ParamInfo],
+    arguments: &mut PlannedArguments,
+    language: &Language,
+    classes: &[ClassInfo],
+    aliases: &[TypeAliasInfo],
+) -> Result<Vec<(String, DomainSource)>, UnsafeDefaultReason> {
+    let mut sources = Vec::new();
+    let mut positional_index = 0usize;
+    for param in params {
+        let value = if param.keyword_only {
+            arguments.named.get(&param.name)
+        } else {
+            let current = arguments.positional.get(positional_index);
+            positional_index += 1;
+            current
+        };
+        let default_activating = value.is_none()
+            || value.is_some_and(|value| {
+                language == &Language::TypeScript
+                    && matches!(value.expression.trim(), "undefined" | "void 0")
+            });
+        if !default_activating || !is_dependency_shaped(param, classes, aliases) {
+            continue;
+        }
+        let substitute = safe_dependency_substitute(param, language, classes, aliases)?;
+        if param.keyword_only {
+            arguments
+                .named
+                .insert(param.name.clone(), substitute.clone());
+        } else if positional_index > 0 {
+            let index = positional_index - 1;
+            if index == arguments.positional.len() {
+                arguments.positional.push(substitute.clone());
+            } else if index < arguments.positional.len() {
+                arguments.positional[index] = substitute.clone();
+            } else {
+                arguments.positional.resize_with(index, || DomainLiteral {
+                    expression: match language {
+                        Language::Python => "None".into(),
+                        Language::TypeScript => "undefined".into(),
+                    },
+                    json_value: None,
+                });
+                arguments.positional.push(substitute.clone());
+            }
+        }
+        sources.push((
+            param.name.clone(),
+            source(
+                DomainSourceKind::SafeDependencySubstitute,
+                Some(&param.name),
+                None,
+            ),
+        ));
+    }
+    Ok(sources)
+}
 
 fn domain_is_closed(domain: &DomainNode) -> bool {
     match domain {
@@ -589,18 +1043,73 @@ fn same_value(a: &DomainLiteral, b: &DomainLiteral) -> bool {
         || normalized_expression(&a.expression) == normalized_expression(&b.expression)
 }
 
-fn same_arguments(a: &PlannedArguments, b: &PlannedArguments) -> bool {
-    a.positional.len() == b.positional.len()
-        && a.positional
-            .iter()
-            .zip(&b.positional)
-            .all(|(left, right)| same_value(left, right))
-        && a.named.len() == b.named.len()
-        && a.named.iter().all(|(name, left)| {
-            b.named
-                .get(name)
-                .is_some_and(|right| same_value(left, right))
-        })
+/// Bind tagged slots into the canonical flat invocation representation.
+/// Variadic slot boundaries exist only during generation/normalization.
+pub(crate) fn bind_argument_slots(
+    signature: &[ParameterDomain],
+    slots: PlannedArgumentSlots,
+) -> Result<PlannedArguments, BindingError> {
+    let mut positional = Vec::new();
+    let mut named = BTreeMap::new();
+    let mut slot_index = 0usize;
+    for parameter in signature {
+        let slot = slots.slots.get(slot_index);
+        match parameter.variadic {
+            Some(VariadicKind::Positional) => {
+                let Some(PlannedArgumentSlot::PositionalVariadic(values)) = slot else {
+                    return Err(BindingError::InvalidSlot {
+                        parameter: parameter.parameter.clone(),
+                        message: "expected positional variadic slot".into(),
+                    });
+                };
+                positional.extend(values.iter().cloned());
+                slot_index += 1;
+            }
+            Some(VariadicKind::Keyword) => {
+                let Some(PlannedArgumentSlot::KeywordVariadic(values)) = slot else {
+                    return Err(BindingError::InvalidSlot {
+                        parameter: parameter.parameter.clone(),
+                        message: "expected keyword variadic slot".into(),
+                    });
+                };
+                named.extend(
+                    values
+                        .iter()
+                        .map(|(name, value)| (name.clone(), value.clone())),
+                );
+                slot_index += 1;
+            }
+            None => {
+                let Some(slot) = slot else {
+                    if parameter.optional {
+                        continue;
+                    }
+                    return Err(BindingError::MissingSlot {
+                        parameter: parameter.parameter.clone(),
+                    });
+                };
+                let PlannedArgumentSlot::Single(value) = slot else {
+                    return Err(BindingError::InvalidSlot {
+                        parameter: parameter.parameter.clone(),
+                        message: "expected single argument slot".into(),
+                    });
+                };
+                if parameter.keyword_only {
+                    named.insert(parameter.parameter.clone(), value.clone());
+                } else {
+                    positional.push(value.clone());
+                }
+                slot_index += 1;
+            }
+        }
+    }
+    if slot_index != slots.slots.len() {
+        return Err(BindingError::TooManySlots {
+            expected: slot_index,
+            actual: slots.slots.len(),
+        });
+    }
+    Ok(PlannedArguments { positional, named })
 }
 
 pub fn classify_input(
@@ -611,26 +1120,75 @@ pub fn classify_input(
         return InputClassification::Unknown;
     }
     let mut saw_unknown = false;
-    for (index, domain) in domains.iter().enumerate() {
-        let value = arguments
-            .positional
-            .get(index)
-            .or_else(|| arguments.named.get(&domain.parameter));
-        let Some(value) = value else {
-            saw_unknown = true;
-            continue;
-        };
-        match value_matches_domain(value, &domain.domain) {
-            Some(true) => {}
-            Some(false) => return InputClassification::Invalid,
-            None => saw_unknown = true,
+    let mut positional_index = 0usize;
+    let mut saw_positional_variadic = false;
+    for parameter in domains {
+        match parameter.variadic {
+            Some(VariadicKind::Positional) => {
+                saw_positional_variadic = true;
+                for value in &arguments.positional[positional_index..] {
+                    match value_matches_domain(value, &parameter.domain) {
+                        Some(true) => {}
+                        Some(false) => return InputClassification::Invalid,
+                        None => saw_unknown = true,
+                    }
+                }
+                positional_index = arguments.positional.len();
+            }
+            Some(VariadicKind::Keyword) => {
+                let known_names = domains
+                    .iter()
+                    .filter(|candidate| candidate.variadic.is_none() && candidate.keyword_only)
+                    .map(|candidate| candidate.parameter.as_str())
+                    .collect::<std::collections::BTreeSet<_>>();
+                for (_, value) in arguments
+                    .named
+                    .iter()
+                    .filter(|(name, _)| !known_names.contains(name.as_str()))
+                {
+                    match value_matches_domain(value, &parameter.domain) {
+                        Some(true) => {}
+                        Some(false) => return InputClassification::Invalid,
+                        None => saw_unknown = true,
+                    }
+                }
+            }
+            None => {
+                let value = if parameter.keyword_only {
+                    arguments.named.get(&parameter.parameter)
+                } else {
+                    let value = arguments.positional.get(positional_index);
+                    if value.is_some() {
+                        positional_index += 1;
+                    }
+                    value.or_else(|| arguments.named.get(&parameter.parameter))
+                };
+                let Some(value) = value else {
+                    if !parameter.optional {
+                        saw_unknown = true;
+                    }
+                    continue;
+                };
+                match value_matches_domain(value, &parameter.domain) {
+                    Some(true) => {}
+                    Some(false) => return InputClassification::Invalid,
+                    None => saw_unknown = true,
+                }
+            }
         }
+    }
+    if positional_index < arguments.positional.len() && !saw_positional_variadic {
+        return InputClassification::Invalid;
     }
     if saw_unknown {
         InputClassification::Unknown
     } else {
         InputClassification::Valid
     }
+}
+
+fn same_arguments(left: &PlannedArguments, right: &PlannedArguments) -> bool {
+    left == right
 }
 
 fn add_planned_input(inputs: &mut Vec<PlannedInput>, mut candidate: PlannedInput) {
@@ -674,7 +1232,7 @@ pub fn build_verification_plan(
             parameter_names: func
                 .params
                 .iter()
-                .filter(|param| !param.name.starts_with('*'))
+                .filter(|param| param.variadic.is_none())
                 .map(|param| param.name.clone())
                 .collect(),
         })
@@ -682,12 +1240,7 @@ pub fn build_verification_plan(
     let mut parameter_domains = Vec::new();
     for func in functions.iter().filter(|func| !func.is_nested) {
         let surface_id = format!("{}:{}", func.name, func.line);
-        for (index, param) in func
-            .params
-            .iter()
-            .filter(|param| !param.name.starts_with('*'))
-            .enumerate()
-        {
+        for (index, param) in func.params.iter().enumerate() {
             let mut sources = vec![source(
                 DomainSourceKind::TypeAnnotation,
                 param.type_annotation.as_deref(),
@@ -700,8 +1253,17 @@ pub fn build_verification_plan(
                     None,
                 ));
             }
-            let domain =
+            let mut domain =
                 domain_for_annotation(param.type_annotation.as_deref(), aliases, classes, language);
+            if matches!(param.variadic, Some(VariadicKind::Positional))
+                && matches!(language, Language::TypeScript)
+            {
+                // TypeScript rest annotations describe the collected array;
+                // strip exactly one outer array so T[][] yields T[] items.
+                if let DomainNode::Array(inner) = domain {
+                    domain = *inner;
+                }
+            }
             parameter_domains.push(ParameterDomain {
                 surface_id: surface_id.clone(),
                 parameter: param.name.clone(),
@@ -709,6 +1271,9 @@ pub fn build_verification_plan(
                 closed: domain_is_closed(&domain),
                 domain,
                 sources,
+                keyword_only: param.keyword_only,
+                optional: param.optional,
+                variadic: param.variadic,
             });
         }
     }
@@ -761,46 +1326,128 @@ pub fn build_verification_plan(
             .unwrap_or(&[]);
         let choices = domains
             .iter()
-            .map(|domain| domain_literals(&domain.domain, language))
+            .map(|parameter| {
+                let values = domain_literals(&parameter.domain, language);
+                match parameter.variadic {
+                    Some(VariadicKind::Positional) => {
+                        let mut slots = vec![PlannedArgumentSlot::PositionalVariadic(vec![])];
+                        for value in values.iter().take(8) {
+                            slots
+                                .push(PlannedArgumentSlot::PositionalVariadic(vec![value.clone()]));
+                        }
+                        // Keep two scalar rest arguments as separate flat
+                        // slots.  This is distinct from one array-valued
+                        // argument, whose domain literal is itself an array.
+                        for left in values.iter().take(4) {
+                            for right in values.iter().take(4) {
+                                slots.push(PlannedArgumentSlot::PositionalVariadic(vec![
+                                    left.clone(),
+                                    right.clone(),
+                                ]));
+                            }
+                        }
+                        slots
+                    }
+                    Some(VariadicKind::Keyword) => {
+                        let mut slots = vec![PlannedArgumentSlot::KeywordVariadic(BTreeMap::new())];
+                        if let Some(value) = values.first() {
+                            let mut one = BTreeMap::new();
+                            one.insert("kw0".to_string(), value.clone());
+                            slots.push(PlannedArgumentSlot::KeywordVariadic(one));
+                        }
+                        if values.len() >= 2 {
+                            let mut two = BTreeMap::new();
+                            two.insert("kw0".to_string(), values[0].clone());
+                            two.insert("kw1".to_string(), values[1].clone());
+                            slots.push(PlannedArgumentSlot::KeywordVariadic(two));
+                        }
+                        slots
+                    }
+                    None => values
+                        .into_iter()
+                        .map(PlannedArgumentSlot::Single)
+                        .collect(),
+                }
+            })
             .collect::<Vec<_>>();
         if !choices.is_empty()
             && choices.iter().all(|values| !values.is_empty())
-            && choices.iter().map(Vec::len).product::<usize>() <= 64
+            && choices.iter().map(Vec::len).product::<usize>() <= 128
         {
-            let mut rows = vec![Vec::new()];
+            let mut rows = vec![PlannedArgumentSlots { slots: Vec::new() }];
             for values in choices {
                 rows = rows
                     .into_iter()
                     .flat_map(|row| {
                         values.iter().cloned().map(move |value| {
                             let mut next = row.clone();
-                            next.push(value);
+                            next.slots.push(value);
                             next
                         })
                     })
                     .collect();
             }
-            for positional in rows {
+            for slots in rows {
+                let Ok(mut arguments) = bind_argument_slots(domains, slots) else {
+                    continue;
+                };
+                let mut sources = vec![source(DomainSourceKind::TypeAnnotation, None, None)];
+                if let Some(function) = functions.iter().find(|function| {
+                    !function.is_nested
+                        && format!("{}:{}", function.name, function.line) == surface.id
+                }) {
+                    let dependency_sources = match normalize_dependency_arguments(
+                        &function.params,
+                        &mut arguments,
+                        language,
+                        classes,
+                        aliases,
+                    ) {
+                        Ok(sources) => sources,
+                        Err(_) => continue,
+                    };
+                    sources.extend(dependency_sources.into_iter().map(|(_, source)| source));
+                }
+                let classification = classify_input(&arguments, domains);
                 add_planned_input(
                     &mut inputs,
                     PlannedInput {
                         surface_id: surface.id.clone(),
-                        arguments: PlannedArguments {
-                            positional,
-                            named: BTreeMap::new(),
-                        },
-                        classification: InputClassification::Valid,
-                        sources: vec![source(DomainSourceKind::TypeAnnotation, None, None)],
+                        classification,
+                        arguments,
+                        sources,
                     },
                 );
             }
         }
     }
     for caller in caller_examples {
+        let Some(function) = functions.iter().find(|function| {
+            !function.is_nested
+                && format!("{}:{}", function.name, function.line) == caller.target_surface_id
+        }) else {
+            continue;
+        };
+        let mut arguments = caller.arguments.clone();
+        let dependency_sources = match normalize_dependency_arguments(
+            &function.params,
+            &mut arguments,
+            language,
+            classes,
+            aliases,
+        ) {
+            Ok(sources) => sources,
+            Err(_) => continue,
+        };
         let classification = if matches!(caller.evidence, CallerEvidence::StaticSyntax) {
             InputClassification::Unknown
         } else {
-            InputClassification::Valid
+            let domains = parameter_domains
+                .iter()
+                .filter(|domain| domain.surface_id == caller.target_surface_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            classify_input(&arguments, &domains)
         };
         let mut observed_source = source(
             DomainSourceKind::ObservedCall,
@@ -808,26 +1455,52 @@ pub fn build_verification_plan(
             Some(caller.line),
         );
         observed_source.source_file = Some(caller.source_file.clone());
+        let mut sources = vec![observed_source];
+        sources.extend(dependency_sources.into_iter().map(|(_, source)| source));
         add_planned_input(
             &mut inputs,
             PlannedInput {
                 surface_id: caller.target_surface_id.clone(),
-                arguments: caller.arguments.clone(),
+                arguments,
                 classification,
-                sources: vec![observed_source],
+                sources,
             },
         );
     }
     for fixture in fixture_examples {
+        let Some(function) = functions.iter().find(|function| {
+            !function.is_nested
+                && format!("{}:{}", function.name, function.line) == fixture.target_surface_id
+        }) else {
+            continue;
+        };
+        let mut arguments = fixture.arguments.clone();
+        let dependency_sources = match normalize_dependency_arguments(
+            &function.params,
+            &mut arguments,
+            language,
+            classes,
+            aliases,
+        ) {
+            Ok(sources) => sources,
+            Err(_) => continue,
+        };
         let mut fixture_source = source(DomainSourceKind::JsonFixture, None, Some(fixture.line));
         fixture_source.source_file = Some(fixture.source_file.clone());
+        let mut sources = vec![fixture_source];
+        sources.extend(dependency_sources.into_iter().map(|(_, source)| source));
+        let domains = parameter_domains
+            .iter()
+            .filter(|domain| domain.surface_id == fixture.target_surface_id)
+            .cloned()
+            .collect::<Vec<_>>();
         add_planned_input(
             &mut inputs,
             PlannedInput {
                 surface_id: fixture.target_surface_id.clone(),
-                arguments: fixture.arguments.clone(),
-                classification: InputClassification::Valid,
-                sources: vec![fixture_source],
+                classification: classify_input(&arguments, &domains),
+                arguments,
+                sources,
             },
         );
     }

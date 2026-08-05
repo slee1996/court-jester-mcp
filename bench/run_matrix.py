@@ -87,6 +87,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--doctor-report", type=Path)
     parser.add_argument("--python-docker-image", default="python:3.12-slim")
     parser.add_argument("--typescript-docker-image", default="node:24-bookworm-slim")
+    parser.add_argument("--verify-memory-mb", type=int, default=512)
+    parser.add_argument("--verify-network", choices=["deny", "allow"], default="deny")
     parser.add_argument("--write-heldout-lock", type=Path)
     parser.add_argument("--enforce-heldout-lock", action="store_true")
     parser.add_argument("--shadow-records", type=Path)
@@ -279,6 +281,8 @@ def execute_cell(
     verify_runtime_profile: str = "local-trusted",
     python_docker_image: str = "python:3.12-slim",
     typescript_docker_image: str = "node:24-bookworm-slim",
+    verify_memory_mb: int = 512,
+    verify_network: str = "deny",
     doctor_report: dict[str, Any] | None = None,
     shadow_records: Path | None = None,
 ) -> tuple[bool, str]:
@@ -299,6 +303,8 @@ def execute_cell(
         verify_runtime_profile=verify_runtime_profile,
         python_docker_image=python_docker_image,
         typescript_docker_image=typescript_docker_image,
+        verify_memory_mb=verify_memory_mb,
+        verify_network=verify_network,
         doctor_report=doctor_report,
         shadow_records=shadow_records,
     )
@@ -319,6 +325,8 @@ def run_serial_plan(
     verify_runtime_profile: str = "local-trusted",
     python_docker_image: str = "python:3.12-slim",
     typescript_docker_image: str = "node:24-bookworm-slim",
+    verify_memory_mb: int = 512,
+    verify_network: str = "deny",
     doctor_report: dict[str, Any] | None = None,
     shadow_records: Path | None = None,
 ) -> tuple[int, int]:
@@ -335,6 +343,8 @@ def run_serial_plan(
             verify_runtime_profile=verify_runtime_profile,
             python_docker_image=python_docker_image,
             typescript_docker_image=typescript_docker_image,
+            verify_memory_mb=verify_memory_mb,
+            verify_network=verify_network,
             doctor_report=doctor_report,
             shadow_records=shadow_records,
         )
@@ -352,6 +362,8 @@ def run_parallel_provider_plan(
     verify_runtime_profile: str = "local-trusted",
     python_docker_image: str = "python:3.12-slim",
     typescript_docker_image: str = "node:24-bookworm-slim",
+    verify_memory_mb: int = 512,
+    verify_network: str = "deny",
     doctor_report: dict[str, Any] | None = None,
     shadow_records: Path | None = None,
 ) -> tuple[int, int]:
@@ -366,6 +378,8 @@ def run_parallel_provider_plan(
             verify_runtime_profile=verify_runtime_profile,
             python_docker_image=python_docker_image,
             typescript_docker_image=typescript_docker_image,
+            verify_memory_mb=verify_memory_mb,
+            verify_network=verify_network,
             doctor_report=doctor_report,
             shadow_records=shadow_records,
         )
@@ -384,6 +398,8 @@ def run_parallel_provider_plan(
                 verify_runtime_profile=verify_runtime_profile,
                 python_docker_image=python_docker_image,
                 typescript_docker_image=typescript_docker_image,
+                verify_memory_mb=verify_memory_mb,
+                verify_network=verify_network,
                 doctor_report=doctor_report,
                 shadow_records=shadow_records,
             )
@@ -408,6 +424,10 @@ def run_parallel_provider_plan(
 
 def main() -> int:
     args = parse_args()
+    if args.verify_memory_mb <= 0:
+        raise SystemExit("--verify-memory-mb must be greater than zero")
+    if args.verify_runtime_profile == "isolated" and args.verify_network == "allow":
+        raise SystemExit("--verify-network allow is incompatible with isolated verification")
     tasks = load_manifest_dir(BENCH_ROOT / "tasks", load_task)
     models = load_manifest_dir(BENCH_ROOT / "models", load_model)
     policies = load_manifest_dir(BENCH_ROOT / "policies", load_policy)
@@ -502,6 +522,20 @@ def main() -> int:
         "verify_schema_version_required": VERIFY_SCHEMA_VERSION_REQUIRED,
         "verify_runtime_profile": args.verify_runtime_profile,
         "runtime_images": {"python": args.python_docker_image, "typescript": args.typescript_docker_image},
+        "verify_memory_mb": args.verify_memory_mb,
+        "verify_network": args.verify_network,
+        "verification_policy": {
+            "network_policy": args.verify_network,
+            "runtime_profile": args.verify_runtime_profile,
+            "memory_mb": args.verify_memory_mb,
+            "runtime_images": {"python": args.python_docker_image, "typescript": args.typescript_docker_image},
+            "typed_cause_precedence": [
+                "target_code:gating",
+                "blocking_diagnostic",
+                "inconclusive",
+                "advisory",
+            ],
+        },
         "doctor_report_sha256": sha256_bytes(args.doctor_report.read_bytes()) if args.doctor_report and args.doctor_report.exists() else None,
         "expected_suite_digest": lock_digest,
         "observed_suite_digest": lock_digest,
@@ -530,6 +564,8 @@ def main() -> int:
             "verify_runtime_profile": args.verify_runtime_profile,
             "python_docker_image": args.python_docker_image,
             "typescript_docker_image": args.typescript_docker_image,
+            "verify_memory_mb": args.verify_memory_mb,
+            "verify_network": args.verify_network,
             "doctor_report": doctor_payload,
             "shadow_records": args.shadow_records,
         }

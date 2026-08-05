@@ -1,9 +1,9 @@
 use court_jester::tools::lint::{lint, lint_with_options, LintOptions};
 use court_jester::tools::verify::{verify, VerifyOptions};
 use court_jester::types::{
-    ComplexityMetric, CoverageGate, ExecuteGate, InferredOracleGate, Language, ReportLevel,
-    RuntimeProfile, StageStatus, TestRunner, VerificationVerdict, DEFAULT_PYTHON_DOCKER_IMAGE,
-    DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+    ComplexityMetric, CoverageGate, ExecuteGate, InferredOracleGate, Language, NetworkPolicy,
+    ReportLevel, RuntimeProfile, StageStatus, TestRunner, VerificationVerdict,
+    DEFAULT_PYTHON_DOCKER_IMAGE, DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -172,6 +172,9 @@ fn verify_keeps_python_lint_runner_errors_advisory() {
             runtime_profile: RuntimeProfile::LocalTrusted,
             python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
             typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+            memory_mb: 512,
+            network: NetworkPolicy::Deny,
+            harness_args: vec![],
         },
     ));
 

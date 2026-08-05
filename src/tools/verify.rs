@@ -33,12 +33,15 @@ pub struct VerifyOptions<'a> {
     pub coverage_gate: CoverageGate,
     pub inferred_oracle_gate: InferredOracleGate,
     pub runtime_profile: RuntimeProfile,
+    pub memory_mb: u64,
+    pub network: NetworkPolicy,
+    pub harness_args: Vec<HarnessArg>,
     pub python_docker_image: &'a str,
     pub typescript_docker_image: &'a str,
 }
 
 fn sandbox_options<'a>(
-    opts: &VerifyOptions<'a>,
+    opts: &'a VerifyOptions<'a>,
     language: &Language,
     timeout_seconds: f64,
     memory_mb: u64,
@@ -57,6 +60,8 @@ fn sandbox_options<'a>(
         timeout_seconds,
         memory_mb,
         runtime_profile: opts.runtime_profile,
+        network_policy: opts.network,
+        harness_args: opts.harness_args.as_slice(),
         docker_image,
         project_dir,
         source_file,
@@ -131,6 +136,13 @@ fn err_execution_result(message: &str) -> ExecutionResult {
         duration_ms: 0,
         timed_out: false,
         memory_error: false,
+        termination: Some(ProcessTermination {
+            kind: ProcessTerminationKind::LaunchFailed,
+            exit_code: None,
+            signal: None,
+            signal_name: None,
+        }),
+        diagnostics: vec![],
     }
 }
 
@@ -175,6 +187,7 @@ fn instrument_source_for_surfaces(
     code: &str,
     functions: &[&FunctionInfo],
     language: &Language,
+    source_mode: SourceMode,
 ) -> Result<String, String> {
     struct InstrumentationTarget<'a> {
         line: usize,
@@ -321,9 +334,10 @@ fn instrument_source_for_surfaces(
     }
 
     let mut parser = Parser::new();
-    let grammar = match language {
-        Language::Python => tree_sitter_python::LANGUAGE.into(),
-        Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+    let grammar = match source_mode {
+        SourceMode::Python => tree_sitter_python::LANGUAGE.into(),
+        SourceMode::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        SourceMode::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
     };
     parser
         .set_language(&grammar)
@@ -457,6 +471,7 @@ fn prepare_authoritative_test(
     tests: &str,
     functions: &[&FunctionInfo],
     language: &Language,
+    source_mode: SourceMode,
     runner: TestRunner,
     project_dir: Option<&str>,
     source_file: Option<&str>,
@@ -473,7 +488,8 @@ fn prepare_authoritative_test(
         source_file.unwrap_or("<inline>"),
         &surfaces,
     );
-    let instrumented = match instrument_source_for_surfaces(code, functions, language) {
+    let instrumented = match instrument_source_for_surfaces(code, functions, language, source_mode)
+    {
         Ok(instrumented) => instrumented,
         Err(reason) => {
             overlay.supported = false;
@@ -767,7 +783,7 @@ fn differential_case_from_arguments(
     let params = function
         .params
         .iter()
-        .filter(|param| !param.name.starts_with('*'))
+        .filter(|param| !param.is_variadic())
         .collect::<Vec<_>>();
     if params.len() != arguments.len() {
         return None;
@@ -792,7 +808,7 @@ fn differential_case(function: &FunctionInfo, language: &Language) -> Option<Dif
     let arguments = function
         .params
         .iter()
-        .filter(|param| !param.name.starts_with('*'))
+        .filter(|param| !param.is_variadic())
         .map(|param| {
             differential_argument(param, language).map(|expression| ReproValue {
                 expression: expression.to_string(),
@@ -1062,7 +1078,7 @@ fn differential_finding(
             candidate_tree_sha256: tree_digest(&candidate_files),
             base_files,
             candidate_files,
-            dependency_contract: DependencyContract { language: language.clone(), runtime_identity: "local-trusted".into(), lockfiles: Vec::new(), third_party_modules: Vec::new() },
+            dependency_contract: DependencyContract { language: *language, runtime_identity: "local-trusted".into(), lockfiles: Vec::new(), third_party_modules: Vec::new() },
         }),
     };
     VerificationFinding {
@@ -1075,6 +1091,8 @@ fn differential_finding(
         severity: FindingSeverity::BehavioralRegression,
         confidence: FindingConfidence::Low,
         category: FindingCategory::Differential,
+        error_type: Some("behavioral_regression".into()),
+        message: format!("Differential regression in {}", function.name),
         location: FindingLocation {
             source_file: source_file.into(),
             function: function.name.clone(),
@@ -1100,8 +1118,7 @@ fn differential_finding(
             },
             minimized: None,
         },
-        error_type: None,
-        message: "base and candidate behavior snapshots differ".into(),
+        launch_context: None,
         classification: None,
         suggestion: Some(
             "add an authoritative fixture or test if this divergence is intentional".into(),
@@ -1261,6 +1278,22 @@ pub fn final_verdict(
     } else {
         VerificationStrength::None
     };
+    // Typed causes outrank the lossy stage status: a gating target cause
+    // remains a failure even when the process also reported a resource or
+    // harness termination, while a blocking non-target cause is inconclusive.
+    let diagnostics = diagnostics_from_stages(stages);
+    if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.impact == DiagnosticImpact::Gating)
+    {
+        return (VerificationVerdict::Fail, strength);
+    }
+    if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.impact == DiagnosticImpact::Blocking)
+    {
+        return (VerificationVerdict::Inconclusive, strength);
+    }
     if stages
         .iter()
         .any(|stage| stage.status == StageStatus::Failed)
@@ -1561,17 +1594,14 @@ struct ObservedCall {
     args: Vec<ObservedArg>,
     source_label: String,
 }
-
-fn parser_for_language(language: &Language) -> Option<Parser> {
+fn parser_for_source_mode(source_mode: SourceMode) -> Option<Parser> {
     let mut parser = Parser::new();
-    match language {
-        Language::Python => parser
-            .set_language(&tree_sitter_python::LANGUAGE.into())
-            .ok()?,
-        Language::TypeScript => parser
-            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
-            .ok()?,
-    }
+    let grammar = match source_mode {
+        SourceMode::Python => tree_sitter_python::LANGUAGE.into(),
+        SourceMode::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        SourceMode::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+    };
+    parser.set_language(&grammar).ok()?;
     Some(parser)
 }
 
@@ -1763,10 +1793,11 @@ fn collect_observed_calls_recursive(
 fn collect_observed_calls(
     code: &str,
     language: &Language,
+    source_mode: SourceMode,
     function_names: &HashSet<String>,
     source_label: &str,
 ) -> Vec<ObservedCall> {
-    let Some(mut parser) = parser_for_language(language) else {
+    let Some(mut parser) = parser_for_source_mode(source_mode) else {
         return Vec::new();
     };
     let Some(tree) = parser.parse(code, None) else {
@@ -1927,6 +1958,54 @@ fn fixture_json_paths(source_file: &str, project_dir: Option<&str>) -> Vec<PathB
         .collect()
 }
 
+fn display_fixture_path(path: &Path, project_dir: Option<&str>) -> PathBuf {
+    let Some(project_dir) = project_dir else {
+        return path.to_path_buf();
+    };
+    let root = Path::new(project_dir);
+    let Some(canonical_root) = std::fs::canonicalize(root).ok() else {
+        return path.to_path_buf();
+    };
+    let Some(relative) = path.strip_prefix(&canonical_root).ok() else {
+        return path.to_path_buf();
+    };
+    root.join(relative)
+}
+fn display_seed_source_label(
+    label: &str,
+    source_file: Option<&str>,
+    project_dir: Option<&str>,
+) -> String {
+    let path = Path::new(label);
+    if !path.is_absolute() {
+        return label.to_string();
+    }
+    let Some(root) = project_dir.map(PathBuf::from).or_else(|| {
+        source_file.and_then(|source| {
+            Path::new(source)
+                .parent()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+        })
+    }) else {
+        return label.to_string();
+    };
+    let display_root = if root.is_absolute() {
+        root
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(&root)
+    } else {
+        root
+    };
+    let Ok(canonical_root) = std::fs::canonicalize(&display_root) else {
+        return label.to_string();
+    };
+    let Ok(relative) = path.strip_prefix(canonical_root) else {
+        return label.to_string();
+    };
+    display_root.join(relative).to_string_lossy().into_owned()
+}
+
 #[derive(Debug, Clone)]
 struct JsonFixtureRow {
     function: String,
@@ -1976,7 +2055,9 @@ fn json_fixture_rows(
                 function: function.clone(),
                 args,
                 expected,
-                source_file: path.to_string_lossy().to_string(),
+                source_file: display_fixture_path(&path, project_dir)
+                    .to_string_lossy()
+                    .to_string(),
                 line: line_index + 1,
             });
         }
@@ -2262,7 +2343,7 @@ fn function_can_accept_query_nested_context(func: &FunctionInfo) -> bool {
     let first_param_type = func
         .params
         .iter()
-        .find(|param| !param.name.starts_with('*'))
+        .find(|param| !param.is_variadic())
         .and_then(|param| param.type_annotation.as_deref());
     let return_type = func.return_type.as_deref();
 
@@ -2821,10 +2902,26 @@ fn discover_project_seed_files(
     candidates
 }
 
+fn source_mode_for_seed_file(language: &Language, path: Option<&str>) -> SourceMode {
+    if matches!(language, Language::Python) {
+        return SourceMode::Python;
+    }
+    match path
+        .and_then(|value| Path::new(value).extension())
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("tsx") | Some("jsx") => SourceMode::Tsx,
+        _ => SourceMode::TypeScript,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_seed_observations(
     code: &str,
     language: &Language,
+    source_mode: SourceMode,
     functions: &[FunctionInfo],
     source_file: Option<&str>,
     project_dir: Option<&str>,
@@ -2839,6 +2936,7 @@ fn collect_seed_observations(
     observed.extend(collect_observed_calls(
         code,
         language,
+        source_mode,
         &function_names,
         primary_label,
     ));
@@ -2847,6 +2945,7 @@ fn collect_seed_observations(
         observed.extend(collect_observed_calls(
             test_code,
             language,
+            source_mode_for_seed_file(language, explicit_test_file),
             &function_names,
             explicit_test_file.unwrap_or("<explicit-test>"),
         ));
@@ -2857,6 +2956,7 @@ fn collect_seed_observations(
                     observed.extend(collect_observed_calls(
                         &test_code,
                         language,
+                        source_mode_for_seed_file(language, path.to_str()),
                         &function_names,
                         &path.to_string_lossy(),
                     ));
@@ -2872,6 +2972,7 @@ fn collect_seed_observations(
                     observed.extend(collect_observed_calls(
                         &context_code,
                         language,
+                        source_mode_for_seed_file(language, path.to_str()),
                         &function_names,
                         &path.to_string_lossy(),
                     ));
@@ -3142,6 +3243,218 @@ fn execute_stage_ok(
     }
     !active_findings.is_empty() || !suppressed_findings.is_empty() || result.exit_code == Some(0)
 }
+fn resolve_verification_contexts(
+    opts: &VerifyOptions<'_>,
+    language: &Language,
+) -> Result<VerificationContext, String> {
+    let invocation_dir = std::env::current_dir()
+        .map_err(|error| format!("cannot resolve invocation directory: {error}"))?;
+    let candidate = ContextRequest {
+        invocation_dir: &invocation_dir,
+        explicit_project_dir: opts.project_dir.map(Path::new),
+        target_file: opts.source_file.map(Path::new),
+        test_file: opts.test_source_file.map(Path::new),
+        language: *language,
+        virtual_file_path: opts.lint_virtual_file_path.map(Path::new),
+    };
+    let base = (opts.base_code.is_some()
+        || opts.base_source_file.is_some()
+        || opts.base_project_dir.is_some())
+    .then(|| ContextRequest {
+        invocation_dir: &invocation_dir,
+        explicit_project_dir: opts.base_project_dir.map(Path::new),
+        target_file: opts.base_source_file.map(Path::new),
+        test_file: None,
+        language: *language,
+        virtual_file_path: None,
+    });
+    crate::resolve_verification_context(candidate, base).map_err(|error| error.to_string())
+}
+
+fn generated_harness_runtime(mode: SourceMode) -> (HarnessRuntime, &'static str, &'static str) {
+    match mode {
+        SourceMode::Python => (HarnessRuntime::Python, "python", "py"),
+        SourceMode::TypeScript => (HarnessRuntime::NodeScript, "node", "ts"),
+        SourceMode::Tsx => (HarnessRuntime::TsxScript, "tsx", "tsx"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_generated_harness<'a>(
+    context: &ExecutionContext,
+    code: String,
+    kind: HarnessKind,
+    opts: &VerifyOptions<'a>,
+    language: &Language,
+    timeout_seconds: f64,
+    project_dir: Option<&'a str>,
+    source_file: Option<&'a str>,
+) -> HarnessExecution {
+    let source_mode = context.target_source.mode;
+    let (runtime, _runtime_name, extension) = generated_harness_runtime(source_mode);
+    let relative_path = context
+        .target_source
+        .source_file
+        .as_deref()
+        .and_then(|source| source.strip_prefix(&context.workspace_root).ok())
+        .and_then(Path::parent)
+        .map(|parent| parent.join(format!(".court-jester-generated-verify.{extension}")))
+        .unwrap_or_else(|| PathBuf::from(format!(".court-jester/generated/verify.{extension}")));
+    sandbox::execute_harness(
+        context,
+        HarnessSpec {
+            kind,
+            runtime,
+            test_adapter: None,
+            source_mode,
+            artifact: HarnessArtifact::Generated {
+                code,
+                relative_path,
+            },
+            args: Vec::new(),
+            network: opts.network,
+        },
+        sandbox_options(
+            opts,
+            language,
+            timeout_seconds,
+            opts.memory_mb,
+            project_dir,
+            source_file,
+        ),
+    )
+    .await
+}
+
+fn authoritative_harness_runtime(
+    language: Language,
+    runner: TestRunner,
+) -> (HarnessRuntime, Option<TestAdapter>) {
+    match language {
+        Language::Python => (HarnessRuntime::Python, None),
+        Language::TypeScript => match runner {
+            TestRunner::Bun => (HarnessRuntime::BunTest, Some(TestAdapter::BunJunit)),
+            TestRunner::RepoNative => (HarnessRuntime::RepoTest, Some(TestAdapter::Opaque)),
+            TestRunner::Node => (HarnessRuntime::NodeScript, Some(TestAdapter::NodeTap)),
+            TestRunner::Auto => (HarnessRuntime::NodeScript, Some(TestAdapter::Opaque)),
+        },
+    }
+}
+
+fn authoritative_execution_context(
+    context: &ExecutionContext,
+    project_dir: Option<&str>,
+    test_file: Option<&str>,
+) -> ExecutionContext {
+    let Some(project_dir) = project_dir else {
+        return context.clone();
+    };
+    let project = PathBuf::from(project_dir);
+    let original_workspace = &context.workspace_root;
+    let map_path = |path: Option<&Path>| {
+        path.and_then(|path| {
+            path.strip_prefix(original_workspace)
+                .ok()
+                .map(|relative| project.join(relative))
+        })
+    };
+    let target_source_file = map_path(context.target_source.source_file.as_deref());
+    let test_source_file = test_file.map(PathBuf::from).or_else(|| {
+        map_path(
+            context
+                .test_source
+                .as_ref()
+                .and_then(|source| source.source_file.as_deref()),
+        )
+    });
+    let target_package_root = context
+        .target_package_root
+        .strip_prefix(original_workspace)
+        .ok()
+        .map(|relative| project.join(relative))
+        .unwrap_or_else(|| project.clone());
+    let test_package_root = test_source_file
+        .as_deref()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .or_else(|| Some(target_package_root.clone()));
+    let mut dependency_roots = vec![project.clone()];
+    for root in &context.dependency_roots {
+        if let Ok(relative) = root.strip_prefix(original_workspace) {
+            let mapped = project.join(relative);
+            if !dependency_roots.iter().any(|existing| existing == &mapped) {
+                dependency_roots.push(mapped);
+            }
+        }
+    }
+    let test_source = test_source_file.map(|source_file| SourceContext {
+        language: context.target_source.language,
+        mode: source_mode_for_path(&source_file, context.target_source.language),
+        source_file: Some(source_file),
+        virtual_file_path: None,
+    });
+    let mut resolved = context.clone();
+    resolved.invocation_dir = project.clone();
+    resolved.workspace_root = project;
+    resolved.target_package_root = target_package_root;
+    resolved.test_package_root = test_package_root;
+    resolved.dependency_roots = dependency_roots;
+    resolved.target_source.source_file = target_source_file;
+    resolved.target_source.virtual_file_path = None;
+    resolved.test_source = test_source;
+    resolved
+}
+
+fn source_mode_for_path(path: &Path, language: Language) -> SourceMode {
+    if language == Language::Python {
+        return SourceMode::Python;
+    }
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some(extension)
+            if extension.eq_ignore_ascii_case("tsx") || extension.eq_ignore_ascii_case("jsx") =>
+        {
+            SourceMode::Tsx
+        }
+        _ => SourceMode::TypeScript,
+    }
+}
+
+fn authoritative_artifact_path(
+    context: &ExecutionContext,
+    project_dir: Option<&str>,
+    source_file: Option<&str>,
+    mode: SourceMode,
+) -> PathBuf {
+    let extension = match mode {
+        SourceMode::Python => "py",
+        SourceMode::TypeScript => "ts",
+        SourceMode::Tsx => "tsx",
+    };
+    project_dir
+        .and_then(|project| {
+            source_file
+                .and_then(|source| Path::new(source).strip_prefix(project).ok())
+                .and_then(Path::parent)
+                .map(|parent| {
+                    parent.join(format!(".court-jester-generated-authoritative.{extension}"))
+                })
+        })
+        .or_else(|| {
+            context
+                .target_source
+                .source_file
+                .as_deref()
+                .and_then(|source| source.strip_prefix(&context.workspace_root).ok())
+                .and_then(Path::parent)
+                .map(|parent| {
+                    parent.join(format!(".court-jester-generated-authoritative.{extension}"))
+                })
+        })
+        .unwrap_or_else(|| {
+            PathBuf::from(format!(".court-jester/generated/authoritative.{extension}"))
+        })
+}
+
 /// Run the full verification pipeline: parse → complexity → lint → synthesize+execute → test.
 pub async fn verify(
     code: &str,
@@ -3150,18 +3463,95 @@ pub async fn verify(
 ) -> VerificationReport {
     let mut stages = vec![];
     let suppressions = parse_suppressions(opts.suppressions);
+    let verification_context = match resolve_verification_contexts(&opts, language) {
+        Ok(context) => context,
+        Err(error) => {
+            stages.push(VerificationStage {
+                name: "context".into(),
+                status: StageStatus::Inconclusive,
+                duration_ms: 0,
+                detail: Some(serde_json::json!({
+                    "diagnostic": {
+                        "domain": "environment",
+                        "kind": "context_resolution",
+                        "message": error,
+                    }
+                })),
+                message: Some("Unable to resolve source or project context".into()),
+            });
+            return finalize_report(
+                build_report(stages, opts.coverage_gate),
+                opts.output_dir,
+                opts.source_file,
+                language,
+                opts.report_level,
+            );
+        }
+    };
+    // All subsequent stages consume the resolved context rather than reinterpreting
+    // the caller's possibly-relative paths. Keep owned spellings alive for APIs
+    // whose compatibility boundary still accepts borrowed strings.
+    let candidate_project_dir_owned = verification_context
+        .candidate
+        .workspace_root
+        .to_string_lossy()
+        .into_owned();
+    let candidate_source_file_owned = verification_context
+        .candidate
+        .target_source
+        .source_file
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
+    let candidate_test_source_file_owned = verification_context
+        .candidate
+        .test_source
+        .as_ref()
+        .and_then(|source| source.source_file.as_ref())
+        .map(|path| path.to_string_lossy().into_owned());
+    let candidate_virtual_file_path_owned = verification_context
+        .candidate
+        .target_source
+        .virtual_file_path
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
+    let base_project_dir_owned = verification_context
+        .base
+        .as_ref()
+        .map(|context| context.workspace_root.to_string_lossy().into_owned());
+    let base_source_file_owned = verification_context
+        .base
+        .as_ref()
+        .and_then(|context| context.target_source.source_file.as_ref())
+        .map(|path| path.to_string_lossy().into_owned());
+    let candidate_embedded_project_dir = candidate_source_file_owned
+        .as_ref()
+        .map(|_| candidate_project_dir_owned.as_str());
+    let base_embedded_project_dir = base_source_file_owned
+        .as_ref()
+        .and(base_project_dir_owned.as_deref());
 
     let start = Instant::now();
-    let analysis = analyze::analyze(code, language);
+    let analysis =
+        analyze::analyze_with_context(code, &verification_context.candidate.target_source);
     let parse_ms = start.elapsed().as_millis() as u64;
 
     if analysis.parse_error {
+        let message = analysis
+            .parse_diagnostics
+            .first()
+            .map(|diagnostic| {
+                format!(
+                    "{} at {}:{}",
+                    diagnostic.message, diagnostic.start_line, diagnostic.start_column
+                )
+            })
+            .unwrap_or_else(|| "Code contains syntax errors".into());
         stages.push(VerificationStage {
             name: "parse".into(),
             status: StageStatus::Failed,
             duration_ms: parse_ms,
             detail: Some(serde_json::to_value(&analysis).unwrap()),
-            message: Some("Code contains syntax errors".into()),
+            message: Some(message),
         });
         return finalize_report(
             build_report(stages, opts.coverage_gate),
@@ -3184,8 +3574,8 @@ pub async fn verify(
     if let Some(threshold) = opts.complexity_threshold {
         let start = Instant::now();
         let (functions_checked, diff_scoped) = if let Some(diff_str) = opts.diff {
-            let changed_ranges = opts
-                .source_file
+            let changed_ranges = candidate_source_file_owned
+                .as_deref()
                 .map(|path| diff::parse_changed_lines_for_file(diff_str, path))
                 .unwrap_or_else(|| diff::parse_changed_lines(diff_str));
             (
@@ -3203,7 +3593,7 @@ pub async fn verify(
                     opts.complexity_metric,
                 ),
                 &suppressions,
-                opts.source_file,
+                candidate_source_file_owned.as_deref(),
                 code,
                 language,
             );
@@ -3243,17 +3633,17 @@ pub async fn verify(
         code,
         language,
         lint::LintOptions {
-            source_file: opts.source_file,
-            project_dir: opts.project_dir,
+            source_file: candidate_source_file_owned.as_deref(),
+            project_dir: Some(candidate_project_dir_owned.as_str()),
             config_path: opts.lint_config_path,
-            virtual_file_path: opts.lint_virtual_file_path,
+            virtual_file_path: candidate_virtual_file_path_owned.as_deref(),
         },
     )
     .await;
     let lint_ms = start.elapsed().as_millis() as u64;
 
     // Filter out false positives only when linting anonymous inline snippets.
-    if opts.source_file.is_none() && opts.lint_virtual_file_path.is_none() {
+    if candidate_source_file_owned.is_none() && candidate_virtual_file_path_owned.is_none() {
         lint_result.diagnostics.retain(|d| {
             !matches!(
                 d.rule.as_str(),
@@ -3297,8 +3687,8 @@ pub async fn verify(
     if !opts.tests_only && !analysis.functions.is_empty() {
         // Determine which functions to fuzz
         let mut functions_to_fuzz: Vec<FunctionInfo> = if let Some(diff_str) = opts.diff {
-            let changed_ranges = opts
-                .source_file
+            let changed_ranges = candidate_source_file_owned
+                .as_deref()
                 .map(|path| diff::parse_changed_lines_for_file(diff_str, path))
                 .unwrap_or_else(|| diff::parse_changed_lines(diff_str));
             analyze::filter_changed_functions(&analysis, &changed_ranges)
@@ -3308,45 +3698,70 @@ pub async fn verify(
         let mut fixture_rows = Vec::new();
         let mut inferred_fixture_properties: HashMap<String, Vec<String>> = HashMap::new();
         let mut inferred_context_properties: HashMap<String, Vec<String>> = HashMap::new();
+        let mut all_classes = analysis.classes.clone();
+        let mut all_aliases = analysis.aliases.clone();
         if opts.auto_seed {
-            if let Some(source_file) = opts.source_file {
+            if let Some(source_file) = candidate_source_file_owned.as_deref() {
                 let function_names: HashSet<String> = functions_to_fuzz
                     .iter()
                     .map(|func| func.name.clone())
                     .collect();
-                fixture_rows = json_fixture_rows(source_file, opts.project_dir, &function_names);
+                let fixture_project_dir_owned = opts.project_dir.map(|project| {
+                    let path = Path::new(project);
+                    if path.is_absolute() {
+                        project.to_string()
+                    } else {
+                        verification_context
+                            .candidate
+                            .invocation_dir
+                            .join(path)
+                            .to_string_lossy()
+                            .into_owned()
+                    }
+                });
+                let project_dir = fixture_project_dir_owned
+                    .as_deref()
+                    .or(Some(candidate_project_dir_owned.as_str()));
+                fixture_rows = json_fixture_rows(source_file, project_dir, &function_names);
                 inferred_fixture_properties = infer_fixture_properties(&fixture_rows);
-                apply_inferred_properties(&mut functions_to_fuzz, &inferred_fixture_properties);
                 inferred_context_properties =
-                    infer_context_properties(source_file, opts.project_dir, &functions_to_fuzz);
+                    infer_context_properties(source_file, project_dir, &functions_to_fuzz);
+                apply_inferred_properties(&mut functions_to_fuzz, &inferred_fixture_properties);
                 apply_inferred_properties(&mut functions_to_fuzz, &inferred_context_properties);
+                let referenced_names =
+                    analyze::referenced_type_names_for_functions(&functions_to_fuzz);
+                let imported = analyze::resolve_imported_types_for_names(
+                    &analysis,
+                    source_file,
+                    language,
+                    &referenced_names,
+                );
+                all_classes.extend(imported.classes);
+                all_aliases.extend(imported.aliases);
             }
-        }
-
-        // Resolve imported types so the fuzzer can construct proper objects
-        let mut all_classes = analysis.classes.clone();
-        let mut all_aliases = analysis.aliases.clone();
-        if let Some(src) = opts.source_file {
-            let referenced_names = analyze::referenced_type_names_for_functions(&functions_to_fuzz);
-            let imported = analyze::resolve_imported_types_for_names(
-                &analysis,
-                src,
-                language,
-                &referenced_names,
-            );
-            all_classes.extend(imported.classes);
-            all_aliases.extend(imported.aliases);
         }
         let observed_calls = collect_seed_observations(
             code,
             language,
+            verification_context.candidate.target_source.mode,
             &functions_to_fuzz,
-            opts.source_file,
-            opts.project_dir,
+            candidate_source_file_owned.as_deref(),
+            Some(candidate_project_dir_owned.as_str()),
             opts.test_code,
-            opts.test_source_file,
+            candidate_test_source_file_owned.as_deref(),
             opts.auto_seed,
         );
+        let observed_calls = observed_calls
+            .into_iter()
+            .map(|mut observed| {
+                observed.source_label = display_seed_source_label(
+                    &observed.source_label,
+                    opts.source_file,
+                    opts.project_dir,
+                );
+                observed
+            })
+            .collect::<Vec<_>>();
         let mut seed_sources = seed_sources(&observed_calls);
         for row in &fixture_rows {
             if !seed_sources.contains(&row.source_file) {
@@ -3436,7 +3851,7 @@ pub async fn verify(
                 inferred_properties.push(InferredProperty {
                     target_surface_id: surface_id.clone(),
                     contract_id: property.clone(),
-                    source_file: opts.source_file.map(str::to_string),
+                    source_file: candidate_source_file_owned.clone(),
                     line: None,
                     evidence: CallerEvidence::StaticSyntax,
                 });
@@ -3488,100 +3903,62 @@ pub async fn verify(
         );
         let coverage_ms = synth_start.elapsed().as_millis() as u64;
         let mut module_load_blocked = false;
-
         if !fuzz_plan.code.is_empty() {
             let full_code = format!("{code}\n{}", fuzz_plan.code);
             let execute_timeout = execute_timeout_for(language);
 
             let start = Instant::now();
-            let mut exec_runtime: Option<String> = None;
-            let mut portability_detail: Option<serde_json::Value> = None;
-            let exec_result = if matches!(language, Language::TypeScript) {
-                if let Some(repo_runtime) =
-                    sandbox::detect_repo_typescript_runner(opts.project_dir, opts.source_file)
-                {
-                    let node_result = sandbox::execute_typescript_node(
-                        &full_code,
-                        sandbox_options(
-                            &opts,
-                            language,
-                            execute_timeout,
-                            512,
-                            opts.project_dir,
-                            opts.source_file,
-                        ),
-                    )
-                    .await;
-                    let node_ok = node_result.exit_code == Some(0)
-                        && !node_result.timed_out
-                        && !node_result.memory_error;
-                    if !node_ok && is_typescript_portability_error(&node_result.stderr) {
-                        if let Some(repo_result) = sandbox::execute_typescript_repo_native(
-                            &full_code,
-                            sandbox_options(
-                                &opts,
-                                language,
-                                execute_timeout,
-                                512,
-                                opts.project_dir,
-                                opts.source_file,
-                            ),
-                        )
-                        .await
-                        {
-                            exec_runtime = Some(repo_runtime.clone());
-                            let (detail, suppressed) = build_portability_detail(
-                                &repo_runtime,
-                                &node_result,
-                                &repo_result,
-                                &suppressions,
-                                opts.source_file,
-                                opts.suppression_source,
-                            );
-                            portability_detail = Some(detail);
-                            if suppressed {
-                                exec_runtime = Some(repo_runtime.clone());
-                            }
-                            repo_result
-                        } else {
-                            exec_runtime = Some("node".into());
-                            node_result
-                        }
-                    } else {
-                        exec_runtime = Some("node".into());
-                        node_result
-                    }
-                } else {
-                    sandbox::execute(
-                        &full_code,
-                        language,
-                        sandbox_options(
-                            &opts,
-                            language,
-                            execute_timeout,
-                            512,
-                            opts.project_dir,
-                            opts.source_file,
-                        ),
-                    )
-                    .await
-                }
-            } else {
-                sandbox::execute(
-                    &full_code,
-                    language,
-                    sandbox_options(
-                        &opts,
-                        language,
-                        execute_timeout,
-                        512,
-                        opts.project_dir,
-                        opts.source_file,
-                    ),
-                )
-                .await
-            };
+            let (_, runtime_name, _) =
+                generated_harness_runtime(verification_context.candidate.target_source.mode);
+            let mut exec_runtime = Some(runtime_name.to_string());
+            let harness_execution = execute_generated_harness(
+                &verification_context.candidate,
+                full_code,
+                HarnessKind::GeneratedVerifier,
+                &opts,
+                language,
+                execute_timeout,
+                Some(candidate_project_dir_owned.as_str()),
+                candidate_source_file_owned.as_deref(),
+            )
+            .await;
+            let harness_diagnostics = harness_execution.diagnostics;
+            let exec_result = harness_execution.process;
             let exec_ms = start.elapsed().as_millis() as u64;
+            let launch_runtime = match exec_runtime.as_deref() {
+                Some("bun") | Some("bun-test") => HarnessRuntime::BunScript,
+                Some("tsx") | Some("tsx-script") => HarnessRuntime::TsxScript,
+                Some("vitest") => HarnessRuntime::Vitest,
+                Some("jest") => HarnessRuntime::Jest,
+                Some("node") | Some("node-script") => HarnessRuntime::NodeScript,
+                Some("python") | Some("python3") => HarnessRuntime::Python,
+                _ => match language {
+                    Language::Python => HarnessRuntime::Python,
+                    Language::TypeScript => HarnessRuntime::NodeScript,
+                },
+            };
+            let launch_context = ReproLaunchContext {
+                limits: ExecutionLimits {
+                    timeout_seconds: execute_timeout,
+                    memory_mb: opts.memory_mb,
+                    runtime_profile: opts.runtime_profile,
+                    network_policy: opts.network,
+                },
+                source_mode: verification_context.candidate.target_source.mode,
+                runtime: launch_runtime,
+                base_source_mode: verification_context
+                    .base
+                    .as_ref()
+                    .map(|context| context.target_source.mode),
+                base_runtime: None,
+                harness_args: opts.harness_args.clone(),
+                docker_image: (opts.runtime_profile == RuntimeProfile::Isolated).then(|| {
+                    match language {
+                        Language::Python => opts.python_docker_image.to_string(),
+                        Language::TypeScript => opts.typescript_docker_image.to_string(),
+                    }
+                }),
+            };
             module_load_blocked = matches!(language, Language::TypeScript)
                 && is_typescript_module_load_error(&exec_result.stderr)
                 && !exec_result
@@ -3614,58 +3991,46 @@ pub async fn verify(
                 message: None,
             });
 
-            if let Some(detail) = portability_detail {
-                let suppressed = detail
-                    .get("suppressed")
-                    .and_then(|value| value.as_bool())
-                    .unwrap_or(false);
-                let behavior_executed = detail
-                    .get("behavior_executed")
-                    .and_then(|value| value.as_bool())
-                    .unwrap_or(false);
-                stages.push(VerificationStage {
-                    name: "portability".into(),
-                    status: if suppressed || behavior_executed {
-                        StageStatus::Advisory
-                    } else {
-                        StageStatus::Inconclusive
-                    },
-                    duration_ms: 0,
-                    detail: Some(detail),
-                    message: if suppressed {
-                        None
-                    } else {
-                        Some("Node compatibility failed; repo-native runtime was used for fuzz execution".into())
-                    },
-                });
-            }
-
             let (differential_findings, differential_detail) = if let Some(base_code) =
                 opts.base_code
             {
-                let baseline_analysis = analyze::analyze(base_code, language);
+                let baseline_analysis = verification_context
+                    .base
+                    .as_ref()
+                    .map(|context| analyze::analyze_with_context(base_code, &context.target_source))
+                    .expect("base context is resolved whenever base code is present");
                 if baseline_analysis.parse_error {
                     (
                         Vec::new(),
-                        serde_json::json!({ "enabled": false, "reason": "baseline_parse_error", "units": [] }),
+                        serde_json::json!({
+                            "enabled": false,
+                            "reason": "baseline_parse_error",
+                            "units": []
+                        }),
                     )
                 } else {
                     let (relative_entry, candidate_files) = embedded_project_sources(
-                        opts.project_dir,
-                        opts.source_file,
+                        candidate_embedded_project_dir,
+                        candidate_source_file_owned.as_deref(),
                         code,
                         language,
                     );
                     let (base_relative_entry, base_files) = embedded_project_sources(
-                        opts.base_project_dir,
-                        opts.base_source_file.or(opts.source_file),
+                        base_embedded_project_dir,
+                        base_source_file_owned.as_deref(),
                         base_code,
                         language,
                     );
                     if relative_entry != base_relative_entry {
                         (
                             Vec::new(),
-                            serde_json::json!({ "enabled": false, "reason": "baseline_entry_path_mismatch", "candidate_entry": relative_entry, "base_entry": base_relative_entry, "units": [] }),
+                            serde_json::json!({
+                                "enabled": false,
+                                "reason": "baseline_entry_path_mismatch",
+                                "candidate_entry": relative_entry,
+                                "base_entry": base_relative_entry,
+                                "units": []
+                            }),
                         )
                     } else {
                         let baseline_by_name = baseline_analysis
@@ -3675,6 +4040,11 @@ pub async fn verify(
                             .collect::<HashMap<_, _>>();
                         let mut findings = Vec::new();
                         let mut units = Vec::new();
+                        let mut differential_diagnostics = Vec::new();
+                        let base_context = verification_context
+                            .base
+                            .as_ref()
+                            .expect("base context is resolved whenever base code is present");
                         for candidate_function in analysis.functions.iter().filter(|function| {
                             function.is_exported && !function.is_method && !function.is_nested
                         }) {
@@ -3707,32 +4077,32 @@ pub async fn verify(
                                 &differential_case,
                                 language,
                             );
-                            let candidate_result = sandbox::execute(
-                                &candidate_probe,
+                            let candidate_execution = execute_generated_harness(
+                                &verification_context.candidate,
+                                candidate_probe,
+                                HarnessKind::Standalone,
+                                &opts,
                                 language,
-                                sandbox_options(
-                                    &opts,
-                                    language,
-                                    execute_timeout,
-                                    512,
-                                    opts.project_dir,
-                                    opts.source_file,
-                                ),
+                                execute_timeout,
+                                Some(candidate_project_dir_owned.as_str()),
+                                candidate_source_file_owned.as_deref(),
                             )
                             .await;
-                            let baseline_result = sandbox::execute(
-                                &baseline_probe,
+                            differential_diagnostics.extend(candidate_execution.diagnostics);
+                            let candidate_result = candidate_execution.process;
+                            let baseline_execution = execute_generated_harness(
+                                base_context,
+                                baseline_probe,
+                                HarnessKind::Standalone,
+                                &opts,
                                 language,
-                                sandbox_options(
-                                    &opts,
-                                    language,
-                                    execute_timeout,
-                                    512,
-                                    opts.base_project_dir,
-                                    opts.base_source_file.or(opts.source_file),
-                                ),
+                                execute_timeout,
+                                base_project_dir_owned.as_deref(),
+                                base_source_file_owned.as_deref(),
                             )
                             .await;
+                            differential_diagnostics.extend(baseline_execution.diagnostics);
+                            let baseline_result = baseline_execution.process;
                             let surface =
                                 format!("{}:{}", candidate_function.name, candidate_function.line);
                             match (
@@ -3763,7 +4133,9 @@ pub async fn verify(
                                 }
                                 (Ok(candidate_snapshot), Ok(baseline_snapshot)) => {
                                     findings.push(differential_finding(
-                                        opts.source_file.unwrap_or("<inline>"),
+                                        candidate_source_file_owned
+                                            .as_deref()
+                                            .unwrap_or("<inline>"),
                                         candidate_function,
                                         differential_case.repro_arguments(),
                                         &candidate_snapshot,
@@ -3788,7 +4160,12 @@ pub async fn verify(
                         }
                         (
                             findings,
-                            serde_json::json!({ "enabled": true, "relative_entry": relative_entry, "units": units }),
+                            serde_json::json!({
+                                "enabled": true,
+                                "relative_entry": relative_entry,
+                                "units": units,
+                                "diagnostics": differential_diagnostics,
+                            }),
                         )
                     }
                 }
@@ -3814,11 +4191,16 @@ pub async fn verify(
 
             let mut failures = parse_findings(&exec_result.stdout).unwrap_or_default();
             failures.extend(differential_findings);
+            for finding in &mut failures {
+                finding.launch_context = Some(launch_context.clone());
+            }
             classify_type_signature_findings(&mut failures, &observed_calls, language);
             for finding in &mut failures {
                 if finding.location.source_file.is_empty() {
-                    finding.location.source_file =
-                        opts.source_file.unwrap_or("<inline>").to_string();
+                    finding.location.source_file = candidate_source_file_owned
+                        .as_deref()
+                        .unwrap_or("<inline>")
+                        .to_string();
                 }
                 if finding.location.line == 0 {
                     if let Some(function) = analysis
@@ -3865,8 +4247,11 @@ pub async fn verify(
                 *ordinal += 1;
                 finding.id = format!("execute:{symbol}:{}", *ordinal);
             }
-            let (failures, suppressed_failures) =
-                split_findings(failures, &suppressions, opts.source_file);
+            let (failures, suppressed_failures) = split_findings(
+                failures,
+                &suppressions,
+                candidate_source_file_owned.as_deref(),
+            );
             let summary = findings_summary(
                 &failures,
                 suppressed_failures.len(),
@@ -3914,9 +4299,152 @@ pub async fn verify(
                 &suppressed_failures,
                 module_load_blocked,
             );
-            let detail = serde_json::json!({
+            let harness_event_detail = {
+                let combined = format!("{}\n{}", exec_result.stdout, exec_result.stderr);
+                if combined.contains(sandbox::HARNESS_EVENT_SENTINEL) {
+                    match sandbox::parse_harness_events(&combined) {
+                        Ok(summary) => serde_json::json!({
+                            "records": summary.records.len(),
+                            "completed_units": summary.completed_units,
+                            "runner_started": summary.runner_started,
+                            "target_resolved": summary.target_resolved,
+                            "target_ready": summary.target_ready,
+                            "harness_completed": summary.harness_completed,
+                        }),
+                        Err(error) => {
+                            let diagnostic = FailureDiagnostic {
+                                domain: FailureDomain::VerifierHarness,
+                                kind: FailureKind::HarnessProtocol,
+                                component: DiagnosticComponent::FuzzHarness,
+                                impact: DiagnosticImpact::Blocking,
+                                message: error,
+                                process: exec_result.termination.clone(),
+                                limits: Some(ExecutionLimits {
+                                    timeout_seconds: execute_timeout,
+                                    memory_mb: opts.memory_mb,
+                                    runtime_profile: opts.runtime_profile,
+                                    network_policy: opts.network,
+                                }),
+                            };
+                            serde_json::json!({
+                                "diagnostics": [diagnostic],
+                            })
+                        }
+                    }
+                } else {
+                    serde_json::Value::Null
+                }
+            };
+            let portability_stage = if matches!(language, Language::TypeScript)
+                && candidate_source_file_owned.is_some()
+                && verification_context.candidate.target_source.mode == SourceMode::TypeScript
+            {
+                let portability_context = &verification_context.candidate;
+                let relative_path = portability_context
+                    .target_source
+                    .source_file
+                    .as_deref()
+                    .and_then(|source| {
+                        Path::new(source)
+                            .strip_prefix(&portability_context.workspace_root)
+                            .ok()
+                            .map(Path::to_path_buf)
+                    });
+                let node_result = if let Some(relative_path) = relative_path {
+                    sandbox::execute_harness(
+                        portability_context,
+                        HarnessSpec {
+                            kind: HarnessKind::Standalone,
+                            runtime: HarnessRuntime::NodeScript,
+                            test_adapter: None,
+                            source_mode: SourceMode::TypeScript,
+                            artifact: HarnessArtifact::Existing { relative_path },
+                            args: Vec::new(),
+                            network: opts.network,
+                        },
+                        sandbox_options(
+                            &opts,
+                            language,
+                            execute_timeout,
+                            opts.memory_mb,
+                            Some(candidate_project_dir_owned.as_str()),
+                            candidate_source_file_owned.as_deref(),
+                        ),
+                    )
+                    .await
+                    .process
+                } else {
+                    ExecutionResult {
+                        stdout: String::new(),
+                        stderr: "TypeScript portability source is outside the workspace".into(),
+                        exit_code: None,
+                        duration_ms: 0,
+                        timed_out: false,
+                        memory_error: false,
+                        termination: Some(ProcessTermination {
+                            kind: ProcessTerminationKind::LaunchFailed,
+                            exit_code: None,
+                            signal: None,
+                            signal_name: None,
+                        }),
+                        diagnostics: vec![],
+                    }
+                };
+                if is_typescript_portability_error(&node_result.stderr) {
+                    let repo_runtime = opts
+                        .project_dir
+                        .map(Path::new)
+                        .filter(|project| {
+                            project.join("bun.lock").is_file()
+                                || project.join("bun.lockb").is_file()
+                        })
+                        .map(|_| "bun")
+                        .unwrap_or("node");
+                    let (detail, suppressed) = build_portability_detail(
+                        repo_runtime,
+                        &node_result,
+                        &exec_result,
+                        &suppressions,
+                        candidate_source_file_owned.as_deref(),
+                        opts.suppression_source,
+                    );
+                    Some(VerificationStage {
+                        name: "portability".into(),
+                        status: if suppressed {
+                            StageStatus::Passed
+                        } else {
+                            StageStatus::Advisory
+                        },
+                        duration_ms: 0,
+                        detail: Some(detail),
+                        message: Some(
+                            "Node portability check reported a repo-runtime compatibility warning"
+                                .into(),
+                        ),
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if portability_stage.as_ref().is_some_and(|stage| {
+                stage
+                    .detail
+                    .as_ref()
+                    .and_then(|detail| detail.get("repo_runtime"))
+                    .and_then(|value| value.as_str())
+                    == Some("bun")
+            }) {
+                exec_runtime = Some("bun".into());
+            }
+            if let Some(stage) = portability_stage {
+                stages.push(stage);
+            }
+            let mut detail = serde_json::json!({
                 "execution": exec_result,
                 "runtime": exec_runtime,
+                "module_load_blocked": module_load_blocked,
                 "valid_invocations": valid_invocations,
                 "evaluated_oracles": evaluated_oracles,
                 "no_inputs_reached": no_inputs_reached,
@@ -3930,7 +4458,16 @@ pub async fn verify(
                 "inferred_fixture_properties": &inferred_fixture_properties,
                 "inferred_context_properties": &inferred_context_properties,
                 "differential": differential_detail,
+                "harness_events": harness_event_detail,
+                "diagnostics": harness_diagnostics,
             });
+            if let Some(diagnostics) = detail
+                .get("harness_events")
+                .and_then(|value| value.get("diagnostics"))
+                .cloned()
+            {
+                detail["diagnostics"] = diagnostics;
+            }
             stages.push(VerificationStage {
                 name: "execute".into(),
                 status: if exec_ok {
@@ -4000,8 +4537,8 @@ pub async fn verify(
     // Stage 5: Test (if test_code provided) — this IS authoritative
     if let Some(tests) = opts.test_code {
         let required_candidates = if let Some(diff_text) = opts.diff {
-            let ranges = opts
-                .source_file
+            let ranges = candidate_source_file_owned
+                .as_deref()
                 .map(|path| diff::parse_changed_lines_for_file(diff_text, path))
                 .unwrap_or_else(|| diff::parse_changed_lines(diff_text));
             analyze::filter_changed_functions(&analysis, &ranges)
@@ -4041,10 +4578,11 @@ pub async fn verify(
             tests,
             &required_functions,
             language,
+            verification_context.candidate.target_source.mode,
             selected_test_runner,
-            opts.project_dir,
-            opts.source_file,
-            opts.test_source_file,
+            Some(candidate_project_dir_owned.as_str()),
+            candidate_source_file_owned.as_deref(),
+            candidate_test_source_file_owned.as_deref(),
         );
         let execution_project = prepared.project_dir.as_deref();
         let execution_source = prepared.source_file.as_deref();
@@ -4058,37 +4596,71 @@ pub async fn verify(
                     .unwrap_or("authoritative-test instrumentation is unsupported"),
             )
         } else {
-            match language {
-                Language::Python => sandbox::execute(
-                    &prepared.code,
-                    language,
-                    sandbox_options(&opts, language, test_timeout(), 512, execution_project, execution_source),
-                ).await,
-                Language::TypeScript => match selected_test_runner {
-                    TestRunner::Auto => sandbox::execute(
-                        &prepared.code,
-                        language,
-                        sandbox_options(&opts, language, test_timeout(), 512, execution_project, execution_source),
-                    ).await,
-                    TestRunner::Node => sandbox::execute_typescript_node(
-                        &prepared.code,
-                        sandbox_options(&opts, language, test_timeout(), 512, execution_project, execution_source),
-                    ).await,
-                    TestRunner::Bun => sandbox::execute_typescript_bun_test(
-                        &prepared.code,
-                        sandbox_options(&opts, language, test_timeout(), 512, execution_project, execution_source),
-                    ).await,
-                    TestRunner::RepoNative => sandbox::execute_typescript_repo_native_test(
-                        &prepared.code,
-                        sandbox_options(&opts, language, test_timeout(), 512, execution_project, execution_source),
-                    ).await.unwrap_or_else(|| err_execution_result("repo-native TypeScript test runner requested, but no repo runtime was detected")),
+            let harness_context = authoritative_execution_context(
+                &verification_context.candidate,
+                execution_project,
+                execution_source,
+            );
+            let source_mode = harness_context.target_source.mode;
+            let (runtime, test_adapter) =
+                authoritative_harness_runtime(*language, selected_test_runner);
+            let artifact = if prepared._root.is_some() {
+                execution_source
+                    .and_then(|source| {
+                        Path::new(source)
+                            .strip_prefix(&harness_context.workspace_root)
+                            .ok()
+                            .map(Path::to_path_buf)
+                    })
+                    .map(|relative_path| HarnessArtifact::Existing { relative_path })
+                    .unwrap_or_else(|| HarnessArtifact::Generated {
+                        code: prepared.code.clone(),
+                        relative_path: authoritative_artifact_path(
+                            &harness_context,
+                            execution_project,
+                            execution_source,
+                            source_mode,
+                        ),
+                    })
+            } else {
+                HarnessArtifact::Generated {
+                    code: prepared.code.clone(),
+                    relative_path: authoritative_artifact_path(
+                        &harness_context,
+                        execution_project,
+                        execution_source,
+                        source_mode,
+                    ),
+                }
+            };
+            sandbox::execute_harness(
+                &harness_context,
+                HarnessSpec {
+                    kind: HarnessKind::AuthoritativeTest,
+                    runtime,
+                    test_adapter,
+                    source_mode,
+                    artifact,
+                    args: Vec::new(),
+                    network: opts.network,
                 },
-            }
+                sandbox_options(
+                    &opts,
+                    language,
+                    test_timeout(),
+                    opts.memory_mb,
+                    execution_project,
+                    execution_source,
+                ),
+            )
+            .await
+            .process
         };
         let test_ms = start.elapsed().as_millis() as u64;
-        let entered_surfaces = parse_target_entered_events(&test_result.stderr);
-        let has_assertion_failure = test_result.stderr.contains("Assertion failed")
-            || test_result.stderr.contains("AssertionError");
+        let test_output = format!("{}\n{}", test_result.stdout, test_result.stderr);
+        let entered_surfaces = parse_target_entered_events(&test_output);
+        let has_assertion_failure =
+            test_output.contains("Assertion failed") || test_output.contains("AssertionError");
         let test_ok = test_result.exit_code == Some(0)
             && !test_result.timed_out
             && !test_result.memory_error
@@ -4101,6 +4673,7 @@ pub async fn verify(
             .count();
 
         let mut test_detail = serde_json::to_value(&test_result).unwrap();
+        test_detail["assertion_failure"] = serde_json::Value::Bool(has_assertion_failure);
         test_detail["instrumentation_overlay"] = serde_json::to_value(&prepared.overlay).unwrap();
         test_detail["target_entered_surfaces"] = serde_json::to_value(&entered_surfaces).unwrap();
         test_detail["authoritative_test_covered_surfaces"] =
@@ -4129,7 +4702,10 @@ pub async fn verify(
         });
 
         if opts.tests_only {
-            let authoritative_source = opts.test_source_file.unwrap_or("<inline>").to_string();
+            let authoritative_source = candidate_test_source_file_owned
+                .as_deref()
+                .unwrap_or("<inline>")
+                .to_string();
             let coverage_functions = required_functions.iter().map(|function| {
                 let surface_id = format!("{}:{}", function.name, function.line);
                 let checked = prepared.overlay.supported && test_ok && entered_surfaces.contains(&surface_id);
@@ -4192,8 +4768,462 @@ pub async fn verify(
     )
 }
 
-fn build_report(stages: Vec<VerificationStage>, gate: CoverageGate) -> VerificationReport {
-    let summary = compute_report_summary(&stages);
+fn diagnostic_from_termination(
+    termination: &ProcessTermination,
+    message: String,
+) -> FailureDiagnostic {
+    let (domain, kind) = match termination.kind {
+        ProcessTerminationKind::TimedOut => (FailureDomain::Resource, FailureKind::Timeout),
+        ProcessTerminationKind::MemoryLimit => (FailureDomain::Resource, FailureKind::MemoryLimit),
+        ProcessTerminationKind::Signaled => (FailureDomain::Environment, FailureKind::Signal),
+        ProcessTerminationKind::LaunchFailed => {
+            (FailureDomain::Environment, FailureKind::LauncherFailure)
+        }
+        ProcessTerminationKind::WaitFailed => {
+            (FailureDomain::Environment, FailureKind::ToolFailure)
+        }
+        ProcessTerminationKind::Exited => (FailureDomain::Environment, FailureKind::NonzeroExit),
+    };
+    FailureDiagnostic {
+        domain,
+        kind,
+        component: DiagnosticComponent::Sandbox,
+        impact: DiagnosticImpact::Blocking,
+        message,
+        process: Some(termination.clone()),
+        limits: None,
+    }
+}
+
+fn diagnostic_from_stage(
+    stage: &VerificationStage,
+    coverage_gate: CoverageGate,
+) -> Option<FailureDiagnostic> {
+    let detail = stage.detail.as_ref();
+    let message = stage
+        .message
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| format!("{} stage did not complete successfully", stage.name));
+
+    let simple = |domain, kind, component, impact| FailureDiagnostic {
+        domain,
+        kind,
+        component,
+        impact,
+        message: message.clone(),
+        process: None,
+        limits: None,
+    };
+
+    match stage.name.as_str() {
+        "context" => Some(simple(
+            FailureDomain::Environment,
+            FailureKind::ContextResolution,
+            DiagnosticComponent::ModuleLoader,
+            DiagnosticImpact::Blocking,
+        )),
+        "parse" => {
+            let parse_message = detail
+                .and_then(|value| value.get("parse_diagnostics"))
+                .and_then(|value| value.as_array())
+                .and_then(|values| values.first())
+                .and_then(|value| value.get("message"))
+                .and_then(|value| value.as_str())
+                .map(|value| format!("{value} ({}).", message))
+                .unwrap_or(message);
+            Some(FailureDiagnostic {
+                domain: FailureDomain::TargetCode,
+                kind: FailureKind::SyntaxError,
+                component: DiagnosticComponent::Target,
+                impact: DiagnosticImpact::Gating,
+                message: parse_message,
+                process: None,
+                limits: None,
+            })
+        }
+        "complexity" => Some(simple(
+            FailureDomain::TargetCode,
+            FailureKind::ComplexityThreshold,
+            DiagnosticComponent::Target,
+            DiagnosticImpact::Gating,
+        )),
+        "lint" => {
+            let runner_failed = detail
+                .and_then(|value| value.get("runner_failed"))
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            if runner_failed || stage.status != StageStatus::Advisory {
+                Some(simple(
+                    FailureDomain::Environment,
+                    if runner_failed {
+                        FailureKind::ToolFailure
+                    } else {
+                        FailureKind::LauncherFailure
+                    },
+                    DiagnosticComponent::LintRunner,
+                    DiagnosticImpact::Advisory,
+                ))
+            } else {
+                None
+            }
+        }
+        "coverage" => Some(simple(
+            FailureDomain::VerifierHarness,
+            FailureKind::ContractViolation,
+            DiagnosticComponent::FuzzHarness,
+            if coverage_gate == CoverageGate::ChangedExports {
+                DiagnosticImpact::Blocking
+            } else {
+                DiagnosticImpact::Advisory
+            },
+        )),
+        "portability" => Some(simple(
+            FailureDomain::Environment,
+            FailureKind::ToolFailure,
+            DiagnosticComponent::Sandbox,
+            DiagnosticImpact::Blocking,
+        )),
+        "differential" => Some(simple(
+            FailureDomain::VerifierHarness,
+            FailureKind::AmbiguousGeneratedInput,
+            DiagnosticComponent::DifferentialRunner,
+            DiagnosticImpact::Advisory,
+        )),
+        "execute" | "test" => {
+            let is_test = stage.name == "test";
+            let assertion_failure = is_test
+                && (message.contains("Assertion failed")
+                    || message.contains("AssertionError")
+                    || detail
+                        .and_then(|value| value.get("assertion_failure"))
+                        .and_then(|value| value.as_bool())
+                        == Some(true));
+            let has_target_finding = detail
+                .and_then(|value| value.get("findings"))
+                .and_then(|value| value.as_array())
+                .is_some_and(|findings| !findings.is_empty())
+                || detail
+                    .and_then(|value| value.get("suppressed_findings"))
+                    .and_then(|value| value.as_array())
+                    .is_some_and(|findings| !findings.is_empty());
+            let execution = detail.and_then(|value| value.get("execution")).or(detail);
+            let module_load_blocked = detail
+                .and_then(|value| value.get("module_load_blocked"))
+                .and_then(|value| value.as_bool())
+                == Some(true)
+                || execution
+                    .and_then(|value| value.get("stderr"))
+                    .and_then(|value| value.as_str())
+                    .is_some_and(is_typescript_module_load_error);
+            if module_load_blocked {
+                return Some(simple(
+                    FailureDomain::Environment,
+                    FailureKind::ModuleLoad,
+                    DiagnosticComponent::ModuleLoader,
+                    DiagnosticImpact::Blocking,
+                ));
+            }
+            if let Some(termination) = execution
+                .and_then(|value| value.get("termination"))
+                .and_then(|value| serde_json::from_value::<ProcessTermination>(value.clone()).ok())
+            {
+                // A target finding is authoritative and must not be replaced by
+                // a generic nonzero-exit diagnostic. Resource/process causes are
+                // retained alongside that finding.
+                if !assertion_failure
+                    && !(has_target_finding
+                        && termination.kind == ProcessTerminationKind::Exited
+                        && termination.exit_code != Some(0))
+                {
+                    return Some(diagnostic_from_termination(&termination, message));
+                }
+            }
+
+            let overlay_unsupported = detail
+                .and_then(|value| value.get("instrumentation_overlay"))
+                .and_then(|value| value.get("supported"))
+                .and_then(|value| value.as_bool())
+                == Some(false);
+            if overlay_unsupported {
+                return Some(simple(
+                    FailureDomain::VerifierHarness,
+                    FailureKind::Instrumentation,
+                    DiagnosticComponent::Instrumentation,
+                    DiagnosticImpact::Blocking,
+                ));
+            }
+
+            if assertion_failure {
+                return Some(simple(
+                    FailureDomain::TargetCode,
+                    FailureKind::AssertionFailure,
+                    DiagnosticComponent::AuthoritativeTestRunner,
+                    DiagnosticImpact::Gating,
+                ));
+            }
+            if has_target_finding {
+                return Some(simple(
+                    FailureDomain::TargetCode,
+                    if is_test {
+                        FailureKind::AssertionFailure
+                    } else {
+                        FailureKind::TargetException
+                    },
+                    if is_test {
+                        DiagnosticComponent::AuthoritativeTestRunner
+                    } else {
+                        DiagnosticComponent::Target
+                    },
+                    DiagnosticImpact::Gating,
+                ));
+            }
+            if !has_target_finding {
+                return Some(simple(
+                    if is_test {
+                        FailureDomain::Environment
+                    } else {
+                        FailureDomain::VerifierHarness
+                    },
+                    if is_test {
+                        FailureKind::ToolFailure
+                    } else {
+                        FailureKind::HarnessProtocol
+                    },
+                    if is_test {
+                        DiagnosticComponent::AuthoritativeTestRunner
+                    } else {
+                        DiagnosticComponent::FuzzHarness
+                    },
+                    DiagnosticImpact::Blocking,
+                ));
+            }
+            None
+        }
+        _ => Some(simple(
+            FailureDomain::Environment,
+            FailureKind::ToolFailure,
+            DiagnosticComponent::Sandbox,
+            DiagnosticImpact::Blocking,
+        )),
+    }
+}
+
+fn append_unique_diagnostic(
+    diagnostics: &mut Vec<FailureDiagnostic>,
+    diagnostic: FailureDiagnostic,
+) {
+    let key = serde_json::to_string(&diagnostic).unwrap_or_else(|_| diagnostic.message.clone());
+    if !diagnostics.iter().any(|existing| {
+        serde_json::to_string(existing)
+            .map(|value| value == key)
+            .unwrap_or(false)
+    }) {
+        diagnostics.push(diagnostic);
+    }
+}
+
+fn diagnostics_from_stage_detail(detail: Option<&serde_json::Value>) -> Vec<FailureDiagnostic> {
+    let mut diagnostics = Vec::new();
+    let Some(detail) = detail else {
+        return diagnostics;
+    };
+    let target_cause = detail
+        .get("findings")
+        .and_then(|value| value.as_array())
+        .is_some_and(|findings| !findings.is_empty())
+        || detail
+            .get("suppressed_findings")
+            .and_then(|value| value.as_array())
+            .is_some_and(|findings| !findings.is_empty())
+        || detail
+            .get("assertion_failure")
+            .and_then(|value| value.as_bool())
+            == Some(true);
+    for key in ["diagnostics", "failure_diagnostics"] {
+        if let Some(values) = detail.get(key).and_then(|value| value.as_array()) {
+            for value in values {
+                if let Ok(diagnostic) = serde_json::from_value::<FailureDiagnostic>(value.clone()) {
+                    if target_cause && diagnostic.kind == FailureKind::NonzeroExit {
+                        continue;
+                    }
+                    append_unique_diagnostic(&mut diagnostics, diagnostic);
+                }
+            }
+        }
+    }
+    if let Some(value) = detail.get("diagnostic") {
+        if let Ok(diagnostic) = serde_json::from_value::<FailureDiagnostic>(value.clone()) {
+            append_unique_diagnostic(&mut diagnostics, diagnostic);
+        }
+    }
+    // ExecutionResult is deliberately kept as a nested legacy-compatible
+    // object. Promote its typed diagnostics and authoritative termination to
+    if let Some(execution) = detail.get("execution") {
+        if let Some(values) = execution
+            .get("diagnostics")
+            .and_then(|value| value.as_array())
+        {
+            for value in values {
+                if let Ok(diagnostic) = serde_json::from_value::<FailureDiagnostic>(value.clone()) {
+                    let target_cause = detail
+                        .get("findings")
+                        .and_then(|value| value.as_array())
+                        .is_some_and(|findings| !findings.is_empty())
+                        || detail
+                            .get("suppressed_findings")
+                            .and_then(|value| value.as_array())
+                            .is_some_and(|findings| !findings.is_empty())
+                        || detail
+                            .get("assertion_failure")
+                            .and_then(|value| value.as_bool())
+                            == Some(true);
+                    if target_cause && diagnostic.kind == FailureKind::NonzeroExit {
+                        continue;
+                    }
+                    append_unique_diagnostic(&mut diagnostics, diagnostic);
+                }
+            }
+        }
+    }
+    diagnostics
+}
+pub fn stage_diagnostics(stage: &VerificationStage) -> Vec<FailureDiagnostic> {
+    diagnostics_from_stage_detail(stage.detail.as_ref())
+}
+
+fn annotate_stage_diagnostics(stages: &mut [VerificationStage], coverage_gate: CoverageGate) {
+    for stage in stages {
+        let mut diagnostics = diagnostics_from_stage_detail(stage.detail.as_ref());
+        let should_infer = matches!(
+            stage.status,
+            StageStatus::Failed | StageStatus::Inconclusive
+        ) || (stage.name == "lint"
+            && stage
+                .detail
+                .as_ref()
+                .and_then(|value| value.get("runner_failed"))
+                .and_then(|value| value.as_bool())
+                == Some(true));
+
+        if stage.name == "execute" || stage.name == "test" {
+            let execution = stage
+                .detail
+                .as_ref()
+                .and_then(|value| value.get("execution"))
+                .or(stage.detail.as_ref());
+            if let Some(execution) = execution {
+                if let Some(termination) = execution.get("termination").and_then(|value| {
+                    serde_json::from_value::<ProcessTermination>(value.clone()).ok()
+                }) {
+                    let assertion_failure = stage.name == "test"
+                        && (stage.message.as_deref().is_some_and(|message| {
+                            message.contains("Assertion failed")
+                                || message.contains("AssertionError")
+                        }) || stage
+                            .detail
+                            .as_ref()
+                            .and_then(|value| value.get("assertion_failure"))
+                            .and_then(|value| value.as_bool())
+                            == Some(true));
+                    let has_target_finding = stage
+                        .detail
+                        .as_ref()
+                        .and_then(|value| value.get("findings"))
+                        .and_then(|value| value.as_array())
+                        .is_some_and(|findings| !findings.is_empty())
+                        || stage
+                            .detail
+                            .as_ref()
+                            .and_then(|value| value.get("suppressed_findings"))
+                            .and_then(|value| value.as_array())
+                            .is_some_and(|findings| !findings.is_empty());
+                    let module_load_blocked = stage
+                        .detail
+                        .as_ref()
+                        .and_then(|value| value.get("module_load_blocked"))
+                        .and_then(|value| value.as_bool())
+                        == Some(true)
+                        || execution
+                            .get("stderr")
+                            .and_then(|value| value.as_str())
+                            .is_some_and(is_typescript_module_load_error);
+                    let should_record_exit = !module_load_blocked
+                        && !assertion_failure
+                        && (termination.kind != ProcessTerminationKind::Exited
+                            || (termination.exit_code != Some(0) && !has_target_finding));
+                    if should_record_exit {
+                        append_unique_diagnostic(
+                            &mut diagnostics,
+                            diagnostic_from_termination(
+                                &termination,
+                                stage.message.clone().unwrap_or_else(|| {
+                                    format!("{} process did not exit successfully", stage.name)
+                                }),
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+
+        if should_infer {
+            if let Some(diagnostic) = diagnostic_from_stage(stage, coverage_gate) {
+                // Preserve typed target/resource causes already emitted by the
+                // harness, while still guaranteeing one cause for this stage.
+                let same_kind = diagnostics
+                    .iter()
+                    .any(|existing| existing.kind == diagnostic.kind);
+                if !same_kind {
+                    append_unique_diagnostic(&mut diagnostics, diagnostic);
+                }
+            }
+        }
+
+        if !diagnostics.is_empty() {
+            let detail = stage.detail.get_or_insert_with(|| serde_json::json!({}));
+            if let Some(object) = detail.as_object_mut() {
+                if object
+                    .get("diagnostic")
+                    .and_then(|value| {
+                        serde_json::from_value::<FailureDiagnostic>(value.clone()).ok()
+                    })
+                    .is_none()
+                {
+                    let diagnostics_key = if stage.name == "lint" {
+                        "failure_diagnostics"
+                    } else {
+                        "diagnostics"
+                    };
+                    object.insert(
+                        diagnostics_key.into(),
+                        serde_json::to_value(&diagnostics)
+                            .unwrap_or_else(|_| serde_json::json!([])),
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn diagnostics_from_stages(stages: &[VerificationStage]) -> Vec<FailureDiagnostic> {
+    let mut diagnostics = Vec::new();
+    for stage in stages {
+        for diagnostic in diagnostics_from_stage_detail(stage.detail.as_ref()) {
+            append_unique_diagnostic(&mut diagnostics, diagnostic);
+        }
+    }
+    diagnostics
+}
+
+fn build_report(mut stages: Vec<VerificationStage>, gate: CoverageGate) -> VerificationReport {
+    // Normalize stage-local causes before computing the report-level verdict.
+    // This keeps old stage JSON readable while ensuring every failed or
+    // inconclusive stage has a typed, deduplicated provenance record.
+    annotate_stage_diagnostics(&mut stages, gate);
+    let diagnostics = diagnostics_from_stages(&stages);
+    let mut summary = compute_report_summary(&stages);
+    summary.diagnostics = DiagnosticsSummary::from_diagnostics(&diagnostics);
     let evidence = evidence_from_stages(&stages);
     let (verdict, strength) = final_verdict(&stages, &summary.coverage, gate, &evidence);
     VerificationReport {
@@ -4202,6 +5232,9 @@ fn build_report(stages: Vec<VerificationStage>, gate: CoverageGate) -> Verificat
         verdict,
         strength,
         summary,
+        diagnostics_summary: (!diagnostics.is_empty())
+            .then(|| DiagnosticsSummary::from_diagnostics(&diagnostics)),
+        diagnostics,
         report_path: None,
     }
 }
@@ -4416,12 +5449,13 @@ pub fn report_json_value(
     report_level: ReportLevel,
 ) -> serde_json::Value {
     match report_level {
-        ReportLevel::Full => serde_json::to_value(report).unwrap(),
         ReportLevel::Minimal => serde_json::json!({
             "schema_version": report.schema_version,
             "verdict": report.verdict,
             "strength": report.strength,
             "summary": report.summary,
+            "diagnostics": report.diagnostics,
+            "diagnostics_summary": report.diagnostics_summary,
             "report_path": report.report_path,
             "stages": report
                 .stages
@@ -4429,6 +5463,7 @@ pub fn report_json_value(
                 .map(minimal_stage_view)
                 .collect::<Vec<_>>(),
         }),
+        ReportLevel::Full => serde_json::to_value(report).unwrap_or_else(|_| serde_json::json!({})),
     }
 }
 
@@ -4491,6 +5526,20 @@ pub fn report_human_summary(report: &VerificationReport) -> String {
         "Complexity: {} violations, {} suppressed",
         summary.complexity_violations, summary.suppressed_complexity_violations
     );
+    if !report.diagnostics.is_empty() {
+        let _ = writeln!(out, "Diagnostics: {}", report.diagnostics.len());
+        for diagnostic in &report.diagnostics {
+            let _ = writeln!(
+                out,
+                "  {:?}/{:?} ({:?}, {:?}): {}",
+                diagnostic.domain,
+                diagnostic.kind,
+                diagnostic.component,
+                diagnostic.impact,
+                clip_human(&diagnostic.message, 160)
+            );
+        }
+    }
 
     let _ = writeln!(out);
     let _ = writeln!(out, "Stages:");
@@ -4702,6 +5751,7 @@ fn compute_report_summary(stages: &[VerificationStage]) -> ReportSummary {
         lint_runner_failures: 0,
         complexity_violations: 0,
         coverage: CoverageSummary::default(),
+        diagnostics: DiagnosticsSummary::default(),
     };
     summary.coverage = coverage_summary_from_stages(stages);
     for stage in stages {
@@ -4750,16 +5800,20 @@ fn compute_report_summary(stages: &[VerificationStage]) -> ReportSummary {
                     .unwrap_or(0) as usize;
             }
             "lint" => {
-                summary.lint_issues = detail
-                    .get("diagnostics")
-                    .and_then(|v| v.as_array())
-                    .map(|v| v.len())
-                    .unwrap_or(0);
-                if detail
+                let runner_failed = detail
                     .get("runner_failed")
                     .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-                {
+                    .unwrap_or(false);
+                summary.lint_issues = if runner_failed {
+                    0
+                } else {
+                    detail
+                        .get("diagnostics")
+                        .and_then(|v| v.as_array())
+                        .map(|v| v.len())
+                        .unwrap_or(0)
+                };
+                if runner_failed {
                     summary.lint_runner_failures += 1;
                 }
             }
@@ -4853,6 +5907,8 @@ fn write_report(
         verdict: report.verdict,
         strength: report.strength,
         summary: report.summary.clone(),
+        diagnostics: report.diagnostics.clone(),
+        diagnostics_summary: report.diagnostics_summary.clone(),
     };
     let basename = source_file
         .map(|s| {
@@ -4947,14 +6003,30 @@ pub fn repair_summary(report: &VerificationReport) -> RepairSummary {
         .cloned();
     let recommended_action = match report.verdict {
         VerificationVerdict::Pass => "none",
-        VerificationVerdict::Fail => "repair",
+        VerificationVerdict::Fail => {
+            if report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.domain == FailureDomain::TargetCode
+                    && diagnostic.impact == DiagnosticImpact::Gating
+            }) {
+                "repair"
+            } else {
+                "inspect_environment"
+            }
+        }
         VerificationVerdict::Inconclusive => {
-            let infrastructure = findings.iter().any(|finding| {
-                !finding.suppressed && finding.severity == FindingSeverity::Infrastructure
-            }) || report.stages.iter().any(|stage| {
-                stage.status == StageStatus::Inconclusive
-                    && matches!(stage.name.as_str(), "portability" | "execute")
+            let non_target_blocker = report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.impact == DiagnosticImpact::Blocking
+                    && diagnostic.domain != FailureDomain::TargetCode
+                    && diagnostic.kind != FailureKind::ContractViolation
             });
+            let infrastructure = non_target_blocker
+                || findings.iter().any(|finding| {
+                    !finding.suppressed && finding.severity == FindingSeverity::Infrastructure
+                })
+                || report.stages.iter().any(|stage| {
+                    stage.status == StageStatus::Inconclusive
+                        && matches!(stage.name.as_str(), "portability" | "execute")
+                });
             if infrastructure {
                 "inspect_environment"
             } else if report.summary.coverage.required
@@ -4976,6 +6048,8 @@ pub fn repair_summary(report: &VerificationReport) -> RepairSummary {
         primary_finding,
         findings,
         coverage: report.summary.coverage.clone(),
+        diagnostics: report.diagnostics.clone(),
+        diagnostics_summary: report.diagnostics_summary.clone(),
     }
 }
 
@@ -4995,6 +6069,22 @@ pub fn load_persisted_report(path: &str) -> Result<PersistedReport, String> {
         ));
     }
     Ok(report)
+}
+pub fn replay_launch_context(
+    report_path: &str,
+    finding_id: &str,
+) -> Result<Option<ReproLaunchContext>, String> {
+    let report = load_persisted_report(report_path)?;
+    let mut matches = persisted_findings(&report)
+        .into_iter()
+        .filter(|finding| finding.id == finding_id);
+    let finding = matches
+        .next()
+        .ok_or_else(|| format!("finding '{finding_id}' was not found in report"))?;
+    if matches.next().is_some() {
+        return Err(format!("finding id '{finding_id}' is duplicated"));
+    }
+    Ok(finding.launch_context)
 }
 
 fn replay_payload(stdout: &str) -> Result<serde_json::Value, String> {
@@ -5118,6 +6208,34 @@ pub async fn replay_report(
     python_docker_image: &str,
     typescript_docker_image: &str,
 ) -> Result<ReplayReport, String> {
+    replay_report_with_options(
+        report_path,
+        finding_id,
+        dependency_project_dir,
+        runtime_profile,
+        python_docker_image,
+        typescript_docker_image,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn replay_report_with_options(
+    report_path: &str,
+    finding_id: &str,
+    dependency_project_dir: Option<&str>,
+    runtime_profile: RuntimeProfile,
+    python_docker_image: &str,
+    typescript_docker_image: &str,
+    timeout_seconds: Option<f64>,
+    memory_mb: Option<u64>,
+    network: Option<NetworkPolicy>,
+    harness_args: Option<&[HarnessArg]>,
+) -> Result<ReplayReport, String> {
     let report = load_persisted_report(report_path)?;
     let mut matches = persisted_findings(&report)
         .into_iter()
@@ -5135,10 +6253,25 @@ pub async fn replay_report(
         )
     })?;
 
+    let launch_context = finding.launch_context.as_ref();
     let docker_image = match language {
         Language::Python => python_docker_image,
         Language::TypeScript => typescript_docker_image,
     };
+    let replay_timeout = timeout_seconds
+        .or_else(|| launch_context.map(|context| context.limits.timeout_seconds))
+        .unwrap_or(10.0);
+    let replay_memory = memory_mb
+        .or_else(|| launch_context.map(|context| context.limits.memory_mb))
+        .unwrap_or(128);
+    let replay_network = network
+        .or_else(|| launch_context.map(|context| context.limits.network_policy))
+        .unwrap_or(NetworkPolicy::Deny);
+    let replay_harness_args = harness_args.unwrap_or_else(|| {
+        launch_context
+            .map(|context| context.harness_args.as_slice())
+            .unwrap_or(&[])
+    });
     if let Some(differential) = finding.repro.differential.as_ref() {
         if let Err(reason) = validate_differential_repro(differential, dependency_project_dir) {
             return Ok(ReplayReport {
@@ -5186,8 +6319,50 @@ pub async fn replay_report(
                 execution: err_execution_result("differential repro has no function symbol"),
             });
         };
-        let base_analysis = analyze::analyze(&base_source, &language);
-        let candidate_analysis = analyze::analyze(&candidate_source, &language);
+        let base_context = match crate::resolve_execution_context(ContextRequest {
+            invocation_dir: base_root.path(),
+            explicit_project_dir: Some(base_root.path()),
+            target_file: Some(Path::new(&base_entry)),
+            test_file: None,
+            language,
+            virtual_file_path: None,
+        }) {
+            Ok(context) => context,
+            Err(error) => {
+                return Ok(ReplayReport {
+                    schema_version: REPORT_SCHEMA_VERSION,
+                    finding_id: finding.id,
+                    outcome: ReplayOutcome::Inconclusive,
+                    execution: err_execution_result(&format!(
+                        "differential replay base context unavailable: {error}"
+                    )),
+                })
+            }
+        };
+        let candidate_context = match crate::resolve_execution_context(ContextRequest {
+            invocation_dir: candidate_root.path(),
+            explicit_project_dir: Some(candidate_root.path()),
+            target_file: Some(Path::new(&candidate_entry)),
+            test_file: None,
+            language,
+            virtual_file_path: None,
+        }) {
+            Ok(context) => context,
+            Err(error) => {
+                return Ok(ReplayReport {
+                    schema_version: REPORT_SCHEMA_VERSION,
+                    finding_id: finding.id,
+                    outcome: ReplayOutcome::Inconclusive,
+                    execution: err_execution_result(&format!(
+                        "differential replay candidate context unavailable: {error}"
+                    )),
+                })
+            }
+        };
+        let base_analysis =
+            analyze::analyze_with_context(&base_source, &base_context.target_source);
+        let candidate_analysis =
+            analyze::analyze_with_context(&candidate_source, &candidate_context.target_source);
         let base_function = base_analysis
             .functions
             .iter()
@@ -5240,17 +6415,21 @@ pub async fn replay_report(
             &language,
         );
         let base_options = SandboxOptions {
-            timeout_seconds: 10.0,
-            memory_mb: 128,
+            timeout_seconds: replay_timeout,
+            memory_mb: replay_memory,
             runtime_profile,
+            network_policy: replay_network,
+            harness_args: replay_harness_args,
             docker_image: (runtime_profile == RuntimeProfile::Isolated).then_some(docker_image),
             project_dir: base_root.path().to_str(),
             source_file: Some(&base_entry),
         };
         let candidate_options = SandboxOptions {
-            timeout_seconds: 10.0,
-            memory_mb: 128,
+            timeout_seconds: replay_timeout,
+            memory_mb: replay_memory,
             runtime_profile,
+            network_policy: replay_network,
+            harness_args: replay_harness_args,
             docker_image: (runtime_profile == RuntimeProfile::Isolated).then_some(docker_image),
             project_dir: candidate_root.path().to_str(),
             source_file: Some(&candidate_entry),
@@ -5318,6 +6497,13 @@ pub async fn replay_report(
                 .saturating_add(candidate_execution.duration_ms),
             timed_out: false,
             memory_error: false,
+            termination: Some(ProcessTermination {
+                kind: ProcessTerminationKind::Exited,
+                exit_code: Some(0),
+                signal: None,
+                signal_name: None,
+            }),
+            diagnostics: vec![],
         };
         return Ok(ReplayReport {
             schema_version: REPORT_SCHEMA_VERSION,
@@ -5339,7 +6525,14 @@ pub async fn replay_report(
         } else if let Some(root) = dependency_project_dir {
             Path::new(root).join(path)
         } else {
-            PathBuf::from(path)
+            return Ok(ReplayReport {
+                schema_version: REPORT_SCHEMA_VERSION,
+                finding_id: finding.id,
+                outcome: ReplayOutcome::Inconclusive,
+                execution: err_execution_result(
+                    "relative replay source requires --dependency-project-dir",
+                ),
+            });
         };
         source = std::fs::read_to_string(&source_path)
             .map_err(|error| format!("source context unavailable for replay: {error}"))?;
@@ -5361,9 +6554,11 @@ pub async fn replay_report(
     });
     let project_dir = project_dir_owned.as_deref();
     let options = SandboxOptions {
-        timeout_seconds: 10.0,
-        memory_mb: 128,
+        timeout_seconds: replay_timeout,
+        memory_mb: replay_memory,
         runtime_profile,
+        network_policy: replay_network,
+        harness_args: replay_harness_args,
         docker_image: (runtime_profile == RuntimeProfile::Isolated).then_some(docker_image),
         project_dir,
         source_file,

@@ -8,11 +8,12 @@ use tar::Archive;
 use tempfile::TempDir;
 
 use court_jester::types::{
-    ComplexityMetric, CoverageGate, ExecuteGate, InferredOracleGate, Language, ReportLevel,
-    RuntimeProfile, StageStatus, SummaryFormat, TestRunner, VerificationReport,
-    VerificationVerdict, DEFAULT_PYTHON_DOCKER_IMAGE, DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+    ComplexityMetric, CoverageGate, DiagnosticImpact, ExecuteGate, FailureDomain, HarnessArg,
+    InferredOracleGate, Language, NetworkPolicy, ReportLevel, RuntimeProfile, StageStatus,
+    SummaryFormat, TestRunner, VerificationReport, VerificationVerdict,
+    DEFAULT_PYTHON_DOCKER_IMAGE, DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
 };
-use court_jester::{detect_project_dir, parse_language, tools};
+use court_jester::{parse_language, tools};
 
 const USAGE: &str = "\
 court-jester — code verification CLI for Python and TypeScript
@@ -52,12 +53,20 @@ VERIFY OPTIONS:
   --execute-gate <MODE>      all | crash | none (default all; no_inputs_reached is always diagnostic)
   --coverage-gate <MODE>     changed-exports | none (default changed-exports)
   --inferred-oracle-gate <MODE> advisory | fail (default advisory)
+  --timeout-seconds <F>      Fuzz/test timeout override
+  --memory-mb <N>            Memory cap MB (default 512)
+  --network <POLICY>         deny | allow (isolated requires deny)
+  --harness-args-json <JSON> Ordered literal/project_path argument array
 
 CI OPTIONS:
   --base <REV>               Base revision for changed-file diffing (required for `ci`)
   --head <REV>               Head revision for changed-file diffing (default HEAD)
   --gate <LIST>              Comma-separated stage gates or all (default parse,lint,coverage,portability,execute,test)
   --report <FORMAT>          human | github | json (default human)
+  --timeout-seconds <F>      Stage timeout override
+  --memory-mb <N>            Memory cap MB (default 512)
+  --network <POLICY>         deny | allow (isolated requires deny)
+  --harness-args-json <JSON> Ordered arguments (only one changed target)
 
 EXECUTE OPTIONS:
   --timeout-seconds <F>      Sandbox timeout (default 10)
@@ -66,6 +75,10 @@ REPLAY OPTIONS:
   --report <PATH>            Persisted schema-v3 report to replay
   --finding <ID>             Finding id to replay (must be unique)
   --dependency-project-dir <PATH>  Dependency project root for replay
+  --timeout-seconds <F>      Replay timeout override
+  --memory-mb <N>            Replay memory cap override
+  --network <POLICY>         Replay network policy override
+  --harness-args-json <JSON> Replay ordered argument override
 DOCTOR OPTIONS:
   --language <LANG>          python | typescript | all (default all)
   --summary <FORMAT>         json | human (default json)
@@ -166,25 +179,59 @@ struct CliArgs {
     inferred_oracle_gate: InferredOracleGate,
     timeout_seconds: Option<f64>,
     memory_mb: Option<u64>,
+    network: NetworkPolicy,
+    network_explicit: bool,
+    harness_args: Vec<HarnessArg>,
+    harness_args_explicit: bool,
     runtime_profile: RuntimeProfile,
+    runtime_profile_explicit: bool,
     python_docker_image: Option<String>,
     typescript_docker_image: Option<String>,
     report_path: Option<String>,
     finding_id: Option<String>,
     dependency_project_dir: Option<String>,
 }
+/// Apply the CLI verification timeout to every verification stage without
+/// expanding the public `VerifyOptions` literal compatibility surface.
+struct VerifyTimeoutEnv {
+    previous: Vec<(String, Option<std::ffi::OsString>)>,
+}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl VerifyTimeoutEnv {
+    fn install(timeout_seconds: Option<f64>) -> Self {
+        let mut previous = Vec::new();
+        if let Some(timeout) = timeout_seconds {
+            for key in [
+                "COURT_JESTER_VERIFY_PYTHON_TIMEOUT_SECONDS",
+                "COURT_JESTER_VERIFY_TYPESCRIPT_TIMEOUT_SECONDS",
+                "COURT_JESTER_VERIFY_TEST_TIMEOUT_SECONDS",
+            ] {
+                previous.push((key.to_string(), env::var_os(key)));
+                env::set_var(key, timeout.to_string());
+            }
+        }
+        Self { previous }
+    }
+}
+
+impl Drop for VerifyTimeoutEnv {
+    fn drop(&mut self) {
+        for (key, value) in self.previous.drain(..) {
+            if let Some(value) = value {
+                env::set_var(key, value);
+            } else {
+                env::remove_var(key);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum CiReportFormat {
+    #[default]
     Human,
     Github,
     Json,
-}
-
-impl Default for CiReportFormat {
-    fn default() -> Self {
-        Self::Human
-    }
 }
 
 impl CiReportFormat {
@@ -219,6 +266,7 @@ fn parse_flags(rest: &[String]) -> Result<CliArgs, String> {
                         raw
                     )
                 })?;
+                out.runtime_profile_explicit = true;
             }
             "--python-docker-image" => out.python_docker_image = Some(take_value(&mut i)?),
             "--typescript-docker-image" => out.typescript_docker_image = Some(take_value(&mut i)?),
@@ -333,6 +381,20 @@ fn parse_flags(rest: &[String]) -> Result<CliArgs, String> {
                     format!("--memory-mb must be a positive integer, got '{}'", raw)
                 })?);
             }
+            "--network" => {
+                let raw = take_value(&mut i)?;
+                out.network = match raw.as_str() {
+                    "deny" => NetworkPolicy::Deny,
+                    "allow" => NetworkPolicy::Allow,
+                    _ => return Err("--network must be one of: deny, allow".into()),
+                };
+                out.network_explicit = true;
+            }
+            "--harness-args-json" => {
+                let raw = take_value(&mut i)?;
+                out.harness_args = parse_harness_args(&raw)?;
+                out.harness_args_explicit = true;
+            }
             "-h" | "--help" => {
                 print!("{}", USAGE);
                 std::process::exit(0);
@@ -355,6 +417,64 @@ fn parse_flags(rest: &[String]) -> Result<CliArgs, String> {
     Ok(out)
 }
 
+fn parse_harness_args(raw: &str) -> Result<Vec<HarnessArg>, String> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|error| {
+        format!("--harness-args-json must be an ordered JSON array of harness arguments: {error}")
+    })?;
+    let items = value.as_array().ok_or_else(|| {
+        "--harness-args-json must be an ordered JSON array of harness arguments".to_string()
+    })?;
+    let mut arguments = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let object = item.as_object().ok_or_else(|| {
+            format!("harness argument {index} must be an object with exactly one key")
+        })?;
+        if object.len() != 1 {
+            return Err(format!(
+                "harness argument {index} must contain exactly one of 'literal' or 'project_path'"
+            ));
+        }
+        if let Some(value) = object.get("literal") {
+            let literal = value
+                .as_str()
+                .ok_or_else(|| format!("harness argument {index}.literal must be a string"))?;
+            if literal.contains('\0') {
+                return Err(format!("harness argument {index}.literal contains NUL"));
+            }
+            arguments.push(HarnessArg::Literal {
+                literal: literal.to_string(),
+            });
+            continue;
+        }
+        if let Some(value) = object.get("project_path") {
+            let project_path = value
+                .as_str()
+                .ok_or_else(|| format!("harness argument {index}.project_path must be a string"))?;
+            let path = Path::new(project_path);
+            if project_path.contains('\0') || path.is_absolute() {
+                return Err(format!(
+                    "harness argument {index}.project_path must be a relative path without NUL"
+                ));
+            }
+            if path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                return Err(format!(
+                    "harness argument {index}.project_path must not escape the project root"
+                ));
+            }
+            arguments.push(HarnessArg::ProjectPath {
+                project_path: project_path.to_string(),
+            });
+            continue;
+        }
+        return Err(format!(
+            "harness argument {index} must contain exactly one of 'literal' or 'project_path'"
+        ));
+    }
+    Ok(arguments)
+}
 fn parse_replay_flags(rest: &[String]) -> Result<CliArgs, String> {
     let mut out = CliArgs::default();
     let mut i = 0;
@@ -375,12 +495,35 @@ fn parse_replay_flags(rest: &[String]) -> Result<CliArgs, String> {
                 out.runtime_profile = RuntimeProfile::parse(&value(&mut i)?).ok_or_else(|| {
                     "--runtime-profile must be one of: local-trusted, isolated".to_string()
                 })?;
+                out.runtime_profile_explicit = true;
             }
             "--python-docker-image" => out.python_docker_image = Some(value(&mut i)?),
             "--typescript-docker-image" => out.typescript_docker_image = Some(value(&mut i)?),
-            "-h" | "--help" => {
-                print!("{USAGE}");
-                std::process::exit(0);
+            "--timeout-seconds" => {
+                out.timeout_seconds = Some(
+                    value(&mut i)?
+                        .parse::<f64>()
+                        .map_err(|_| "--timeout-seconds must be a number".to_string())?,
+                );
+            }
+            "--memory-mb" => {
+                out.memory_mb = Some(
+                    value(&mut i)?
+                        .parse::<u64>()
+                        .map_err(|_| "--memory-mb must be a positive integer".to_string())?,
+                );
+            }
+            "--network" => {
+                out.network = match value(&mut i)?.as_str() {
+                    "deny" => NetworkPolicy::Deny,
+                    "allow" => NetworkPolicy::Allow,
+                    _ => return Err("--network must be one of: deny, allow".into()),
+                };
+                out.network_explicit = true;
+            }
+            "--harness-args-json" => {
+                out.harness_args = parse_harness_args(&value(&mut i)?)?;
+                out.harness_args_explicit = true;
             }
             other => return Err(format!("unknown replay flag '{other}'")),
         }
@@ -405,6 +548,26 @@ fn validate_runtime_flags(cmd: &str, args: &CliArgs) -> Result<(), String> {
     {
         return Err("docker image overrides are valid only with --runtime-profile isolated".into());
     }
+    if let Some(timeout) = args.timeout_seconds {
+        if !timeout.is_finite() || timeout <= 0.0 {
+            return Err("--timeout-seconds must be finite and greater than zero".into());
+        }
+        if !matches!(cmd, "verify" | "execute" | "ci" | "replay") {
+            return Err(format!("--timeout-seconds is not supported for `{cmd}`"));
+        }
+    }
+    if let Some(memory) = args.memory_mb {
+        if memory == 0 {
+            return Err("--memory-mb must be greater than zero".into());
+        }
+        if memory
+            .checked_mul(1024)
+            .and_then(|bytes| bytes.checked_mul(1024))
+            .is_none()
+        {
+            return Err("--memory-mb is too large".into());
+        }
+    }
     if matches!(cmd, "verify" | "execute") {
         if let Some(raw) = args.language.as_deref() {
             let language = parse_language(raw).map_err(|_| "invalid --language".to_string())?;
@@ -426,6 +589,69 @@ fn validate_runtime_flags(cmd: &str, args: &CliArgs) -> Result<(), String> {
         if image.trim().is_empty() || image.starts_with('-') {
             return Err("docker image must be non-empty and must not begin with '-'".into());
         }
+    }
+    Ok(())
+}
+fn resolve_cli_context(
+    args: &CliArgs,
+    language: Language,
+    target_file: &str,
+) -> Result<court_jester::types::ExecutionContext, String> {
+    let invocation_dir =
+        env::current_dir().map_err(|error| format!("cannot resolve current directory: {error}"))?;
+    court_jester::resolve_execution_context(court_jester::types::ContextRequest {
+        invocation_dir: &invocation_dir,
+        explicit_project_dir: args.project_dir.as_deref().map(Path::new),
+        target_file: Some(Path::new(target_file)),
+        test_file: args.test_file.as_deref().map(Path::new),
+        language,
+        virtual_file_path: args.virtual_file_path.as_deref().map(Path::new),
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn validate_harness_args_in_context(
+    harness_args: &[HarnessArg],
+    context: &court_jester::types::ExecutionContext,
+) -> Result<(), String> {
+    for argument in harness_args {
+        let HarnessArg::ProjectPath { project_path } = argument else {
+            continue;
+        };
+        let candidate = context.workspace_root.join(project_path);
+        let canonical = std::fs::canonicalize(&candidate).map_err(|error| {
+            format!(
+                "harness project path '{}' is unavailable under '{}': {}",
+                project_path,
+                context.workspace_root.display(),
+                error
+            )
+        })?;
+        if !canonical.starts_with(&context.workspace_root) {
+            return Err(format!(
+                "harness project path '{}' escapes project root '{}'",
+                project_path,
+                context.workspace_root.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_policy_flags(cmd: &str, args: &CliArgs) -> Result<(), String> {
+    let unsupported = matches!(cmd, "analyze" | "lint" | "doctor");
+    if unsupported
+        && (args.memory_mb.is_some() || args.network_explicit || args.harness_args_explicit)
+    {
+        return Err(format!(
+            "memory, network, and harness-args flags are not supported for `{cmd}`"
+        ));
+    }
+    if cmd == "execute" && (args.network_explicit || args.harness_args_explicit) {
+        return Err("`execute` does not accept --network or --harness-args-json".into());
+    }
+    if args.runtime_profile == RuntimeProfile::Isolated && args.network == NetworkPolicy::Allow {
+        return Err("isolated execution requires --network deny".into());
     }
     Ok(())
 }
@@ -478,11 +704,21 @@ fn validate_base_pair(
     if candidate_rel != base_rel {
         return Err("--base-file must have the same relative filename as --file".into());
     }
-    let extension_language = |path: &str| match Path::new(path).extension().and_then(|e| e.to_str())
-    {
-        Some("py") => Some(Language::Python),
-        Some("ts") | Some("tsx") => Some(Language::TypeScript),
-        _ => None,
+    let extension_language = |path: &str| {
+        let lower = path.to_ascii_lowercase();
+        if lower.ends_with(".d.ts") {
+            return Some(Language::TypeScript);
+        }
+        match Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("py") => Some(Language::Python),
+            Some("ts") | Some("tsx") | Some("jsx") => Some(Language::TypeScript),
+            _ => None,
+        }
     };
     let base_language = extension_language(base_file);
     if base_language.as_ref() != Some(language) {
@@ -601,6 +837,23 @@ fn aggregate_verdict(
     }
 }
 
+fn ci_stage_verdict(stage: &court_jester::types::VerificationStage) -> VerificationVerdict {
+    let diagnostics = tools::verify::stage_diagnostics(stage);
+    if diagnostics.iter().any(|diagnostic| {
+        diagnostic.domain == FailureDomain::TargetCode
+            && diagnostic.impact == DiagnosticImpact::Gating
+    }) {
+        VerificationVerdict::Fail
+    } else if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.impact == DiagnosticImpact::Blocking)
+    {
+        VerificationVerdict::Inconclusive
+    } else {
+        stage_verdict(&stage.status)
+    }
+}
+
 fn ci_selected_verdict(report: &VerificationReport, gates: &[String]) -> VerificationVerdict {
     let selected: BTreeSet<&str> = gates.iter().map(String::as_str).collect();
     let mut verdict = VerificationVerdict::Pass;
@@ -608,7 +861,7 @@ fn ci_selected_verdict(report: &VerificationReport, gates: &[String]) -> Verific
     for stage in &report.stages {
         if selected.contains(stage.name.as_str()) {
             found = true;
-            verdict = aggregate_verdict(verdict, stage_verdict(&stage.status));
+            verdict = aggregate_verdict(verdict, ci_stage_verdict(stage));
         }
     }
     if found {
@@ -625,20 +878,25 @@ fn ci_stage_failures(report: &VerificationReport, gates: &[String]) -> Vec<Strin
         .iter()
         .filter(|stage| {
             selected.contains(stage.name.as_str())
-                && matches!(
-                    stage.status,
-                    StageStatus::Failed | StageStatus::Inconclusive | StageStatus::Skipped
-                )
+                && ci_stage_verdict(stage) != VerificationVerdict::Pass
         })
         .map(|stage| stage.name.clone())
         .collect()
 }
 
 fn ci_language_for_path(path: &str) -> Option<Language> {
-    let path = Path::new(path);
-    match path.extension().and_then(|ext| ext.to_str()) {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".d.ts") {
+        return None;
+    }
+    match Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .as_deref()
+    {
         Some("py") => Some(Language::Python),
-        Some("ts") => Some(Language::TypeScript),
+        Some("ts") | Some("tsx") | Some("jsx") => Some(Language::TypeScript),
         _ => None,
     }
 }
@@ -736,6 +994,12 @@ async fn run_ci_for_repo(repo_dir: &Path, args: &CliArgs) -> Result<CiRunResult,
     let baseline_temp = archive_baseline_tree(repo_dir, &base)?;
     let gates = parse_ci_gates(args.gate.as_deref())?;
     let changed_files = ci_changed_source_files(repo_dir, &base, &head)?;
+    if args.harness_args_explicit && changed_files.len() != 1 {
+        return Err(
+            "`ci` accepts --harness-args-json only when exactly one changed target is selected"
+                .into(),
+        );
+    }
     let diff = if changed_files.is_empty() {
         String::new()
     } else {
@@ -762,7 +1026,7 @@ async fn run_ci_for_repo(repo_dir: &Path, args: &CliArgs) -> Result<CiRunResult,
         let project_dir = args
             .project_dir
             .clone()
-            .or_else(|| detect_project_dir(&absolute_string));
+            .or_else(|| Some(repo_dir.to_string_lossy().into_owned()));
         let report = tools::verify::verify(
             &code,
             language,
@@ -793,6 +1057,9 @@ async fn run_ci_for_repo(repo_dir: &Path, args: &CliArgs) -> Result<CiRunResult,
                 coverage_gate: args.coverage_gate,
                 inferred_oracle_gate: args.inferred_oracle_gate,
                 runtime_profile: args.runtime_profile,
+                memory_mb: args.memory_mb.unwrap_or(512),
+                network: args.network,
+                harness_args: args.harness_args.clone(),
                 python_docker_image: args
                     .python_docker_image
                     .as_deref()
@@ -810,7 +1077,7 @@ async fn run_ci_for_repo(repo_dir: &Path, args: &CliArgs) -> Result<CiRunResult,
         verdict = aggregate_verdict(verdict, file_verdict);
         files.push(CiFileResult {
             file: relative_path.clone(),
-            language: language.clone(),
+            language: *language,
             verdict: file_verdict,
             failing_gates,
             report,
@@ -923,6 +1190,12 @@ fn render_ci_human(result: &CiRunResult) -> String {
         for gate in &file.failing_gates {
             if let Some(stage) = file.report.stages.iter().find(|stage| stage.name == *gate) {
                 out.push_str(&format!("  {}: {}\n", gate, ci_stage_brief(stage)));
+                for diagnostic in tools::verify::stage_diagnostics(stage) {
+                    out.push_str(&format!(
+                        "    - [{:?}/{:?}, {:?}] {}\n",
+                        diagnostic.domain, diagnostic.kind, diagnostic.impact, diagnostic.message
+                    ));
+                }
             }
         }
     }
@@ -935,7 +1208,6 @@ fn github_escape(message: &str) -> String {
         .replace('\r', "%0D")
         .replace('\n', "%0A")
 }
-
 fn render_ci_github(result: &CiRunResult) -> String {
     let mut lines = Vec::new();
     for file in result
@@ -947,6 +1219,40 @@ fn render_ci_github(result: &CiRunResult) -> String {
             let Some(stage) = file.report.stages.iter().find(|stage| stage.name == *gate) else {
                 continue;
             };
+            let diagnostics = tools::verify::stage_diagnostics(stage);
+            let confirmed_target_failure = diagnostics.iter().any(|diagnostic| {
+                diagnostic.domain == FailureDomain::TargetCode
+                    && diagnostic.impact == DiagnosticImpact::Gating
+            });
+            let blocking_non_target: Vec<_> = diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.impact == DiagnosticImpact::Blocking
+                        && !(diagnostic.domain == FailureDomain::TargetCode
+                            && diagnostic.impact == DiagnosticImpact::Gating)
+                })
+                .collect();
+            for diagnostic in &blocking_non_target {
+                lines.push(format!(
+                    "::warning file={}::{}",
+                    file.file,
+                    github_escape(&format!(
+                        "{:?}/{:?}: {}",
+                        diagnostic.domain, diagnostic.kind, diagnostic.message
+                    ))
+                ));
+            }
+            if !confirmed_target_failure && !blocking_non_target.is_empty() {
+                continue;
+            }
+            if !confirmed_target_failure && diagnostics.is_empty() {
+                lines.push(format!(
+                    "::warning file={}::{}",
+                    file.file,
+                    github_escape(&ci_stage_brief(stage))
+                ));
+                continue;
+            }
             match gate.as_str() {
                 "complexity" => {
                     let violations = stage
@@ -1160,7 +1466,7 @@ async fn run_doctor(args: &CliArgs) -> Result<court_jester::types::DoctorReport,
                             .is_some_and(|v| v < 24);
                     checks.push(doctor_check(
                         "runtime",
-                        Some(language.clone()),
+                        Some(*language),
                         if node_bad {
                             StageStatus::Failed
                         } else {
@@ -1172,7 +1478,7 @@ async fn run_doctor(args: &CliArgs) -> Result<court_jester::types::DoctorReport,
                 }
                 Err(error) => checks.push(doctor_check(
                     "runtime",
-                    Some(language.clone()),
+                    Some(*language),
                     StageStatus::Failed,
                     serde_json::Value::Null,
                     Some(error),
@@ -1189,7 +1495,7 @@ async fn run_doctor(args: &CliArgs) -> Result<court_jester::types::DoctorReport,
             };
             checks.push(doctor_check(
                 "linter",
-                Some(language.clone()),
+                Some(*language),
                 status,
                 serde_json::json!({"program": linter}),
                 (status == StageStatus::Advisory)
@@ -1227,14 +1533,14 @@ async fn run_doctor(args: &CliArgs) -> Result<court_jester::types::DoctorReport,
             match tools::sandbox::docker_image_id(image).await {
                 Ok(id) => checks.push(doctor_check(
                     "docker_image",
-                    Some(language.clone()),
+                    Some(*language),
                     StageStatus::Passed,
                     serde_json::json!({"image": image, "id": id}),
                     None,
                 )),
                 Err(error) => checks.push(doctor_check(
                     "docker_image",
-                    Some(language.clone()),
+                    Some(*language),
                     StageStatus::Failed,
                     serde_json::json!({"image": image}),
                     Some(error),
@@ -1244,15 +1550,75 @@ async fn run_doctor(args: &CliArgs) -> Result<court_jester::types::DoctorReport,
                 Language::Python => "print('court-jester doctor')",
                 Language::TypeScript => "console.log(process.versions.node)",
             };
+            let project = TempDir::new()
+                .map_err(|error| format!("failed to create doctor workspace: {error}"))?;
+            let project_path = project.path().to_path_buf();
+            let source_mode = match language {
+                Language::Python => court_jester::types::SourceMode::Python,
+                Language::TypeScript => court_jester::types::SourceMode::TypeScript,
+            };
+            let context = court_jester::types::ExecutionContext {
+                invocation_dir: project_path.clone(),
+                workspace_root: project_path.clone(),
+                target_package_root: project_path.clone(),
+                test_package_root: None,
+                dependency_roots: Vec::new(),
+                target_source: court_jester::types::SourceContext {
+                    language: *language,
+                    mode: source_mode,
+                    source_file: None,
+                    virtual_file_path: None,
+                },
+                test_source: None,
+            };
+            let project_dir_owned = project_path.to_string_lossy().into_owned();
             let options = court_jester::types::SandboxOptions {
                 timeout_seconds: 10.0,
                 memory_mb: 128,
                 runtime_profile: RuntimeProfile::Isolated,
+                network_policy: NetworkPolicy::Deny,
+                harness_args: &[],
                 docker_image: Some(image),
-                project_dir: None,
+                project_dir: Some(project_dir_owned.as_str()),
                 source_file: None,
             };
-            let result = tools::sandbox::execute(code, language, options).await;
+            let runtime = match source_mode {
+                court_jester::types::SourceMode::Python => {
+                    court_jester::types::HarnessRuntime::Python
+                }
+                court_jester::types::SourceMode::TypeScript => {
+                    court_jester::types::HarnessRuntime::NodeScript
+                }
+                court_jester::types::SourceMode::Tsx => {
+                    court_jester::types::HarnessRuntime::TsxScript
+                }
+            };
+            let result = tools::sandbox::execute_harness(
+                &context,
+                court_jester::types::HarnessSpec {
+                    kind: court_jester::types::HarnessKind::Standalone,
+                    runtime,
+                    test_adapter: None,
+                    source_mode,
+                    artifact: court_jester::types::HarnessArtifact::Generated {
+                        code: code.to_string(),
+                        relative_path: std::path::PathBuf::from(format!(
+                            ".court-jester/doctor.{extension}",
+                            extension =
+                                if matches!(source_mode, court_jester::types::SourceMode::Python) {
+                                    "py"
+                                } else {
+                                    "ts"
+                                }
+                        )),
+                    },
+                    args: Vec::new(),
+                    network: NetworkPolicy::Deny,
+                },
+                options,
+            )
+            .await
+            .process;
             let smoke_ok = result.exit_code == Some(0) && !result.timed_out && !result.memory_error;
             let node_bad = matches!(language, Language::TypeScript)
                 && result
@@ -1262,7 +1628,7 @@ async fn run_doctor(args: &CliArgs) -> Result<court_jester::types::DoctorReport,
                     .next()
                     .and_then(|v| v.parse::<u32>().ok())
                     .is_some_and(|v| v < 24);
-            checks.push(doctor_check("runtime_smoke", Some(language.clone()), if smoke_ok && !node_bad { StageStatus::Passed } else { StageStatus::Failed }, serde_json::json!({"image": image, "stdout": result.stdout, "stderr": result.stderr, "network": "none", "read_only": true, "memory_mb": 128}), (!smoke_ok).then(|| "isolated runtime smoke failed".into()).or_else(|| node_bad.then(|| "Node.js >=24 is required".into()))));
+            checks.push(doctor_check("runtime_smoke", Some(*language), if smoke_ok && !node_bad { StageStatus::Passed } else { StageStatus::Failed }, serde_json::json!({"image": image, "stdout": result.stdout, "stderr": result.stderr, "network": "none", "read_only": true, "memory_mb": 128}), (!smoke_ok).then(|| "isolated runtime smoke failed".into()).or_else(|| node_bad.then(|| "Node.js >=24 is required".into()))));
         }
     }
     let verdict = if checks
@@ -1288,6 +1654,7 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
         parse_flags(rest)?
     };
     validate_runtime_flags(cmd, &args)?;
+    validate_policy_flags(cmd, &args)?;
     if cmd == "replay" {
         let report_path = args
             .report_path
@@ -1297,17 +1664,55 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
             .finding_id
             .as_deref()
             .ok_or_else(|| "--finding is required for `court-jester replay`".to_string())?;
-        let report = tools::verify::replay_report(
+        let persisted_context = tools::verify::replay_launch_context(report_path, finding_id)?;
+        let persisted_report = tools::verify::load_persisted_report(report_path)?;
+        let replay_language = parse_language(&persisted_report.meta.language).map_err(|_| {
+            format!(
+                "unsupported report language '{}'; expected python or typescript",
+                persisted_report.meta.language
+            )
+        })?;
+        let runtime_profile = if args.runtime_profile_explicit {
+            args.runtime_profile
+        } else {
+            persisted_context
+                .as_ref()
+                .map(|context| context.limits.runtime_profile)
+                .unwrap_or(args.runtime_profile)
+        };
+        let persisted_image = persisted_context
+            .as_ref()
+            .and_then(|context| context.docker_image.as_deref());
+        let python_docker_image = args
+            .python_docker_image
+            .as_deref()
+            .or_else(|| {
+                matches!(replay_language, Language::Python)
+                    .then_some(persisted_image)
+                    .flatten()
+            })
+            .unwrap_or(DEFAULT_PYTHON_DOCKER_IMAGE);
+        let typescript_docker_image = args
+            .typescript_docker_image
+            .as_deref()
+            .or_else(|| {
+                matches!(replay_language, Language::TypeScript)
+                    .then_some(persisted_image)
+                    .flatten()
+            })
+            .unwrap_or(DEFAULT_TYPESCRIPT_DOCKER_IMAGE);
+        let report = tools::verify::replay_report_with_options(
             report_path,
             finding_id,
             args.dependency_project_dir.as_deref(),
-            args.runtime_profile,
-            args.python_docker_image
-                .as_deref()
-                .unwrap_or(DEFAULT_PYTHON_DOCKER_IMAGE),
-            args.typescript_docker_image
-                .as_deref()
-                .unwrap_or(DEFAULT_TYPESCRIPT_DOCKER_IMAGE),
+            runtime_profile,
+            python_docker_image,
+            typescript_docker_image,
+            args.timeout_seconds,
+            args.memory_mb,
+            args.network_explicit.then_some(args.network),
+            args.harness_args_explicit
+                .then_some(args.harness_args.as_slice()),
         )
         .await?;
         println!(
@@ -1365,6 +1770,7 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
         "ci" => {
             let repo_dir = env::current_dir()
                 .map_err(|e| format!("failed to resolve current directory for ci: {}", e))?;
+            let _verify_timeout_env = VerifyTimeoutEnv::install(args.timeout_seconds);
             let result = run_ci_for_repo(&repo_dir, &args).await?;
             match args.ci_report_format {
                 CiReportFormat::Human => {
@@ -1388,11 +1794,10 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
             let file = require_file(&args)?.to_string();
             let language = require_language(&args)?;
             let code = read_file(&file)?;
+            let context = resolve_cli_context(&args, language, &file)?;
+            validate_harness_args_in_context(&args.harness_args, &context)?;
+            let project_dir_owned = context.workspace_root.to_string_lossy().into_owned();
             let complexity_threshold = resolve_complexity_threshold(&args)?;
-            let project_dir = args
-                .project_dir
-                .clone()
-                .or_else(|| detect_project_dir(&file));
             let test_code = read_optional_file(args.test_file.as_deref())?;
             let suppressions = read_optional_file(args.suppressions_file.as_deref())?;
             if let Some(raw) = suppressions.as_deref() {
@@ -1416,7 +1821,7 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
                 test_runner: args.test_runner,
                 complexity_threshold,
                 complexity_metric: args.complexity_metric,
-                project_dir: project_dir.as_deref(),
+                project_dir: Some(project_dir_owned.as_str()),
                 lint_config_path: args.config_path.as_deref(),
                 lint_virtual_file_path: args.virtual_file_path.as_deref(),
                 diff: diff.as_deref(),
@@ -1433,6 +1838,9 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
                 coverage_gate: args.coverage_gate,
                 inferred_oracle_gate: args.inferred_oracle_gate,
                 runtime_profile: args.runtime_profile,
+                memory_mb: args.memory_mb.unwrap_or(512),
+                network: args.network,
+                harness_args: args.harness_args.clone(),
                 python_docker_image: args
                     .python_docker_image
                     .as_deref()
@@ -1443,6 +1851,7 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
                     .unwrap_or(DEFAULT_TYPESCRIPT_DOCKER_IMAGE),
                 tests_only: args.tests_only,
             };
+            let _verify_timeout_env = VerifyTimeoutEnv::install(args.timeout_seconds);
             let report = tools::verify::verify(&code, &language, opts).await;
             match args.summary_format {
                 SummaryFormat::Json => {
@@ -1474,7 +1883,19 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
             let language = require_language(&args)?;
             let code = read_file(&file)?;
             let complexity_threshold = resolve_complexity_threshold(&args)?;
-            let analysis = tools::analyze::analyze(&code, &language);
+            let invocation_dir = env::current_dir()
+                .map_err(|error| format!("cannot resolve current directory: {error}"))?;
+            let context =
+                court_jester::resolve_execution_context(court_jester::types::ContextRequest {
+                    invocation_dir: &invocation_dir,
+                    explicit_project_dir: args.project_dir.as_deref().map(Path::new),
+                    target_file: Some(Path::new(&file)),
+                    test_file: None,
+                    language,
+                    virtual_file_path: args.virtual_file_path.as_deref().map(Path::new),
+                })
+                .map_err(|error| error.to_string())?;
+            let analysis = tools::analyze::analyze_with_context(&code, &context.target_source);
             let mut value = serde_json::to_value(&analysis)
                 .map_err(|e| format!("failed to serialize analysis: {}", e))?;
             if let Some(diff) = read_optional_file(args.diff_file.as_deref())? {
@@ -1515,16 +1936,14 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
             let file = require_file(&args)?.to_string();
             let language = require_language(&args)?;
             let code = read_file(&file)?;
-            let project_dir = args
-                .project_dir
-                .clone()
-                .or_else(|| detect_project_dir(&file));
+            let context = resolve_cli_context(&args, language, &file)?;
+            let project_dir_owned = context.workspace_root.to_string_lossy().into_owned();
             let result = tools::lint::lint_with_options(
                 &code,
                 &language,
                 tools::lint::LintOptions {
                     source_file: Some(file.as_str()),
-                    project_dir: project_dir.as_deref(),
+                    project_dir: Some(project_dir_owned.as_str()),
                     config_path: args.config_path.as_deref(),
                     virtual_file_path: args.virtual_file_path.as_deref(),
                 },
@@ -1542,10 +1961,8 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
             let file = require_file(&args)?.to_string();
             let language = require_language(&args)?;
             let code = read_file(&file)?;
-            let project_dir = args
-                .project_dir
-                .clone()
-                .or_else(|| detect_project_dir(&file));
+            let context = resolve_cli_context(&args, language, &file)?;
+            let project_dir_owned = context.workspace_root.to_string_lossy().into_owned();
             let timeout = args.timeout_seconds.unwrap_or(10.0);
             let memory = args.memory_mb.unwrap_or(128);
             let docker_image = if args.runtime_profile == RuntimeProfile::Isolated {
@@ -1566,12 +1983,45 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
                 timeout_seconds: timeout,
                 memory_mb: memory,
                 runtime_profile: args.runtime_profile,
+                network_policy: args.network,
+                harness_args: args.harness_args.as_slice(),
                 docker_image,
-                project_dir: project_dir.as_deref(),
+                project_dir: Some(project_dir_owned.as_str()),
                 source_file: Some(file.as_str()),
             };
             options.validate()?;
-            let result = tools::sandbox::execute(&code, &language, options).await;
+            let source_mode = context.target_source.mode;
+            let (runtime, extension) = match source_mode {
+                court_jester::types::SourceMode::Python => {
+                    (court_jester::types::HarnessRuntime::Python, "py")
+                }
+                court_jester::types::SourceMode::TypeScript => {
+                    (court_jester::types::HarnessRuntime::NodeScript, "ts")
+                }
+                court_jester::types::SourceMode::Tsx => {
+                    (court_jester::types::HarnessRuntime::TsxScript, "tsx")
+                }
+            };
+            let result = tools::sandbox::execute_harness(
+                &context,
+                court_jester::types::HarnessSpec {
+                    kind: court_jester::types::HarnessKind::Standalone,
+                    runtime,
+                    test_adapter: None,
+                    source_mode,
+                    artifact: court_jester::types::HarnessArtifact::Generated {
+                        code,
+                        relative_path: std::path::PathBuf::from(format!(
+                            ".court-jester/generated/execute.{extension}"
+                        )),
+                    },
+                    args: Vec::new(),
+                    network: args.network,
+                },
+                options,
+            )
+            .await
+            .process;
             let json = serde_json::to_string_pretty(&result)
                 .map_err(|e| format!("failed to serialize execute result: {}", e))?;
             println!("{}", json);

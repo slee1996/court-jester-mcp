@@ -4,7 +4,7 @@ use court_jester::tools::verify::{
 };
 use court_jester::types::{
     ComplexityMetric, CoverageGate, ExecuteGate, FindingCategory, FindingConfidence,
-    FindingSeverity, InferredOracleGate, InputClassification, Language, OracleKind,
+    FindingSeverity, InferredOracleGate, InputClassification, Language, NetworkPolicy, OracleKind,
     OracleProvenance, ReplayOutcome, ReportLevel, RuntimeProfile, StageStatus, TestRunner,
     VerificationReport, VerificationStrength, VerificationVerdict, DEFAULT_PYTHON_DOCKER_IMAGE,
     DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
@@ -79,6 +79,9 @@ fn default_opts(test_code: Option<&str>) -> VerifyOptions<'_> {
         runtime_profile: RuntimeProfile::LocalTrusted,
         python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
         typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        memory_mb: 512,
+        network: NetworkPolicy::Deny,
+        harness_args: vec![],
     }
 }
 
@@ -214,6 +217,9 @@ async fn tests_only_verify_skips_execute_stage() {
         runtime_profile: RuntimeProfile::LocalTrusted,
         python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
         typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        memory_mb: 512,
+        network: NetworkPolicy::Deny,
+        harness_args: vec![],
     };
     let report = verify(code, &Language::Python, opts).await;
 
@@ -258,6 +264,9 @@ async fn tests_only_verify_requires_authoritative_test() {
         runtime_profile: RuntimeProfile::LocalTrusted,
         python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
         typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        memory_mb: 512,
+        network: NetworkPolicy::Deny,
+        harness_args: vec![],
     };
     let report = verify(code, &Language::Python, opts).await;
 
@@ -488,6 +497,9 @@ exit 1
             runtime_profile: RuntimeProfile::LocalTrusted,
             python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
             typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+            memory_mb: 512,
+            network: NetworkPolicy::Deny,
+            harness_args: vec![],
         },
     )
     .await;
@@ -1837,6 +1849,9 @@ async fn python_test_stage_can_import_source_module_from_sibling_path() {
         runtime_profile: RuntimeProfile::LocalTrusted,
         python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
         typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        memory_mb: 512,
+        network: NetworkPolicy::Deny,
+        harness_args: vec![],
     };
     let report = verify(code, &Language::Python, opts).await;
 
@@ -1880,6 +1895,9 @@ async fn verify_with_threshold_adds_stage() {
         runtime_profile: RuntimeProfile::LocalTrusted,
         python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
         typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        memory_mb: 512,
+        network: NetworkPolicy::Deny,
+        harness_args: vec![],
     };
     let report = verify(code, &Language::Python, opts).await;
     assert!(
@@ -1931,6 +1949,9 @@ def changed(x: int) -> int:
             runtime_profile: RuntimeProfile::LocalTrusted,
             python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
             typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+            memory_mb: 512,
+            network: NetworkPolicy::Deny,
+            harness_args: vec![],
         },
     )
     .await;
@@ -1990,6 +2011,9 @@ def classify(x: int) -> str:
             runtime_profile: RuntimeProfile::LocalTrusted,
             python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
             typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+            memory_mb: 512,
+            network: NetworkPolicy::Deny,
+            harness_args: vec![],
         },
     )
     .await;
@@ -2060,6 +2084,9 @@ def check_access(a: bool, b: bool, c: bool) -> int:
             runtime_profile: RuntimeProfile::LocalTrusted,
             python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
             typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+            memory_mb: 512,
+            network: NetworkPolicy::Deny,
+            harness_args: vec![],
         },
     )
     .await;
@@ -2154,6 +2181,9 @@ def changed(x: int) -> int:
         runtime_profile: RuntimeProfile::LocalTrusted,
         python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
         typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        memory_mb: 512,
+        network: NetworkPolicy::Deny,
+        harness_args: vec![],
     };
     let report = verify(code, &Language::Python, opts).await;
     // Should pass since changed() is a simple function
@@ -2206,6 +2236,9 @@ async fn writes_report_to_output_dir() {
         runtime_profile: RuntimeProfile::LocalTrusted,
         python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
         typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        memory_mb: 512,
+        network: NetworkPolicy::Deny,
+        harness_args: vec![],
     };
     let report = verify(code, &Language::Python, opts).await;
 
@@ -2296,6 +2329,9 @@ async fn rejected_only_fuzz_run_is_not_counted_as_pass_in_report_summary() {
         runtime_profile: RuntimeProfile::LocalTrusted,
         python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
         typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        memory_mb: 512,
+        network: NetworkPolicy::Deny,
+        harness_args: vec![],
     };
     let report = verify(code, &Language::Python, opts).await;
 
@@ -2437,6 +2473,9 @@ async fn execute_findings_can_be_suppressed_without_failing_verify() {
             runtime_profile: RuntimeProfile::LocalTrusted,
             python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
             typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+            memory_mb: 512,
+            network: NetworkPolicy::Deny,
+            harness_args: vec![],
         },
     )
     .await;
@@ -2525,6 +2564,9 @@ def check_access(a: bool, b: bool, c: bool) -> int:
             runtime_profile: RuntimeProfile::LocalTrusted,
             python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
             typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+            memory_mb: 512,
+            network: NetworkPolicy::Deny,
+            harness_args: vec![],
         },
     )
     .await;
@@ -2585,6 +2627,9 @@ def check_access(a: bool, b: bool, c: bool) -> int:
             runtime_profile: RuntimeProfile::LocalTrusted,
             python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
             typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+            memory_mb: 512,
+            network: NetworkPolicy::Deny,
+            harness_args: vec![],
         },
     )
     .await;
@@ -3121,6 +3166,9 @@ export function add(input: number): number {
         runtime_profile: RuntimeProfile::LocalTrusted,
         python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
         typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        memory_mb: 512,
+        network: NetworkPolicy::Deny,
+        harness_args: vec![],
     };
     let report = verify(code, &Language::TypeScript, opts).await;
 
@@ -3243,6 +3291,9 @@ hostLabel("https://example.com");
             runtime_profile: RuntimeProfile::LocalTrusted,
             python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
             typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+            memory_mb: 512,
+            network: NetworkPolicy::Deny,
+            harness_args: vec![],
         },
     )
     .await;
@@ -3295,6 +3346,9 @@ hostLabel("https://example.com");
             runtime_profile: RuntimeProfile::LocalTrusted,
             python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
             typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+            memory_mb: 512,
+            network: NetworkPolicy::Deny,
+            harness_args: vec![],
         },
     )
     .await;
@@ -3361,6 +3415,9 @@ export const defaultHost = labels.hostLabel("https://example.com");
             runtime_profile: RuntimeProfile::LocalTrusted,
             python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
             typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+            memory_mb: 512,
+            network: NetworkPolicy::Deny,
+            harness_args: vec![],
         },
     )
     .await;
@@ -3439,6 +3496,9 @@ export const previewCity = primaryCity({ address: { city: "Boise" } });
             runtime_profile: RuntimeProfile::LocalTrusted,
             python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
             typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+            memory_mb: 512,
+            network: NetworkPolicy::Deny,
+            harness_args: vec![],
         },
     )
     .await;
@@ -3507,6 +3567,9 @@ def first_item(items):
             runtime_profile: RuntimeProfile::LocalTrusted,
             python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
             typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+            memory_mb: 512,
+            network: NetworkPolicy::Deny,
+            harness_args: vec![],
         },
     )
     .await;
@@ -3587,6 +3650,9 @@ def sort_items(items):
             runtime_profile: RuntimeProfile::LocalTrusted,
             python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
             typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+            memory_mb: 512,
+            network: NetworkPolicy::Deny,
+            harness_args: vec![],
         },
     )
     .await;
@@ -3659,6 +3725,9 @@ def sort_items(items):
             runtime_profile: RuntimeProfile::LocalTrusted,
             python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
             typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+            memory_mb: 512,
+            network: NetworkPolicy::Deny,
+            harness_args: vec![],
         },
     )
     .await;
@@ -3774,6 +3843,9 @@ assert.equal(displayHandle({ profile: { handle: " Admin " }, username: "root" })
         runtime_profile: RuntimeProfile::LocalTrusted,
         python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
         typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        memory_mb: 512,
+        network: NetworkPolicy::Deny,
+        harness_args: vec![],
     };
     let report = verify(code, &Language::TypeScript, opts).await;
 
@@ -3859,6 +3931,9 @@ test("add", () => {
             runtime_profile: RuntimeProfile::LocalTrusted,
             python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
             typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+            memory_mb: 512,
+            network: NetworkPolicy::Deny,
+            harness_args: vec![],
         },
     )
     .await;
@@ -3970,6 +4045,9 @@ assert Path(__file__).name == "test_app.py"
         runtime_profile: RuntimeProfile::LocalTrusted,
         python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
         typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        memory_mb: 512,
+        network: NetworkPolicy::Deny,
+        harness_args: vec![],
     };
     let report = verify(code, &Language::Python, opts).await;
 
@@ -4035,6 +4113,9 @@ assert Path(__file__).name == "test_app.py"
         runtime_profile: RuntimeProfile::LocalTrusted,
         python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
         typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        memory_mb: 512,
+        network: NetworkPolicy::Deny,
+        harness_args: vec![],
     };
     let report = verify(code, &Language::Python, opts).await;
 
@@ -4124,6 +4205,9 @@ assert.equal(primaryPlanCode({ plans: [null, ""] }), "FREE");
         runtime_profile: RuntimeProfile::LocalTrusted,
         python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
         typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        memory_mb: 512,
+        network: NetworkPolicy::Deny,
+        harness_args: vec![],
     };
     let report = verify(normalizers, &Language::TypeScript, opts).await;
 
@@ -4193,6 +4277,9 @@ if (displayInitials("Spencer Lee") !== "SL") {
         runtime_profile: RuntimeProfile::LocalTrusted,
         python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
         typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        memory_mb: 512,
+        network: NetworkPolicy::Deny,
+        harness_args: vec![],
     };
     let report = verify(code, &Language::TypeScript, opts).await;
 

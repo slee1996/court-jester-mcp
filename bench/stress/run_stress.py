@@ -12,6 +12,7 @@ from typing import Any
 
 from ..cli_client import CourtJesterClient
 from ..common import BENCH_ROOT
+from ..runner import report_terminal_cause
 
 
 @dataclass(slots=True)
@@ -32,6 +33,8 @@ class StressRequestResult:
     parsed_timed_out: bool | None
     parsed_memory_error: bool | None
     parsed_stderr_summary: str | None
+    typed_cause: dict[str, Any] | None
+    execution_metadata: dict[str, Any] | None
 
 
 def parse_args() -> argparse.Namespace:
@@ -140,6 +143,7 @@ def worker_run(
             tool = choose_tool(request_mix)
             arguments = build_arguments(tool, payload)
             started = time.time()
+            error_kind = None
             ok = False
             verdict = None
             error_message = None
@@ -147,6 +151,8 @@ def worker_run(
             process_return_code = None
             stderr_tail = None
             parsed_exit_code = None
+            typed_cause = None
+            execution_metadata = None
             parsed_timed_out = None
             parsed_memory_error = None
             parsed_stderr_summary = None
@@ -157,7 +163,12 @@ def worker_run(
                     parsed_verdict = parsed.get("verdict")
                     if parsed_verdict in {"pass", "fail", "inconclusive"}:
                         verdict = parsed_verdict
-                if isinstance(parsed, dict):
+                    typed_cause = report_terminal_cause(parsed)
+                    if typed_cause and typed_cause.get("classification") == "inconclusive":
+                        verdict = "inconclusive"
+                    result_metadata = response.get("result", {}).get("metadata")
+                    if isinstance(result_metadata, dict):
+                        execution_metadata = result_metadata
                     if "exit_code" in parsed:
                         parsed_exit_code = parsed.get("exit_code")
                     if "timed_out" in parsed:
@@ -195,6 +206,8 @@ def worker_run(
                         parsed_timed_out=parsed_timed_out,
                         parsed_memory_error=parsed_memory_error,
                         parsed_stderr_summary=parsed_stderr_summary,
+                        typed_cause=typed_cause,
+                        execution_metadata=execution_metadata,
                     )
                 )
     finally:

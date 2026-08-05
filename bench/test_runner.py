@@ -6,6 +6,7 @@ from unittest import mock
 from pathlib import Path
 
 from bench.common import BENCH_ROOT, ModelManifest, PolicyManifest, TaskManifest, load_model, load_task
+from bench.cli_client import CourtJesterClient
 from bench.agent_trace import AgentTraceSetup
 from bench.providers import ClaudeCliProvider
 from bench.providers import CodexCliProvider
@@ -22,6 +23,38 @@ from bench.runner import (
     should_retry_provider_failure,
     supports_agent_path_trace,
 )
+
+class CliClientCommandContractTest(unittest.TestCase):
+    def test_verify_forwards_runtime_limits_network_and_harness_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = CourtJesterClient(binary_path=Path("/tmp/court-jester"))
+            command = client._build_command(
+                "verify",
+                {
+                    "code": "def value():\n    return 1\n",
+                    "language": "python",
+                    "runtime_profile": "isolated",
+                    "python_docker_image": "python:test",
+                    "verify_memory_mb": 96,
+                    "verify_network": "deny",
+                    "harness_args": [
+                        {"literal": "--reporter"},
+                        {"project_path": "tests"},
+                    ],
+                },
+                Path(directory),
+            )
+
+        self.assertIn("--runtime-profile", command)
+        self.assertIn("--memory-mb", command)
+        self.assertIn("--network", command)
+        self.assertIn("--python-docker-image", command)
+        harness_index = command.index("--harness-args-json")
+        self.assertEqual(
+            json.loads(command[harness_index + 1]),
+            [{"literal": "--reporter"}, {"project_path": "tests"}],
+        )
+
 
 
 class RunnerFailureClassificationTest(unittest.TestCase):
@@ -1415,6 +1448,80 @@ class GoldPatchReplayTest(unittest.TestCase):
 
 
 class RunnerArtifactContractTest(unittest.TestCase):
+    def test_typed_non_target_failure_is_abstention_and_target_cause_wins(self) -> None:
+        from bench.runner import classify_verify_failure, verifier_observation
+
+        def report(domain: str, kind: str, impact: str) -> dict[str, object]:
+            diagnostic = {
+                "domain": domain,
+                "kind": kind,
+                "component": "sandbox" if domain != "target_code" else "target",
+                "impact": impact,
+                "message": "typed cause",
+                "process": {
+                    "kind": "memory_limit",
+                    "exit_code": None,
+                    "signal": 9,
+                    "signal_name": "SIGKILL",
+                } if kind == "memory_limit" else None,
+            }
+            return {
+                "schema_version": 3,
+                "verdict": "fail",
+                "strength": "property_checked",
+                "summary": {},
+                "diagnostics": [diagnostic],
+                "stages": [
+                    {
+                        "name": "execute",
+                        "status": "failed",
+                        "duration_ms": 1,
+                        "detail": {"diagnostics": [diagnostic]},
+                    }
+                ],
+            }
+
+        environmental = {
+            "court_jester": {
+                "results": [{"path": "app.py", "response": report("resource", "memory_limit", "blocking")}]
+            }
+        }
+        observation = verifier_observation(environmental)
+        self.assertEqual(observation["outcome"], "abstain")
+        self.assertEqual(observation["reason"], "verify_inconclusive")
+        self.assertEqual(classify_verify_failure(environmental["court_jester"]["results"])[0], "inconclusive")
+
+        target = {
+            "court_jester": {
+                "results": [
+                    {"path": "app.py", "response": report("resource", "memory_limit", "blocking")},
+                    {"path": "target.py", "response": report("target_code", "assertion_failure", "gating")},
+                ]
+            }
+        }
+        target_observation = verifier_observation(target)
+        self.assertEqual(target_observation["outcome"], "fail")
+        self.assertEqual(target_observation["reason"], "assertion_failure")
+
+    def test_collect_verify_haystack_returns_deterministic_text(self) -> None:
+        from bench.runner import collect_verify_haystack
+
+        report = {
+            "stages": [
+                {
+                    "name": "execute",
+                    "status": "failed",
+                    "duration_ms": 1,
+                    "message": "target failure",
+                    "detail": {"stderr": "stderr marker", "stdout": "stdout marker"},
+                }
+            ]
+        }
+        self.assertEqual(
+            collect_verify_haystack([{"response": report}]),
+            "target failure\nstderr marker\nstdout marker",
+        )
+
     def test_verifier_observation_abstains_without_a_valid_completed_v3_report(self) -> None:
         from bench.runner import verifier_observation
 

@@ -1,6 +1,7 @@
 use court_jester::tools::sandbox::{build_instrumentation_overlay, execute};
 use court_jester::types::{
-    InstrumentationMode, Language, RuntimeProfile, SandboxOptions, TestRunner,
+    FailureDomain, InstrumentationMode, Language, NetworkPolicy, ProcessTerminationKind,
+    RuntimeProfile, SandboxOptions, TestRunner,
 };
 
 fn sandbox_options<'a>(
@@ -13,6 +14,8 @@ fn sandbox_options<'a>(
         timeout_seconds,
         memory_mb,
         runtime_profile: RuntimeProfile::LocalTrusted,
+        network_policy: NetworkPolicy::Deny,
+        harness_args: &[],
         docker_image: None,
         project_dir,
         source_file,
@@ -34,6 +37,114 @@ async fn python_hello_world() {
 }
 
 #[tokio::test]
+async fn python_network_access_is_denied_with_typed_diagnostic() {
+    let r = execute(
+        "import socket\nsocket.create_connection(('example.com', 80))",
+        &Language::Python,
+        sandbox_options(10.0, 128, None, None),
+    )
+    .await;
+    assert_ne!(r.exit_code, Some(0));
+    assert!(r.stderr.contains("court-jester network access denied"));
+    assert!(r
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.kind == court_jester::types::FailureKind::NetworkDenied));
+    assert!(r
+        .diagnostics
+        .iter()
+        .any(|diagnostic| { diagnostic.domain == FailureDomain::Environment }));
+}
+
+#[tokio::test]
+async fn typescript_network_and_process_access_are_denied_with_typed_diagnostics() {
+    let r = execute(
+        r#"try {
+  fetch("http://example.com");
+} catch (error) {
+  console.error(String(error));
+}
+try {
+  require("node:child_process").spawnSync(process.execPath, ["-e", ""]);
+} catch (error) {
+  console.error(String(error));
+}
+"#,
+        &Language::TypeScript,
+        sandbox_options(10.0, 128, None, None),
+    )
+    .await;
+    assert_eq!(
+        r.exit_code,
+        Some(0),
+        "guarded probe should handle denied calls: {:?}",
+        r
+    );
+    assert!(r.stderr.contains("court-jester network access denied"));
+    assert!(r.stderr.contains("court-jester process spawn denied"));
+    assert!(r
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.kind == court_jester::types::FailureKind::NetworkDenied));
+    assert!(r
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.kind == court_jester::types::FailureKind::ProcessSpawnDenied));
+    assert!(r
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            matches!(
+                diagnostic.kind,
+                court_jester::types::FailureKind::NetworkDenied
+                    | court_jester::types::FailureKind::ProcessSpawnDenied
+            )
+        })
+        .all(|diagnostic| diagnostic.domain == FailureDomain::Environment));
+}
+
+#[tokio::test]
+async fn explicit_local_network_allow_does_not_install_guards() {
+    let python_code = r#"
+import socket
+import subprocess
+print(socket.socket.connect.__name__)
+print(subprocess.Popen.__name__)
+"#;
+    let mut python_options = sandbox_options(10.0, 128, None, None);
+    python_options.network_policy = NetworkPolicy::Allow;
+    let python = execute(python_code, &Language::Python, python_options).await;
+    assert_eq!(python.exit_code, Some(0), "stderr: {}", python.stderr);
+    assert!(!python.stdout.contains("_deny_network"));
+    assert!(!python.stdout.contains("_deny_process"));
+    assert!(python
+        .diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic.kind != court_jester::types::FailureKind::NetworkDenied));
+
+    let typescript_code = r#"
+console.log(fetch.name);
+console.log(require("node:child_process").spawn.name);
+"#;
+    let mut typescript_options = sandbox_options(10.0, 128, None, None);
+    typescript_options.network_policy = NetworkPolicy::Allow;
+    let typescript = execute(typescript_code, &Language::TypeScript, typescript_options).await;
+    assert_eq!(
+        typescript.exit_code,
+        Some(0),
+        "stderr: {}",
+        typescript.stderr
+    );
+    assert!(!typescript
+        .stderr
+        .contains("court-jester network access denied"));
+    assert!(typescript
+        .diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic.kind != court_jester::types::FailureKind::NetworkDenied));
+}
+
+#[tokio::test]
 async fn python_syntax_error() {
     let r = execute(
         "def foo(:",
@@ -46,14 +157,23 @@ async fn python_syntax_error() {
 }
 
 #[tokio::test]
-async fn python_timeout() {
+async fn python_timeout_preserves_partial_output_and_typed_termination() {
     let r = execute(
-        "import time\ntime.sleep(100)",
+        "print('before', flush=True)\nimport time\ntime.sleep(100)",
         &Language::Python,
         sandbox_options(2.0, 128, None, None),
     )
     .await;
     assert!(r.timed_out, "expected timeout, got: {:?}", r);
+    assert_eq!(
+        r.termination.as_ref().map(|termination| termination.kind),
+        Some(ProcessTerminationKind::TimedOut)
+    );
+    assert!(r.stdout.contains("before"), "partial output lost: {:?}", r);
+    assert!(r
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.kind == court_jester::types::FailureKind::Timeout));
 }
 
 #[tokio::test]
@@ -237,17 +357,22 @@ spawn(
 
 setInterval(() => {}, 1000);
 "#;
-    let r = execute(
-        code,
-        &Language::TypeScript,
-        sandbox_options(5.0, 64, None, None),
-    )
-    .await;
+    let mut options = sandbox_options(5.0, 64, None, None);
+    options.network_policy = NetworkPolicy::Allow;
+    let r = execute(code, &Language::TypeScript, options).await;
     assert!(
         r.memory_error,
         "expected child-process RSS to trip memory limit, got: {:?}",
         r
     );
+    assert_eq!(
+        r.termination.as_ref().map(|termination| termination.kind),
+        Some(ProcessTerminationKind::MemoryLimit)
+    );
+    assert!(r
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.kind == court_jester::types::FailureKind::MemoryLimit));
 }
 #[tokio::test]
 async fn typescript_source_file_retries_with_node_loader_for_type_alias_imports() {
@@ -449,7 +574,9 @@ async fn typescript_bun_repo_falls_back_from_node_for_extensionless_relative_imp
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false);
-    assert!(bun_ok, "bun must be available for this regression test");
+    if !bun_ok {
+        return;
+    }
 
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("bun.lock"), "").unwrap();
@@ -483,6 +610,8 @@ fn sandbox_options_reject_invalid_limits_and_profile_overrides() {
         timeout_seconds: f64::NAN,
         memory_mb: 128,
         runtime_profile: RuntimeProfile::LocalTrusted,
+        network_policy: NetworkPolicy::Deny,
+        harness_args: &[],
         docker_image: None,
         project_dir: None,
         source_file: None,
@@ -492,6 +621,8 @@ fn sandbox_options_reject_invalid_limits_and_profile_overrides() {
         timeout_seconds: 1.0,
         memory_mb: 1,
         runtime_profile: RuntimeProfile::LocalTrusted,
+        network_policy: NetworkPolicy::Deny,
+        harness_args: &[],
         docker_image: Some("-bad:image"),
         project_dir: None,
         source_file: None,
@@ -501,11 +632,24 @@ fn sandbox_options_reject_invalid_limits_and_profile_overrides() {
         timeout_seconds: 1.0,
         memory_mb: 1,
         runtime_profile: RuntimeProfile::Isolated,
+        network_policy: NetworkPolicy::Deny,
+        harness_args: &[],
         docker_image: None,
         project_dir: None,
         source_file: None,
     };
     assert!(isolated_without_image.validate().is_err());
+    let isolated_with_network = SandboxOptions {
+        timeout_seconds: 1.0,
+        memory_mb: 1,
+        runtime_profile: RuntimeProfile::Isolated,
+        network_policy: NetworkPolicy::Allow,
+        harness_args: &[],
+        docker_image: Some("python:3.12-slim"),
+        project_dir: None,
+        source_file: None,
+    };
+    assert!(isolated_with_network.validate().is_err());
 }
 
 #[test]
@@ -562,6 +706,8 @@ async fn isolated_python_execution_is_guarded_and_uses_selected_image() {
         timeout_seconds: 10.0,
         memory_mb: 128,
         runtime_profile: RuntimeProfile::Isolated,
+        network_policy: NetworkPolicy::Deny,
+        harness_args: &[],
         docker_image: Some("python:3.12-slim"),
         project_dir: None,
         source_file: None,

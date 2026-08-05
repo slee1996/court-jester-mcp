@@ -1,8 +1,14 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::tools::domain;
 use crate::types::*;
 
+pub fn bind_argument_slots(
+    signature: &[ParameterDomain],
+    slots: PlannedArgumentSlots,
+) -> Result<PlannedArguments, BindingError> {
+    domain::bind_argument_slots(signature, slots)
+}
 /// Number of random inputs to generate per function.
 const FUZZ_ITERATIONS: usize = 30;
 const TS_TYPE_RECURSION_LIMIT: usize = 8;
@@ -52,6 +58,8 @@ pub fn synthesize_calls_for(
     synthesize_plan_for(functions, classes, aliases, language).code
 }
 
+type PlannedSeedInputs = HashMap<String, Vec<PlannedArguments>>;
+
 pub fn synthesize_plan_for(
     functions: &[FunctionInfo],
     classes: &[ClassInfo],
@@ -64,8 +72,6 @@ pub fn synthesize_plan_for(
 }
 
 /// Render one repository-derived verification plan.  All public synthesis
-/// entry points eventually call this function; no independent seed renderer
-/// exists.
 pub fn synthesize_plan_for_verification(
     functions: &[FunctionInfo],
     classes: &[ClassInfo],
@@ -73,10 +79,18 @@ pub fn synthesize_plan_for_verification(
     language: &Language,
     plan: &VerificationPlan,
 ) -> FuzzPlan {
-    let mut seed_inputs: HashMap<String, Vec<Vec<String>>> = HashMap::new();
+    let mut seed_inputs: PlannedSeedInputs = HashMap::new();
+    let mut safe_dependency_surfaces = HashSet::new();
     for input in &plan.inputs {
         if input.classification == InputClassification::Invalid {
             continue;
+        }
+        if input
+            .sources
+            .iter()
+            .any(|source| source.kind == DomainSourceKind::SafeDependencySubstitute)
+        {
+            safe_dependency_surfaces.insert(input.surface_id.clone());
         }
         seed_inputs
             .entry(
@@ -88,16 +102,17 @@ pub fn synthesize_plan_for_verification(
                     .to_string(),
             )
             .or_default()
-            .push(
-                input
-                    .arguments
-                    .positional
-                    .iter()
-                    .map(|item| item.expression.clone())
-                    .collect(),
-            );
+            .push(input.arguments.clone());
     }
-    synthesize_plan_legacy(functions, classes, aliases, language, &seed_inputs)
+    let safe_dependency_surfaces = safe_dependency_surfaces.into_iter().collect::<Vec<_>>();
+    synthesize_plan_legacy(
+        functions,
+        classes,
+        aliases,
+        language,
+        &seed_inputs,
+        &safe_dependency_surfaces,
+    )
 }
 
 /// Compatibility constructor for callers that already extracted literal
@@ -141,7 +156,8 @@ fn synthesize_plan_legacy(
     classes: &[ClassInfo],
     aliases: &[TypeAliasInfo],
     language: &Language,
-    seed_inputs: &HashMap<String, Vec<Vec<String>>>,
+    seed_inputs: &PlannedSeedInputs,
+    safe_dependency_surfaces: &[String],
 ) -> FuzzPlan {
     let class_defs: HashMap<&str, &ClassInfo> =
         classes.iter().map(|c| (c.name.as_str(), c)).collect();
@@ -155,13 +171,21 @@ fn synthesize_plan_legacy(
         max_nesting_depth: 0,
         complexity_breakdown: std::collections::BTreeMap::new(),
         parse_error: false,
+        source_mode: SourceMode::for_language(language),
+        parse_diagnostics: vec![],
     };
     match language {
-        Language::Python => synthesize_python(&pseudo_analysis, &class_defs, seed_inputs),
+        Language::Python => synthesize_python(
+            &pseudo_analysis,
+            &class_defs,
+            seed_inputs,
+            safe_dependency_surfaces,
+        ),
         Language::TypeScript => synthesize_typescript(
             &pseudo_analysis,
             &build_ts_named_types(classes, aliases),
             seed_inputs,
+            safe_dependency_surfaces,
         ),
     }
 }
@@ -227,7 +251,7 @@ fn has_exported_surface(functions: &[FunctionInfo]) -> bool {
 fn callable_param_count(func: &FunctionInfo) -> usize {
     func.params
         .iter()
-        .filter(|param| !param.name.starts_with('*'))
+        .filter(|param| !param.is_variadic())
         .count()
 }
 
@@ -337,7 +361,7 @@ fn known_factory_callable<'a>(
         let params = candidate
             .params
             .iter()
-            .filter(|param| !param.name.starts_with('*'))
+            .filter(|param| !param.is_variadic())
             .collect::<Vec<_>>();
         params.iter().all(|param| param.type_annotation.is_some())
             && ts_params_are_fuzzable(candidate, &params, type_defs)
@@ -394,28 +418,86 @@ fn factory_callable_coverage(
     coverage
 }
 
-fn python_seed_rows_expr(
-    func: &FunctionInfo,
-    seed_inputs: &HashMap<String, Vec<Vec<String>>>,
-) -> String {
+fn python_seed_rows_expr(func: &FunctionInfo, seed_inputs: &PlannedSeedInputs) -> String {
     let Some(rows) = seed_inputs.get(&func.name) else {
         return "[]".to_string();
     };
+    let fixed_params = func
+        .params
+        .iter()
+        .filter(|param| !param.is_variadic())
+        .collect::<Vec<_>>();
+    let fixed_names = fixed_params
+        .iter()
+        .map(|param| param.name.as_str())
+        .collect::<HashSet<_>>();
+    let keyword_variadic = func.params.iter().any(ParamInfo::is_keyword_variadic);
     format!(
         "[{}]",
         rows.iter()
-            .map(|row| format!("[{}]", row.join(", ")))
+            .map(|row| {
+                let mut values = Vec::new();
+                let mut positional_index = 0usize;
+                for param in &fixed_params {
+                    if param.keyword_only {
+                        if let Some(value) = row.named.get(&param.name) {
+                            values.push(value.expression.clone());
+                        } else {
+                            values.push("None".into());
+                        }
+                    } else if let Some(value) = row.positional.get(positional_index) {
+                        values.push(value.expression.clone());
+                        positional_index += 1;
+                    } else {
+                        values.push("None".into());
+                        positional_index += 1;
+                    }
+                }
+                if func.params.iter().any(ParamInfo::is_positional_variadic) {
+                    values.extend(
+                        row.positional[positional_index..]
+                            .iter()
+                            .map(|value| value.expression.clone()),
+                    );
+                }
+                if keyword_variadic {
+                    let kwargs = row
+                        .named
+                        .iter()
+                        .filter(|(name, _)| !fixed_names.contains(name.as_str()))
+                        .map(|(name, value)| {
+                            format!(
+                                "{}: {}",
+                                serde_json::to_string(name).unwrap_or_else(|_| "\"\"".into()),
+                                value.expression
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    values.push(format!("{{{kwargs}}}"));
+                }
+                format!("[{}]", values.join(", "))
+            })
             .collect::<Vec<_>>()
             .join(", ")
     )
 }
 
-fn ts_seed_rows(func: &FunctionInfo, seed_inputs: &HashMap<String, Vec<Vec<String>>>) -> String {
+fn ts_seed_rows(func: &FunctionInfo, seed_inputs: &PlannedSeedInputs) -> String {
     let Some(rows) = seed_inputs.get(&func.name) else {
         return String::new();
     };
     rows.iter()
-        .map(|row| format!("[{}]", row.join(", ")))
+        .map(|row| {
+            format!(
+                "[{}]",
+                row.positional
+                    .iter()
+                    .map(|item| item.expression.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -554,10 +636,29 @@ fn should_fuzz_ts_helper(
 
 // ── Python fuzz harness ─────────────────────────────────────────────────────
 
+fn unsafe_dependency_reason(
+    params: &[&ParamInfo],
+    language: &Language,
+    classes: &[ClassInfo],
+    aliases: &[TypeAliasInfo],
+) -> Option<String> {
+    params.iter().find_map(|param| {
+        if !param.optional && param.default_value.is_none() {
+            return None;
+        }
+        if !domain::is_dependency_shaped(param, classes, aliases) {
+            return None;
+        }
+        let reason = domain::safe_dependency_substitute(param, language, classes, aliases).err()?;
+        Some(unsafe_default_dependency_reason(&param.name, reason))
+    })
+}
+
 fn synthesize_python(
     analysis: &AnalysisResult,
     type_defs: &HashMap<&str, &ClassInfo>,
-    seed_inputs: &HashMap<String, Vec<Vec<String>>>,
+    seed_inputs: &PlannedSeedInputs,
+    safe_dependency_surfaces: &[String],
 ) -> FuzzPlan {
     let mut code = String::new();
     let mut coverage = Vec::new();
@@ -565,22 +666,27 @@ fn synthesize_python(
 
     // Embed a tiny random generator (no imports needed)
     code.push_str(PYTHON_FUZZ_PRELUDE);
+    let safe_surfaces =
+        serde_json::to_string(safe_dependency_surfaces).unwrap_or_else(|_| "[]".into());
+    code.push_str(&format!(
+        "_CJ_SAFE_DEPENDENCY_SURFACES = set({safe_surfaces})\n"
+    ));
 
     let mut any_synthesized = false;
     let mut selected_functions = Vec::new();
 
     for func in synth_candidate_functions(&analysis.functions) {
-        let callable_params: Vec<&ParamInfo> = func
-            .params
-            .iter()
-            .filter(|p| !p.name.starts_with('*'))
-            .collect();
+        let callable_params: Vec<&ParamInfo> =
+            func.params.iter().filter(|p| !p.is_variadic()).collect();
+        let positional_variadic = func.params.iter().find(|p| p.is_positional_variadic());
+        let keyword_variadic = func.params.iter().find(|p| p.is_keyword_variadic());
         let has_nested = has_nested_children(func, &analysis.functions);
         let has_seed_rows = seed_inputs
             .get(&func.name)
             .is_some_and(|rows| !rows.is_empty());
-
         if callable_params.is_empty()
+            && positional_variadic.is_none()
+            && keyword_variadic.is_none()
             && !has_nested
             && has_noncheckable_python_zero_arg_return_contract(func)
         {
@@ -590,6 +696,19 @@ fn synthesize_python(
                 Some(
                     "zero-argument function has no meaningful parameter surface or stable return contract to fuzz".into(),
                 ),
+            ));
+            continue;
+        }
+        if let Some(reason) = unsafe_dependency_reason(
+            &callable_params,
+            &Language::Python,
+            &analysis.classes,
+            &analysis.aliases,
+        ) {
+            coverage.push(coverage_entry(
+                func,
+                FuzzFunctionStatus::SkippedUnsupportedType,
+                Some(reason),
             ));
             continue;
         }
@@ -638,9 +757,20 @@ fn synthesize_python(
             None,
         ));
         selected_functions.push(func);
-
-        // Build the call with keyword args where needed
-        let call_args: Vec<String> = callable_params
+        let mut generated_parts = generators.clone();
+        let rest_start = callable_params.len();
+        if let Some(rest) = positional_variadic {
+            let item_generator = python_generator(rest.type_annotation.as_deref(), type_defs);
+            generated_parts.push(format!(
+                "*[{} for _ in range(_fuzz_int_range(0, 2))]",
+                item_generator
+            ));
+        }
+        if keyword_variadic.is_some() {
+            generated_parts.push("{\"__court_jester_kw\": _fuzz_str()}".into());
+        }
+        let gen_list = generated_parts.join(", ");
+        let mut call_args: Vec<String> = callable_params
             .iter()
             .enumerate()
             .map(|(i, p)| {
@@ -651,7 +781,18 @@ fn synthesize_python(
                 }
             })
             .collect();
-        let repeat_call_args: Vec<String> = callable_params
+        if positional_variadic.is_some() {
+            if keyword_variadic.is_some() {
+                call_args.push(format!("*_call_args[{}:-1]", rest_start));
+            } else {
+                call_args.push(format!("*_call_args[{}:]", rest_start));
+            }
+        }
+        if keyword_variadic.is_some() {
+            call_args.push("**_call_args[-1]".into());
+        }
+        let call = call_args.join(", ");
+        let mut repeat_call_args: Vec<String> = callable_params
             .iter()
             .enumerate()
             .map(|(i, p)| {
@@ -662,11 +803,18 @@ fn synthesize_python(
                 }
             })
             .collect();
-
-        let gen_list = generators.join(", ");
-        let call = call_args.join(", ");
+        if positional_variadic.is_some() {
+            if keyword_variadic.is_some() {
+                repeat_call_args.push(format!("*_repeat_args[{}:-1]", rest_start));
+            } else {
+                repeat_call_args.push(format!("*_repeat_args[{}:]", rest_start));
+            }
+        }
+        if keyword_variadic.is_some() {
+            repeat_call_args.push("**_repeat_args[-1]".into());
+        }
         let ret_type = func.return_type.as_deref().unwrap_or("");
-        let candidate_call_args: Vec<String> = callable_params
+        let mut candidate_call_args: Vec<String> = callable_params
             .iter()
             .enumerate()
             .map(|(i, p)| {
@@ -677,6 +825,16 @@ fn synthesize_python(
                 }
             })
             .collect();
+        if positional_variadic.is_some() {
+            if keyword_variadic.is_some() {
+                candidate_call_args.push(format!("*_candidate[{}:-1]", rest_start));
+            } else {
+                candidate_call_args.push(format!("*_candidate[{}:]", rest_start));
+            }
+        }
+        if keyword_variadic.is_some() {
+            candidate_call_args.push("**_candidate[-1]".into());
+        }
         let candidate_call = candidate_call_args.join(", ");
         let declared_properties = func
             .declared_properties
@@ -716,10 +874,10 @@ for _ in range({FUZZ_ITERATIONS}):
 _pass = 0
 _reject = 0
 _crash = 0
-for _args in _all_inputs:
+for _iteration, _args in enumerate(_all_inputs):
     try:
         _call_args = _copy.deepcopy(_args)
-        _target_entered("{name}:{line}")
+        _target_entered("{name}:{line}", _iteration)
         _result = _materialize_if_iterator({name}({call}))
         _pass += 1
 {type_check}
@@ -734,14 +892,17 @@ for _args in _all_inputs:
 {nullish_string_leak_check}
 {comparator_check}
 {symmetry_check}
+        _cj_unit_completed("{name}:{line}", _iteration, "passed")
     except Exception as _e:
         if _is_crash(_e):
             _crash += 1
+            _cj_unit_completed("{name}:{line}", _iteration, "target_exception")
             _emit_error("{name}", _args, _e, [{declared_properties}], lambda _candidate: _reproduces_python(_candidate, _e, lambda: {name}({candidate_call})), invocation_path="direct")
             if _crash == 1:
                 print(f"  CRASH {name}({{_short_repr(_args)}}): {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
         else:
             _reject += 1
+            _cj_unit_completed("{name}:{line}", _iteration, "rejected")
 {query_string_semantic_check}
 {pep440_version_ordering_check}
 {pep440_specifier_membership_check}
@@ -804,11 +965,8 @@ else:
         if func.returned_callables.is_empty() {
             continue;
         }
-        let callable_params: Vec<&ParamInfo> = func
-            .params
-            .iter()
-            .filter(|p| !p.name.starts_with('*'))
-            .collect();
+        let callable_params: Vec<&ParamInfo> =
+            func.params.iter().filter(|p| !p.is_variadic()).collect();
         let generators: Vec<String> = callable_params
             .iter()
             .map(|p| python_generator(p.type_annotation.as_deref(), type_defs))
@@ -825,7 +983,7 @@ else:
                 !candidate
                     .params
                     .iter()
-                    .any(|param| !param.name.starts_with('*') && param.type_annotation.is_none())
+                    .any(|param| !param.is_variadic() && param.type_annotation.is_none())
             })
             .map(|candidate| candidate.name.as_str())
             .filter(|name| {
@@ -1799,9 +1957,44 @@ import sys as _sys
 _rng.seed(42)
 _fuzz_failures = 0
 _FUZZ_RESULTS = []
-def _target_entered(surface_id):
+_CJ_SEQUENCE = 0
+_CJ_COMPLETED_UNITS = 0
+def _cj_event(event, data=None):
+    global _CJ_SEQUENCE
+    payload = {"protocol_version": 1, "sequence": _CJ_SEQUENCE, "event": event}
+    if data is not None:
+        payload["data"] = data
+    print("__COURT_JESTER_EVENT_JSON__" + _json.dumps(payload, ensure_ascii=False), flush=True)
+    _CJ_SEQUENCE += 1
+def _cj_bootstrap():
+    _cj_event("bootstrap_started")
+    _cj_event("target_resolved", {"module": "generated"})
+    _cj_event("target_ready")
+_cj_bootstrap()
+def _cj_unit_started(surface_id, iteration, input_origin="generated"):
+    _cj_event("unit_started", {
+        "surface_id": str(surface_id),
+        "iteration": int(iteration),
+        "input_classification": "valid",
+        "input_origin": str(input_origin),
+    })
+def _cj_unit_completed(surface_id, iteration, outcome):
+    global _CJ_COMPLETED_UNITS
+    _cj_event("unit_completed", {
+        "surface_id": str(surface_id),
+        "iteration": int(iteration),
+        "outcome": outcome,
+    })
+    _CJ_COMPLETED_UNITS += 1
+def _target_entered(surface_id, iteration=None):
+    if iteration is not None:
+        input_origin = (
+            "safe_dependency_substitute"
+            if str(surface_id) in _CJ_SAFE_DEPENDENCY_SURFACES
+            else "generated"
+        )
+        _cj_unit_started(surface_id, iteration, input_origin)
     print(_json.dumps({"event": "target_entered", "surface_id": str(surface_id)}), file=_sys.stderr, flush=True)
-_FUZZ_TEXT_LIMIT = 240
 _FINDING_ORDINALS = {}
 def _sanitize_symbol(value):
     return "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in str(value))
@@ -1903,7 +2096,9 @@ def _emit_finding(function, args, error, severity="crash", oracle_kind="runtime_
     repro_args = minimized if minimized_case is not None else args
     expectation = {"severity": severity, "oracle_kind": oracle_kind, "category": category}
     repro = {"kind": "function_call", "function": str(function), "arguments": original_case["arguments"], "input_text": original_case["input_text"], "case_label": case_label, "snippet": _replay_snippet(function, repro_args, severity, oracle_kind, category, type(error).__name__), "command": None, "expectation": expectation}
-    _FUZZ_RESULTS.append({"id": _finding_id(function), "severity": severity, "confidence": confidence, "category": category, "location": {"source_file": "", "function": str(function), "line": 0, "invocation_path": invocation_path}, "oracle": {"id": oracle_id, "kind": oracle_kind, "provenance": oracle_provenance, "confidence": confidence, "expected": expected, "actual": actual if actual is not None else _clip_text(error)}, "input_classification": input_classification, "repro": repro, "minimization": {"status": status, "attempts": attempts, "original": original_case, "minimized": minimized_case}, "error_type": type(error).__name__, "message": _clip_text(error), "suppressed": False})
+    record = {"id": _finding_id(function), "severity": severity, "confidence": confidence, "category": category, "location": {"source_file": "", "function": str(function), "line": 0, "invocation_path": invocation_path}, "oracle": {"id": oracle_id, "kind": oracle_kind, "provenance": oracle_provenance, "confidence": confidence, "expected": expected, "actual": actual if actual is not None else _clip_text(error)}, "input_classification": input_classification, "repro": repro, "minimization": {"status": status, "attempts": attempts, "original": original_case, "minimized": minimized_case}, "error_type": type(error).__name__, "message": _clip_text(error), "suppressed": False}
+    _FUZZ_RESULTS.append(record)
+    _cj_event("finding", {"finding": record})
 def _emit_error(function, args, error, properties=(), reproduce=None, case_label=None, invocation_path="direct"):
     is_property = isinstance(error, AssertionError)
     declared = any(name in properties for name in ("idempotent", "bounded", "nonneg", "sorted", "permutation", "clamped", "symmetric", "no_nullish_string", "antisymmetric"))
@@ -1926,6 +2121,7 @@ def _reproduces_python(candidate, original, invoke):
 # Crash detection: these exception types indicate real bugs, not validation.
 _CRASH_TYPES = (TypeError, AttributeError, KeyError, IndexError, RecursionError, MemoryError, ValueError, ZeroDivisionError, UnicodeError)
 
+_FUZZ_TEXT_LIMIT = 240
 def _clip_text(value, limit=_FUZZ_TEXT_LIMIT):
     text = str(value)
     if len(text) <= limit:
@@ -2058,6 +2254,7 @@ def _is_palindrome_sequence(value):
 "#;
 
 const PYTHON_FUZZ_EPILOGUE: &str = r#"
+_cj_event("harness_completed", {"completed_units": _CJ_COMPLETED_UNITS})
 if _FUZZ_RESULTS:
     print("__COURT_JESTER_FINDINGS_JSON__")
     print(_json.dumps(_FUZZ_RESULTS, ensure_ascii=False, allow_nan=False))
@@ -2072,29 +2269,33 @@ else:
 fn synthesize_typescript(
     analysis: &AnalysisResult,
     type_defs: &TsNamedTypes<'_>,
-    seed_inputs: &HashMap<String, Vec<Vec<String>>>,
+    seed_inputs: &PlannedSeedInputs,
+    safe_dependency_surfaces: &[String],
 ) -> FuzzPlan {
     let mut code = String::new();
     let mut coverage = Vec::new();
     let has_exported = has_exported_surface(&analysis.functions);
 
     code.push_str(TYPESCRIPT_FUZZ_PRELUDE);
+    let safe_surfaces =
+        serde_json::to_string(safe_dependency_surfaces).unwrap_or_else(|_| "[]".into());
+    code.push_str(&format!(
+        "const _CJ_SAFE_DEPENDENCY_SURFACES = new Set({safe_surfaces});\n"
+    ));
 
     let mut any_synthesized = false;
     let mut selected_functions = Vec::new();
 
     for func in synth_candidate_functions(&analysis.functions) {
-        let callable_params: Vec<&ParamInfo> = func
-            .params
-            .iter()
-            .filter(|p| !p.name.starts_with('*'))
-            .collect();
+        let callable_params: Vec<&ParamInfo> =
+            func.params.iter().filter(|p| !p.is_variadic()).collect();
+        let positional_variadic = func.params.iter().find(|p| p.is_positional_variadic());
         let has_nested = has_nested_children(func, &analysis.functions);
         let has_seed_rows = seed_inputs
             .get(&func.name)
             .is_some_and(|rows| !rows.is_empty());
-
         if callable_params.is_empty()
+            && positional_variadic.is_none()
             && !has_nested
             && has_noncheckable_ts_zero_arg_return_contract(func)
         {
@@ -2104,6 +2305,19 @@ fn synthesize_typescript(
                 Some(
                     "zero-argument function has no meaningful parameter surface or stable return contract to fuzz".into(),
                 ),
+            ));
+            continue;
+        }
+        if let Some(reason) = unsafe_dependency_reason(
+            &callable_params,
+            &Language::TypeScript,
+            &analysis.classes,
+            &analysis.aliases,
+        ) {
+            coverage.push(coverage_entry(
+                func,
+                FuzzFunctionStatus::SkippedUnsupportedType,
+                Some(reason),
             ));
             continue;
         }
@@ -2159,17 +2373,25 @@ fn synthesize_typescript(
                     .unwrap_or_default()
             })
             .collect();
-
         let contract = infer_ts_contract(func, &param_types, ret_type, type_defs);
-        let generators: Vec<String> = callable_params
+
+        let mut generated_parts: Vec<String> = callable_params
             .iter()
             .enumerate()
             .map(|(idx, p)| {
                 ts_generator_for_param(contract, p.type_annotation.as_deref(), type_defs, idx, func)
             })
             .collect();
-
-        let gen_list = generators.join(", ");
+        if let Some(rest) = positional_variadic {
+            let rest_annotation = rest.type_annotation.as_deref().map(ts_rest_item_annotation);
+            let item_generator =
+                ts_generator_for_param(contract, rest_annotation.as_deref(), type_defs, 0, func);
+            generated_parts.push(format!(
+                "...Array.from({{ length: _fuzzIntRange(0, 2) }}, () => {})",
+                item_generator
+            ));
+        }
+        let gen_list = generated_parts.join(", ");
 
         let mut properties: Vec<&str> = vec![];
         let mut push_property = |property: &'static str| {
@@ -2304,6 +2526,30 @@ fn synthesize_typescript(
             ts_http_response_helpers_semantic_check(func, &param_types);
         let static_file_semantic_check = ts_http_static_file_semantic_check(func, &param_types);
 
+        let mut seed_rows = ts_seed_rows(func, seed_inputs);
+        if has_declared_property(func, "sorted")
+            && param_types.first().is_some_and(|type_name| {
+                type_name.ends_with("[]")
+                    || type_name.starts_with("Array<")
+                    || type_name.starts_with("ReadonlyArray<")
+            })
+        {
+            let mut property_row = generated_parts.clone();
+            if let Some(first) = property_row.first_mut() {
+                *first = if param_types[0].contains("string") {
+                    "[\"b\", \"a\"]".into()
+                } else {
+                    "[2, 1]".into()
+                };
+            }
+            let property_row = format!("[{}]", property_row.join(", "));
+            seed_rows = if seed_rows.is_empty() {
+                property_row
+            } else {
+                format!("{property_row}, {seed_rows}")
+            };
+        }
+
         code.push_str(&format!(
             r#"
 {{
@@ -2324,7 +2570,7 @@ fn synthesize_typescript(
             iters = FUZZ_ITERATIONS,
             call_expr = ts_call_with_spread(func, "...args"),
             typecheck = ts_type_check_fn(ret_type),
-            seed_rows = ts_seed_rows(func, seed_inputs),
+            seed_rows = seed_rows,
             query_string_semantic_check = query_string_semantic_check,
             query_string_parser_semantic_check = query_string_parser_semantic_check,
             defaults_semantic_check = defaults_semantic_check,
@@ -2391,7 +2637,7 @@ fn synthesize_typescript_factory_exercise(
         let callable_params: Vec<&ParamInfo> = func
             .params
             .iter()
-            .filter(|param| !param.name.starts_with('*'))
+            .filter(|param| !param.is_variadic())
             .collect();
         if !ts_params_are_fuzzable(func, &callable_params, type_defs) {
             continue;
@@ -2410,7 +2656,7 @@ fn synthesize_typescript_factory_exercise(
                 let args = declaration
                     .params
                     .iter()
-                    .filter(|param| !param.name.starts_with('*'))
+                    .filter(|param| !param.is_variadic())
                     .map(|param| ts_generator(param.type_annotation.as_deref(), type_defs))
                     .collect::<Vec<_>>()
                     .join(", ");
@@ -2851,6 +3097,17 @@ fn ts_type_is_fuzzable_with_stack(
             }
         }
     }
+}
+
+fn ts_rest_item_annotation(type_ann: &str) -> String {
+    let trimmed = type_ann.trim();
+    if let Some(inner) = trimmed.strip_suffix("[]") {
+        return inner.trim().to_string();
+    }
+    if trimmed.starts_with("Array<") && trimmed.ends_with('>') {
+        return trimmed[6..trimmed.len() - 1].trim().to_string();
+    }
+    trimmed.to_string()
 }
 
 fn ts_generator_for_param(
@@ -3619,7 +3876,38 @@ fn ts_type_check_fn(ret_type: &str) -> &str {
 
 const TYPESCRIPT_FUZZ_PRELUDE: &str = r#"
 let _seed = 42;
-function _targetEntered(surfaceId: string): void { console.error(JSON.stringify({ event: "target_entered", surface_id: surfaceId })); }
+let _cjSequence = 0;
+let _cjCompletedUnits = 0;
+function _cjEvent(event: string, data?: unknown): void {
+  const payload: Record<string, unknown> = { protocol_version: 1, sequence: _cjSequence, event };
+  if (data !== undefined) payload.data = data;
+  console.log("__COURT_JESTER_EVENT_JSON__" + JSON.stringify(payload));
+  _cjSequence++;
+}
+_cjEvent("bootstrap_started");
+_cjEvent("target_resolved", { module: "generated" });
+_cjEvent("target_ready");
+function _cjUnitStarted(surfaceId: string, iteration: number, inputOrigin: string = "generated"): void {
+  _cjEvent("unit_started", {
+    surface_id: surfaceId,
+    iteration,
+    input_classification: "valid",
+    input_origin: inputOrigin,
+  });
+}
+function _cjUnitCompleted(surfaceId: string, iteration: number, outcome: string): void {
+  _cjEvent("unit_completed", { surface_id: surfaceId, iteration, outcome });
+  _cjCompletedUnits++;
+}
+function _targetEntered(surfaceId: string, iteration?: number): void {
+  if (iteration !== undefined) {
+    const inputOrigin = _CJ_SAFE_DEPENDENCY_SURFACES.has(surfaceId)
+      ? "safe_dependency_substitute"
+      : "generated";
+    _cjUnitStarted(surfaceId, iteration, inputOrigin);
+  }
+  console.error(JSON.stringify({ event: "target_entered", surface_id: surfaceId }));
+}
 function _fuzzRand(): number { _seed = (_seed * 1103515245 + 12345) & 0x7fffffff; return _seed / 0x7fffffff; }
 function _fuzzIntRange(lo: number, hi: number): number { return lo + Math.floor(_fuzzRand() * (hi - lo + 1)); }
 function _fuzzNum(): number { return (_fuzzRand() - 0.5) * 2000; }
@@ -3921,7 +4209,9 @@ function _emitFinding(name: string, args: unknown[], error: unknown, severity = 
   const expectation = { severity, oracle_kind: oracleKind, category }; const message = error instanceof Error ? error.message : String(error);
   const errorType = error instanceof Error ? error.constructor.name : "unknown";
   const snippet = `// Court Jester replay snippet\nlet _reproduced = false;\ntry { (${name} as Function)(${reproArgs.map((value) => _shortJson(value)).join(", ")}); } catch (_replayError) { _reproduced = _replayError instanceof Error && _replayError.constructor.name === ${JSON.stringify(errorType)}; }\nconsole.log("__COURT_JESTER_REPLAY_JSON__");\nconsole.log(JSON.stringify({reproduced:_reproduced,severity:${JSON.stringify(severity)},oracle_kind:${JSON.stringify(oracleKind)},category:${JSON.stringify(category)}}));`;
-  _fuzzResults.push({ id: _findingId(name), severity, confidence, category, location: { source_file: "", function: name, line: sourceLine, invocation_path: invocationPath }, oracle: { id: `${oracleKind}:${_sanitizeSymbol(name)}`, kind: oracleKind, provenance, confidence, actual: message }, input_classification: "valid", repro: { kind: "function_call", function: name, arguments: _reproCase(args, caseLabel).arguments, case_label: caseLabel, snippet, command: null, expectation }, minimization: { status, attempts, original: _reproCase(args, caseLabel), minimized }, error_type: errorType, message, suppressed: false });
+  const record: Record<string, unknown> = { id: _findingId(name), severity, confidence, category, location: { source_file: "", function: name, line: sourceLine, invocation_path: invocationPath }, oracle: { id: `${oracleKind}:${_sanitizeSymbol(name)}`, kind: oracleKind, provenance, confidence, actual: message }, input_classification: "valid", repro: { kind: "function_call", function: name, arguments: _reproCase(args, caseLabel).arguments, case_label: caseLabel, snippet, command: null, expectation }, minimization: { status, attempts, original: _reproCase(args, caseLabel), minimized }, error_type: errorType, message, suppressed: false };
+  _fuzzResults.push(record);
+  _cjEvent("finding", { finding: record });
 }
 function _declaredPropertyForFailure(error: unknown): string | null {
   if (!(error instanceof Error)) return null;
@@ -3961,9 +4251,10 @@ function _fuzzOne(
   for (let i = 0; i < iters; i++) {
     allInputs.push(seedRows.length > 0 ? _fuzzSeedRow(seedRows) : genArgs());
   }
-  for (const args of allInputs) {
+  for (let i = 0; i < allInputs.length; i++) {
+    const args = allInputs[i];
     try {
-      _targetEntered(`${name}:${sourceLine}`);
+      _targetEntered(`${name}:${sourceLine}`, i);
       const result = fn(args);
       // Type check
       if (expectedType !== null && typeof result !== expectedType) {
@@ -4047,10 +4338,12 @@ function _fuzzOne(
           throw new Error(`Comparator antisymmetry violated: ${JSON.stringify(result)} vs ${JSON.stringify(resultRev)}`);
         }
       }
+      _cjUnitCompleted(`${name}:${sourceLine}`, i, "passed");
       pass++;
     } catch (e: unknown) {
       if (_isCrash(e)) {
         crash++;
+        _cjUnitCompleted(`${name}:${sourceLine}`, i, "target_exception");
         const propertyFailure = e instanceof Error && !(e instanceof TypeError || e instanceof RangeError || e instanceof ReferenceError || e instanceof URIError);
         const failedProperty = _declaredPropertyForFailure(e);
         const declared = propertyFailure && failedProperty !== null && declaredProperties.includes(failedProperty);
@@ -4063,6 +4356,7 @@ function _fuzzOne(
         if (crash === 1) firstCrash = `  CRASH ${name}(${_shortJson(args)}): ${_clipText(e)}`;
       } else {
         reject++;
+        _cjUnitCompleted(`${name}:${sourceLine}`, i, "rejected");
       }
     }
   }
@@ -4079,10 +4373,11 @@ function _fuzzOne(
   } else {
     console.log(`FUZZ ${name}: ${pass} passed, ${reject} rejected (of ${total})`);
     return true;
-  }
+}
 }
 "#;
 const TYPESCRIPT_FUZZ_EPILOGUE: &str = r#"
+_cjEvent("harness_completed", { completed_units: _cjCompletedUnits });
 if (_fuzzResults.length > 0) {
   console.log("__COURT_JESTER_FINDINGS_JSON__");
   console.log(JSON.stringify(_fuzzResults));
@@ -4449,11 +4744,7 @@ fn find_involution_pairs(analysis: &AnalysisResult) -> Vec<(&FunctionInfo, &Func
     let mut seen: Vec<String> = vec![];
 
     for func in candidates {
-        let params: Vec<_> = func
-            .params
-            .iter()
-            .filter(|p| !p.name.starts_with('*'))
-            .collect();
+        let params: Vec<_> = func.params.iter().filter(|p| !p.is_variadic()).collect();
         if params.len() != 1 {
             continue;
         }
@@ -4466,11 +4757,8 @@ fn find_involution_pairs(analysis: &AnalysisResult) -> Vec<(&FunctionInfo, &Func
             }
             let partner_lower = lower.replace(enc, dec);
             if let Some(partner) = func_map.get(&partner_lower) {
-                let partner_params: Vec<_> = partner
-                    .params
-                    .iter()
-                    .filter(|p| !p.name.starts_with('*'))
-                    .collect();
+                let partner_params: Vec<_> =
+                    partner.params.iter().filter(|p| !p.is_variadic()).collect();
                 if partner_params.len() != 1 {
                     continue;
                 }
@@ -4501,11 +4789,7 @@ fn synthesize_python_involution_checks(
     let mut code = String::new();
 
     for (enc, dec) in &pairs {
-        let param = enc
-            .params
-            .iter()
-            .find(|p| !p.name.starts_with('*'))
-            .unwrap();
+        let param = enc.params.iter().find(|p| !p.is_variadic()).unwrap();
         let gen = python_generator(param.type_annotation.as_deref(), type_defs);
 
         code.push_str(&format!(
@@ -4544,11 +4828,7 @@ fn synthesize_typescript_involution_checks(
     let mut code = String::new();
 
     for (enc, dec) in &pairs {
-        let param = enc
-            .params
-            .iter()
-            .find(|p| !p.name.starts_with('*'))
-            .unwrap();
+        let param = enc.params.iter().find(|p| !p.is_variadic()).unwrap();
         if !ts_type_is_fuzzable(param.type_annotation.as_deref(), type_defs) {
             continue;
         }

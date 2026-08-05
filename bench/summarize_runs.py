@@ -7,9 +7,7 @@ import math
 import random
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Iterable
-
-from bench.runner import report_verdict
+from bench.runner import report_terminal_cause, report_verdict
 
 
 BENCH_ARTIFACT_SCHEMA_VERSION = 1
@@ -77,36 +75,57 @@ def _load_artifacts(results_dir: Path, allow_legacy: bool = False) -> tuple[list
             value["legacy_reasons"] = reasons
         value.setdefault("_artifact_path", str(path.relative_to(results_dir)))
         rows.append(value)
-    expected = matrix.get("expected_total", matrix.get("expected_cells"))
-    expected_total = int(expected) if isinstance(expected, int) and expected >= 0 else len(paths)
-    return rows, {"artifact_schema_version": BENCH_ARTIFACT_SCHEMA_VERSION, "verify_schema_version_required": VERIFY_SCHEMA_VERSION_REQUIRED, "expected_total": expected_total, "present_total": len(rows), "invalid_artifacts": invalid, "legacy_included": bool(allow_legacy and any(row.get("legacy_artifact") for row in rows)), "matrix": matrix}
-
+    expected_value = matrix.get("expected_total", matrix.get("expected_cells"))
+    if isinstance(expected_value, bool):
+        expected_value = None
+    try:
+        expected_total = int(expected_value) if expected_value is not None else len(rows)
+    except (TypeError, ValueError):
+        expected_total = len(rows)
+        invalid.append({"path": "matrix.json", "reason": "invalid_expected_total"})
+    if expected_total < 0:
+        expected_total = len(rows)
+        invalid.append({"path": "matrix.json", "reason": "invalid_expected_total"})
+    if expected_total != len(rows):
+        invalid.append(
+            {
+                "path": "matrix.json",
+                "reason": f"expected_{expected_total}_cells_found_{len(rows)}",
+            }
+        )
+    return rows, {
+        "artifact_schema_version": matrix.get("artifact_schema_version"),
+        "verify_schema_version_required": matrix.get("verify_schema_version_required"),
+        "expected_total": expected_total,
+        "present_total": len(rows),
+        "invalid_artifacts": invalid,
+        "legacy_included": any(bool(row.get("legacy_artifact")) for row in rows),
+    }
 def _report_observation(row: dict[str, Any]) -> str | None:
-    """Return the aggregate verdict represented by the row's retained reports."""
+    """Return aggregate typed verdict while preserving legacy report behavior."""
     court_jester = row.get("court_jester")
     if isinstance(court_jester, dict) and "results" in court_jester:
         results = court_jester.get("results")
         if not isinstance(results, list) or not results:
             return None
-        verdicts: list[str] = []
-        for item in results:
-            if not isinstance(item, dict) or item.get("tool_error") is not None:
-                return None
-            verdict = report_verdict(item.get("response"))
-            if verdict is None:
-                return None
-            verdicts.append(verdict)
     else:
-        verdict = report_verdict(row.get("verify_report"))
-        if verdict is None:
-            return None
-        verdicts = [verdict]
+        results = [{"response": row.get("verify_report")}]
 
-    if "fail" in verdicts:
-        return "fail"
-    if "inconclusive" in verdicts:
-        return "abstain"
-    return "pass"
+    saw_inconclusive = False
+    for item in results:
+        if not isinstance(item, dict) or item.get("tool_error") is not None:
+            return None
+        report = item.get("response")
+        if report_verdict(report) is None:
+            return None
+        cause = report_terminal_cause(report)
+        if cause and cause.get("classification") in {"target", "legacy"}:
+            return "fail"
+        if report_verdict(report) == "inconclusive" or (
+            cause and cause.get("classification") == "inconclusive"
+        ):
+            saw_inconclusive = True
+    return "abstain" if saw_inconclusive else "pass"
 
 
 def _stored_observation(row: dict[str, Any]) -> tuple[str, str] | None:
@@ -154,11 +173,17 @@ def _observation(row: dict[str, Any]) -> tuple[str, str]:
     if stored is not None:
         return stored
 
-    verdict = report_verdict(row.get("verify_report"))
-    if verdict == "inconclusive":
-        return "abstain", "verify_inconclusive"
-    if verdict in {"pass", "fail"}:
-        return verdict, f"verify_{verdict}ed"
+    report = row.get("verify_report")
+    verdict = report_verdict(report)
+    cause = report_terminal_cause(report)
+    if cause and cause.get("classification") in {"target", "legacy"}:
+        return "fail", str(cause.get("kind") or "verify_failed")
+    if verdict == "inconclusive" or (
+        cause and cause.get("classification") == "inconclusive"
+    ):
+        return "abstain", str(cause.get("kind") or "verify_inconclusive")
+    if verdict == "pass":
+        return "pass", "verify_passed"
     if row.get("legacy_artifact") is True and row.get("verify_failed") is True:
         return "fail", "legacy_verify_failed"
     return "abstain", ("timeout" if "timeout" in status else str(row.get("failure_reason") or status or "missing_verifier_observation"))
@@ -479,10 +504,34 @@ def summarize_items(items: list[dict[str, object]]) -> dict[str, object]:
         verify_failure_kind_expectations,
     )
     failure_counts = defaultdict(int)
+    typed_cause_counts = defaultdict(int)
+    source_modes: set[str] = set()
+    network_policies: set[str] = set()
+    termination_kinds: set[str] = set()
+    provenance: set[str] = set()
     repair_trigger_counts = defaultdict(int)
     repair_feedback_style_counts = defaultdict(int)
     for item in items:
         failure_counts[item.get("failure_category", "unknown")] += 1
+        metadata = item.get("verify_metadata")
+        if not isinstance(metadata, dict):
+            summary = item.get("verify_summary")
+            metadata = summary.get("metadata") if isinstance(summary, dict) else None
+        if isinstance(metadata, dict):
+            for key, destination in (
+                ("source_modes", source_modes),
+                ("network_policies", network_policies),
+                ("termination_kinds", termination_kinds),
+                ("provenance", provenance),
+            ):
+                values = metadata.get(key)
+                if isinstance(values, list):
+                    destination.update(str(value) for value in values)
+            terminal = metadata.get("terminal_cause")
+            if isinstance(terminal, dict):
+                kind = terminal.get("kind")
+                if isinstance(kind, str):
+                    typed_cause_counts[kind] += 1
         repair_source = item.get("repair_trigger_source")
         if repair_source:
             repair_trigger_counts[str(repair_source)] += 1
@@ -490,6 +539,7 @@ def summarize_items(items: list[dict[str, object]]) -> dict[str, object]:
         if repair_feedback_style:
             repair_feedback_style_counts[str(repair_feedback_style)] += 1
     serialized_counts = json.dumps(dict(sorted(failure_counts.items())), sort_keys=True)
+    serialized_typed_causes = json.dumps(dict(sorted(typed_cause_counts.items())), sort_keys=True)
     serialized_repair_triggers = json.dumps(dict(sorted(repair_trigger_counts.items())), sort_keys=True)
     serialized_feedback_styles = json.dumps(dict(sorted(repair_feedback_style_counts.items())), sort_keys=True)
     return {
@@ -526,6 +576,11 @@ def summarize_items(items: list[dict[str, object]]) -> dict[str, object]:
         "total_end_to_end_hours": total_end_to_end_hours,
         "successes_per_hour": successes_per_hour,
         "minutes_per_success": minutes_per_success,
+        "typed_cause_counts": serialized_typed_causes,
+        "source_modes": sorted(source_modes),
+        "network_policies": sorted(network_policies),
+        "termination_kinds": sorted(termination_kinds),
+        "provenance": sorted(provenance),
         "total_product_loop_ms": total_product_loop_ms,
         "avg_product_loop_ms": avg_product_loop_ms,
         "total_product_loop_hours": total_product_loop_hours,
@@ -711,23 +766,32 @@ def expected_verify_failure_kinds_for_item(item: dict[str, object]) -> list[str]
 
 
 def verify_failure_kind_matched(item: dict[str, object], expected_failure_kinds: list[str]) -> bool:
-    failure_stage = None
+    observed: set[str] = set()
     failure_details = item.get("failure_details")
     if isinstance(failure_details, dict):
         raw_stage = failure_details.get("verify_failure_stage")
         if isinstance(raw_stage, str):
-            failure_stage = raw_stage
+            observed.add(raw_stage)
+        raw_kind = failure_details.get("verify_failure_kind")
+        if isinstance(raw_kind, str):
+            observed.add(raw_kind)
+        verify_metadata = failure_details.get("verify_metadata")
+        if isinstance(verify_metadata, dict):
+            terminal = verify_metadata.get("terminal_cause")
+            if isinstance(terminal, dict):
+                for key in ("kind", "domain", "component", "impact"):
+                    value = terminal.get(key)
+                    if isinstance(value, str):
+                        observed.add(value)
 
-    failed_stage_counts: dict[str, object] = {}
     verify_summary = item.get("verify_summary")
     if isinstance(verify_summary, dict):
         raw_counts = verify_summary.get("failed_stage_counts")
         if isinstance(raw_counts, dict):
-            failed_stage_counts = raw_counts
-
-    observed = {str(name) for name in failed_stage_counts.keys()}
-    if failure_stage:
-        observed.add(failure_stage)
+            observed.update(str(name) for name in raw_counts.keys())
+        raw_causes = verify_summary.get("terminal_cause_counts")
+        if isinstance(raw_causes, dict):
+            observed.update(str(name) for name in raw_causes.keys())
     return any(kind in observed for kind in expected_failure_kinds)
 
 

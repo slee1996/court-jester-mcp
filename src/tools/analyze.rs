@@ -5,18 +5,33 @@ use tree_sitter::Parser;
 use crate::types::*;
 
 pub fn analyze(code: &str, language: &Language) -> AnalysisResult {
-    let mut parser = Parser::new();
+    let context = SourceContext {
+        language: *language,
+        mode: SourceMode::for_language(language),
+        source_file: None,
+        virtual_file_path: None,
+    };
+    analyze_with_context(code, &context)
+}
 
-    match language {
-        Language::Python => {
+pub fn analyze_with_context(code: &str, context: &SourceContext) -> AnalysisResult {
+    let mut parser = Parser::new();
+    let grammar_mode = context.mode;
+    match grammar_mode {
+        SourceMode::Python => {
             parser
                 .set_language(&tree_sitter_python::LANGUAGE.into())
                 .expect("Failed to load Python grammar");
         }
-        Language::TypeScript => {
+        SourceMode::TypeScript => {
             parser
                 .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
                 .expect("Failed to load TypeScript grammar");
+        }
+        SourceMode::Tsx => {
+            parser
+                .set_language(&tree_sitter_typescript::LANGUAGE_TSX.into())
+                .expect("Failed to load TSX grammar");
         }
     }
 
@@ -33,20 +48,38 @@ pub fn analyze(code: &str, language: &Language) -> AnalysisResult {
                 max_nesting_depth: 0,
                 complexity_breakdown: BTreeMap::new(),
                 parse_error: true,
-            }
+                source_mode: grammar_mode,
+                parse_diagnostics: vec![ParseDiagnostic {
+                    kind: "error".into(),
+                    message: "Parser could not produce a syntax tree at 1:1".into(),
+                    start_line: 1,
+                    start_column: 1,
+                    end_line: 1,
+                    end_column: 1,
+                    excerpt: code
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(160)
+                        .collect(),
+                }],
+            };
         }
     };
 
     let root = tree.root_node();
     let bytes = code.as_bytes();
-    let file_complexity = program_complexity(&root, language, bytes);
+    let parse_diagnostics = parse_diagnostics(&root, code);
+    let semantic_language = context.language;
+    let file_complexity = program_complexity(&root, &semantic_language, bytes);
 
     let mut functions = vec![];
     let mut classes = vec![];
     let mut aliases = vec![];
     let mut imports = vec![];
 
-    match language {
+    match semantic_language {
         Language::Python => {
             visit_python(&root, bytes, &mut functions, &mut classes, &mut imports, 0);
         }
@@ -65,7 +98,7 @@ pub fn analyze(code: &str, language: &Language) -> AnalysisResult {
         }
     }
 
-    annotate_function_source_directives(code, language, &mut functions);
+    annotate_function_source_directives(code, &semantic_language, &mut functions);
 
     AnalysisResult {
         functions,
@@ -77,7 +110,65 @@ pub fn analyze(code: &str, language: &Language) -> AnalysisResult {
         max_nesting_depth: file_complexity.max_nesting_depth,
         complexity_breakdown: file_complexity.breakdown,
         parse_error: root.has_error(),
+        source_mode: grammar_mode,
+        parse_diagnostics,
     }
+}
+
+fn parse_diagnostics(root: &tree_sitter::Node<'_>, source: &str) -> Vec<ParseDiagnostic> {
+    fn visit(node: tree_sitter::Node<'_>, source: &str, diagnostics: &mut Vec<ParseDiagnostic>) {
+        if node.is_error() || node.is_missing() {
+            let start = node.start_position();
+            let end = node.end_position();
+            let missing = node.is_missing();
+            let node_kind = node.kind();
+            let message = if missing {
+                format!("Missing syntax node {node_kind}")
+            } else {
+                format!("Unexpected syntax node {node_kind}")
+            };
+            let excerpt = source
+                .lines()
+                .nth(start.row)
+                .unwrap_or("")
+                .chars()
+                .take(160)
+                .collect();
+            diagnostics.push(ParseDiagnostic {
+                kind: if missing { "missing" } else { "error" }.into(),
+                message,
+                start_line: start.row + 1,
+                start_column: start.column + 1,
+                end_line: end.row + 1,
+                end_column: end.column + 1,
+                excerpt,
+            });
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            visit(child, source, diagnostics);
+        }
+    }
+
+    let mut diagnostics = Vec::new();
+    visit(*root, source, &mut diagnostics);
+    diagnostics.sort_by_key(|diagnostic| {
+        (
+            diagnostic.start_line,
+            diagnostic.start_column,
+            diagnostic.end_line,
+            diagnostic.end_column,
+            diagnostic.kind.clone(),
+        )
+    });
+    diagnostics.dedup_by(|left, right| {
+        left.start_line == right.start_line
+            && left.start_column == right.start_column
+            && left.end_line == right.end_line
+            && left.end_column == right.end_column
+            && left.kind == right.kind
+    });
+    diagnostics
 }
 
 fn text<'a>(node: &tree_sitter::Node, source: &'a [u8]) -> &'a str {
@@ -601,10 +692,9 @@ fn extract_python_params(func: &tree_sitter::Node, source: &[u8]) -> Vec<ParamIn
 
     for child in params_node.named_children(&mut cursor) {
         match child.kind() {
-            // Bare `*` separator — all following params are keyword-only
+            // Bare `*` separator — all following params are keyword-only.
             "keyword_separator" => {
                 keyword_only = true;
-                continue;
             }
             "identifier" => {
                 let name = text(&child, source);
@@ -614,11 +704,12 @@ fn extract_python_params(func: &tree_sitter::Node, source: &[u8]) -> Vec<ParamIn
                         type_annotation: None,
                         default_value: None,
                         keyword_only,
+                        optional: false,
+                        variadic: None,
                     });
                 }
             }
             "typed_parameter" => {
-                // typed_parameter has no "name" field — the identifier is the first named child
                 let name = child.named_child(0).map(|n| text(&n, source)).unwrap_or("");
                 if name != "self" && name != "cls" {
                     let type_ann = child
@@ -629,6 +720,8 @@ fn extract_python_params(func: &tree_sitter::Node, source: &[u8]) -> Vec<ParamIn
                         type_annotation: type_ann,
                         default_value: None,
                         keyword_only,
+                        optional: false,
+                        variadic: None,
                     });
                 }
             }
@@ -645,6 +738,8 @@ fn extract_python_params(func: &tree_sitter::Node, source: &[u8]) -> Vec<ParamIn
                     type_annotation: None,
                     default_value: value,
                     keyword_only,
+                    optional: true,
+                    variadic: None,
                 });
             }
             "typed_default_parameter" => {
@@ -663,14 +758,27 @@ fn extract_python_params(func: &tree_sitter::Node, source: &[u8]) -> Vec<ParamIn
                     type_annotation: type_ann,
                     default_value: value,
                     keyword_only,
+                    optional: true,
+                    variadic: None,
                 });
             }
             "list_splat_pattern" | "dictionary_splat_pattern" => {
+                let raw_name = text(&child, source);
+                let is_keyword = child.kind() == "dictionary_splat_pattern";
                 params.push(ParamInfo {
-                    name: text(&child, source).to_string(),
-                    type_annotation: None,
+                    name: raw_name.trim_start_matches('*').to_string(),
+                    type_annotation: child
+                        .named_child(0)
+                        .and_then(|node| node.child_by_field_name("type"))
+                        .map(|node| text(&node, source).to_string()),
                     default_value: None,
-                    keyword_only: false,
+                    keyword_only: is_keyword,
+                    optional: true,
+                    variadic: Some(if is_keyword {
+                        VariadicKind::Keyword
+                    } else {
+                        VariadicKind::Positional
+                    }),
                 });
             }
             _ => {}
@@ -681,6 +789,7 @@ fn extract_python_params(func: &tree_sitter::Node, source: &[u8]) -> Vec<ParamIn
 }
 
 /// Extract fields from a Python class body (dataclass-style type-annotated fields).
+#[allow(clippy::single_match)]
 fn extract_python_class_fields(class_node: &tree_sitter::Node, source: &[u8]) -> Vec<FieldInfo> {
     let body = match class_node.child_by_field_name("body") {
         Some(n) => n,
@@ -2000,21 +2109,43 @@ fn extract_ts_params(func: &tree_sitter::Node, source: &[u8]) -> Vec<ParamInfo> 
     for child in params_node.named_children(&mut cursor) {
         match child.kind() {
             "required_parameter" | "optional_parameter" => {
-                let name = child
+                let raw_name = child
                     .child_by_field_name("pattern")
                     .map(|n| text(&n, source).to_string())
                     .unwrap_or_default();
+                let variadic = raw_name.starts_with("...");
+                let name = raw_name.trim_start_matches("...").to_string();
                 let type_ann = child
                     .child_by_field_name("type")
                     .map(|n| type_text(&n, source));
                 let default_value = child
                     .child_by_field_name("value")
                     .map(|n| text(&n, source).to_string());
+                let optional =
+                    child.kind() == "optional_parameter" || default_value.is_some() || variadic;
                 params.push(ParamInfo {
                     name,
                     type_annotation: type_ann,
                     default_value,
                     keyword_only: false,
+                    optional,
+                    variadic: variadic.then_some(VariadicKind::Positional),
+                });
+            }
+            "rest_pattern" => {
+                let raw_name = child
+                    .named_child(0)
+                    .map(|n| text(&n, source))
+                    .unwrap_or_else(|| text(&child, source));
+                params.push(ParamInfo {
+                    name: raw_name.trim_start_matches("...").to_string(),
+                    type_annotation: child
+                        .child_by_field_name("type")
+                        .map(|n| type_text(&n, source)),
+                    default_value: None,
+                    keyword_only: false,
+                    optional: true,
+                    variadic: Some(VariadicKind::Positional),
                 });
             }
             _ => {}
@@ -2117,8 +2248,29 @@ pub fn resolve_imported_types(
             Ok(c) => c,
             Err(_) => continue,
         };
+        let imported_context = SourceContext {
+            language: *language,
+            mode: if matches!(language, Language::Python) {
+                SourceMode::Python
+            } else {
+                match resolved
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                {
+                    Some(extension)
+                        if extension.eq_ignore_ascii_case("tsx")
+                            || extension.eq_ignore_ascii_case("jsx") =>
+                    {
+                        SourceMode::Tsx
+                    }
+                    _ => SourceMode::TypeScript,
+                }
+            },
+            source_file: Some(resolved.clone()),
+            virtual_file_path: None,
+        };
+        let imported = analyze_with_context(&code, &imported_context);
 
-        let imported = analyze(&code, language);
         for class in imported.classes {
             if !known_classes.contains(class.name.as_str()) {
                 resolved_types.classes.push(class);
@@ -2231,7 +2383,28 @@ fn resolve_imported_types_for_request(
             Ok(code) => code,
             Err(_) => continue,
         };
-        let imported = analyze(&code, language);
+        let imported_context = SourceContext {
+            language: *language,
+            mode: if matches!(language, Language::Python) {
+                SourceMode::Python
+            } else {
+                match resolved
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                {
+                    Some(extension)
+                        if extension.eq_ignore_ascii_case("tsx")
+                            || extension.eq_ignore_ascii_case("jsx") =>
+                    {
+                        SourceMode::Tsx
+                    }
+                    _ => SourceMode::TypeScript,
+                }
+            },
+            source_file: Some(resolved.clone()),
+            virtual_file_path: None,
+        };
+        let imported = analyze_with_context(&code, &imported_context);
         let nested =
             resolve_imported_types_for_request(&imported, &resolved, language, delta, state);
         resolved_types.classes.extend(nested.classes);
@@ -2551,18 +2724,11 @@ fn parse_python_import(statement: &str) -> Option<ParsedImport> {
                 Some((exported_name, local_name)) => (exported_name.trim(), local_name.trim()),
                 None => (part, part),
             };
-            if exported_name.is_empty() || local_name.is_empty() {
-                continue;
-            }
             bindings.push(ParsedImportBinding::Named {
                 local_name: local_name.to_string(),
                 exported_name: exported_name.to_string(),
             });
         }
-    }
-
-    if bindings.is_empty() {
-        return None;
     }
 
     Some(ParsedImport { path, bindings })
@@ -2576,13 +2742,21 @@ fn resolve_import_file(
 ) -> Option<std::path::PathBuf> {
     match language {
         Language::TypeScript => {
-            // "./types" or "../../types/foo" → try .ts/.tsx and index files.
             let base = source_dir.join(import_path);
-
             if base.exists() {
                 return Some(base);
             }
-            for ext in &[".ts", ".tsx", "/index.ts", "/index.tsx"] {
+            for ext in &[
+                ".ts",
+                ".tsx",
+                ".jsx",
+                ".js",
+                ".d.ts",
+                "/index.ts",
+                "/index.tsx",
+                "/index.jsx",
+                "/index.js",
+            ] {
                 let candidate = std::path::PathBuf::from(format!("{}{}", base.display(), ext));
                 if candidate.exists() {
                     return Some(candidate);
@@ -2591,7 +2765,6 @@ fn resolve_import_file(
             None
         }
         Language::Python => {
-            // ".module" → module.py, "..pkg.module" → ../pkg/module.py
             let leading_dots = import_path.chars().take_while(|c| *c == '.').count();
             if leading_dots == 0 {
                 return None;
@@ -2611,16 +2784,12 @@ fn resolve_import_file(
             if candidate.exists() {
                 return Some(candidate);
             }
-            // Try as package: module/__init__.py
             let candidate = if rel.is_empty() {
                 base_dir.join("__init__.py")
             } else {
                 base_dir.join(&rel).join("__init__.py")
             };
-            if candidate.exists() {
-                return Some(candidate);
-            }
-            None
+            candidate.exists().then_some(candidate)
         }
     }
 }
@@ -2694,15 +2863,29 @@ pub fn filter_changed_functions(
         .collect()
 }
 
-/// Collect local call edges from supported source/test files. The scanner is
-fn parser_for_language(language: &Language) -> Option<Parser> {
+fn parser_for_mode(mode: SourceMode) -> Option<Parser> {
     let mut parser = Parser::new();
-    let grammar = match language {
-        Language::Python => tree_sitter_python::LANGUAGE.into(),
-        Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+    let grammar = match mode {
+        SourceMode::Python => tree_sitter_python::LANGUAGE.into(),
+        SourceMode::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        SourceMode::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
     };
     parser.set_language(&grammar).ok()?;
     Some(parser)
+}
+
+fn source_mode_for_file(language: &Language, path: &str) -> SourceMode {
+    if matches!(language, Language::Python) {
+        return SourceMode::Python;
+    }
+    match path
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("tsx") | Some("jsx") => SourceMode::Tsx,
+        _ => SourceMode::TypeScript,
+    }
 }
 
 fn node_text(node: &tree_sitter::Node<'_>, source: &[u8]) -> String {
@@ -2733,7 +2916,13 @@ pub fn collect_call_edges(files: &[(String, String)], language: &Language) -> Ve
     let mut symbols = std::collections::HashMap::<String, String>::new();
     let mut imported = std::collections::HashMap::<(String, String), CallResolution>::new();
     for (path, source) in &ordered {
-        let analysis = analyze(source, language);
+        let context = SourceContext {
+            language: *language,
+            mode: source_mode_for_file(language, path),
+            source_file: None,
+            virtual_file_path: None,
+        };
+        let analysis = analyze_with_context(source, &context);
         for function in analysis.functions.iter().filter(|f| !f.is_nested) {
             symbols
                 .entry(function.name.clone())
@@ -2779,7 +2968,8 @@ pub fn collect_call_edges(files: &[(String, String)], language: &Language) -> Ve
     }
     let mut edges = Vec::new();
     for (path, source) in ordered {
-        let Some(mut parser) = parser_for_language(language) else {
+        let mode = source_mode_for_file(language, path);
+        let Some(mut parser) = parser_for_mode(mode) else {
             continue;
         };
         let Some(tree) = parser.parse(source, None) else {

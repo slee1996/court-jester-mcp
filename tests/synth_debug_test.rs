@@ -12,6 +12,8 @@ fn debug_print_synthesized_code() {
                 type_annotation: Some("string".to_string()),
                 default_value: None,
                 keyword_only: false,
+                optional: false,
+                variadic: None,
             }],
             return_type: Some("number".to_string()),
             line: 1,
@@ -33,6 +35,8 @@ fn debug_print_synthesized_code() {
         complexity: 1,
         cognitive_complexity: 0,
         max_nesting_depth: 0,
+        source_mode: SourceMode::TypeScript,
+        parse_diagnostics: vec![],
         complexity_breakdown: BTreeMap::new(),
         parse_error: false,
     };

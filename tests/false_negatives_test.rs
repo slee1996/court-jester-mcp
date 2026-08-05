@@ -3,8 +3,8 @@
 
 use court_jester::tools::verify::{verify, VerifyOptions};
 use court_jester::types::{
-    ComplexityMetric, CoverageGate, ExecuteGate, InferredOracleGate, Language, ReportLevel,
-    RuntimeProfile, StageStatus, TestRunner, DEFAULT_PYTHON_DOCKER_IMAGE,
+    ComplexityMetric, CoverageGate, ExecuteGate, InferredOracleGate, Language, NetworkPolicy,
+    ReportLevel, RuntimeProfile, StageStatus, TestRunner, DEFAULT_PYTHON_DOCKER_IMAGE,
     DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
 };
 
@@ -35,6 +35,9 @@ fn opts() -> VerifyOptions<'static> {
         runtime_profile: RuntimeProfile::LocalTrusted,
         python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
         typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        memory_mb: 512,
+        network: NetworkPolicy::Deny,
+        harness_args: vec![],
     }
 }
 

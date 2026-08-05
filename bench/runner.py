@@ -122,6 +122,149 @@ def stage_findings(stage: Any) -> list[dict[str, Any]]:
     detail = stage.get("detail")
     findings = detail.get("findings") if isinstance(detail, dict) else None
     return [finding for finding in findings if isinstance(finding, dict)] if isinstance(findings, list) else []
+def _report_diagnostics(report: Any) -> list[dict[str, Any]]:
+    """Collect typed diagnostics without interpreting human-readable output.
+
+    Diagnostics were added additively to schema v3.  A few stage producers put
+    them in ``detail`` while the final report puts them at the top level, so
+    consume both locations and de-duplicate by their serialized content.
+    """
+    if not isinstance(report, dict):
+        return []
+    values: list[dict[str, Any]] = []
+    candidates: list[Any] = [report.get("diagnostics")]
+    for stage in report.get("stages", []):
+        if not isinstance(stage, dict):
+            continue
+        detail = stage.get("detail")
+        if isinstance(detail, dict):
+            candidates.append(detail.get("diagnostics"))
+            execution = detail.get("execution")
+            if isinstance(execution, dict):
+                candidates.append(execution.get("diagnostics"))
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not isinstance(candidate, list):
+            continue
+        for diagnostic in candidate:
+            if not isinstance(diagnostic, dict):
+                continue
+            key = json.dumps(diagnostic, sort_keys=True, separators=(",", ":"))
+            if key not in seen:
+                seen.add(key)
+                values.append(diagnostic)
+    return values
+
+
+def _report_findings(report: Any) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    if not isinstance(report, dict):
+        return findings
+    for stage in report.get("stages", []):
+        findings.extend(stage_findings(stage))
+    return findings
+
+
+def _is_target_finding(finding: dict[str, Any]) -> bool:
+    """Return true only for an unsuppressed, non-infrastructure finding."""
+    if finding.get("suppressed") is True:
+        return False
+    severity = str(finding.get("severity") or "").lower()
+    category = str(finding.get("category") or "").lower()
+    return severity in {"crash", "property_violation", "behavioral_regression"} and category != "infrastructure"
+
+
+def report_terminal_cause(report: Any) -> dict[str, Any] | None:
+    """Resolve a report's terminal cause using typed diagnostic precedence.
+
+    ``target`` is intentionally narrower than a failed stage: verifier,
+    environment, and resource diagnostics are benchmark abstentions.  Reports
+    without typed diagnostics retain the old stage/verdict interpretation.
+    """
+    if not isinstance(report, dict):
+        return None
+    diagnostics = _report_diagnostics(report)
+    typed = bool(diagnostics) or "diagnostics" in report or "diagnostics_summary" in report
+    target = [
+        diagnostic
+        for diagnostic in diagnostics
+        if str(diagnostic.get("domain") or "").lower() == "target_code"
+        and str(diagnostic.get("impact") or "").lower() == "gating"
+    ]
+    if target:
+        cause = dict(target[0])
+        cause["classification"] = "target"
+        return cause
+    findings = [finding for finding in _report_findings(report) if _is_target_finding(finding)]
+    if findings:
+        return {"classification": "target", "finding": findings[0]}
+    blocking = [
+        diagnostic
+        for diagnostic in diagnostics
+        if str(diagnostic.get("impact") or "").lower() == "blocking"
+    ]
+    if blocking:
+        cause = dict(blocking[0])
+        cause["classification"] = "inconclusive"
+        return cause
+    if typed and report.get("verdict") == "fail":
+        # A typed report with no target evidence cannot be scored as a target
+        # defect, even if an older producer emitted a failed verdict.
+        return {"classification": "inconclusive", "kind": "harness_protocol"}
+    if report.get("verdict") == "inconclusive":
+        return {"classification": "inconclusive"}
+    if report.get("verdict") == "fail":
+        return {"classification": "legacy"}
+    return None
+
+
+def report_has_target_failure(report: Any) -> bool:
+    cause = report_terminal_cause(report)
+    return bool(cause and cause.get("classification") in {"target", "legacy"})
+
+
+def report_metadata(report: Any) -> dict[str, Any]:
+    """Extract machine-readable execution context for benchmark artifacts."""
+    metadata: dict[str, set[str]] = {
+        "source_modes": set(),
+        "network_policies": set(),
+        "runtimes": set(),
+        "input_origins": set(),
+        "provenance": set(),
+        "termination_kinds": set(),
+        "failure_domains": set(),
+        "failure_kinds": set(),
+        "diagnostic_components": set(),
+    }
+
+    def walk(value: Any, key: str = "") -> None:
+        if isinstance(value, dict):
+            for name, child in value.items():
+                normalized = str(name).lower()
+                if normalized in {"source_mode", "network_policy", "network", "runtime", "input_origin", "provenance", "termination_kind", "failure_domain", "failure_kind", "component"}:
+                    if isinstance(child, str):
+                        field = {
+                            "source_mode": "source_modes",
+                            "network_policy": "network_policies",
+                            "network": "network_policies",
+                            "runtime": "runtimes",
+                            "input_origin": "input_origins",
+                            "provenance": "provenance",
+                            "termination_kind": "termination_kinds",
+                            "failure_domain": "failure_domains",
+                            "failure_kind": "failure_kinds",
+                            "component": "diagnostic_components",
+                        }[normalized]
+                        metadata[field].add(child)
+                if normalized == "kind" and key in {"termination", "process"} and isinstance(child, str):
+                    metadata["termination_kinds"].add(child)
+                walk(child, normalized)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child, key)
+
+    walk(report)
+    return {key: sorted(values) for key, values in metadata.items() if values}
 
 
 def finding_function(finding: dict[str, Any]) -> str:
@@ -237,6 +380,8 @@ def run_single(
     verify_runtime_profile: str = "local-trusted",
     python_docker_image: str = "python:3.12-slim",
     typescript_docker_image: str = "node:24-bookworm-slim",
+    verify_memory_mb: int = 512,
+    verify_network: str = "deny",
     doctor_report: dict[str, Any] | None = None,
     shadow_records: Path | None = None,
 ) -> dict[str, Any]:
@@ -286,6 +431,13 @@ def run_single(
         "verify_schema_version_required": VERIFY_SCHEMA_VERSION_REQUIRED,
         "verify_runtime_profile": verify_runtime_profile,
         "runtime_images": {"python": python_docker_image, "typescript": typescript_docker_image},
+        "verify_memory_mb": verify_memory_mb,
+        "verify_network": verify_network,
+        "verification_policy": {
+            "runtime_profile": verify_runtime_profile,
+            "memory_mb": verify_memory_mb,
+            "network_policy": verify_network,
+        },
         "doctor_report": doctor_report,
         "hidden_seed_sha256": hidden_seed_sha256,
         "timestamps": {"started_at_epoch_ms": int(time.time() * 1000)},
@@ -329,6 +481,13 @@ def run_single(
             "repeat_index": repeat_index,
             "repeat_ordinal": repeat_index + 1,
             "repeat_count": repeat_count,
+            "verify_memory_mb": verify_memory_mb,
+            "verify_network": verify_network,
+            "verification_policy": {
+                "runtime_profile": verify_runtime_profile,
+                "memory_mb": verify_memory_mb,
+                "network_policy": verify_network,
+            },
             "dry_run": dry_run,
             "status": "running",
             "task_gold_patch_mode": use_task_gold_patches,
@@ -611,6 +770,9 @@ def run_single(
                     arguments["runtime_profile"] = verify_runtime_profile
                     arguments["python_docker_image"] = python_docker_image
                     arguments["typescript_docker_image"] = typescript_docker_image
+                    arguments["verify_memory_mb"] = verify_memory_mb
+                    arguments["verify_network"] = verify_network
+                    arguments["network_policy"] = verify_network
                     materialized_verify_paths: list[Path] = []
                     if task.verify_tests_only:
                         if promoted_verify_test_path is not None:
@@ -674,25 +836,32 @@ def run_single(
                     finally:
                         cleanup_materialized_paths(materialized_verify_paths)
                     parsed = None
+                    execution_metadata: dict[str, Any] | None = None
                     if isinstance(response, dict):
                         result_payload = response.get("result")
                         if isinstance(result_payload, dict):
                             parsed = result_payload.get("parsed")
+                            raw_metadata = result_payload.get("metadata")
+                            if isinstance(raw_metadata, dict):
+                                execution_metadata = raw_metadata
                     item = {
                         "path": rel_path,
                         "tool_name": "verify",
                         "duration_ms": tool_duration_ms,
                         "response": parsed,
+                        "execution_metadata": execution_metadata,
                     }
                     attempt_cj_results.append(item)
                     result["tool_usage"]["verify_calls"] += 1
                     attempt_cj_total_ms += tool_duration_ms
                     if report_verdict(parsed) is None:
                         verify_inconclusive = True
-                    if report_is_failed(parsed):
-                        verify_failed = True
-                    elif report_is_inconclusive(parsed):
-                        verify_inconclusive = True
+                    else:
+                        cause_kind, _, _ = classify_verify_failure([item])
+                        if cause_kind == "inconclusive":
+                            verify_inconclusive = True
+                        elif cause_kind is not None:
+                            verify_failed = True
         attempt_record["court_jester"] = {
             "results": attempt_cj_results,
             "verify_failed": verify_failed,
@@ -1006,6 +1175,7 @@ def run_single(
     result["public_checks"] = [asdict(item) for item in public_results]
     result["hidden_checks"] = [asdict(item) for item in hidden_results]
     result["verify_summary"] = summarize_verify_results(court_jester_results)
+    result["verify_metadata"] = result["verify_summary"].get("metadata", {})
     result["verify_gate_ok"] = verify_gate_ok
     result["public_checks_pass"] = public_ok
     result["hidden_checks_pass"] = hidden_ok
@@ -1492,6 +1662,7 @@ def classify_outcome(
         "verify_failure_kind": verify_failure_kind,
         "verify_failure_stage": verify_failure_stage,
         "verify_failure_path": verify_failure_path,
+        "verify_metadata": verify_failure_metadata(verify_results),
     }
 
     if verify_failure_kind == "inconclusive":
@@ -1514,37 +1685,138 @@ def classify_outcome(
     return "unknown_failure", details
 
 
+def _cause_label(cause: dict[str, Any], report: dict[str, Any]) -> str:
+    if cause.get("classification") == "inconclusive":
+        kind = str(cause.get("kind") or "")
+        return "timeout" if kind in {"timeout", "memory_limit"} else "inconclusive"
+    if cause.get("classification") == "legacy":
+        for stage in report.get("stages", []):
+            if not stage_is_failed(stage):
+                continue
+            detail = stage.get("detail") if isinstance(stage.get("detail"), dict) else {}
+            haystack = "\n".join(
+                [
+                    stage_message(stage).lower(),
+                    str(detail.get("stdout", "")).lower(),
+                    str(detail.get("stderr", "")).lower(),
+                ]
+            )
+            if "timed out" in haystack:
+                return "timeout"
+            return "stage_failure"
+        return "report_failure"
+    return str(cause.get("kind") or "target_failure")
+
+
+def verify_failure_metadata(verify_results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Return terminal typed cause and stable execution metadata."""
+    selected: tuple[dict[str, Any], str | None, str | None] | None = None
+    reports_metadata: dict[str, set[str]] = {}
+    for item in verify_results:
+        report = item.get("response") if isinstance(item, dict) else None
+        if not isinstance(report, dict):
+            continue
+        for key, values in report_metadata(report).items():
+            reports_metadata.setdefault(key, set()).update(values)
+        item_metadata = item.get("execution_metadata") if isinstance(item, dict) else None
+        if isinstance(item_metadata, dict):
+            for key, target in (
+                ("source_modes", "source_modes"),
+                ("source_mode", "source_modes"),
+                ("network_policies", "network_policies"),
+                ("network_policy", "network_policies"),
+                ("runtimes", "runtimes"),
+                ("runtime", "runtimes"),
+                ("termination_kinds", "termination_kinds"),
+                ("provenance", "provenance"),
+            ):
+                values = item_metadata.get(key)
+                if isinstance(values, str):
+                    reports_metadata.setdefault(target, set()).add(values)
+                elif isinstance(values, list):
+                    reports_metadata.setdefault(target, set()).update(str(value) for value in values)
+        cause = report_terminal_cause(report)
+        if cause is None:
+            continue
+        stage_name = None
+        for stage in report.get("stages", []):
+            if not isinstance(stage, dict):
+                continue
+            detail = stage.get("detail")
+            stage_diagnostics = detail.get("diagnostics") if isinstance(detail, dict) else None
+            if isinstance(stage_diagnostics, list) and any(
+                isinstance(diagnostic, dict)
+                and all(
+                    diagnostic.get(key) == value
+                    for key, value in cause.items()
+                    if key != "classification"
+                )
+                for diagnostic in stage_diagnostics
+            ):
+                stage_name = str(stage.get("name"))
+                break
+            if cause.get("finding") in stage_findings(stage):
+                stage_name = str(stage.get("name"))
+                break
+            if cause.get("classification") == "legacy" and stage_is_failed(stage):
+                stage_name = str(stage.get("name"))
+                break
+        candidate = (cause, stage_name, item.get("path") if isinstance(item, dict) else None)
+        if selected is None or (
+            cause.get("classification") in {"target", "legacy"}
+            and selected[0].get("classification") not in {"target", "legacy"}
+        ):
+            selected = candidate
+    metadata: dict[str, Any] = {
+        key: sorted(values) for key, values in sorted(reports_metadata.items()) if values
+    }
+    if selected is not None:
+        cause, stage, path = selected
+        metadata["terminal_cause"] = {
+            key: value
+            for key, value in cause.items()
+            if key in {
+                "classification",
+                "domain",
+                "kind",
+                "component",
+                "impact",
+                "process",
+                "limits",
+            }
+        }
+        metadata["failure_stage"] = stage
+        metadata["failure_path"] = path
+    return metadata
+
+
 def classify_verify_failure(
     verify_results: list[dict[str, Any]],
 ) -> tuple[str | None, str | None, str | None]:
-    first_inconclusive_path: str | None = None
-    saw_inconclusive = False
+    first_inconclusive: tuple[str, str | None, str | None] | None = None
     for item in verify_results:
         parsed = item.get("response")
+        path = item.get("path") if isinstance(item, dict) else None
         if not isinstance(parsed, dict):
             continue
         verdict = report_verdict(parsed)
         if verdict == "inconclusive":
-            saw_inconclusive = True
-            if first_inconclusive_path is None:
-                first_inconclusive_path = item.get("path")
+            if first_inconclusive is None:
+                first_inconclusive = ("inconclusive", None, path)
             continue
         if verdict != "fail":
             continue
-        for stage in parsed["stages"]:
-            if not stage_is_failed(stage):
-                continue
-            detail = stage.get("detail") if isinstance(stage.get("detail"), dict) else {}
-            message = stage_message(stage).lower()
-            stdout = str(detail.get("stdout", "")).lower()
-            stderr = str(detail.get("stderr", "")).lower()
-            haystack = "\n".join([message, stdout, stderr])
-            if "timed out" in haystack:
-                return "timeout", stage["name"], item.get("path")
-            return "stage_failure", stage["name"], item.get("path")
-        return "report_failure", None, item.get("path")
-    if saw_inconclusive:
-        return "inconclusive", None, first_inconclusive_path
+        cause = report_terminal_cause(parsed)
+        if cause is None:
+            continue
+        label = _cause_label(cause, parsed)
+        stage = verify_failure_metadata([item]).get("failure_stage")
+        if cause.get("classification") in {"target", "legacy"}:
+            return label, stage, path
+        if first_inconclusive is None:
+            first_inconclusive = ("inconclusive", stage, path)
+    if first_inconclusive is not None:
+        return first_inconclusive
     return None, None, None
 
 def summarize_verify_results(verify_results: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1553,6 +1825,7 @@ def summarize_verify_results(verify_results: list[dict[str, Any]]) -> dict[str, 
     failed_stages: dict[str, int] = {}
     stage_durations_ms: dict[str, int] = {}
     finding_count = 0
+    terminal_causes: dict[str, int] = {}
 
     for item in verify_results:
         parsed = item.get("response")
@@ -1560,10 +1833,17 @@ def summarize_verify_results(verify_results: list[dict[str, Any]]) -> dict[str, 
         if not isinstance(parsed, dict):
             continue
         verdict = report_verdict(parsed)
-        if verdict == "fail" and isinstance(path, str):
-            failed_paths.append(path)
-        elif verdict == "inconclusive" and isinstance(path, str):
-            inconclusive_paths.append(path)
+        cause = report_terminal_cause(parsed)
+        if isinstance(path, str):
+            if cause and cause.get("classification") in {"target", "legacy"}:
+                failed_paths.append(path)
+            elif verdict == "inconclusive" or (
+                cause and cause.get("classification") == "inconclusive"
+            ):
+                inconclusive_paths.append(path)
+        if cause:
+            label = str(cause.get("kind") or cause.get("classification") or "unknown")
+            terminal_causes[label] = terminal_causes.get(label, 0) + 1
         for stage in parsed.get("stages", []):
             if not isinstance(stage, dict):
                 continue
@@ -1584,6 +1864,8 @@ def summarize_verify_results(verify_results: list[dict[str, Any]]) -> dict[str, 
         "failed_stage_counts": failed_stages,
         "stage_durations_ms": stage_durations_ms,
         "finding_count": finding_count,
+        "terminal_cause_counts": dict(sorted(terminal_causes.items())),
+        "metadata": verify_failure_metadata(verify_results),
     }
 def _observation(
     outcome: str,
@@ -1592,6 +1874,7 @@ def _observation(
     failure_stage: str | None = None,
     failure_path: str | None = None,
     report_schema_version: int | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "outcome": outcome,
@@ -1599,6 +1882,7 @@ def _observation(
         "failure_stage": failure_stage,
         "failure_path": failure_path,
         "report_schema_version": report_schema_version,
+        "metadata": metadata or {},
     }
 
 
@@ -1648,16 +1932,25 @@ def verifier_observation(result: dict[str, Any]) -> dict[str, Any]:
                 failure_path=path,
                 report_schema_version=schema_version,
             )
-        valid_reports.append((item, report))
-
     failure_kind, failure_stage, failure_path = classify_verify_failure(verify_results)
-    if any(report_verdict(report) == "fail" for _, report in valid_reports):
+    verify_metadata = verify_failure_metadata(verify_results)
+    if failure_kind is not None and failure_kind != "inconclusive":
         return _observation(
             "fail",
-            failure_kind or "verify_failed",
+            failure_kind,
             failure_stage=failure_stage,
             failure_path=failure_path,
             report_schema_version=VERIFY_SCHEMA_VERSION_REQUIRED,
+            metadata=verify_metadata,
+        )
+    if failure_kind == "inconclusive":
+        return _observation(
+            "abstain",
+            "verify_inconclusive",
+            failure_stage=failure_stage,
+            failure_path=failure_path,
+            report_schema_version=VERIFY_SCHEMA_VERSION_REQUIRED,
+            metadata=verify_metadata,
         )
     for item, report in valid_reports:
         if report_verdict(report) == "inconclusive":
@@ -1666,11 +1959,13 @@ def verifier_observation(result: dict[str, Any]) -> dict[str, Any]:
                 "verify_inconclusive",
                 failure_path=item.get("path"),
                 report_schema_version=VERIFY_SCHEMA_VERSION_REQUIRED,
+                metadata=verify_metadata,
             )
     return _observation(
         "pass",
         "verify_passed",
         report_schema_version=VERIFY_SCHEMA_VERSION_REQUIRED,
+        metadata=verify_metadata,
     )
 
 def append_shadow_record(path: Path | None, result: dict[str, Any], *, patch_digest: str = "") -> None:
@@ -2004,6 +2299,7 @@ def collect_verify_haystack(items: list[dict[str, Any]]) -> str:
             chunks.append(str(detail.get("stdout") or ""))
             for finding in stage_findings(stage):
                 chunks.append(str(finding))
+    return "\n".join(chunk for chunk in chunks if chunk)
 
 
 def build_fuzz_repro_assertion(language: str, failure: Any) -> str | None:

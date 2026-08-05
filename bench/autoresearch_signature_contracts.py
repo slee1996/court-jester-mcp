@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .common import BENCH_ROOT, REPO_ROOT, TaskManifest, load_task, load_task_set
+from .runner import report_metadata, report_terminal_cause
 
 
 DEFAULT_OUTPUT = BENCH_ROOT / "results" / "autoresearch" / "signature-contracts"
@@ -94,8 +95,10 @@ def stage_map(report: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
         if isinstance(stage, dict) and stage.get("name")
     }
 
-
 def first_execute_failure(report: dict[str, Any] | None) -> dict[str, Any] | None:
+    cause = report_terminal_cause(report)
+    if cause and cause.get("classification") == "inconclusive":
+        return None
     execute = stage_map(report).get("execute")
     if not execute:
         return None
@@ -307,8 +310,15 @@ def verify_task(
         result = run_json_command(command, cwd=workspace, timeout_seconds=timeout_seconds)
         report = result.get("json")
         verdict = report.get("verdict") if isinstance(report, dict) else None
-        failed = True if verdict == "fail" else False if verdict == "pass" else None
+        cause = report_terminal_cause(report)
+        if cause and cause.get("classification") in {"target", "legacy"}:
+            failed = True
+        elif verdict == "pass":
+            failed = False
+        else:
+            failed = None
         failure = first_execute_failure(report)
+        typed_metadata = report_metadata(report)
         path_results.append(
             {
                 "path": relative,
@@ -324,8 +334,14 @@ def verify_task(
                     for name, stage in stage_map(report).items()
                 },
                 "failure": failure,
+                "typed_cause": cause,
+                "metadata": typed_metadata,
                 "evidence_kind": "timeout"
                 if result["timed_out"]
+                else evidence_kind(failure, report)
+                if failure
+                else str(cause.get("kind") or "inconclusive")
+                if cause
                 else evidence_kind(failure, report),
                 "stderr": result.get("stderr", "")[-1200:],
             }

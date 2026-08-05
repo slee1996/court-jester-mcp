@@ -4,6 +4,26 @@ This changelog tracks user-visible verifier semantics, report-shape changes, and
 
 ## Unreleased
 
+## 0.2.1 - 2026-08-01
+
+Post-0.2.0 correctness and execution-hardening release. See [docs/release-notes-0.2.1.md](docs/release-notes-0.2.1.md) for the complete change list and validation evidence.
+
+### Verification context and execution
+
+- Project-aware source, test, dependency, and package-root resolution now remains consistent across analysis, synthesis, lint, authoritative tests, differential runs, and replay.
+- Python and TypeScript/TSX harness launches preserve project semantics while reporting parse, module-load, timeout, memory, process, and network failures as typed diagnostics.
+- Generated harnesses and candidate artifacts stay inside owned temporary roots; local and isolated execution enforce the selected network and resource policies without mutating the target repository.
+
+### Synthesis and provenance
+
+- Rest and keyword-variadic arguments preserve their call shape through planning, binding, execution, minimization, persistence, and replay.
+- Callable and service-like defaults receive deterministic no-I/O substitutes only when their declared return shape is synthesizable; unsafe defaults are skipped with typed reasons.
+- Seed, fixture, observed-call, generated-input, and safe-substitute provenance is retained in unit events, plans, findings, and benchmark metadata.
+
+### Compatibility
+
+- The schema-v3 report contract remains compatible with 0.2.0 consumers; this release adds typed diagnostic detail without restoring legacy success fields.
+
 ## 0.2.0 - 2026-07-15
 
 Full categorized change log, migration guide, command additions, validation evidence, and source statistics: [docs/release-notes-0.2.0.md](docs/release-notes-0.2.0.md).

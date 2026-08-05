@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing v0.2.0-or-newer tag to build and upload.'
+        description: 'Existing v0.2.1-or-newer tag to build and upload.'
         required: true
 
 permissions:

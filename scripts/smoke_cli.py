@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 
 from __future__ import annotations
-
 import argparse
 import json
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -45,6 +45,151 @@ def run_command(argv: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
         check=False,
     )
 
+
+
+def run_extended_release_smoke(binary: Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="court-jester-smoke-") as directory:
+        project = Path(directory)
+        valid_tsx = project / "Badge.tsx"
+        valid_tsx.write_text(
+            "export function Badge({ label }: { label: string }) {\n"
+            "  return <span>{label}</span>;\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        analyze = run_command(
+            [
+                str(binary),
+                "analyze",
+                "--file",
+                str(valid_tsx),
+                "--language",
+                "typescript",
+                "--project-dir",
+                str(project),
+            ],
+            project,
+        )
+        if analyze.returncode != 0:
+            raise RuntimeError(analyze.stderr.strip() or analyze.stdout.strip())
+        analysis = json.loads(analyze.stdout)
+        if (
+            analysis.get("source_mode") != "tsx"
+            or analysis.get("parse_error") is not False
+            or not any(
+                function.get("name") == "Badge"
+                for function in analysis.get("functions", [])
+            )
+        ):
+            raise RuntimeError(f"valid TSX analysis was not admitted: {analysis}")
+
+        malformed_tsx = project / "Malformed.tsx"
+        malformed_tsx.write_text(
+            "export function Badge( {\n  return <span>broken;\n",
+            encoding="utf-8",
+        )
+        malformed = run_command(
+            [
+                str(binary),
+                "analyze",
+                "--file",
+                str(malformed_tsx),
+                "--language",
+                "typescript",
+                "--project-dir",
+                str(project),
+            ],
+            project,
+        )
+        if malformed.returncode != 0:
+            raise RuntimeError(malformed.stderr.strip() or malformed.stdout.strip())
+        malformed_report = json.loads(malformed.stdout)
+        diagnostics = malformed_report.get("parse_diagnostics", [])
+        if not malformed_report.get("parse_error") or not diagnostics:
+            raise RuntimeError(
+                f"malformed TSX did not produce structured diagnostics: {malformed_report}"
+            )
+        first_diagnostic = diagnostics[0]
+        if not (
+            isinstance(first_diagnostic.get("start_line"), int)
+            and first_diagnostic["start_line"] >= 1
+            and isinstance(first_diagnostic.get("start_column"), int)
+            and first_diagnostic["start_column"] >= 1
+        ):
+            raise RuntimeError(
+                f"malformed TSX diagnostic lacks a location: {first_diagnostic}"
+            )
+
+        target = project / "arg_target.py"
+        target.write_text(
+            "import argparse\n"
+            "import json\n"
+            "from pathlib import Path\n"
+            "\n"
+            "_parser = argparse.ArgumentParser()\n"
+            "_parser.add_argument('action')\n"
+            "_parser.add_argument('--manifest', required=True)\n"
+            "_arguments = _parser.parse_args()\n"
+            "Path(_arguments.manifest).read_text(encoding='utf-8')\n"
+            "\n"
+            "def echo(value: str) -> str:\n"
+            "    return value\n",
+            encoding="utf-8",
+        )
+        (project / "manifest.json").write_text(
+            json.dumps({"name": "smoke"}), encoding="utf-8"
+        )
+        harness_args = json.dumps(
+            [
+                {"literal": "run"},
+                {"literal": "--manifest"},
+                {"project_path": "manifest.json"},
+            ]
+        )
+        verify = run_command(
+            [
+                str(binary),
+                "verify",
+                "--file",
+                str(target),
+                "--language",
+                "python",
+                "--project-dir",
+                str(project),
+                "--harness-args-json",
+                harness_args,
+            ],
+            project,
+        )
+        if verify.returncode not in {0, 1}:
+            raise RuntimeError(verify.stderr.strip() or verify.stdout.strip())
+        report = json.loads(verify.stdout)
+        if "required" in (verify.stdout + verify.stderr).lower() and "manifest" in (
+            verify.stdout + verify.stderr
+        ).lower():
+            raise RuntimeError(
+                "Python harness arguments were not forwarded to the target: "
+                f"{verify.stderr.strip()}"
+            )
+        execute_stage = next(
+            (
+                stage
+                for stage in report.get("stages", [])
+                if stage.get("name") == "execute"
+            ),
+            None,
+        )
+        execute_detail = (execute_stage or {}).get("detail") or {}
+        events = execute_detail.get("harness_events") or {}
+        if events.get("target_ready") is not True:
+            raise RuntimeError(
+                f"generated harness did not report target readiness: {events}"
+            )
+        termination = (execute_detail.get("execution") or {}).get("termination") or {}
+        if termination.get("kind") in {"timed_out", "memory_limit"}:
+            raise RuntimeError(
+                f"argument-forwarding smoke unexpectedly hit a resource limit: {termination}"
+            )
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Smoke-test the Court Jester CLI.")
@@ -149,6 +294,13 @@ def main() -> int:
     if args.verify_sample and report.get("verdict") != "fail":
         print("Expected the bundled sample fixture to fail verify.", file=sys.stderr)
         return 1
+    if args.verify_sample:
+        try:
+            run_extended_release_smoke(binary)
+        except (OSError, RuntimeError, json.JSONDecodeError) as exc:
+            print(f"Extended release smoke failed: {exc}", file=sys.stderr)
+            return 1
+        print("Extended TSX and harness-argument smoke checks passed.")
     return 0
 
 

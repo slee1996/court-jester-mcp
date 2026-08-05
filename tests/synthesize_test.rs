@@ -1,4 +1,4 @@
-use court_jester::tools::domain::build_verification_plan;
+use court_jester::tools::domain::{build_verification_plan, safe_dependency_substitute};
 use court_jester::tools::synthesize::{
     synthesize_calls, synthesize_plan, synthesize_plan_for_verification,
     synthesize_plan_for_with_seeds,
@@ -17,6 +17,8 @@ fn make_analysis(functions: Vec<FunctionInfo>, classes: Vec<ClassInfo>) -> Analy
         max_nesting_depth: 0,
         complexity_breakdown: BTreeMap::new(),
         parse_error: false,
+        source_mode: SourceMode::TypeScript,
+        parse_diagnostics: vec![],
     }
 }
 
@@ -30,6 +32,8 @@ fn func(name: &str, params: Vec<(&str, Option<&str>)>, ret: Option<&str>) -> Fun
                 type_annotation: t.map(|s| s.to_string()),
                 default_value: None,
                 keyword_only: false,
+                optional: false,
+                variadic: None,
             })
             .collect(),
         return_type: ret.map(|s| s.to_string()),
@@ -61,6 +65,8 @@ fn kwonly_func(
             type_annotation: t.map(|s| s.to_string()),
             default_value: None,
             keyword_only: false,
+            optional: false,
+            variadic: None,
         })
         .collect();
     params.extend(keyword.into_iter().map(|(n, t)| ParamInfo {
@@ -68,6 +74,8 @@ fn kwonly_func(
         type_annotation: t.map(|s| s.to_string()),
         default_value: None,
         keyword_only: true,
+        optional: false,
+        variadic: None,
     }));
     FunctionInfo {
         name: name.to_string(),
@@ -1443,6 +1451,8 @@ fn typescript_fuzzes_resolved_alias_params() {
         max_nesting_depth: 0,
         complexity_breakdown: BTreeMap::new(),
         parse_error: false,
+        source_mode: SourceMode::TypeScript,
+        parse_diagnostics: vec![],
     };
     let code = synthesize_calls(&analysis, &Language::TypeScript);
     assert!(
@@ -1499,6 +1509,8 @@ fn typescript_recursive_alias_params_do_not_overflow() {
         max_nesting_depth: 0,
         complexity_breakdown: BTreeMap::new(),
         parse_error: false,
+        source_mode: SourceMode::TypeScript,
+        parse_diagnostics: vec![],
     };
     let code = synthesize_calls(&analysis, &Language::TypeScript);
     assert!(
@@ -2026,6 +2038,8 @@ fn python_skips_methods_in_fuzz() {
                     type_annotation: Some("int".to_string()),
                     default_value: None,
                     keyword_only: false,
+                    optional: false,
+                    variadic: None,
                 }],
                 return_type: Some("int".to_string()),
                 line: 2,
@@ -2193,6 +2207,133 @@ fn typescript_callback_generator() {
         code.contains("() => undefined"),
         "callback should generate stub function, got: {code}"
     );
+}
+
+#[test]
+fn safe_dependency_substitution_preserves_return_shape_and_provenance() {
+    let typescript = ParamInfo {
+        name: "geocoder".into(),
+        type_annotation: Some("(city: string) => Promise<string>".into()),
+        default_value: Some("EXTERNAL_DEFAULT_CALLED".into()),
+        keyword_only: false,
+        optional: true,
+        variadic: None,
+    };
+    let substitute = safe_dependency_substitute(&typescript, &Language::TypeScript, &[], &[])
+        .expect("typed async dependency should be safely substituted");
+    assert!(substitute.expression.contains("Promise.resolve"));
+    assert!(!substitute.expression.contains("EXTERNAL_DEFAULT_CALLED"));
+
+    let python = ParamInfo {
+        name: "callback".into(),
+        type_annotation: Some("Callable[[str], str]".into()),
+        default_value: Some("external_callback".into()),
+        keyword_only: false,
+        optional: true,
+        variadic: None,
+    };
+    let python_substitute = safe_dependency_substitute(&python, &Language::Python, &[], &[])
+        .expect("Python Callable dependency should be safely substituted");
+    assert!(python_substitute.expression.contains("lambda"));
+    assert!(python_substitute.expression.contains("\"\""));
+}
+
+#[test]
+fn safe_service_object_substitution_replaces_callable_members() {
+    let service = ClassInfo {
+        name: "GeoService".into(),
+        bases: vec![],
+        line: 1,
+        fields: vec![FieldInfo {
+            name: "lookup".into(),
+            type_annotation: Some("(city: string) => Promise<string>".into()),
+            optional: false,
+            has_default: false,
+        }],
+    };
+    let parameter = ParamInfo {
+        name: "service".into(),
+        type_annotation: Some("GeoService".into()),
+        default_value: Some("EXTERNAL_DEFAULT_CALLED".into()),
+        keyword_only: false,
+        optional: true,
+        variadic: None,
+    };
+    let substitute = safe_dependency_substitute(
+        &parameter,
+        &Language::TypeScript,
+        std::slice::from_ref(&service),
+        &[],
+    )
+    .expect("service object should have a no-I/O substitute");
+    assert!(substitute.expression.contains("lookup"));
+    assert!(substitute.expression.contains("Promise.resolve"));
+    assert!(!substitute.expression.contains("EXTERNAL_DEFAULT_CALLED"));
+}
+
+#[test]
+fn unsafe_dependency_defaults_are_skipped_with_typed_reason() {
+    let mut target = func("load", vec![("service", None)], None);
+    target.params[0].default_value = Some("EXTERNAL_DEFAULT_CALLED".into());
+    let analysis = make_analysis(vec![target], vec![]);
+    let plan = synthesize_plan(&analysis, &Language::Python);
+    let entry = plan
+        .coverage
+        .iter()
+        .find(|entry| entry.function == "load")
+        .expect("coverage entry");
+    assert_eq!(entry.status, FuzzFunctionStatus::SkippedUnsupportedType);
+    assert!(entry
+        .reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("unsafe_default_dependency:service:untyped")));
+}
+
+#[test]
+fn normalized_dependency_seed_is_not_external_and_marks_harness_origin() {
+    let mut target = func(
+        "lookup",
+        vec![("geocoder", Some("(city: string) => Promise<string>"))],
+        None,
+    );
+    target.params[0].default_value = Some("EXTERNAL_DEFAULT_CALLED".into());
+    let caller = CallerExample {
+        caller: "public_api".into(),
+        target_surface_id: "lookup:1".into(),
+        source_file: "caller.ts".into(),
+        line: 4,
+        arguments: PlannedArguments {
+            positional: vec![],
+            named: BTreeMap::new(),
+        },
+        evidence: CallerEvidence::RuntimeConfirmed,
+    };
+    let plan = build_verification_plan(
+        &[target.clone()],
+        &[],
+        &[],
+        &Language::TypeScript,
+        &[caller],
+        &[],
+        &[],
+    );
+    let input = plan
+        .inputs
+        .iter()
+        .find(|input| input.surface_id == "lookup:1")
+        .expect("normalized caller input");
+    assert_eq!(input.arguments.positional.len(), 1);
+    assert!(!input.arguments.positional[0]
+        .expression
+        .contains("EXTERNAL_DEFAULT_CALLED"));
+    assert!(input
+        .sources
+        .iter()
+        .any(|source| { source.kind == DomainSourceKind::SafeDependencySubstitute }));
+
+    let harness =
+        synthesize_plan_for_verification(&[target], &[], &[], &Language::TypeScript, &plan);
+    assert!(harness.code.contains("safe_dependency_substitute"));
 }
 
 #[test]
