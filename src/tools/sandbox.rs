@@ -973,10 +973,195 @@ fn copy_materialization_tree_inner(
     active_directories.remove(&canonical_source);
     result
 }
+struct NodePackageResolver {
+    _directory: tempfile::TempDir,
+    loader: std::path::PathBuf,
+}
+
+fn create_node_package_resolver() -> Result<NodePackageResolver, String> {
+    let directory = tempfile::tempdir()
+        .map_err(|error| format!("failed to create Node package resolver: {error}"))?;
+    let loader = directory.path().join("package-resolver.mjs");
+    std::fs::write(
+        &loader,
+        r##"
+import { readFileSync, realpathSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+const mode = process.env.COURT_JESTER_NODE_RESOLUTION_MODE || "";
+const overlayRoot = realPathOrSelf(process.env.COURT_JESTER_NODE_OVERLAY_ROOT || "");
+const sourceRoot = realPathOrSelf(process.env.COURT_JESTER_NODE_SOURCE_ROOT || "");
+const targetRoot = realPathOrSelf(process.env.COURT_JESTER_NODE_TARGET_ROOT || "");
+const overlayTargetRoot = realPathOrSelf(
+  process.env.COURT_JESTER_NODE_OVERLAY_TARGET_ROOT || "",
+);
+const generatedArtifact = realPathOrSelf(
+  process.env.COURT_JESTER_NODE_GENERATED_ARTIFACT || "",
+);
+const targetSelfReferenceName = readSelfReferenceName(overlayTargetRoot);
+
+function realPathOrSelf(value) {
+  if (!value) return value;
+  try {
+    return realpathSync(value);
+  } catch {
+    return value;
+  }
+}
+
+function readSelfReferenceName(root) {
+  try {
+    const manifest = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
+    return Object.hasOwn(manifest, "exports") ? manifest.name : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isPackageSpecifier(specifier) {
+  return !specifier.startsWith(".")
+    && !specifier.startsWith("/")
+    && !specifier.startsWith("#")
+    && !/^[A-Za-z][A-Za-z0-9+.-]*:/.test(specifier);
+}
+
+function requestedPackageName(specifier) {
+  const segments = specifier.split("/");
+  return specifier.startsWith("@") ? segments.slice(0, 2).join("/") : segments[0];
+}
+
+function containsPath(root, candidate) {
+  if (!root) return false;
+  const relative = path.relative(root, candidate);
+  return relative === "" || (!relative.startsWith(`..${path.sep}`)
+    && relative !== ".."
+    && !path.isAbsolute(relative));
+}
+
+function isInsideNodeModules(candidate) {
+  return candidate.split(path.sep).includes("node_modules");
+}
+
+function overlayParentPath(context) {
+  if (!overlayRoot || !context.parentURL?.startsWith("file:")) return undefined;
+  try {
+    const parentPath = realPathOrSelf(fileURLToPath(context.parentURL));
+    return containsPath(overlayRoot, parentPath) ? parentPath : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function sourceParentURL(parentPath) {
+  const relative = path.relative(overlayRoot, parentPath);
+  return pathToFileURL(path.join(sourceRoot, relative)).href;
+}
+
+function packageWasNotFound(error, packageName) {
+  if (error?.code !== "ERR_MODULE_NOT_FOUND") return false;
+  return error.message?.includes(`Cannot find package '${packageName}'`) === true
+    || error.message?.includes(`Cannot find package "${packageName}"`) === true;
+}
+
+export async function resolve(specifier, context, nextResolve) {
+  if (!isPackageSpecifier(specifier)) {
+    return nextResolve(specifier, context);
+  }
+  const parentPath = overlayParentPath(context);
+  if (!parentPath) {
+    return nextResolve(specifier, context);
+  }
+
+  const packageName = requestedPackageName(specifier);
+  if (mode === "existing") {
+    try {
+      return await nextResolve(specifier, context);
+    } catch (error) {
+      if (isInsideNodeModules(parentPath) || !packageWasNotFound(error, packageName)) {
+        throw error;
+      }
+      if (parentPath === generatedArtifact) {
+        const mappedParentURL = sourceParentURL(parentPath);
+        if (mappedParentURL !== context.parentURL) {
+          try {
+            return await nextResolve(specifier, {
+              ...context,
+              parentURL: mappedParentURL,
+            });
+          } catch (mappedError) {
+            if (!packageWasNotFound(mappedError, packageName)) throw mappedError;
+          }
+        }
+        return nextResolve(specifier, {
+          ...context,
+          parentURL: pathToFileURL(path.join(targetRoot, "package.json")).href,
+        });
+      }
+      return nextResolve(specifier, {
+        ...context,
+        parentURL: sourceParentURL(parentPath),
+      });
+    }
+  }
+
+  const originatesFromTarget = parentPath === generatedArtifact
+    || containsPath(overlayTargetRoot, parentPath);
+  if (!originatesFromTarget) {
+    return nextResolve(specifier, {
+      ...context,
+      parentURL: sourceParentURL(parentPath),
+    });
+  }
+  const resolutionRoot = packageName === targetSelfReferenceName
+    ? overlayTargetRoot
+    : targetRoot;
+  return nextResolve(specifier, {
+    ...context,
+    parentURL: pathToFileURL(path.join(resolutionRoot, "package.json")).href,
+  });
+}
+"##,
+    )
+    .map_err(|error| format!("failed to write Node package resolver: {error}"))?;
+    Ok(NodePackageResolver {
+        _directory: directory,
+        loader,
+    })
+}
+
+fn node_dependency_paths(dependency_roots: &[std::path::PathBuf]) -> Vec<String> {
+    dependency_roots
+        .iter()
+        .map(|root| root.join("node_modules"))
+        .filter(|path| path.is_dir())
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn node_package_resolver_roots(
+    target_package_root: &std::path::Path,
+    dependency_roots: &[std::path::PathBuf],
+) -> Vec<String> {
+    let mut roots = Vec::with_capacity(dependency_roots.len() + 1);
+    for root in std::iter::once(target_package_root)
+        .chain(dependency_roots.iter().map(std::path::PathBuf::as_path))
+    {
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    roots
+        .into_iter()
+        .map(|root| root.to_string_lossy().into_owned())
+        .collect()
+}
+
 struct NetworkGuard {
     _directory: tempfile::TempDir,
     python_sitecustomize: std::path::PathBuf,
     node_preload: std::path::PathBuf,
+    vitest_coordinator: std::path::PathBuf,
 }
 
 fn create_network_guard() -> Result<NetworkGuard, String> {
@@ -984,6 +1169,7 @@ fn create_network_guard() -> Result<NetworkGuard, String> {
         tempfile::tempdir().map_err(|error| format!("failed to create network guard: {error}"))?;
     let python_sitecustomize = directory.path().join("sitecustomize.py");
     let node_preload = directory.path().join("network-guard.cjs");
+    let vitest_coordinator = directory.path().join("vitest-coordinator.mjs");
     std::fs::write(
         &python_sitecustomize,
         r#"
@@ -1099,8 +1285,14 @@ try {
 } catch (_) {}
 try {
   const workerThreads = require("worker_threads");
-  if (workerThreads.Worker && workerThreads.Worker.prototype) {
-    patch(workerThreads.Worker.prototype, ["postMessage"], denyProcess);
+  if (typeof workerThreads.Worker === "function") {
+    workerThreads.Worker = function CourtJesterBlockedWorker() {
+      return denyProcess();
+    };
+    const builtinModule = require("module");
+    if (typeof builtinModule.syncBuiltinESMExports === "function") {
+      builtinModule.syncBuiltinESMExports();
+    }
   }
 } catch (_) {}
 globalThis.fetch = denyNetwork;
@@ -1109,10 +1301,29 @@ globalThis.__COURT_JESTER_NETWORK_GUARD__ = true;
 "#,
     )
     .map_err(|error| format!("failed to write Node network guard: {error}"))?;
+    std::fs::write(
+        &vitest_coordinator,
+        r#"
+import { pathToFileURL } from "node:url";
+
+const [entrypoint, guard, ...args] = process.argv.slice(2);
+if (!entrypoint || !guard) {
+  throw new Error("court-jester Vitest coordinator requires an entrypoint and worker guard");
+}
+const preload = `--require=${guard}`;
+process.env.NODE_OPTIONS = process.env.NODE_OPTIONS
+  ? `${preload} ${process.env.NODE_OPTIONS}`
+  : preload;
+process.argv = [process.execPath, entrypoint, ...args];
+await import(pathToFileURL(entrypoint).href);
+"#,
+    )
+    .map_err(|error| format!("failed to write Vitest coordinator: {error}"))?;
     Ok(NetworkGuard {
         _directory: directory,
         python_sitecustomize,
         node_preload,
+        vitest_coordinator,
     })
 }
 
@@ -1871,6 +2082,11 @@ fn harness_diagnostics(
     if process.exit_code == Some(0) {
         return diagnostics;
     }
+    let has_non_target_blocker = diagnostics.iter().any(|diagnostic| {
+        diagnostic.impact == DiagnosticImpact::Blocking
+            && diagnostic.domain != FailureDomain::TargetCode
+            && diagnostic.kind != FailureKind::NonzeroExit
+    });
     match adapter.unwrap_or(TestAdapter::Opaque) {
         TestAdapter::Opaque => {}
         TestAdapter::NodeTap => {
@@ -1896,11 +2112,53 @@ fn harness_diagnostics(
                 });
             }
         }
-        TestAdapter::BunJunit | TestAdapter::VitestJson | TestAdapter::JestJson => {
-            let structured_failure = process.stdout.contains("<failure")
-                || process.stdout.contains("\"status\":\"failed\"")
-                || process.stdout.contains("\"pass\":false")
-                || process.stderr.contains("<failure");
+        TestAdapter::BunJunit => {
+            if has_non_target_blocker {
+                return diagnostics;
+            }
+            let reported_failure =
+                process
+                    .stdout
+                    .lines()
+                    .chain(process.stderr.lines())
+                    .any(|line| {
+                        let line = line.trim();
+                        line.starts_with("(fail)")
+                            || line.starts_with("(error)")
+                            || [" fail", " error"].iter().any(|suffix| {
+                                line.strip_suffix(suffix)
+                                    .and_then(|count| count.trim().parse::<usize>().ok())
+                                    .is_some_and(|count| count > 0)
+                            })
+                    });
+            let (domain, kind, impact, message) = if reported_failure {
+                (
+                    FailureDomain::TargetCode,
+                    FailureKind::AssertionFailure,
+                    DiagnosticImpact::Gating,
+                    "authoritative Bun test failed",
+                )
+            } else {
+                (
+                    FailureDomain::VerifierHarness,
+                    FailureKind::HarnessProtocol,
+                    DiagnosticImpact::Blocking,
+                    "Bun test runner did not emit a recognized failure result",
+                )
+            };
+            diagnostics.push(FailureDiagnostic {
+                domain,
+                kind,
+                component: DiagnosticComponent::AuthoritativeTestRunner,
+                impact,
+                message: message.into(),
+                process: process.termination.clone(),
+                limits: Some(limits.clone()),
+            });
+        }
+        TestAdapter::VitestJson | TestAdapter::JestJson => {
+            let structured_failure = process.stdout.contains("\"status\":\"failed\"")
+                || process.stdout.contains("\"pass\":false");
             if structured_failure {
                 diagnostics.push(FailureDiagnostic {
                     domain: FailureDomain::TargetCode,
@@ -1925,6 +2183,121 @@ fn harness_diagnostics(
         }
     }
     diagnostics
+}
+
+#[derive(Debug)]
+struct DockerPathMapping {
+    project_root: std::path::PathBuf,
+    container_artifact: std::path::PathBuf,
+    container_cwd: std::path::PathBuf,
+}
+
+fn docker_path_mapping(
+    source_root: &std::path::Path,
+    project_root: &std::path::Path,
+    host_artifact: &std::path::Path,
+    launch_cwd: &std::path::Path,
+) -> Result<DockerPathMapping, String> {
+    let source_root = std::fs::canonicalize(source_root)
+        .map_err(|error| format!("docker source root is unavailable: {error}"))?;
+    let project_root = std::fs::canonicalize(project_root)
+        .map_err(|error| format!("docker project mirror is unavailable: {error}"))?;
+    let host_artifact = std::fs::canonicalize(host_artifact)
+        .map_err(|error| format!("docker harness artifact is unavailable: {error}"))?;
+    let artifact_relative = host_artifact
+        .strip_prefix(&source_root)
+        .ok()
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| "docker harness artifact is outside the project mirror".to_string())?;
+    let artifact_relative = normalize_harness_path(artifact_relative)?;
+    let launch_cwd = std::fs::canonicalize(launch_cwd)
+        .map_err(|error| format!("docker harness working directory is unavailable: {error}"))?;
+    let cwd_relative = launch_cwd
+        .strip_prefix(&source_root)
+        .map_err(|_| "docker harness working directory is outside the project mirror")?;
+
+    Ok(DockerPathMapping {
+        project_root,
+        container_artifact: std::path::Path::new("/workspace").join(artifact_relative),
+        container_cwd: std::path::Path::new("/workspace").join(cwd_relative),
+    })
+}
+
+const DOCKER_DEPENDENCY_WORKSPACE: &str = "/court-jester/dependencies";
+
+#[derive(Debug, PartialEq, Eq)]
+struct DockerDependencyMapping {
+    workspace_root: std::path::PathBuf,
+    container_roots: Vec<String>,
+    node_paths: Vec<String>,
+}
+
+fn docker_dependency_mapping(
+    workspace_root: &std::path::Path,
+    dependency_roots: &[std::path::PathBuf],
+) -> Result<DockerDependencyMapping, String> {
+    let workspace_root = std::fs::canonicalize(workspace_root)
+        .map_err(|error| format!("docker dependency workspace is unavailable: {error}"))?;
+    let container_workspace = std::path::Path::new(DOCKER_DEPENDENCY_WORKSPACE);
+    let mut container_roots = Vec::new();
+    let mut node_paths = Vec::new();
+
+    for dependency in dependency_roots {
+        let canonical = match std::fs::canonicalize(dependency) {
+            Ok(path) if path.is_dir() => path,
+            _ => continue,
+        };
+        let Ok(relative) = canonical.strip_prefix(&workspace_root) else {
+            continue;
+        };
+        let container_root = if relative.as_os_str().is_empty() {
+            container_workspace.to_path_buf()
+        } else {
+            container_workspace.join(relative)
+        };
+        let container_root = container_root.to_string_lossy().into_owned();
+        if container_roots
+            .iter()
+            .any(|existing| existing == &container_root)
+        {
+            continue;
+        }
+        if canonical.join("node_modules").is_dir() {
+            node_paths.push(
+                std::path::Path::new(&container_root)
+                    .join("node_modules")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        container_roots.push(container_root);
+    }
+
+    Ok(DockerDependencyMapping {
+        workspace_root,
+        container_roots,
+        node_paths,
+    })
+}
+
+fn configure_docker_node_loader(
+    runtime: crate::types::HarnessRuntime,
+    loader: &str,
+    command: &mut Vec<String>,
+) -> Option<String> {
+    match runtime {
+        crate::types::HarnessRuntime::NodeScript | crate::types::HarnessRuntime::NodeTest => {
+            command.splice(
+                1..1,
+                ["--experimental-loader".to_string(), loader.to_string()],
+            );
+            None
+        }
+        crate::types::HarnessRuntime::TsxScript => {
+            Some(format!("NODE_OPTIONS=--experimental-loader={loader}"))
+        }
+        _ => None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1968,34 +2341,17 @@ async fn run_harness_in_docker(
             ));
         }
     }
-    let source_root = root
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| context.workspace_root.clone());
-    let source_root = std::fs::canonicalize(&source_root).unwrap_or_else(|_| source_root.clone());
+    let source_root = root.unwrap_or(&context.workspace_root);
     let project_root = root
-        .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
-        .or_else(|| {
-            mirror
-                .as_ref()
-                .map(|directory| directory.path().to_path_buf())
-        })
-        .unwrap_or_else(|| source_root.clone());
-    let artifact_relative = match host_artifact.strip_prefix(&source_root) {
-        Ok(path) if !path.as_os_str().is_empty() => path.to_path_buf(),
-        _ => return launch_failure("docker harness artifact is outside the project mirror"),
-    };
-    let artifact_relative = match normalize_harness_path(&artifact_relative) {
-        Ok(path) => path,
+        .or_else(|| mirror.as_ref().map(|directory| directory.path()))
+        .unwrap_or(source_root);
+    let mapping = match docker_path_mapping(source_root, project_root, host_artifact, launch_cwd) {
+        Ok(mapping) => mapping,
         Err(error) => return launch_failure(error),
     };
-    let container_artifact = std::path::Path::new("/workspace").join(&artifact_relative);
-    let cwd_relative = launch_cwd
-        .strip_prefix(&source_root)
-        .ok()
-        .filter(|path| !path.as_os_str().is_empty())
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_default();
-    let container_cwd = std::path::Path::new("/workspace").join(cwd_relative);
+    let project_root = mapping.project_root;
+    let container_artifact = mapping.container_artifact;
+    let container_cwd = mapping.container_cwd;
 
     let container = format!(
         "court-jester-harness-{}-{}",
@@ -2040,33 +2396,34 @@ async fn run_harness_in_docker(
         image.to_string(),
     ];
 
-    let mut python_paths = Vec::new();
-    let mut node_paths = Vec::new();
-    for (index, dependency) in context.dependency_roots.iter().enumerate() {
-        let canonical = match std::fs::canonicalize(dependency) {
-            Ok(path) if path.is_dir() => path,
-            _ => continue,
+    let dependency_mapping =
+        match docker_dependency_mapping(&context.workspace_root, &context.dependency_roots) {
+            Ok(mapping) => mapping,
+            Err(error) => return launch_failure(error),
         };
-        if let Ok(relative) = canonical.strip_prefix(&project_root) {
-            let container_path = std::path::Path::new("/workspace").join(relative);
-            python_paths.push(container_path.to_string_lossy().into_owned());
-            node_paths.push(container_path.to_string_lossy().into_owned());
-            continue;
-        }
-        let container_path =
-            std::path::PathBuf::from(format!("/court-jester/dependencies/{index}"));
+    let resolver_roots =
+        node_package_resolver_roots(&context.target_package_root, &context.dependency_roots)
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .collect::<Vec<_>>();
+    let resolver_mapping = match docker_dependency_mapping(&context.workspace_root, &resolver_roots)
+    {
+        Ok(mapping) => mapping,
+        Err(error) => return launch_failure(error),
+    };
+    let python_paths = dependency_mapping.container_roots;
+    let node_paths = dependency_mapping.node_paths;
+    let container_node_resolver_roots = resolver_mapping.container_roots;
+    if !python_paths.is_empty() || !container_node_resolver_roots.is_empty() {
         create.insert(create.len() - 1, "--mount".to_string());
         create.insert(
             create.len() - 1,
             format!(
                 "type=bind,src={},dst={},readonly",
-                canonical.display(),
-                container_path.display()
+                dependency_mapping.workspace_root.display(),
+                DOCKER_DEPENDENCY_WORKSPACE
             ),
         );
-        let container_path = container_path.to_string_lossy().into_owned();
-        python_paths.push(container_path.clone());
-        node_paths.push(container_path);
     }
     if !python_paths.is_empty() {
         create.insert(create.len() - 1, "-e".to_string());
@@ -2081,6 +2438,71 @@ async fn run_harness_in_docker(
             create.len() - 1,
             format!("NODE_PATH={}", node_paths.join(":")),
         );
+    }
+
+    let node_package_resolver = if matches!(
+        harness.runtime,
+        crate::types::HarnessRuntime::NodeScript
+            | crate::types::HarnessRuntime::NodeTest
+            | crate::types::HarnessRuntime::TsxScript
+    ) && !container_node_resolver_roots.is_empty()
+    {
+        match create_node_package_resolver() {
+            Ok(resolver) => Some(resolver),
+            Err(error) => return launch_failure(error),
+        }
+    } else {
+        None
+    };
+    let container_package_resolver = "/court-jester/package-resolver.mjs";
+    if let Some(resolver) = node_package_resolver.as_ref() {
+        create.insert(create.len() - 1, "--mount".to_string());
+        create.insert(
+            create.len() - 1,
+            format!(
+                "type=bind,src={},dst={},readonly",
+                resolver.loader.display(),
+                container_package_resolver
+            ),
+        );
+        let target_relative = context
+            .target_package_root
+            .strip_prefix(&context.workspace_root)
+            .unwrap_or_else(|_| std::path::Path::new(""));
+        let container_source_root = std::path::Path::new(DOCKER_DEPENDENCY_WORKSPACE);
+        let resolver_environment = [
+            format!(
+                "COURT_JESTER_NODE_RESOLUTION_MODE={}",
+                if root.is_some() {
+                    "generated"
+                } else {
+                    "existing"
+                }
+            ),
+            "COURT_JESTER_NODE_OVERLAY_ROOT=/workspace".to_string(),
+            format!(
+                "COURT_JESTER_NODE_SOURCE_ROOT={}",
+                container_source_root.display()
+            ),
+            format!(
+                "COURT_JESTER_NODE_TARGET_ROOT={}",
+                container_source_root.join(target_relative).display()
+            ),
+            format!(
+                "COURT_JESTER_NODE_OVERLAY_TARGET_ROOT={}",
+                std::path::Path::new("/workspace")
+                    .join(target_relative)
+                    .display()
+            ),
+            format!(
+                "COURT_JESTER_NODE_GENERATED_ARTIFACT={}",
+                container_artifact.display()
+            ),
+        ];
+        for value in resolver_environment {
+            create.insert(create.len() - 1, "-e".to_string());
+            create.insert(create.len() - 1, value);
+        }
     }
 
     let artifact = container_artifact.to_string_lossy().into_owned();
@@ -2104,12 +2526,9 @@ async fn run_harness_in_docker(
             "--test".to_string(),
             artifact,
         ],
-        crate::types::HarnessRuntime::BunTest => vec![
-            "bun".to_string(),
-            "test".to_string(),
-            "--reporter=junit".to_string(),
-            artifact,
-        ],
+        crate::types::HarnessRuntime::BunTest => {
+            vec!["bun".to_string(), "test".to_string(), artifact]
+        }
         crate::types::HarnessRuntime::Vitest => vec![
             "vitest".to_string(),
             "run".to_string(),
@@ -2126,6 +2545,14 @@ async fn run_harness_in_docker(
             artifact,
         ],
     };
+    if node_package_resolver.is_some() {
+        if let Some(node_options) =
+            configure_docker_node_loader(harness.runtime, container_package_resolver, &mut command)
+        {
+            create.insert(create.len() - 1, "-e".to_string());
+            create.insert(create.len() - 1, node_options);
+        }
+    }
     for argument in harness.args.iter().chain(limits.harness_args.iter()) {
         match argument {
             crate::types::HarnessArg::Literal { literal } => {
@@ -2503,7 +2930,7 @@ pub async fn execute_harness(
         HarnessRuntime::Jest => "jest",
         HarnessRuntime::RepoTest => "npm",
     };
-    let executable = match which_binary(&path_env, executable_name) {
+    let mut executable = match which_binary(&path_env, executable_name) {
         Some(path) => std::path::PathBuf::from(path),
         None => {
             let process = launch_failure(format!(
@@ -2535,7 +2962,7 @@ pub async fn execute_harness(
                 .map(Into::into),
             );
         }
-        HarnessRuntime::BunTest => args.extend(["test", "--reporter=junit"].map(Into::into)),
+        HarnessRuntime::BunTest => args.push("test".into()),
         HarnessRuntime::Vitest => args.extend(["run", "--reporter=json"].map(Into::into)),
         HarnessRuntime::Jest => args.extend(["--json"].map(Into::into)),
         HarnessRuntime::RepoTest => args.extend(["test", "--"].map(Into::into)),
@@ -2563,15 +2990,97 @@ pub async fn execute_harness(
     }
     let mut env = Vec::new();
     env.push(("PATH".into(), path_env.clone()));
-    let dependency_paths = context
+    let dependency_roots = context
         .dependency_roots
         .iter()
         .map(|root| root.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
-    if !dependency_paths.is_empty() {
-        let joined = dependency_paths.join(if cfg!(windows) { ";" } else { ":" });
-        env.push(("NODE_PATH".into(), joined.clone()));
-        env.push(("PYTHONPATH".into(), joined));
+    let node_paths = node_dependency_paths(&context.dependency_roots);
+    if !node_paths.is_empty() {
+        env.push((
+            "NODE_PATH".into(),
+            node_paths.join(if cfg!(windows) { ";" } else { ":" }),
+        ));
+    }
+    if !dependency_roots.is_empty() {
+        env.push((
+            "PYTHONPATH".into(),
+            dependency_roots.join(if cfg!(windows) { ";" } else { ":" }),
+        ));
+    }
+    let node_package_resolver = if matches!(
+        harness.runtime,
+        HarnessRuntime::NodeScript | HarnessRuntime::NodeTest | HarnessRuntime::TsxScript
+    ) {
+        match create_node_package_resolver() {
+            Ok(resolver) => {
+                let package_relative = context
+                    .target_package_root
+                    .strip_prefix(&context.workspace_root)
+                    .unwrap_or_else(|_| std::path::Path::new(""));
+                let overlay_root = temporary
+                    .as_ref()
+                    .map(|directory| directory.path())
+                    .unwrap_or(context.workspace_root.as_path());
+                let overlay_target_root = if temporary.is_some() {
+                    overlay_root.join(package_relative)
+                } else {
+                    context.target_package_root.clone()
+                };
+                for (name, value) in [
+                    (
+                        "COURT_JESTER_NODE_RESOLUTION_MODE",
+                        if temporary.is_some() {
+                            "generated"
+                        } else {
+                            "existing"
+                        }
+                        .to_string(),
+                    ),
+                    (
+                        "COURT_JESTER_NODE_OVERLAY_ROOT",
+                        overlay_root.to_string_lossy().into_owned(),
+                    ),
+                    (
+                        "COURT_JESTER_NODE_SOURCE_ROOT",
+                        context.workspace_root.to_string_lossy().into_owned(),
+                    ),
+                    (
+                        "COURT_JESTER_NODE_TARGET_ROOT",
+                        context.target_package_root.to_string_lossy().into_owned(),
+                    ),
+                    (
+                        "COURT_JESTER_NODE_OVERLAY_TARGET_ROOT",
+                        overlay_target_root.to_string_lossy().into_owned(),
+                    ),
+                    (
+                        "COURT_JESTER_NODE_GENERATED_ARTIFACT",
+                        host_artifact.to_string_lossy().into_owned(),
+                    ),
+                ] {
+                    env.push((name.into(), value));
+                }
+                Some(resolver)
+            }
+            Err(error) => {
+                let process = launch_failure(error);
+                return HarnessExecution {
+                    diagnostics: process.diagnostics.clone(),
+                    process,
+                };
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(resolver) = node_package_resolver.as_ref() {
+        args.splice(
+            0..0,
+            [
+                std::ffi::OsString::from("--experimental-loader"),
+                resolver.loader.clone().into_os_string(),
+            ],
+        );
     }
     let network_guard = if effective_network == NetworkPolicy::Deny {
         match create_network_guard() {
@@ -2590,22 +3099,57 @@ pub async fn execute_harness(
     if let Some(guard) = network_guard.as_ref() {
         match harness.source_mode {
             SourceMode::Python => apply_network_guard(&mut env, &Language::Python, guard),
-            SourceMode::TypeScript | SourceMode::Tsx => {
+            SourceMode::TypeScript | SourceMode::Tsx
+                if harness.runtime != HarnessRuntime::Vitest =>
+            {
                 apply_network_guard(&mut env, &Language::TypeScript, guard)
             }
+            SourceMode::TypeScript | SourceMode::Tsx => {}
         }
-        if matches!(
-            harness.runtime,
-            HarnessRuntime::BunScript | HarnessRuntime::BunTest
-        ) {
+        let bun_preload_index = match harness.runtime {
+            HarnessRuntime::BunScript => Some(0),
+            HarnessRuntime::BunTest => Some(1),
+            _ => None,
+        };
+        if let Some(index) = bun_preload_index {
             args.splice(
-                0..0,
+                index..index,
                 [
                     std::ffi::OsString::from("--preload"),
                     guard.node_preload.clone().into_os_string(),
                 ],
             );
             env.retain(|(name, _)| name != "NODE_OPTIONS");
+        }
+        if harness.runtime == HarnessRuntime::Vitest {
+            let vitest_entrypoint =
+                std::fs::canonicalize(&executable).unwrap_or_else(|_| executable.clone());
+            let Some(node) = which_binary(&path_env, "node") else {
+                let process = launch_failure(
+                    "required runtime 'node' is unavailable for the Vitest coordinator",
+                );
+                return HarnessExecution {
+                    diagnostics: process.diagnostics.clone(),
+                    process,
+                };
+            };
+            executable = node.into();
+            args.splice(
+                2..2,
+                [
+                    std::ffi::OsString::from("--pool=forks"),
+                    std::ffi::OsString::from("--maxWorkers=1"),
+                    std::ffi::OsString::from("--minWorkers=1"),
+                ],
+            );
+            args.splice(
+                0..0,
+                [
+                    guard.vitest_coordinator.clone().into_os_string(),
+                    vitest_entrypoint.into_os_string(),
+                    guard.node_preload.clone().into_os_string(),
+                ],
+            );
         }
     }
     let plan = LaunchPlan {
@@ -2688,9 +3232,201 @@ pub async fn execute_harness(
 #[cfg(test)]
 mod tests {
     use super::{
-        copy_materialization_tree, has_typescript_type_only_relative_imports, virtual_env_bin,
-        which_binary,
+        configure_docker_node_loader, copy_materialization_tree, create_node_package_resolver,
+        docker_dependency_mapping, docker_path_mapping, has_typescript_type_only_relative_imports,
+        virtual_env_bin, which_binary,
     };
+
+    #[test]
+    fn generated_harness_resolver_prefers_target_owned_package_over_ambient_ancestor() {
+        let directory = tempfile::tempdir().unwrap();
+        let target_root = directory.path().join("target-package");
+        let project_mirror = directory.path().join("generated-project-mirror");
+        let ambient_package = directory.path().join("node_modules/fixture-package");
+        let target_package = target_root.join("node_modules/fixture-package");
+        let harness = project_mirror.join(".court-jester/generated/execute.mjs");
+        std::fs::create_dir_all(&ambient_package).unwrap();
+        std::fs::create_dir_all(&target_package).unwrap();
+        std::fs::create_dir_all(harness.parent().unwrap()).unwrap();
+        for package in [&ambient_package, &target_package] {
+            std::fs::write(
+                package.join("package.json"),
+                r#"{"name":"fixture-package","type":"module","exports":"./index.js"}"#,
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            ambient_package.join("index.js"),
+            "export const marker = 'ambient-ancestor';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            target_package.join("index.js"),
+            "export const marker = 'target-owned';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &harness,
+            "import { marker } from 'fixture-package';\nconsole.log(marker);\n",
+        )
+        .unwrap();
+
+        let resolver = create_node_package_resolver().unwrap();
+        let output = std::process::Command::new("node")
+            .arg("--no-warnings")
+            .arg("--experimental-loader")
+            .arg(&resolver.loader)
+            .arg(&harness)
+            .env("COURT_JESTER_NODE_RESOLUTION_MODE", "generated")
+            .env("COURT_JESTER_NODE_OVERLAY_ROOT", &project_mirror)
+            .env("COURT_JESTER_NODE_SOURCE_ROOT", directory.path())
+            .env("COURT_JESTER_NODE_TARGET_ROOT", &target_root)
+            .env("COURT_JESTER_NODE_OVERLAY_TARGET_ROOT", &project_mirror)
+            .env("COURT_JESTER_NODE_GENERATED_ARTIFACT", &harness)
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "target-owned",
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn docker_paths_accept_lexical_alias_for_generated_overlay() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_root = directory.path().join("source");
+        let alias_root = directory.path().join("alias");
+        std::fs::create_dir(&source_root).unwrap();
+        std::os::unix::fs::symlink(&source_root, &alias_root).unwrap();
+        let artifact = alias_root.join(".court-jester/doctor.py");
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(&artifact, "print('ok')\n").unwrap();
+
+        let mapping =
+            docker_path_mapping(&alias_root, &alias_root, &artifact, &alias_root).unwrap();
+
+        assert_eq!(
+            mapping.project_root,
+            std::fs::canonicalize(&source_root).unwrap()
+        );
+        assert_eq!(
+            mapping.container_artifact,
+            std::path::Path::new("/workspace/.court-jester/doctor.py")
+        );
+        assert_eq!(mapping.container_cwd, std::path::Path::new("/workspace"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn docker_paths_reject_artifact_symlink_escape() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_root = directory.path().join("source");
+        let outside_root = directory.path().join("outside");
+        std::fs::create_dir(&source_root).unwrap();
+        std::fs::create_dir(&outside_root).unwrap();
+        let source_root = std::fs::canonicalize(source_root).unwrap();
+        let outside_root = std::fs::canonicalize(outside_root).unwrap();
+        std::fs::write(outside_root.join("doctor.py"), "print('escaped')\n").unwrap();
+        std::os::unix::fs::symlink(&outside_root, source_root.join("escaped")).unwrap();
+        let artifact = source_root.join("escaped/doctor.py");
+
+        let error =
+            docker_path_mapping(&source_root, &source_root, &artifact, &source_root).unwrap_err();
+
+        assert_eq!(
+            error,
+            "docker harness artifact is outside the project mirror"
+        );
+    }
+
+    #[test]
+    fn docker_dependencies_share_one_workspace_topology() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let package = workspace.join("packages/app");
+        std::fs::create_dir_all(package.join("node_modules")).unwrap();
+        std::fs::create_dir_all(
+            workspace.join("node_modules/.pnpm/example@1.0.0/node_modules/example"),
+        )
+        .unwrap();
+
+        let mapping =
+            docker_dependency_mapping(&workspace, &[package.clone(), workspace.clone()]).unwrap();
+
+        assert_eq!(
+            mapping.workspace_root,
+            std::fs::canonicalize(&workspace).unwrap()
+        );
+        assert_eq!(
+            mapping.container_roots,
+            vec![
+                "/court-jester/dependencies/packages/app".to_string(),
+                "/court-jester/dependencies".to_string(),
+            ]
+        );
+        assert_eq!(
+            mapping.node_paths,
+            vec![
+                "/court-jester/dependencies/packages/app/node_modules".to_string(),
+                "/court-jester/dependencies/node_modules".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn docker_tsx_loader_uses_node_options_before_cli_startup() {
+        let mut command = vec![
+            "tsx".to_string(),
+            "/workspace/.court-jester/execute.tsx".to_string(),
+        ];
+
+        let environment = configure_docker_node_loader(
+            crate::types::HarnessRuntime::TsxScript,
+            "/court-jester/package-resolver.mjs",
+            &mut command,
+        );
+
+        assert_eq!(
+            environment.as_deref(),
+            Some("NODE_OPTIONS=--experimental-loader=/court-jester/package-resolver.mjs")
+        );
+        assert_eq!(command, vec!["tsx", "/workspace/.court-jester/execute.tsx"]);
+    }
+
+    #[test]
+    fn docker_node_loader_precedes_script_arguments() {
+        let mut command = vec![
+            "node".to_string(),
+            "--no-warnings".to_string(),
+            "/workspace/.court-jester/execute.ts".to_string(),
+        ];
+
+        let environment = configure_docker_node_loader(
+            crate::types::HarnessRuntime::NodeScript,
+            "/court-jester/package-resolver.mjs",
+            &mut command,
+        );
+
+        assert!(environment.is_none());
+        assert_eq!(
+            command,
+            vec![
+                "node",
+                "--experimental-loader",
+                "/court-jester/package-resolver.mjs",
+                "--no-warnings",
+                "/workspace/.court-jester/execute.ts",
+            ]
+        );
+    }
 
     #[test]
     fn which_binary_finds_existing_binary_on_path() {

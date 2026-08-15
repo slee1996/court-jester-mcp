@@ -4,6 +4,22 @@ This changelog tracks user-visible verifier semantics, report-shape changes, and
 
 ## Unreleased
 
+## 0.2.2 - 2026-08-14
+
+Runtime correctness release for the three defects confirmed after 0.2.1. See [docs/release-notes-0.2.2.md](docs/release-notes-0.2.2.md) for the complete change list and validation evidence.
+
+### Authoritative test runners
+
+- Bun tests now use the project test runner without incomplete JUnit reporter arguments, while preserving sandbox-blocker precedence and the public `bun_junit` adapter value.
+- Automatic TypeScript test selection recognizes Vitest imports and configured Vitest packages, including globals-enabled TSX suites.
+- Vitest coordinators retain their bounded worker pool while test workers enforce network and process denial.
+
+### Isolated execution and dependencies
+
+- Canonical Docker path mapping fixes isolated doctor smoke checks on macOS without weakening symlink containment.
+- Generated Node and TSX harnesses resolve target, workspace, scoped, self-reference, and pnpm-linked dependencies while preserving native nearest-package precedence.
+
+
 ## 0.2.1 - 2026-08-01
 
 Post-0.2.0 correctness and execution-hardening release. See [docs/release-notes-0.2.1.md](docs/release-notes-0.2.1.md) for the complete change list and validation evidence.

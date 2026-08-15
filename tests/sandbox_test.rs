@@ -1,7 +1,9 @@
-use court_jester::tools::sandbox::{build_instrumentation_overlay, execute};
+use court_jester::resolve_execution_context;
+use court_jester::tools::sandbox::{build_instrumentation_overlay, execute, execute_harness};
 use court_jester::types::{
-    FailureDomain, InstrumentationMode, Language, NetworkPolicy, ProcessTerminationKind,
-    RuntimeProfile, SandboxOptions, TestRunner,
+    ContextRequest, FailureDomain, HarnessArtifact, HarnessKind, HarnessRuntime, HarnessSpec,
+    InstrumentationMode, Language, NetworkPolicy, ProcessTerminationKind, RuntimeProfile,
+    SandboxOptions, SourceMode, TestRunner,
 };
 
 fn sandbox_options<'a>(
@@ -101,6 +103,47 @@ try {
             )
         })
         .all(|diagnostic| diagnostic.domain == FailureDomain::Environment));
+}
+
+#[tokio::test]
+async fn typescript_worker_exports_deny_direct_and_forged_internal_workers() {
+    let code = r#"
+import { Worker } from "node:worker_threads";
+
+const workerTypes = [
+  Worker,
+  class InternalWorker extends Worker {},
+];
+for (const WorkerType of workerTypes) {
+  try {
+    const worker = new WorkerType("setInterval(() => {}, 1000)", { eval: true });
+    console.log("worker-created");
+    void worker.terminate();
+  } catch (error) {
+    console.error(String(error));
+  }
+}
+"#;
+    let result = execute(
+        code,
+        &Language::TypeScript,
+        sandbox_options(10.0, 128, None, None),
+    )
+    .await;
+
+    assert_eq!(result.exit_code, Some(0), "result: {result:?}");
+    assert!(
+        !result.stdout.contains("worker-created"),
+        "a guarded Worker constructor remained usable: {result:?}"
+    );
+    assert_eq!(
+        result
+            .stderr
+            .matches("court-jester process spawn denied")
+            .count(),
+        2,
+        "both direct and subclassed Worker construction must be denied: {result:?}"
+    );
 }
 
 #[tokio::test]
@@ -221,6 +264,576 @@ async fn python_project_dir_imports_local_module() {
     .await;
     assert_eq!(r.exit_code, Some(0), "stderr: {}", r.stderr);
     assert_eq!(r.stdout.trim(), "42");
+}
+
+#[tokio::test]
+async fn generated_typescript_harness_resolves_scoped_package_from_target_package_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path();
+    let package = workspace.join("packages/api");
+    let source = package.join("src/routes/hotels.ts");
+    let dependency = package.join("node_modules/@prisma/client");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&dependency).unwrap();
+    std::fs::write(workspace.join("package.json"), r#"{"private":true}"#).unwrap();
+    std::fs::write(package.join("package.json"), r#"{"type":"module"}"#).unwrap();
+    std::fs::write(&source, "export const route = true;\n").unwrap();
+    std::fs::write(
+        dependency.join("package.json"),
+        r#"{"name":"@prisma/client","type":"module","exports":{".":{"import":"./index.js","require":"./index.cjs"}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dependency.join("index.js"),
+        "export const workspaceMarker = 'prisma-workspace-ok';\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dependency.join("index.cjs"),
+        "exports.workspaceMarker = 'wrong-require-condition';\n",
+    )
+    .unwrap();
+    let harness_code =
+        "import { workspaceMarker } from '@prisma/client';\nconsole.log(workspaceMarker);\n";
+    let existing_harness = workspace.join(".court-jester/existing.ts");
+    std::fs::create_dir_all(existing_harness.parent().unwrap()).unwrap();
+    std::fs::write(&existing_harness, harness_code).unwrap();
+
+    let context = resolve_execution_context(ContextRequest {
+        invocation_dir: workspace,
+        explicit_project_dir: Some(workspace),
+        target_file: Some(&source),
+        test_file: None,
+        language: Language::TypeScript,
+        virtual_file_path: None,
+    })
+    .unwrap();
+    let project_dir = workspace.to_string_lossy();
+    let source_file = source.to_string_lossy();
+    let generated = execute_harness(
+        &context,
+        HarnessSpec {
+            kind: HarnessKind::Standalone,
+            runtime: HarnessRuntime::NodeScript,
+            test_adapter: None,
+            source_mode: SourceMode::TypeScript,
+            artifact: HarnessArtifact::Generated {
+                code: harness_code.into(),
+                relative_path: ".court-jester/generated/execute.ts".into(),
+            },
+            args: Vec::new(),
+            network: NetworkPolicy::Deny,
+        },
+        sandbox_options(
+            10.0,
+            128,
+            Some(project_dir.as_ref()),
+            Some(source_file.as_ref()),
+        ),
+    )
+    .await
+    .process;
+
+    assert_eq!(generated.exit_code, Some(0), "stderr: {}", generated.stderr);
+    assert_eq!(generated.stdout.trim(), "prisma-workspace-ok");
+
+    let existing = execute_harness(
+        &context,
+        HarnessSpec {
+            kind: HarnessKind::Standalone,
+            runtime: HarnessRuntime::NodeScript,
+            test_adapter: None,
+            source_mode: SourceMode::TypeScript,
+            artifact: HarnessArtifact::Existing {
+                relative_path: ".court-jester/existing.ts".into(),
+            },
+            args: Vec::new(),
+            network: NetworkPolicy::Deny,
+        },
+        sandbox_options(
+            10.0,
+            128,
+            Some(project_dir.as_ref()),
+            Some(source_file.as_ref()),
+        ),
+    )
+    .await
+    .process;
+
+    assert_eq!(existing.exit_code, Some(0), "stderr: {}", existing.stderr);
+    assert_eq!(existing.stdout.trim(), "prisma-workspace-ok");
+
+    let bun_available = std::process::Command::new("bun")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if bun_available {
+        let bun = execute_harness(
+            &context,
+            HarnessSpec {
+                kind: HarnessKind::Standalone,
+                runtime: HarnessRuntime::BunScript,
+                test_adapter: None,
+                source_mode: SourceMode::TypeScript,
+                artifact: HarnessArtifact::Generated {
+                    code: harness_code.into(),
+                    relative_path: ".court-jester/generated/execute.ts".into(),
+                },
+                args: Vec::new(),
+                network: NetworkPolicy::Deny,
+            },
+            sandbox_options(
+                10.0,
+                128,
+                Some(project_dir.as_ref()),
+                Some(source_file.as_ref()),
+            ),
+        )
+        .await
+        .process;
+
+        assert_eq!(bun.exit_code, Some(0), "stderr: {}", bun.stderr);
+        assert_eq!(bun.stdout.trim(), "prisma-workspace-ok");
+    }
+}
+
+#[tokio::test]
+async fn generated_typescript_harness_resolves_target_package_self_reference() {
+    for has_hoisted_node_modules in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        let package = workspace.join("packages/api");
+        let source = package.join("src/routes/hotels.ts");
+        let exported_module = package.join("src/self.js");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(workspace.join("package.json"), r#"{"private":true}"#).unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            r#"{"name":"@acme/api","type":"module","exports":{"./self":"./src/self.js"}}"#,
+        )
+        .unwrap();
+        std::fs::write(&source, "export const route = true;\n").unwrap();
+        std::fs::write(
+            &exported_module,
+            "export const packageMarker = 'target-self-reference';\n",
+        )
+        .unwrap();
+        if has_hoisted_node_modules {
+            std::fs::create_dir_all(workspace.join("node_modules")).unwrap();
+        }
+
+        let context = resolve_execution_context(ContextRequest {
+            invocation_dir: workspace,
+            explicit_project_dir: Some(workspace),
+            target_file: Some(&source),
+            test_file: None,
+            language: Language::TypeScript,
+            virtual_file_path: None,
+        })
+        .unwrap();
+        assert_eq!(
+            context
+                .dependency_roots
+                .iter()
+                .any(|root| root == &context.target_package_root),
+            !has_hoisted_node_modules
+        );
+        let project_dir = workspace.to_string_lossy();
+        let source_file = source.to_string_lossy();
+        let result = execute_harness(
+            &context,
+            HarnessSpec {
+                kind: HarnessKind::Standalone,
+                runtime: HarnessRuntime::NodeScript,
+                test_adapter: None,
+                source_mode: SourceMode::TypeScript,
+                artifact: HarnessArtifact::Generated {
+                    code: "import { packageMarker } from '@acme/api/self';\nconsole.log(packageMarker);\n"
+                        .into(),
+                    relative_path: ".court-jester/generated/execute.ts".into(),
+                },
+                args: Vec::new(),
+                network: NetworkPolicy::Deny,
+            },
+            sandbox_options(
+                10.0,
+                128,
+                Some(project_dir.as_ref()),
+                Some(source_file.as_ref()),
+            ),
+        )
+        .await
+        .process;
+
+        assert_eq!(
+            result.exit_code,
+            Some(0),
+            "hoisted node_modules={has_hoisted_node_modules}, stderr: {}",
+            result.stderr
+        );
+        assert_eq!(result.stdout.trim(), "target-self-reference");
+    }
+}
+
+#[tokio::test]
+async fn generated_typescript_harness_does_not_fall_through_broken_nearer_package() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path();
+    let package = workspace.join("packages/api");
+    let source = package.join("src/routes/hotels.ts");
+    let nearer_dependency = package.join("node_modules/fixture-package");
+    let farther_dependency = workspace.join("node_modules/fixture-package");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&nearer_dependency).unwrap();
+    std::fs::create_dir_all(&farther_dependency).unwrap();
+    std::fs::write(workspace.join("package.json"), r#"{"private":true}"#).unwrap();
+    std::fs::write(package.join("package.json"), r#"{"type":"module"}"#).unwrap();
+    std::fs::write(&source, "export const route = true;\n").unwrap();
+    std::fs::write(
+        nearer_dependency.join("package.json"),
+        r#"{"name":"fixture-package","type":"module","exports":"./missing.js"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        farther_dependency.join("package.json"),
+        r#"{"name":"fixture-package","type":"module","exports":"./index.js"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        farther_dependency.join("index.js"),
+        "export const packageMarker = 'farther-workspace-version';\n",
+    )
+    .unwrap();
+
+    let context = resolve_execution_context(ContextRequest {
+        invocation_dir: workspace,
+        explicit_project_dir: Some(workspace),
+        target_file: Some(&source),
+        test_file: None,
+        language: Language::TypeScript,
+        virtual_file_path: None,
+    })
+    .unwrap();
+    let project_dir = workspace.to_string_lossy();
+    let source_file = source.to_string_lossy();
+    let result = execute_harness(
+        &context,
+        HarnessSpec {
+            kind: HarnessKind::Standalone,
+            runtime: HarnessRuntime::NodeScript,
+            test_adapter: None,
+            source_mode: SourceMode::TypeScript,
+            artifact: HarnessArtifact::Generated {
+                code: "import { packageMarker } from 'fixture-package';\nconsole.log(packageMarker);\n"
+                    .into(),
+                relative_path: ".court-jester/generated/execute.ts".into(),
+            },
+            args: Vec::new(),
+            network: NetworkPolicy::Deny,
+        },
+        sandbox_options(
+            10.0,
+            128,
+            Some(project_dir.as_ref()),
+            Some(source_file.as_ref()),
+        ),
+    )
+    .await
+    .process;
+
+    assert_ne!(result.exit_code, Some(0), "result: {result:?}");
+    assert!(
+        result.stderr.contains("missing.js"),
+        "expected nearer broken package error, stderr: {}",
+        result.stderr
+    );
+    assert!(!result.stdout.contains("farther-workspace-version"));
+}
+
+#[tokio::test]
+async fn generated_typescript_harness_preserves_workspace_packages_nearest_dependency() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path();
+    let target = workspace.join("packages/api");
+    let shared = workspace.join("packages/shared");
+    let source = target.join("src/index.ts");
+    let target_dependency = target.join("node_modules/fixture-package");
+    let shared_dependency = shared.join("node_modules/fixture-package");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&target_dependency).unwrap();
+    std::fs::create_dir_all(&shared_dependency).unwrap();
+    std::fs::write(workspace.join("package.json"), r#"{"private":true}"#).unwrap();
+    std::fs::write(target.join("package.json"), r#"{"type":"module"}"#).unwrap();
+    std::fs::write(shared.join("package.json"), r#"{"type":"module"}"#).unwrap();
+    std::fs::write(&source, "export const target = true;\n").unwrap();
+    std::fs::write(
+        shared.join("index.js"),
+        "import { marker } from 'fixture-package';\nconsole.log(marker);\n",
+    )
+    .unwrap();
+    for (dependency, marker) in [
+        (&target_dependency, "target-version"),
+        (&shared_dependency, "shared-version"),
+    ] {
+        std::fs::write(
+            dependency.join("package.json"),
+            r#"{"name":"fixture-package","type":"module","exports":"./index.js"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dependency.join("index.js"),
+            format!("export const marker = '{marker}';\n"),
+        )
+        .unwrap();
+    }
+
+    let context = resolve_execution_context(ContextRequest {
+        invocation_dir: workspace,
+        explicit_project_dir: Some(workspace),
+        target_file: Some(&source),
+        test_file: None,
+        language: Language::TypeScript,
+        virtual_file_path: None,
+    })
+    .unwrap();
+    let result = execute_harness(
+        &context,
+        HarnessSpec {
+            kind: HarnessKind::Standalone,
+            runtime: HarnessRuntime::NodeScript,
+            test_adapter: None,
+            source_mode: SourceMode::TypeScript,
+            artifact: HarnessArtifact::Generated {
+                code: "import '../../packages/shared/index.js';\n".into(),
+                relative_path: ".court-jester/generated/execute.ts".into(),
+            },
+            args: Vec::new(),
+            network: NetworkPolicy::Deny,
+        },
+        sandbox_options(
+            10.0,
+            128,
+            Some(workspace.to_str().unwrap()),
+            Some(source.to_str().unwrap()),
+        ),
+    )
+    .await
+    .process;
+
+    assert_eq!(result.exit_code, Some(0), "result: {result:?}");
+    assert_eq!(result.stdout.trim(), "shared-version");
+}
+
+#[tokio::test]
+async fn generated_typescript_package_self_reference_loads_overlay_export() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path();
+    let target = workspace.join("packages/api");
+    let source = target.join("src/self.ts");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(workspace.join("package.json"), r#"{"private":true}"#).unwrap();
+    std::fs::write(
+        target.join("package.json"),
+        r#"{"name":"@acme/api","type":"module","exports":{"./self":"./src/self.ts"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &source,
+        "export const marker = 'stale-disk-export';\nconsole.log(marker);\n",
+    )
+    .unwrap();
+
+    let context = resolve_execution_context(ContextRequest {
+        invocation_dir: workspace,
+        explicit_project_dir: Some(workspace),
+        target_file: Some(&source),
+        test_file: None,
+        language: Language::TypeScript,
+        virtual_file_path: None,
+    })
+    .unwrap();
+    let result = execute_harness(
+        &context,
+        HarnessSpec {
+            kind: HarnessKind::Standalone,
+            runtime: HarnessRuntime::NodeScript,
+            test_adapter: None,
+            source_mode: SourceMode::TypeScript,
+            artifact: HarnessArtifact::Generated {
+                code: "import { marker as selfMarker } from '@acme/api/self';\nexport const marker = 'candidate-overlay-export';\nconsole.log(selfMarker);\n".into(),
+                relative_path: "packages/api/src/self.ts".into(),
+            },
+            args: Vec::new(),
+            network: NetworkPolicy::Deny,
+        },
+        sandbox_options(
+            10.0,
+            128,
+            Some(workspace.to_str().unwrap()),
+            Some(source.to_str().unwrap()),
+        ),
+    )
+    .await
+    .process;
+
+    assert_eq!(result.exit_code, Some(0), "result: {result:?}");
+    assert_eq!(result.stdout.trim(), "candidate-overlay-export");
+}
+
+#[tokio::test]
+async fn generated_typescript_dependency_preserves_broken_nested_package_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path();
+    let target = workspace.join("packages/api");
+    let source = target.join("src/index.ts");
+    let consumer = target.join("node_modules/consumer-package");
+    let broken_nested = consumer.join("node_modules/fixture-package");
+    let valid_farther = target.join("node_modules/fixture-package");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&broken_nested).unwrap();
+    std::fs::create_dir_all(&valid_farther).unwrap();
+    std::fs::write(workspace.join("package.json"), r#"{"private":true}"#).unwrap();
+    std::fs::write(target.join("package.json"), r#"{"type":"module"}"#).unwrap();
+    std::fs::write(&source, "export const target = true;\n").unwrap();
+    std::fs::write(
+        consumer.join("package.json"),
+        r#"{"name":"consumer-package","type":"module","exports":"./index.js"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        consumer.join("index.js"),
+        "import { marker } from 'fixture-package';\nconsole.log(marker);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        broken_nested.join("package.json"),
+        r#"{"name":"fixture-package","type":"module","exports":"./missing.js"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        valid_farther.join("package.json"),
+        r#"{"name":"fixture-package","type":"module","exports":"./index.js"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        valid_farther.join("index.js"),
+        "export const marker = 'farther-target-version';\n",
+    )
+    .unwrap();
+
+    let context = resolve_execution_context(ContextRequest {
+        invocation_dir: workspace,
+        explicit_project_dir: Some(workspace),
+        target_file: Some(&source),
+        test_file: None,
+        language: Language::TypeScript,
+        virtual_file_path: None,
+    })
+    .unwrap();
+    let result = execute_harness(
+        &context,
+        HarnessSpec {
+            kind: HarnessKind::Standalone,
+            runtime: HarnessRuntime::NodeScript,
+            test_adapter: None,
+            source_mode: SourceMode::TypeScript,
+            artifact: HarnessArtifact::Generated {
+                code: "import 'consumer-package';\n".into(),
+                relative_path: ".court-jester/generated/execute.ts".into(),
+            },
+            args: Vec::new(),
+            network: NetworkPolicy::Deny,
+        },
+        sandbox_options(
+            10.0,
+            128,
+            Some(workspace.to_str().unwrap()),
+            Some(source.to_str().unwrap()),
+        ),
+    )
+    .await
+    .process;
+
+    assert_ne!(result.exit_code, Some(0), "result: {result:?}");
+    assert!(result.stderr.contains("missing.js"), "result: {result:?}");
+    assert!(!result.stdout.contains("farther-target-version"));
+}
+
+#[tokio::test]
+async fn existing_typescript_harness_keeps_native_package_resolution() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path();
+    let target = workspace.join("packages/api");
+    let source = target.join("src/index.ts");
+    let harness = workspace.join(".court-jester/existing.ts");
+    let ambient_dependency = workspace.join("node_modules/fixture-package");
+    let target_dependency = target.join("node_modules/fixture-package");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(harness.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&ambient_dependency).unwrap();
+    std::fs::create_dir_all(&target_dependency).unwrap();
+    std::fs::write(
+        workspace.join("package.json"),
+        r#"{"private":true,"type":"module"}"#,
+    )
+    .unwrap();
+    std::fs::write(target.join("package.json"), r#"{"type":"module"}"#).unwrap();
+    std::fs::write(&source, "export const target = true;\n").unwrap();
+    std::fs::write(
+        &harness,
+        "import { marker } from 'fixture-package';\nconsole.log(marker);\n",
+    )
+    .unwrap();
+    for (dependency, marker) in [
+        (&ambient_dependency, "native-ambient-version"),
+        (&target_dependency, "target-version"),
+    ] {
+        std::fs::write(
+            dependency.join("package.json"),
+            r#"{"name":"fixture-package","type":"module","exports":"./index.js"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dependency.join("index.js"),
+            format!("export const marker = '{marker}';\n"),
+        )
+        .unwrap();
+    }
+
+    let context = resolve_execution_context(ContextRequest {
+        invocation_dir: workspace,
+        explicit_project_dir: Some(workspace),
+        target_file: Some(&source),
+        test_file: None,
+        language: Language::TypeScript,
+        virtual_file_path: None,
+    })
+    .unwrap();
+    let result = execute_harness(
+        &context,
+        HarnessSpec {
+            kind: HarnessKind::Standalone,
+            runtime: HarnessRuntime::NodeScript,
+            test_adapter: None,
+            source_mode: SourceMode::TypeScript,
+            artifact: HarnessArtifact::Existing {
+                relative_path: ".court-jester/existing.ts".into(),
+            },
+            args: Vec::new(),
+            network: NetworkPolicy::Deny,
+        },
+        sandbox_options(
+            10.0,
+            128,
+            Some(workspace.to_str().unwrap()),
+            Some(source.to_str().unwrap()),
+        ),
+    )
+    .await
+    .process;
+
+    assert_eq!(result.exit_code, Some(0), "result: {result:?}");
+    assert_eq!(result.stdout.trim(), "native-ambient-version");
 }
 
 #[tokio::test]
@@ -716,4 +1329,141 @@ async fn isolated_python_execution_is_guarded_and_uses_selected_image() {
     assert_eq!(result.exit_code, Some(0), "stderr: {}", result.stderr);
     assert_eq!(result.stdout.trim(), "isolated");
     assert!(!result.timed_out);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn isolated_typescript_preserves_pnpm_workspace_symlinks() {
+    let docker_available = std::process::Command::new("docker")
+        .arg("info")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if !docker_available {
+        return;
+    }
+    let image = "node:24-bookworm-slim";
+    let image_available = std::process::Command::new("docker")
+        .args(["image", "inspect", image])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if !image_available {
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path();
+    let package = workspace.join("packages/app");
+    let source = package.join("src/index.ts");
+    let store_package =
+        workspace.join("node_modules/.pnpm/pnpm-fixture@1.0.0/node_modules/pnpm-fixture");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(package.join("node_modules")).unwrap();
+    std::fs::create_dir_all(&store_package).unwrap();
+    std::fs::write(workspace.join("package.json"), r#"{"private":true}"#).unwrap();
+    std::fs::write(package.join("package.json"), r#"{"type":"module"}"#).unwrap();
+    std::fs::write(&source, "export const source = true;\n").unwrap();
+    std::fs::write(
+        store_package.join("package.json"),
+        r#"{"name":"pnpm-fixture","type":"module","exports":"./index.js"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        store_package.join("index.js"),
+        "export const marker = 'pnpm-topology-ok';\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        "../../../node_modules/.pnpm/pnpm-fixture@1.0.0/node_modules/pnpm-fixture",
+        package.join("node_modules/pnpm-fixture"),
+    )
+    .unwrap();
+    let existing_harness = workspace.join(".court-jester/existing.ts");
+    std::fs::create_dir_all(existing_harness.parent().unwrap()).unwrap();
+    std::fs::write(
+        &existing_harness,
+        "import { marker } from 'pnpm-fixture';\nconsole.log(marker);\n",
+    )
+    .unwrap();
+
+    let context = resolve_execution_context(ContextRequest {
+        invocation_dir: workspace,
+        explicit_project_dir: Some(workspace),
+        target_file: Some(&source),
+        test_file: None,
+        language: Language::TypeScript,
+        virtual_file_path: None,
+    })
+    .unwrap();
+    let project_dir = workspace.to_string_lossy();
+    let source_file = source.to_string_lossy();
+    let execution = execute_harness(
+        &context,
+        HarnessSpec {
+            kind: HarnessKind::Standalone,
+            runtime: HarnessRuntime::NodeScript,
+            source_mode: SourceMode::TypeScript,
+            artifact: HarnessArtifact::Generated {
+                code: "import { marker } from 'pnpm-fixture';\nconsole.log(marker);\n".into(),
+                relative_path: ".court-jester/generated/execute.ts".into(),
+            },
+            network: NetworkPolicy::Deny,
+            args: vec![],
+            test_adapter: None,
+        },
+        SandboxOptions {
+            timeout_seconds: 10.0,
+            memory_mb: 128,
+            runtime_profile: RuntimeProfile::Isolated,
+            network_policy: NetworkPolicy::Deny,
+            harness_args: &[],
+            docker_image: Some(image),
+            project_dir: Some(project_dir.as_ref()),
+            source_file: Some(source_file.as_ref()),
+        },
+    )
+    .await;
+
+    assert_eq!(
+        execution.process.exit_code,
+        Some(0),
+        "stderr: {}",
+        execution.process.stderr
+    );
+    assert_eq!(execution.process.stdout.trim(), "pnpm-topology-ok");
+
+    let existing = execute_harness(
+        &context,
+        HarnessSpec {
+            kind: HarnessKind::Standalone,
+            runtime: HarnessRuntime::NodeScript,
+            source_mode: SourceMode::TypeScript,
+            artifact: HarnessArtifact::Existing {
+                relative_path: ".court-jester/existing.ts".into(),
+            },
+            network: NetworkPolicy::Deny,
+            args: vec![],
+            test_adapter: None,
+        },
+        SandboxOptions {
+            timeout_seconds: 10.0,
+            memory_mb: 128,
+            runtime_profile: RuntimeProfile::Isolated,
+            network_policy: NetworkPolicy::Deny,
+            harness_args: &[],
+            docker_image: Some(image),
+            project_dir: Some(project_dir.as_ref()),
+            source_file: Some(source_file.as_ref()),
+        },
+    )
+    .await;
+
+    assert_eq!(
+        existing.process.exit_code,
+        Some(0),
+        "stderr: {}",
+        existing.process.stderr
+    );
+    assert_eq!(existing.process.stdout.trim(), "pnpm-topology-ok");
 }

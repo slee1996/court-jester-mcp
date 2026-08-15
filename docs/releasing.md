@@ -16,12 +16,12 @@ Court Jester currently ships through GitHub Releases only. Do not publish this r
 
 ## Publish
 
-For version `0.2.1`:
+For version `0.2.2`:
 
 ```bash
-git tag -a v0.2.1 -m "Release 0.2.1"
+git tag -a v0.2.2 -m "Release 0.2.2"
 git push origin main
-git push origin v0.2.1
+git push origin v0.2.2
 ```
 
 Pushing the tag starts `.github/workflows/release.yml`. The workflow:
@@ -30,7 +30,7 @@ Pushing the tag starts `.github/workflows/release.yml`. The workflow:
 2. checks that the tag exactly matches the Cargo package version and dated release notes;
 3. builds macOS and Linux archives for Arm64 and AMD64;
 4. emits a SHA-256 file beside every archive and verifies every checksum;
-5. creates one GitHub release from `docs/release-notes-0.2.1.md` and uploads all eight files.
+5. creates one GitHub release from `docs/release-notes-0.2.2.md` and uploads all eight files.
 
 Do not create the tag until the intended commit is on `main`. The workflow uses `--verify-tag` and will reject a missing or mismatched tag.
 
@@ -41,19 +41,19 @@ Watch the release workflow and inspect the resulting release:
 ```bash
 gh run list --workflow Release --limit 1
 gh run watch <run-id>
-gh release view v0.2.1 --json tagName,name,isDraft,isPrerelease,assets,url
+gh release view v0.2.2 --json tagName,name,isDraft,isPrerelease,assets,url
 ```
 
 The release must be non-draft and non-prerelease and contain these platform archives plus matching `.sha256` files:
 
-- `court-jester-v0.2.1-darwin-arm64.tar.gz`
-- `court-jester-v0.2.1-darwin-amd64.tar.gz`
-- `court-jester-v0.2.1-linux-arm64.tar.gz`
-- `court-jester-v0.2.1-linux-amd64.tar.gz`
+- `court-jester-v0.2.2-darwin-arm64.tar.gz`
+- `court-jester-v0.2.2-darwin-amd64.tar.gz`
+- `court-jester-v0.2.2-linux-arm64.tar.gz`
+- `court-jester-v0.2.2-linux-amd64.tar.gz`
 - one matching `.sha256` file for each archive.
 
-Finally, run the documented installer on a disposable account or machine and confirm `court-jester --version` prints `court-jester 0.2.1`. The installer downloads the matching checksum and refuses an archive it cannot verify.
+Finally, run the documented installer on a disposable account or machine and confirm `court-jester --version` prints `court-jester 0.2.2`. The installer downloads the matching checksum and refuses an archive it cannot verify.
 
 ## Backfill
 
-The manual `workflow_dispatch` path accepts an existing `v0.2.1`-or-newer tag. It is for rebuilding assets from that immutable tag, not for releasing an uncommitted worktree or publishing to crates.io.
+The manual `workflow_dispatch` path accepts an existing `v0.2.2`-or-newer tag. It is for rebuilding assets from that immutable tag, not for releasing an uncommitted worktree or publishing to crates.io.

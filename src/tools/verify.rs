@@ -128,6 +128,89 @@ fn test_code_has_imports(code: &str, language: &Language) -> bool {
     })
 }
 
+fn typescript_code_imports_vitest(code: &str) -> bool {
+    code.lines().any(|line| {
+        let statement = line.split_once("//").map_or(line, |(code, _)| code).trim();
+        let is_import_statement = statement.starts_with("import ")
+            || statement.starts_with("export ")
+            || statement.starts_with("} from ");
+        is_import_statement
+            && (statement.contains("from \"vitest\"")
+                || statement.contains("from 'vitest'")
+                || statement == "import \"vitest\";"
+                || statement == "import 'vitest';")
+    })
+}
+
+const VITEST_CONFIG_FILENAMES: &[&str] = &[
+    "vitest.config.ts",
+    "vitest.config.tsx",
+    "vitest.config.js",
+    "vitest.config.mjs",
+    "vitest.config.cjs",
+    "vitest.config.mts",
+    "vitest.config.cts",
+];
+
+fn package_json_declares_vitest(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(package) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    let dependency_declares_vitest = [
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+    ]
+    .iter()
+    .any(|section| {
+        package
+            .get(section)
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|dependencies| dependencies.contains_key("vitest"))
+    });
+    let script_runs_vitest = package
+        .get("scripts")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|scripts| {
+            scripts.values().any(|script| {
+                script
+                    .as_str()
+                    .is_some_and(|command| command.split_whitespace().any(|word| word == "vitest"))
+            })
+        });
+    dependency_declares_vitest || script_runs_vitest
+}
+
+fn context_declares_vitest(context: &ExecutionContext) -> bool {
+    let start = context
+        .test_source
+        .as_ref()
+        .and_then(|source| source.source_file.as_deref())
+        .and_then(Path::parent)
+        .or(context.test_package_root.as_deref())
+        .unwrap_or(context.target_package_root.as_path());
+    for directory in start.ancestors() {
+        if !directory.starts_with(&context.workspace_root) {
+            break;
+        }
+        if VITEST_CONFIG_FILENAMES
+            .iter()
+            .any(|name| directory.join(name).is_file())
+            || package_json_declares_vitest(&directory.join("package.json"))
+        {
+            return true;
+        }
+        if directory == context.workspace_root {
+            break;
+        }
+    }
+    false
+}
+
 fn err_execution_result(message: &str) -> ExecutionResult {
     ExecutionResult {
         stdout: String::new(),
@@ -3329,6 +3412,8 @@ async fn execute_generated_harness<'a>(
 fn authoritative_harness_runtime(
     language: Language,
     runner: TestRunner,
+    test_code: &str,
+    context: &ExecutionContext,
 ) -> (HarnessRuntime, Option<TestAdapter>) {
     match language {
         Language::Python => (HarnessRuntime::Python, None),
@@ -3336,6 +3421,12 @@ fn authoritative_harness_runtime(
             TestRunner::Bun => (HarnessRuntime::BunTest, Some(TestAdapter::BunJunit)),
             TestRunner::RepoNative => (HarnessRuntime::RepoTest, Some(TestAdapter::Opaque)),
             TestRunner::Node => (HarnessRuntime::NodeScript, Some(TestAdapter::NodeTap)),
+            TestRunner::Auto
+                if typescript_code_imports_vitest(test_code)
+                    || context_declares_vitest(context) =>
+            {
+                (HarnessRuntime::Vitest, Some(TestAdapter::VitestJson))
+            }
             TestRunner::Auto => (HarnessRuntime::NodeScript, Some(TestAdapter::Opaque)),
         },
     }
@@ -4601,9 +4692,17 @@ pub async fn verify(
                 execution_project,
                 execution_source,
             );
-            let source_mode = harness_context.target_source.mode;
-            let (runtime, test_adapter) =
-                authoritative_harness_runtime(*language, selected_test_runner);
+            let source_mode = harness_context
+                .test_source
+                .as_ref()
+                .map(|source| source.mode)
+                .unwrap_or(harness_context.target_source.mode);
+            let (runtime, test_adapter) = authoritative_harness_runtime(
+                *language,
+                selected_test_runner,
+                &runner_probe,
+                &harness_context,
+            );
             let artifact = if prepared._root.is_some() {
                 execution_source
                     .and_then(|source| {
@@ -4659,8 +4758,14 @@ pub async fn verify(
         let test_ms = start.elapsed().as_millis() as u64;
         let test_output = format!("{}\n{}", test_result.stdout, test_result.stderr);
         let entered_surfaces = parse_target_entered_events(&test_output);
-        let has_assertion_failure =
-            test_output.contains("Assertion failed") || test_output.contains("AssertionError");
+        let has_non_target_blocker = has_non_target_blocking_diagnostic(&test_result.diagnostics);
+        let has_assertion_failure = !has_non_target_blocker
+            && (test_output.contains("Assertion failed")
+                || test_output.contains("AssertionError")
+                || test_result.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.kind == FailureKind::AssertionFailure
+                        && diagnostic.component == DiagnosticComponent::AuthoritativeTestRunner
+                }));
         let test_ok = test_result.exit_code == Some(0)
             && !test_result.timed_out
             && !test_result.memory_error
@@ -4674,6 +4779,7 @@ pub async fn verify(
 
         let mut test_detail = serde_json::to_value(&test_result).unwrap();
         test_detail["assertion_failure"] = serde_json::Value::Bool(has_assertion_failure);
+        test_detail["non_target_blocking"] = serde_json::Value::Bool(has_non_target_blocker);
         test_detail["instrumentation_overlay"] = serde_json::to_value(&prepared.overlay).unwrap();
         test_detail["target_entered_surfaces"] = serde_json::to_value(&entered_surfaces).unwrap();
         test_detail["authoritative_test_covered_surfaces"] =
@@ -4795,6 +4901,38 @@ fn diagnostic_from_termination(
     }
 }
 
+fn is_non_target_blocker(diagnostic: &FailureDiagnostic) -> bool {
+    diagnostic.impact == DiagnosticImpact::Blocking
+        && diagnostic.domain != FailureDomain::TargetCode
+        && diagnostic.kind != FailureKind::NonzeroExit
+}
+
+fn has_non_target_blocking_diagnostic(diagnostics: &[FailureDiagnostic]) -> bool {
+    diagnostics.iter().any(is_non_target_blocker)
+}
+
+fn detail_has_non_target_blocker(detail: Option<&serde_json::Value>) -> bool {
+    let Some(detail) = detail else {
+        return false;
+    };
+    if detail
+        .get("non_target_blocking")
+        .and_then(|value| value.as_bool())
+        == Some(true)
+    {
+        return true;
+    }
+    let has_blocker = |value: &serde_json::Value| {
+        ["diagnostics", "failure_diagnostics"]
+            .iter()
+            .filter_map(|key| value.get(key).and_then(|entries| entries.as_array()))
+            .flatten()
+            .filter_map(|entry| serde_json::from_value::<FailureDiagnostic>(entry.clone()).ok())
+            .any(|d| is_non_target_blocker(&d))
+    };
+    has_blocker(detail) || detail.get("execution").is_some_and(has_blocker)
+}
+
 fn diagnostic_from_stage(
     stage: &VerificationStage,
     coverage_gate: CoverageGate,
@@ -4892,7 +5030,9 @@ fn diagnostic_from_stage(
         )),
         "execute" | "test" => {
             let is_test = stage.name == "test";
+            let non_target_blocked = detail_has_non_target_blocker(detail);
             let assertion_failure = is_test
+                && !non_target_blocked
                 && (message.contains("Assertion failed")
                     || message.contains("AssertionError")
                     || detail
@@ -4923,6 +5063,9 @@ fn diagnostic_from_stage(
                     DiagnosticComponent::ModuleLoader,
                     DiagnosticImpact::Blocking,
                 ));
+            }
+            if non_target_blocked {
+                return None;
             }
             if let Some(termination) = execution
                 .and_then(|value| value.get("termination"))
@@ -5040,11 +5183,14 @@ fn diagnostics_from_stage_detail(detail: Option<&serde_json::Value>) -> Vec<Fail
             .get("assertion_failure")
             .and_then(|value| value.as_bool())
             == Some(true);
+    let non_target_blocked = detail_has_non_target_blocker(Some(detail));
     for key in ["diagnostics", "failure_diagnostics"] {
         if let Some(values) = detail.get(key).and_then(|value| value.as_array()) {
             for value in values {
                 if let Ok(diagnostic) = serde_json::from_value::<FailureDiagnostic>(value.clone()) {
-                    if target_cause && diagnostic.kind == FailureKind::NonzeroExit {
+                    if (target_cause || non_target_blocked)
+                        && diagnostic.kind == FailureKind::NonzeroExit
+                    {
                         continue;
                     }
                     append_unique_diagnostic(&mut diagnostics, diagnostic);
@@ -5078,7 +5224,9 @@ fn diagnostics_from_stage_detail(detail: Option<&serde_json::Value>) -> Vec<Fail
                             .get("assertion_failure")
                             .and_then(|value| value.as_bool())
                             == Some(true);
-                    if target_cause && diagnostic.kind == FailureKind::NonzeroExit {
+                    if (target_cause || non_target_blocked)
+                        && diagnostic.kind == FailureKind::NonzeroExit
+                    {
                         continue;
                     }
                     append_unique_diagnostic(&mut diagnostics, diagnostic);
@@ -5116,7 +5264,9 @@ fn annotate_stage_diagnostics(stages: &mut [VerificationStage], coverage_gate: C
                 if let Some(termination) = execution.get("termination").and_then(|value| {
                     serde_json::from_value::<ProcessTermination>(value.clone()).ok()
                 }) {
+                    let non_target_blocked = detail_has_non_target_blocker(stage.detail.as_ref());
                     let assertion_failure = stage.name == "test"
+                        && !non_target_blocked
                         && (stage.message.as_deref().is_some_and(|message| {
                             message.contains("Assertion failed")
                                 || message.contains("AssertionError")
@@ -5149,6 +5299,7 @@ fn annotate_stage_diagnostics(stages: &mut [VerificationStage], coverage_gate: C
                             .and_then(|value| value.as_str())
                             .is_some_and(is_typescript_module_load_error);
                     let should_record_exit = !module_load_blocked
+                        && !non_target_blocked
                         && !assertion_failure
                         && (termination.kind != ProcessTerminationKind::Exited
                             || (termination.exit_code != Some(0) && !has_target_finding));

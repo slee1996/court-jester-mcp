@@ -56,6 +56,19 @@ fn typed_diagnostics_round_trip_and_old_v3_defaults() {
 }
 
 #[test]
+fn bun_junit_adapter_preserves_public_variant_and_serde_value() {
+    let adapter = TestAdapter::BunJunit;
+    assert_eq!(
+        serde_json::to_value(adapter).unwrap(),
+        serde_json::json!("bun_junit")
+    );
+    assert_eq!(
+        serde_json::from_value::<TestAdapter>(serde_json::json!("bun_junit")).unwrap(),
+        adapter
+    );
+}
+
+#[test]
 fn harness_event_parser_enforces_version_order_bounds_and_deduplication() {
     let bootstrap =
         serde_json::json!({"protocol_version": 1, "sequence": 0, "event": "bootstrap_started"});

@@ -3,10 +3,11 @@ use court_jester::tools::verify::{
     verify, VerifyOptions,
 };
 use court_jester::types::{
-    ComplexityMetric, CoverageGate, ExecuteGate, FindingCategory, FindingConfidence,
-    FindingSeverity, InferredOracleGate, InputClassification, Language, NetworkPolicy, OracleKind,
-    OracleProvenance, ReplayOutcome, ReportLevel, RuntimeProfile, StageStatus, TestRunner,
-    VerificationReport, VerificationStrength, VerificationVerdict, DEFAULT_PYTHON_DOCKER_IMAGE,
+    ComplexityMetric, CoverageGate, DiagnosticComponent, DiagnosticImpact, ExecuteGate,
+    FailureDomain, FailureKind, FindingCategory, FindingConfidence, FindingSeverity,
+    InferredOracleGate, InputClassification, Language, NetworkPolicy, OracleKind, OracleProvenance,
+    ReplayOutcome, ReportLevel, RuntimeProfile, StageStatus, TestRunner, VerificationReport,
+    VerificationStrength, VerificationVerdict, DEFAULT_PYTHON_DOCKER_IMAGE,
     DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
 };
 use std::fs;
@@ -439,8 +440,9 @@ async fn lint_runner_failures_do_not_count_as_lint_issues_in_summary() {
 #[tokio::test]
 async fn human_summary_highlights_offenders_and_findings() {
     let code = r#"
+// court-jester-properties nonempty_string
 function deepGet(input: { value: { name: string } | null } | null): string {
-    return input!.value!.name.toLowerCase();
+    return "";
 }
 "#;
     let mut opts = default_opts(None);
@@ -3904,7 +3906,7 @@ async fn typescript_test_stage_auto_prefers_bun_for_bun_test_imports() {
         &tool_dir,
         "bun",
         &format!(
-            "#!/bin/sh\nprintf 'runner=bun\\n' > \"{}\"\nfor arg in \"$@\"; do printf 'arg=%s\\n' \"$arg\" >> \"{}\"; done\nexit 0\n",
+            "#!/bin/sh\nprintf 'runner=bun\\n' > \"{}\"\nfor arg in \"$@\"; do printf 'arg=%s\\n' \"$arg\" >> \"{}\"; done\nif [ \"$1\" != \"test\" ]; then printf 'expected bun test subcommand first\\n' >&2; exit 2; fi\nexit 0\n",
             bun_log.display(),
             bun_log.display(),
         ),
@@ -4018,13 +4020,500 @@ test("add", () => {
         bun_log_text.contains("runner=bun"),
         "expected bun runner log, got: {bun_log_text}"
     );
+    let mut bun_args = bun_log_text
+        .lines()
+        .filter_map(|line| line.strip_prefix("arg="));
+    assert_eq!(
+        bun_args.next(),
+        Some("test"),
+        "Bun must receive its test subcommand before preload flags, got: {bun_log_text}"
+    );
     assert!(
-        bun_log_text.contains("arg=test"),
-        "expected bun test subcommand, got: {bun_log_text}"
+        bun_args.any(|argument| argument == "--preload"),
+        "the default deny-network policy must still preload its guard, got: {bun_log_text}"
     );
     assert!(
         !node_log.exists(),
         "node should not have been invoked for bun:test authoritative tests"
+    );
+}
+
+#[tokio::test]
+async fn typescript_test_stage_auto_routes_vitest_tsx_through_project_runner() {
+    let dir = tempfile::tempdir().unwrap();
+    let tool_dir = dir.path().join("node_modules").join(".bin");
+    let vitest_log = dir.path().join("vitest.log");
+    let node_log = dir.path().join("node.log");
+    install_fake_tool_at(
+        &tool_dir,
+        "vitest",
+        &format!(
+            r#"#!/bin/sh
+printf 'runner=vitest\n' > "{}"
+for arg in "$@"; do printf 'arg=%s\n' "$arg" >> "{}"; done
+cat <<'EOF'
+{{"numTotalTestSuites":1,"numPassedTestSuites":1,"numFailedTestSuites":0,"numTotalTests":1,"numPassedTests":1,"numFailedTests":0,"success":true}}
+EOF
+exit 0
+"#,
+            vitest_log.display(),
+            vitest_log.display(),
+        ),
+    );
+    install_fake_tool_at(
+        &tool_dir,
+        "node",
+        &format!(
+            "#!/bin/sh\nprintf 'runner=node\\n' > \"{}\"\nexit 1\n",
+            node_log.display(),
+        ),
+    );
+
+    let src_dir = dir.path().join("src");
+    let pages_dir = src_dir.join("pages");
+    std::fs::create_dir_all(&pages_dir).unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"devDependencies":{"vitest":"3.2.4"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("vitest.config.ts"),
+        "export default { test: { globals: true } };\n",
+    )
+    .unwrap();
+    let source_path = src_dir.join("analytics.ts");
+    let test_path = pages_dir.join("AnalyticsPage.test.tsx");
+    let code =
+        "export function analyticsLabel(value: string): string { return value.toUpperCase(); }\n";
+    let tests = r#"
+import { analyticsLabel } from "../analytics.ts";
+
+describe("AnalyticsPage", () => {
+  beforeEach(() => vi.restoreAllMocks());
+  it("renders its label", () => {
+    expect(analyticsLabel("ready")).toBe("READY");
+  });
+});
+"#;
+    std::fs::write(&source_path, code).unwrap();
+    std::fs::write(&test_path, tests).unwrap();
+
+    let source_file = source_path.to_string_lossy().into_owned();
+    let test_file = test_path.to_string_lossy().into_owned();
+    let project_dir = dir.path().to_string_lossy().into_owned();
+    let mut opts = default_opts(Some(tests));
+    opts.test_source_file = Some(&test_file);
+    opts.test_runner = TestRunner::Auto;
+    opts.tests_only = true;
+    opts.project_dir = Some(&project_dir);
+    opts.source_file = Some(&source_file);
+    opts.network = NetworkPolicy::Allow;
+
+    let report = verify(code, &Language::TypeScript, opts).await;
+    let test_stage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "test")
+        .expect("test stage should be present");
+    assert_eq!(
+        test_stage.status,
+        StageStatus::Passed,
+        "Vitest authoritative test should pass: {:#?}",
+        report.stages
+    );
+
+    let vitest_log_text = std::fs::read_to_string(&vitest_log)
+        .unwrap_or_else(|error| panic!("Auto must launch Vitest ({error}): {:#?}", report.stages));
+    assert!(
+        vitest_log_text.contains("runner=vitest"),
+        "expected Vitest project runner, got:\n{vitest_log_text}"
+    );
+    assert!(
+        vitest_log_text.contains("arg=run") && vitest_log_text.contains("arg=--reporter=json"),
+        "expected a complete Vitest JSON reporter invocation, got:\n{vitest_log_text}"
+    );
+    assert!(
+        !vitest_log_text.contains("arg=--reporter=junit"),
+        "must not inject an incomplete JUnit reporter, got:\n{vitest_log_text}"
+    );
+    assert!(
+        vitest_log_text
+            .lines()
+            .any(|line| line.ends_with("src/pages/AnalyticsPage.test.tsx")),
+        "expected the .test.tsx artifact, got:\n{vitest_log_text}"
+    );
+    assert!(
+        !node_log.exists(),
+        "Node/plain script must not run a Vitest authoritative test"
+    );
+}
+
+#[tokio::test]
+async fn vitest_coordinator_can_fork_guarded_test_worker_under_default_deny() {
+    let dir = tempfile::tempdir().unwrap();
+    let tool_dir = dir.path().join("node_modules").join(".bin");
+    install_fake_tool_at(
+        &tool_dir,
+        "vitest",
+        r#"#!/usr/bin/env node
+const { fork } = require("node:child_process");
+
+if (globalThis.__COURT_JESTER_NETWORK_GUARD__) {
+  console.error("Vitest coordinator unexpectedly received the target guard");
+  process.exit(70);
+}
+for (const flag of ["--pool=forks", "--maxWorkers=1", "--minWorkers=1"]) {
+  if (!process.argv.includes(flag)) {
+    console.error(`Vitest coordinator did not bound its worker pool with ${flag}`);
+    process.exit(73);
+  }
+}
+const testFile = process.argv.at(-1);
+const worker = fork(testFile, {
+  execArgv: ["--no-warnings", "--experimental-transform-types"],
+  stdio: ["ignore", "pipe", "pipe", "ipc"],
+});
+worker.stdout.pipe(process.stdout);
+worker.stderr.pipe(process.stderr);
+worker.once("exit", (code, signal) => {
+  process.exitCode = signal ? 71 : (code ?? 72);
+});
+"#,
+    );
+    std::fs::write(
+        dir.path().join("vitest.config.ts"),
+        "export default { test: { globals: true } };\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name":"guarded-vitest-fixture","type":"module"}"#,
+    )
+    .unwrap();
+
+    let source_path = dir.path().join("target.ts");
+    let test_path = dir.path().join("target.test.ts");
+    let code = "export const targetValue = 1;\n";
+    let tests = r#"
+import { spawnSync } from "node:child_process";
+import { connect } from "node:net";
+
+let denied = 0;
+for (const operation of [
+  () => spawnSync(process.execPath, ["--version"]),
+  () => connect(9, "127.0.0.1"),
+]) {
+  try {
+    operation();
+  } catch (error) {
+    if (/court-jester (process spawn|network access) denied/.test(String(error))) {
+      denied += 1;
+    }
+  }
+}
+if (denied !== 2) {
+  throw new Error(`expected worker process and network denial, observed ${denied}`);
+}
+console.log(JSON.stringify({
+  numTotalTestSuites: 1,
+  numPassedTestSuites: 1,
+  numFailedTestSuites: 0,
+  numTotalTests: 1,
+  numPassedTests: 1,
+  numFailedTests: 0,
+  success: true,
+}));
+"#;
+    std::fs::write(&source_path, code).unwrap();
+    std::fs::write(&test_path, tests).unwrap();
+
+    let source_file = source_path.to_string_lossy().into_owned();
+    let test_file = test_path.to_string_lossy().into_owned();
+    let project_dir = dir.path().to_string_lossy().into_owned();
+    let mut opts = default_opts(Some(tests));
+    opts.test_source_file = Some(&test_file);
+    opts.test_runner = TestRunner::Auto;
+    opts.tests_only = true;
+    opts.project_dir = Some(&project_dir);
+    opts.source_file = Some(&source_file);
+
+    let report = verify(code, &Language::TypeScript, opts).await;
+    let test_stage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "test")
+        .expect("test stage should be present");
+    assert_eq!(
+        test_stage.status,
+        StageStatus::Passed,
+        "unguarded coordinator must fork a guarded test worker: {:#?}",
+        report.stages
+    );
+}
+
+#[tokio::test]
+async fn bun_authoritative_runner_uses_default_reporter_and_classifies_failures() {
+    let dir = tempfile::tempdir().unwrap();
+    let tool_dir = dir.path().join("node_modules").join(".bin");
+    let bun_log = dir.path().join("bun.log");
+    install_fake_tool_at(
+        &tool_dir,
+        "bun",
+        &format!(
+            r#"#!/bin/sh
+reporter_junit=0
+printf 'runner=bun\n' > "{}"
+for arg in "$@"; do
+  printf 'arg=%s\n' "$arg" >> "{}"
+  if [ "$arg" = "--reporter=junit" ]; then reporter_junit=1; fi
+done
+if [ "$reporter_junit" -eq 1 ]; then
+  echo 'error: --reporter=junit requires --reporter-outfile [file] to specify where to save the XML report' >&2
+  exit 1
+fi
+cat >&2 <<'EOF'
+bun test v1.2.0
+
+(fail) add > rejects an incorrect sum
+
+ 0 pass
+ 1 fail
+Ran 1 test across 1 file.
+EOF
+exit 1
+"#,
+            bun_log.display(),
+            bun_log.display(),
+        ),
+    );
+
+    let src_dir = dir.path().join("src");
+    let tests_dir = dir.path().join("tests");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::create_dir_all(&tests_dir).unwrap();
+    let source_path = src_dir.join("math.ts");
+    let test_path = tests_dir.join("unit.test.ts");
+    let code = "export function add(a: number, b: number): number { return a + b; }\n";
+    let tests = r#"
+import { test, expect } from "bun:test";
+import { add } from "../src/math.ts";
+
+test("add", () => {
+  expect(add(2, 3)).toBe(6);
+});
+"#;
+    std::fs::write(&source_path, code).unwrap();
+    std::fs::write(&test_path, tests).unwrap();
+    let source_file = source_path.to_string_lossy().into_owned();
+    let test_file = test_path.to_string_lossy().into_owned();
+    let project_dir = dir.path().to_string_lossy().into_owned();
+    let mut opts = default_opts(Some(tests));
+    opts.test_source_file = Some(&test_file);
+    opts.test_runner = TestRunner::Bun;
+    opts.tests_only = true;
+    opts.project_dir = Some(&project_dir);
+    opts.source_file = Some(&source_file);
+    opts.network = NetworkPolicy::Allow;
+
+    let report = verify(code, &Language::TypeScript, opts).await;
+
+    assert_eq!(
+        report.verdict,
+        VerificationVerdict::Fail,
+        "a Bun assertion failure is a target-code failure: {:#?}",
+        report.diagnostics
+    );
+    assert!(
+        report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.domain == FailureDomain::TargetCode
+                && diagnostic.kind == FailureKind::AssertionFailure
+                && diagnostic.component == DiagnosticComponent::AuthoritativeTestRunner
+        }),
+        "expected an authoritative assertion diagnostic: {:#?}",
+        report.diagnostics
+    );
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.kind != FailureKind::HarnessProtocol),
+        "default Bun failure output must not be diagnosed as a harness protocol error: {:#?}",
+        report.diagnostics
+    );
+
+    let bun_log_text = std::fs::read_to_string(&bun_log).unwrap();
+    assert!(
+        bun_log_text.contains("arg=test"),
+        "expected Bun's project test runner, got:\n{bun_log_text}"
+    );
+    assert!(
+        !bun_log_text.contains("arg=--reporter=junit"),
+        "must not request JUnit without a reporter outfile, got:\n{bun_log_text}"
+    );
+}
+
+#[tokio::test]
+async fn bun_top_level_error_is_an_authoritative_target_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let tool_dir = dir.path().join("node_modules").join(".bin");
+    install_fake_tool_at(
+        &tool_dir,
+        "bun",
+        r#"#!/bin/sh
+cat >&2 <<'EOF'
+bun test v1.2.0
+
+error: setup exploded
+      at <anonymous> (/workspace/tests/unit.test.ts:4:7)
+
+ 0 pass
+ 0 fail
+ 1 error
+Ran 0 tests across 1 file.
+EOF
+exit 1
+"#,
+    );
+
+    let src_dir = dir.path().join("src");
+    let tests_dir = dir.path().join("tests");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::create_dir_all(&tests_dir).unwrap();
+    let source_path = src_dir.join("math.ts");
+    let test_path = tests_dir.join("unit.test.ts");
+    let code = "export function add(a: number, b: number): number { return a + b; }\n";
+    let tests = r#"
+import { beforeAll, test, expect } from "bun:test";
+import { add } from "../src/math.ts";
+
+beforeAll(() => {
+  throw new Error("setup exploded");
+});
+
+test("add", () => {
+  expect(add(2, 3)).toBe(5);
+});
+"#;
+    std::fs::write(&source_path, code).unwrap();
+    std::fs::write(&test_path, tests).unwrap();
+    let source_file = source_path.to_string_lossy().into_owned();
+    let test_file = test_path.to_string_lossy().into_owned();
+    let project_dir = dir.path().to_string_lossy().into_owned();
+    let mut opts = default_opts(Some(tests));
+    opts.test_source_file = Some(&test_file);
+    opts.test_runner = TestRunner::Bun;
+    opts.tests_only = true;
+    opts.project_dir = Some(&project_dir);
+    opts.source_file = Some(&source_file);
+    opts.network = NetworkPolicy::Allow;
+
+    let report = verify(code, &Language::TypeScript, opts).await;
+
+    assert_eq!(
+        report.verdict,
+        VerificationVerdict::Fail,
+        "a Bun setup error is an authoritative target failure: {:#?}",
+        report.diagnostics
+    );
+    assert!(
+        report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.domain == FailureDomain::TargetCode
+                && diagnostic.kind == FailureKind::AssertionFailure
+                && diagnostic.component == DiagnosticComponent::AuthoritativeTestRunner
+                && diagnostic.impact == DiagnosticImpact::Gating
+        }),
+        "expected an authoritative target diagnostic: {:#?}",
+        report.diagnostics
+    );
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.kind != FailureKind::HarnessProtocol),
+        "positive Bun error summaries must not become protocol blockers: {:#?}",
+        report.diagnostics
+    );
+}
+
+#[tokio::test]
+async fn bun_assertion_wrapped_sandbox_blockers_remain_non_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let tool_dir = dir.path().join("node_modules").join(".bin");
+    install_fake_tool_at(
+        &tool_dir,
+        "bun",
+        r#"#!/bin/sh
+cat >&2 <<'EOF'
+AssertionError: Got unwanted exception.
+Actual message: "court-jester network access denied"
+    at <anonymous> (/workspace/tests/client.test.ts:7:10)
+court-jester process spawn denied
+bun test v1.2.0
+
+(fail) load > denies network and process access
+
+ 0 pass
+ 1 fail
+Ran 1 test across 1 file.
+EOF
+exit 1
+"#,
+    );
+
+    let src_dir = dir.path().join("src");
+    let tests_dir = dir.path().join("tests");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::create_dir_all(&tests_dir).unwrap();
+    let source_path = src_dir.join("client.ts");
+    let test_path = tests_dir.join("client.test.ts");
+    let code = "export async function load(): Promise<void> {}\n";
+    let tests = r#"
+import { expect, test } from "bun:test";
+
+test("denied operations", () => {
+  expect(() => fetch("https://example.com")).not.toThrow();
+  expect(() => Bun.spawnSync(["echo", "blocked"])).not.toThrow();
+});
+"#;
+    std::fs::write(&source_path, code).unwrap();
+    std::fs::write(&test_path, tests).unwrap();
+    let source_file = source_path.to_string_lossy().into_owned();
+    let test_file = test_path.to_string_lossy().into_owned();
+    let project_dir = dir.path().to_string_lossy().into_owned();
+    let mut opts = default_opts(Some(tests));
+    opts.test_source_file = Some(&test_file);
+    opts.test_runner = TestRunner::Bun;
+    opts.tests_only = true;
+    opts.project_dir = Some(&project_dir);
+    opts.source_file = Some(&source_file);
+
+    let report = verify(code, &Language::TypeScript, opts).await;
+
+    assert_eq!(
+        report.verdict,
+        VerificationVerdict::Inconclusive,
+        "a sandbox blocker is not a target-code failure: {:#?}",
+        report.diagnostics
+    );
+    assert!(
+        report.diagnostics.iter().any(|diagnostic| {
+            matches!(
+                diagnostic.kind,
+                FailureKind::NetworkDenied | FailureKind::ProcessSpawnDenied
+            )
+        }),
+        "expected typed sandbox blockers: {:#?}",
+        report.diagnostics
+    );
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.domain != FailureDomain::TargetCode
+                && diagnostic.kind != FailureKind::AssertionFailure),
+        "sandbox-caused Bun output must not become a target assertion: {:#?}",
+        report.diagnostics
     );
 }
 
