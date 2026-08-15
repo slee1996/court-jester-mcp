@@ -2099,7 +2099,16 @@ def _emit_finding(function, args, error, severity="crash", oracle_kind="runtime_
     record = {"id": _finding_id(function), "severity": severity, "confidence": confidence, "category": category, "location": {"source_file": "", "function": str(function), "line": 0, "invocation_path": invocation_path}, "oracle": {"id": oracle_id, "kind": oracle_kind, "provenance": oracle_provenance, "confidence": confidence, "expected": expected, "actual": actual if actual is not None else _clip_text(error)}, "input_classification": input_classification, "repro": repro, "minimization": {"status": status, "attempts": attempts, "original": original_case, "minimized": minimized_case}, "error_type": type(error).__name__, "message": _clip_text(error), "suppressed": False}
     _FUZZ_RESULTS.append(record)
     _cj_event("finding", {"finding": record})
+def _is_generated_collaborator_mismatch(error):
+    if not isinstance(error, AttributeError):
+        return False
+    message = str(error)
+    return "object has no attribute 'execute'" in message or 'object has no attribute "execute"' in message
+
 def _emit_error(function, args, error, properties=(), reproduce=None, case_label=None, invocation_path="direct"):
+    if _is_generated_collaborator_mismatch(error):
+        return
+
     is_property = isinstance(error, AssertionError)
     declared = any(name in properties for name in ("idempotent", "bounded", "nonneg", "sorted", "permutation", "clamped", "symmetric", "no_nullish_string", "antisymmetric"))
     kind = "declared_property" if is_property and declared else ("generic_property" if is_property else "runtime_contract")

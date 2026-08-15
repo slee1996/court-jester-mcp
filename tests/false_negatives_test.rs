@@ -31,7 +31,7 @@ fn opts() -> VerifyOptions<'static> {
         report_level: ReportLevel::Full,
         execute_gate: ExecuteGate::All,
         coverage_gate: CoverageGate::ChangedExports,
-        inferred_oracle_gate: InferredOracleGate::Advisory,
+        inferred_oracle_gate: InferredOracleGate::Fail,
         runtime_profile: RuntimeProfile::LocalTrusted,
         python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
         typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
@@ -43,11 +43,21 @@ fn opts() -> VerifyOptions<'static> {
 
 /// Helper: run verify, return whether the execute stage reported crashes.
 async fn fuzz_catches_bug(code: &str, language: &Language) -> bool {
-    let report = verify(code, language, opts()).await;
+    let project = tempfile::tempdir().unwrap();
+    let extension = match language {
+        Language::Python => "py",
+        Language::TypeScript => "ts",
+    };
+    let source = project.path().join(format!("target.{extension}"));
+    std::fs::write(&source, code).unwrap();
+    let mut options = opts();
+    options.project_dir = Some(project.path().to_str().unwrap());
+    options.source_file = Some(source.to_str().unwrap());
+    let report = verify(code, language, options).await;
     let exec_stage = report.stages.iter().find(|s| s.name == "execute");
     match exec_stage {
         Some(stage) => stage.status == StageStatus::Failed,
-        None => false, // no execute stage = no functions found
+        None => false,
     }
 }
 
@@ -182,6 +192,18 @@ def greet(name: str) -> str:
     assert!(
         !fuzz_catches_bug(code, &Language::Python).await,
         "safe greeting should NOT be flagged"
+    );
+}
+
+#[tokio::test]
+async fn no_false_positive_for_unavailable_cursor_collaborator() {
+    let code = r#"
+def require_collection_persistence(cursor, school_id):
+    cursor.execute("SELECT 1", (school_id,))
+"#;
+    assert!(
+        !fuzz_catches_bug(code, &Language::Python).await,
+        "generated scalar cursor substitutes are invalid collaborator inputs"
     );
 }
 

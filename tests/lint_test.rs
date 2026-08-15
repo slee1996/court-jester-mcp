@@ -141,6 +141,9 @@ fn verify_keeps_python_lint_runner_errors_advisory() {
     let _guard = path_lock().lock().unwrap_or_else(|e| e.into_inner());
     let tool_dir = install_fake_tool("ruff", "#!/bin/sh\necho 'bad ruff config' 1>&2\nexit 2\n");
     let _path = EnvVarGuard::prepend_path(tool_dir.path());
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("add.py");
+    std::fs::write(&source, "def add(a: int, b: int) -> int:\n    return a + b").unwrap();
 
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let report = runtime.block_on(verify(
@@ -156,14 +159,14 @@ fn verify_keeps_python_lint_runner_errors_advisory() {
             tests_only: false,
             complexity_threshold: None,
             complexity_metric: ComplexityMetric::Cyclomatic,
-            project_dir: None,
+            project_dir: Some(project.path().to_str().unwrap()),
             lint_config_path: None,
             lint_virtual_file_path: None,
             diff: None,
             suppressions: None,
             suppression_source: None,
             auto_seed: true,
-            source_file: None,
+            source_file: Some(source.to_str().unwrap()),
             output_dir: None,
             report_level: ReportLevel::Full,
             execute_gate: ExecuteGate::All,

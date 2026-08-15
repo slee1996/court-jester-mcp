@@ -1330,7 +1330,7 @@ async fn execute_standalone(
             let repo_runner =
                 detect_repo_typescript_runner(context.workspace_root.to_str(), source);
             let path = std::env::var("PATH").unwrap_or_default();
-            if repo_runner.as_deref() == Some("bun") && typescript_code_requires_bun_runtime(code) {
+            if repo_runner.as_deref() == Some("bun") {
                 HarnessRuntime::BunScript
             } else if which_binary(&path, "node").is_some() {
                 HarnessRuntime::NodeScript
@@ -2254,6 +2254,12 @@ async fn run_harness_in_docker(
     process
 }
 
+fn virtual_env_bin(virtual_env: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
+    virtual_env.map(|root| {
+        std::path::PathBuf::from(root).join(if cfg!(windows) { "Scripts" } else { "bin" })
+    })
+}
+
 pub async fn execute_harness(
     context: &ExecutionContext,
     harness: HarnessSpec,
@@ -2354,13 +2360,21 @@ pub async fn execute_harness(
                 .as_ref()
                 .map(|name| temporary.path().join(name))
                 .unwrap_or_else(|| temporary.path().to_path_buf());
-            if let Err(error) = copy_materialization_tree(&context.workspace_root, &overlay_root) {
-                let process =
-                    launch_failure(format!("failed to materialize project overlay: {error}"));
-                return HarnessExecution {
-                    diagnostics: process.diagnostics.clone(),
-                    process,
-                };
+            let should_materialize = limits
+                .source_file
+                .is_some_and(|path| std::path::Path::new(path).is_file())
+                || (harness.kind == HarnessKind::Standalone && limits.project_dir.is_some());
+            if should_materialize {
+                if let Err(error) =
+                    copy_materialization_tree(&context.workspace_root, &overlay_root)
+                {
+                    let process =
+                        launch_failure(format!("failed to materialize project overlay: {error}"));
+                    return HarnessExecution {
+                        diagnostics: process.diagnostics.clone(),
+                        process,
+                    };
+                }
             }
             let host_artifact = overlay_root.join(&relative_path);
             if let Some(parent) = host_artifact.parent() {
@@ -2398,6 +2412,15 @@ pub async fn execute_harness(
             } else {
                 temporary.path().join(package_relative)
             };
+            if let Err(error) = std::fs::create_dir_all(&launch_cwd) {
+                let process = launch_failure(format!(
+                    "failed to create harness working directory: {error}"
+                ));
+                return HarnessExecution {
+                    diagnostics: process.diagnostics.clone(),
+                    process,
+                };
+            }
             (Some(temporary), host_artifact, launch_cwd)
         }
         HarnessArtifact::Existing { relative_path } => {
@@ -2443,9 +2466,13 @@ pub async fn execute_harness(
             (None, canonical, context.target_package_root.clone())
         }
     };
+
     let path_env = {
         let base = std::env::var("PATH").unwrap_or_default();
         let mut prefixes = Vec::new();
+        if let Some(bin) = virtual_env_bin(std::env::var_os("VIRTUAL_ENV").as_deref()) {
+            prefixes.push(bin.to_string_lossy().into_owned());
+        }
         for root in &context.dependency_roots {
             prefixes.push(
                 root.join("node_modules/.bin")
@@ -2496,7 +2523,7 @@ pub async fn execute_harness(
                 args.extend(["--no-warnings", "--experimental-transform-types"].map(Into::into));
             }
         }
-        HarnessRuntime::BunScript => args.push("run".into()),
+        HarnessRuntime::BunScript => {}
         HarnessRuntime::NodeTest => {
             args.extend(
                 [
@@ -2661,7 +2688,8 @@ pub async fn execute_harness(
 #[cfg(test)]
 mod tests {
     use super::{
-        copy_materialization_tree, has_typescript_type_only_relative_imports, which_binary,
+        copy_materialization_tree, has_typescript_type_only_relative_imports, virtual_env_bin,
+        which_binary,
     };
 
     #[test]
@@ -2828,5 +2856,15 @@ mod tests {
         assert!(destination.path().join("keep.py").is_file());
         assert!(destination.path().join("bench/keep.py").is_file());
         assert!(!destination.path().join("bench/results").exists());
+    }
+
+    #[test]
+    fn active_virtual_environment_contributes_runtime_bin() {
+        let root = std::path::Path::new("/tmp/project-environment");
+        assert_eq!(
+            virtual_env_bin(Some(root.as_os_str())),
+            Some(root.join(if cfg!(windows) { "Scripts" } else { "bin" }))
+        );
+        assert_eq!(virtual_env_bin(None), None);
     }
 }

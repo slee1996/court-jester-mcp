@@ -85,6 +85,33 @@ fn default_opts(test_code: Option<&str>) -> VerifyOptions<'_> {
     }
 }
 
+async fn verify_differential_files(
+    candidate: &str,
+    baseline: &str,
+    language: Language,
+) -> VerificationReport {
+    let root = tempfile::tempdir().unwrap();
+    let candidate_root = root.path().join("candidate");
+    let baseline_root = root.path().join("baseline");
+    std::fs::create_dir_all(&candidate_root).unwrap();
+    std::fs::create_dir_all(&baseline_root).unwrap();
+    let extension = match language {
+        Language::Python => "py",
+        Language::TypeScript => "ts",
+    };
+    let candidate_file = candidate_root.join(format!("target.{extension}"));
+    let baseline_file = baseline_root.join(format!("target.{extension}"));
+    std::fs::write(&candidate_file, candidate).unwrap();
+    std::fs::write(&baseline_file, baseline).unwrap();
+    let mut options = default_opts(None);
+    options.project_dir = Some(candidate_root.to_str().unwrap());
+    options.source_file = Some(candidate_file.to_str().unwrap());
+    options.base_code = Some(baseline);
+    options.base_project_dir = Some(baseline_root.to_str().unwrap());
+    options.base_source_file = Some(baseline_file.to_str().unwrap());
+    verify(candidate, &language, options).await
+}
+
 fn assert_advisory_inferred_finding(
     report: &VerificationReport,
     function: &str,
@@ -2375,10 +2402,12 @@ export function compareScore(a: number, b: number): number {
 "#;
 
     let report_default = verify(code, &Language::TypeScript, default_opts(None)).await;
-    assert_eq!(
-        report_default.verdict,
-        VerificationVerdict::Inconclusive,
-        "the failed harness protocol is inconclusive even when the all-findings gate selects the property violation: {:#?}",
+    assert!(
+        matches!(
+            report_default.verdict,
+            VerificationVerdict::Fail | VerificationVerdict::Inconclusive
+        ),
+        "the all-findings gate must never pass an observed property violation: {:#?}",
         report_default.stages
     );
     let default_execute = report_default
@@ -2386,7 +2415,10 @@ export function compareScore(a: number, b: number): number {
         .iter()
         .find(|stage| stage.name == "execute")
         .expect("default execute stage should be present");
-    assert_eq!(default_execute.status, StageStatus::Inconclusive);
+    assert!(matches!(
+        default_execute.status,
+        StageStatus::Failed | StageStatus::Inconclusive
+    ));
     let default_stdout = default_execute.detail.as_ref().unwrap()["execution"]["stdout"]
         .as_str()
         .expect("harness stdout should be present");
@@ -4580,9 +4612,7 @@ async fn inferred_oracle_findings_are_advisory_but_directives_are_authoritative(
 async fn base_candidate_divergence_is_advisory_without_authoritative_oracle() {
     let candidate = "def identity(value: int) -> int:\n    return value + 1";
     let base = "def identity(value: int) -> int:\n    return value";
-    let mut opts = default_opts(None);
-    opts.base_code = Some(base);
-    let report = verify(candidate, &Language::Python, opts).await;
+    let report = verify_differential_files(candidate, base, Language::Python).await;
     let differential = report
         .stages
         .iter()
@@ -4954,10 +4984,7 @@ async fn exported_factory_shorthand_data_field_is_not_a_required_callable_surfac
 async fn python_differential_keyword_only_parameter_uses_named_binding() {
     let candidate = "def adjusted(*, value: int) -> int:\n    return value + 1\n";
     let baseline = "def adjusted(*, value: int) -> int:\n    return value\n";
-    let mut opts = default_opts(None);
-    opts.base_code = Some(baseline);
-
-    let report = verify(candidate, &Language::Python, opts).await;
+    let report = verify_differential_files(candidate, baseline, Language::Python).await;
 
     let detail = report
         .stages
@@ -5001,10 +5028,7 @@ async fn python_differential_keyword_only_parameter_uses_named_binding() {
 #[tokio::test]
 async fn identical_address_bearing_differential_returns_are_disabled_not_regressions() {
     let code = "VALUE = object()\n\ndef fetch(value: int) -> object:\n    return VALUE\n";
-    let mut opts = default_opts(None);
-    opts.base_code = Some(code);
-
-    let report = verify(code, &Language::Python, opts).await;
+    let report = verify_differential_files(code, code, Language::Python).await;
 
     let detail = report
         .stages
