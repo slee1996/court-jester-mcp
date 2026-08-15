@@ -4931,8 +4931,8 @@ fn diagnostic_from_stage(
                 // A target finding is authoritative and must not be replaced by
                 // a generic nonzero-exit diagnostic. Resource/process causes are
                 // retained alongside that finding.
-                if !assertion_failure
-                    && !(has_target_finding
+                if !(assertion_failure
+                    || has_target_finding
                         && termination.kind == ProcessTerminationKind::Exited
                         && termination.exit_code != Some(0))
                 {

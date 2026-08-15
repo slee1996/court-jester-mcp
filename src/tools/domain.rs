@@ -820,19 +820,21 @@ pub fn normalize_dependency_arguments(
                 .insert(param.name.clone(), substitute.clone());
         } else if positional_index > 0 {
             let index = positional_index - 1;
-            if index == arguments.positional.len() {
-                arguments.positional.push(substitute.clone());
-            } else if index < arguments.positional.len() {
-                arguments.positional[index] = substitute.clone();
-            } else {
-                arguments.positional.resize_with(index, || DomainLiteral {
-                    expression: match language {
-                        Language::Python => "None".into(),
-                        Language::TypeScript => "undefined".into(),
-                    },
-                    json_value: None,
-                });
-                arguments.positional.push(substitute.clone());
+            match index.cmp(&arguments.positional.len()) {
+                std::cmp::Ordering::Equal => arguments.positional.push(substitute.clone()),
+                std::cmp::Ordering::Less => {
+                    arguments.positional[index] = substitute.clone();
+                }
+                std::cmp::Ordering::Greater => {
+                    arguments.positional.resize_with(index, || DomainLiteral {
+                        expression: match language {
+                            Language::Python => "None".into(),
+                            Language::TypeScript => "undefined".into(),
+                        },
+                        json_value: None,
+                    });
+                    arguments.positional.push(substitute.clone());
+                }
             }
         }
         sources.push((
