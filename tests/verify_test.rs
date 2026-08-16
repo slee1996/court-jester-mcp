@@ -3,12 +3,12 @@ use court_jester::tools::verify::{
     verify, VerifyOptions,
 };
 use court_jester::types::{
-    ComplexityMetric, CoverageGate, DiagnosticComponent, DiagnosticImpact, ExecuteGate,
-    FailureDomain, FailureKind, FindingCategory, FindingConfidence, FindingSeverity,
-    InferredOracleGate, InputClassification, Language, NetworkPolicy, OracleKind, OracleProvenance,
-    ReplayOutcome, ReportLevel, RuntimeProfile, StageStatus, TestRunner, VerificationReport,
-    VerificationStrength, VerificationVerdict, DEFAULT_PYTHON_DOCKER_IMAGE,
-    DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+    ComplexityMetric, CoverageGate, CoverageSummary, DiagnosticComponent, DiagnosticImpact,
+    ExecuteGate, FailureDomain, FailureKind, FindingCategory, FindingConfidence, FindingSeverity,
+    FindingsSummary, InferredOracleGate, InputClassification, Language, NetworkPolicy, OracleKind,
+    OracleProvenance, ReplayOutcome, ReportLevel, ReportSummary, RuntimeProfile, StageStatus,
+    TestRunner, VerificationReport, VerificationStage, VerificationStrength, VerificationVerdict,
+    DEFAULT_PYTHON_DOCKER_IMAGE, DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -531,23 +531,71 @@ async fn lint_runner_failures_do_not_count_as_lint_issues_in_summary() {
     );
 }
 
-#[tokio::test]
-async fn human_summary_highlights_offenders_and_findings() {
-    let code = r#"
-// court-jester-properties nonempty_string
-function deepGet(input: { value: { name: string } | null } | null): string {
-    return "";
-}
-"#;
-    let mut opts = default_opts(None);
-    opts.complexity_threshold = Some(0);
-    let report = verify(code, &Language::TypeScript, opts).await;
-
-    assert!(
-        report.verdict != VerificationVerdict::Pass,
-        "report should fail: {:#?}",
-        report.stages
-    );
+#[test]
+fn human_summary_highlights_offenders_and_findings() {
+    let report = VerificationReport {
+        schema_version: 3,
+        stages: vec![
+            VerificationStage {
+                name: "complexity".into(),
+                status: StageStatus::Failed,
+                duration_ms: 0,
+                detail: Some(serde_json::json!({
+                    "threshold": 0,
+                    "violations": [{
+                        "function": "deepGet",
+                        "line": 3,
+                        "complexity": 1,
+                        "cognitive_complexity": 0,
+                    }],
+                })),
+                message: Some("1 function(s) exceed complexity threshold 0".into()),
+            },
+            VerificationStage {
+                name: "execute".into(),
+                status: StageStatus::Failed,
+                duration_ms: 1,
+                detail: Some(serde_json::json!({
+                    "finding_counts": {
+                        "crash": 0,
+                        "property_violation": 1,
+                    },
+                    "findings": [{
+                        "function": "deepGet",
+                        "severity": "high",
+                        "message": "Return value must be a non-empty string",
+                    }],
+                    "no_inputs_reached": 0,
+                })),
+                message: None,
+            },
+        ],
+        verdict: VerificationVerdict::Fail,
+        strength: VerificationStrength::PropertyChecked,
+        summary: ReportSummary {
+            functions_analyzed: 1,
+            functions_fuzzed: 1,
+            functions_skipped: 0,
+            functions_blocked_module_load: 0,
+            fuzz_pass: 0,
+            fuzz_no_inputs_reached: 0,
+            findings: FindingsSummary {
+                total: 1,
+                gating: 1,
+                ..Default::default()
+            },
+            suppressed_complexity_violations: 0,
+            suppressed_portability_warnings: 0,
+            lint_issues: 0,
+            lint_runner_failures: 0,
+            complexity_violations: 1,
+            coverage: CoverageSummary::default(),
+            diagnostics: Default::default(),
+        },
+        diagnostics: vec![],
+        diagnostics_summary: None,
+        report_path: None,
+    };
 
     let summary = report_human_summary(&report);
     assert!(summary.contains("Overall: Fail"), "got:\n{summary}");

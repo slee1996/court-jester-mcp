@@ -4,6 +4,15 @@ This changelog tracks user-visible verifier semantics, report-shape changes, and
 
 ## Unreleased
 
+## 0.2.4 - 2026-08-15
+
+Publication retry for the 0.2.3 correctness backlog after the first tag exposed a CI-only test flake. See [docs/release-notes-0.2.4.md](docs/release-notes-0.2.4.md) for the complete change list and validation evidence.
+
+### Release validation
+
+- Human-summary formatting now uses a deterministic report fixture instead of depending on concurrent Node fuzz execution, eliminating the CI-only false failure without reducing formatter coverage.
+
+
 ## 0.2.3 - 2026-08-15
 
 Runtime, synthesis, and reporting correctness release for issues #1, #9, and #15 through #26. See [docs/release-notes-0.2.3.md](docs/release-notes-0.2.3.md) for the complete change list and validation evidence.

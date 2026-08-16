@@ -57,7 +57,7 @@ clippy:
 
 # Validate every local gate required before creating a release tag.
 release-check:
-    python3 scripts/check_release.py --tag v0.2.3
+    python3 scripts/check_release.py --tag v0.2.4
     cargo fmt --all -- --check
     cargo clippy --locked --all-targets -- -D warnings
     cargo test --locked --tests
