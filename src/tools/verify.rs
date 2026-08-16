@@ -4944,7 +4944,7 @@ pub async fn verify(
                     sandbox::execute_harness(
                         portability_context,
                         HarnessSpec {
-                            kind: HarnessKind::Standalone,
+                            kind: HarnessKind::PortabilityProbe,
                             runtime: HarnessRuntime::NodeScript,
                             test_adapter: None,
                             source_mode: SourceMode::TypeScript,

@@ -1017,7 +1017,11 @@ fn copy_materialization_tree_inner(
             let destination_path = destination.join(entry.file_name());
             let file_type = entry.file_type()?;
             if file_type.is_symlink() {
-                let resolved = std::fs::canonicalize(&source_path)?;
+                let resolved = match std::fs::canonicalize(&source_path) {
+                    Ok(resolved) => resolved,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                };
                 if !resolved.starts_with(source_root) {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::PermissionDenied,
@@ -1294,7 +1298,7 @@ function matchPathAlias(pattern, specifier) {
   return specifier.slice(prefix.length, specifier.length - suffix.length);
 }
 
-function resolveAliasFile(candidate) {
+function resolveAliasFile(candidate, root = overlayRoot) {
   const candidates = [
     candidate,
     ...[".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json"].map(
@@ -1305,13 +1309,13 @@ function resolveAliasFile(candidate) {
     ),
   ];
   for (const possible of candidates) {
-    if (!containsPath(overlayRoot, possible)) {
-      unsupportedAlias("resolved path alias escapes the project mirror");
+    if (!containsPath(root, possible)) {
+      unsupportedAlias("resolved project path escapes the configured root");
     }
     try {
       const resolved = realpathSync(possible);
-      if (!containsPath(overlayRoot, resolved)) {
-        unsupportedAlias("resolved path alias escapes the project mirror");
+      if (!containsPath(root, resolved)) {
+        unsupportedAlias("resolved project path escapes the configured root");
       }
       if (statSync(resolved).isFile()) return resolved;
     } catch {}
@@ -1355,11 +1359,38 @@ function isExplicitPathAliasSpecifier(specifier) {
     || specifier.startsWith("#");
 }
 
+function fileResolution(file) {
+  const resolution = { url: pathToFileURL(file).href, shortCircuit: true };
+  if (path.extname(file) === ".json") {
+    resolution.format = "json";
+    resolution.importAttributes = { type: "json" };
+  }
+  return resolution;
+}
 function aliasResolution(specifier) {
   const alias = resolvePathAlias(specifier);
-  return alias
-    ? { url: pathToFileURL(alias).href, shortCircuit: true }
-    : undefined;
+  return alias ? fileResolution(alias) : undefined;
+}
+
+function relativeResolution(specifier, parentPath) {
+  const root = containsPath(overlayRoot, parentPath)
+    ? overlayRoot
+    : containsPath(sourceRoot, parentPath)
+      ? sourceRoot
+      : undefined;
+  if (!root) return undefined;
+  let relative = resolveAliasFile(
+    path.resolve(path.dirname(parentPath), specifier),
+    root,
+  );
+  if (!relative && root === overlayRoot && sourceRoot) {
+    const sourceParent = path.join(sourceRoot, path.relative(overlayRoot, parentPath));
+    relative = resolveAliasFile(
+      path.resolve(path.dirname(sourceParent), specifier),
+      sourceRoot,
+    );
+  }
+  return relative ? fileResolution(relative) : undefined;
 }
 
 function isInsideNodeModules(candidate) {
@@ -1371,6 +1402,16 @@ function overlayParentPath(context) {
   try {
     const parentPath = realPathOrSelf(fileURLToPath(context.parentURL));
     return containsPath(overlayRoot, parentPath) ? parentPath : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function sourceProjectParentPath(context) {
+  if (!sourceRoot || !context.parentURL?.startsWith("file:")) return undefined;
+  try {
+    const parentPath = realPathOrSelf(fileURLToPath(context.parentURL));
+    return containsPath(sourceRoot, parentPath) ? parentPath : undefined;
   } catch {
     return undefined;
   }
@@ -1389,7 +1430,12 @@ function packageWasNotFound(error, packageName) {
 
 export async function resolve(specifier, context, nextResolve) {
   const parentPath = overlayParentPath(context);
-  if (parentPath && isExplicitPathAliasSpecifier(specifier)) {
+  const projectParentPath = parentPath || sourceProjectParentPath(context);
+  if (projectParentPath && specifier.startsWith(".")) {
+    const relative = relativeResolution(specifier, projectParentPath);
+    if (relative) return relative;
+  }
+  if (projectParentPath && isExplicitPathAliasSpecifier(specifier)) {
     const alias = aliasResolution(specifier);
     if (alias) return alias;
   }
@@ -2930,7 +2976,8 @@ async fn run_harness_in_docker(
         crate::types::HarnessRuntime::NodeScript
             | crate::types::HarnessRuntime::NodeTest
             | crate::types::HarnessRuntime::TsxScript
-    ) && !container_node_resolver_roots.is_empty()
+    ) && harness.kind != crate::types::HarnessKind::PortabilityProbe
+        && !container_node_resolver_roots.is_empty()
     {
         match create_node_package_resolver() {
             Ok(resolver) => Some(resolver),
@@ -3496,7 +3543,8 @@ pub async fn execute_harness(
     let node_package_resolver = if matches!(
         harness.runtime,
         HarnessRuntime::NodeScript | HarnessRuntime::NodeTest | HarnessRuntime::TsxScript
-    ) {
+    ) && harness.kind != HarnessKind::PortabilityProbe
+    {
         match create_node_package_resolver() {
             Ok(resolver) => {
                 let package_relative = context
@@ -4209,6 +4257,24 @@ mod tests {
         assert!(destination.path().join("keep.py").is_file());
         assert!(destination.path().join("bench/keep.py").is_file());
         assert!(!destination.path().join("bench/results").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ignores_dangling_symlinks_when_materializing_project_overlay() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("keep.ts"), "export const keep = true;\n").unwrap();
+        std::os::unix::fs::symlink(
+            source.path().join("missing-target"),
+            source.path().join("dangling-link"),
+        )
+        .unwrap();
+
+        let destination = tempfile::tempdir().unwrap();
+        copy_materialization_tree(source.path(), destination.path()).unwrap();
+
+        assert!(destination.path().join("keep.ts").is_file());
+        assert!(!destination.path().join("dangling-link").exists());
     }
 
     #[test]

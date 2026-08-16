@@ -249,6 +249,7 @@ pub struct DiagnosticsSummary {
 #[serde(rename_all = "snake_case")]
 pub enum HarnessKind {
     Standalone,
+    PortabilityProbe,
     GeneratedVerifier,
     AuthoritativeTest,
 }

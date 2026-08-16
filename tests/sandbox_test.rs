@@ -397,6 +397,75 @@ async fn generated_typescript_harness_resolves_scoped_package_from_target_packag
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn generated_harness_resolves_extensionless_imports_from_workspace_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path();
+    let target = workspace.join("packages/api");
+    let shared = workspace.join("packages/shared");
+    let source = target.join("src/index.ts");
+    let shared_link = target.join("node_modules/@acme/shared");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(shared.join("src/types")).unwrap();
+    std::fs::create_dir_all(shared_link.parent().unwrap()).unwrap();
+    std::fs::write(workspace.join("package.json"), r#"{"private":true}"#).unwrap();
+    std::fs::write(target.join("package.json"), r#"{"type":"module"}"#).unwrap();
+    std::fs::write(&source, "export const target = true;\n").unwrap();
+    std::fs::write(
+        shared.join("package.json"),
+        r#"{"name":"@acme/shared","type":"module","exports":"./src/index.ts"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        shared.join("src/index.ts"),
+        "export { marker } from './types/tenant';\n",
+    )
+    .unwrap();
+    std::fs::write(
+        shared.join("src/types/tenant.ts"),
+        "export const marker = 'workspace-extensionless-ok';\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("../../../shared", &shared_link).unwrap();
+
+    let context = resolve_execution_context(ContextRequest {
+        invocation_dir: workspace,
+        explicit_project_dir: Some(workspace),
+        target_file: Some(&source),
+        test_file: None,
+        language: Language::TypeScript,
+        virtual_file_path: None,
+    })
+    .unwrap();
+    let result = execute_harness(
+        &context,
+        HarnessSpec {
+            kind: HarnessKind::GeneratedVerifier,
+            runtime: HarnessRuntime::NodeScript,
+            test_adapter: None,
+            source_mode: SourceMode::TypeScript,
+            artifact: HarnessArtifact::Generated {
+                code: "import { marker } from '@acme/shared';\nconsole.log(marker);\n".into(),
+                relative_path: ".court-jester/generated/execute.ts".into(),
+            },
+            args: Vec::new(),
+            network: NetworkPolicy::Deny,
+        },
+        sandbox_options(
+            10.0,
+            128,
+            Some(workspace.to_str().unwrap()),
+            Some(source.to_str().unwrap()),
+        ),
+    )
+    .await
+    .process;
+
+    assert_eq!(result.exit_code, Some(0), "result: {result:?}");
+    assert_eq!(result.stdout.trim(), "workspace-extensionless-ok");
+}
+
 async fn execute_typescript_alias_probe(
     tsconfig: &str,
     modules: &[(&str, &str)],
@@ -448,6 +517,41 @@ async fn execute_typescript_alias_probe(
     )
     .await
     .process
+}
+
+#[tokio::test]
+async fn generated_node_harness_resolves_extensionless_relative_typescript_imports() {
+    let result = execute_typescript_alias_probe(
+        "{}",
+        &[
+            (
+                "src/routes/model.ts",
+                "import { marker } from './redaction';\nexport { marker };\n",
+            ),
+            (
+                "src/routes/redaction.ts",
+                "export const marker = 'extensionless-relative-ok';\n",
+            ),
+        ],
+        "import { marker } from './model';\nconsole.log(marker);\n",
+    )
+    .await;
+
+    assert_eq!(result.exit_code, Some(0), "result: {result:?}");
+    assert_eq!(result.stdout.trim(), "extensionless-relative-ok");
+}
+
+#[tokio::test]
+async fn generated_node_harness_loads_project_json_without_import_attributes() {
+    let result = execute_typescript_alias_probe(
+        "{}",
+        &[("src/routes/tenant.json", r#"{"tenant":"json-import-ok"}"#)],
+        "import tenant from './tenant.json';\nconsole.log(tenant.tenant);\n",
+    )
+    .await;
+
+    assert_eq!(result.exit_code, Some(0), "result: {result:?}");
+    assert_eq!(result.stdout.trim(), "json-import-ok");
 }
 
 #[tokio::test]

@@ -4,6 +4,15 @@ This changelog tracks user-visible verifier semantics, report-shape changes, and
 
 ## Unreleased
 
+## 0.2.6 - 2026-08-15
+
+Workspace-package runtime follow-up for issue #21. See [docs/release-notes-0.2.6.md](docs/release-notes-0.2.6.md) for validation evidence.
+
+### Runtime and project context
+
+- Generated TypeScript harnesses resolve extensionless relative imports from workspace packages reached through package-manager symlinks. The Node loader now accepts both temporary-overlay and canonical source-workspace parent paths while retaining configured-root containment.
+- Strict Node portability probes bypass the project loader, preserving extensionless-import warnings without blocking repository-native behavior checks.
+
 ## 0.2.5 - 2026-08-15
 
 Publication retry for the correctness backlog after concurrent child-process integration tests produced a second CI-only false failure. See [docs/release-notes-0.2.5.md](docs/release-notes-0.2.5.md) for the complete change list and validation evidence.
