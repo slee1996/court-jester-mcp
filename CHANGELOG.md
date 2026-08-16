@@ -4,6 +4,15 @@ This changelog tracks user-visible verifier semantics, report-shape changes, and
 
 ## Unreleased
 
+## 0.2.9 - 2026-08-15
+
+Publication retry for 0.2.8 after its Node 24 regression exposed an incompatibility between synchronous load hooks and the project resolver's asynchronous loader chain. See [docs/release-notes-0.2.9.md](docs/release-notes-0.2.9.md) for the complete change list and validation evidence.
+
+### Composable module instrumentation
+
+- Authoritative target instrumentation now joins Node's asynchronous loader chain and uses a process-scoped registration guard, preserving compatibility with the existing TypeScript resolver while registering independently in Vitest fork workers.
+- The native module-load regression now passes both Node 23 locally and Node 24 in a Linux container with an asynchronous resolver loader active.
+
 ## 0.2.8 - 2026-08-15
 
 Publication retry for 0.2.7 after Linux Node 24 exposed that native TypeScript loading can bypass patched `fs` exports. See [docs/release-notes-0.2.8.md](docs/release-notes-0.2.8.md) for the complete change list and validation evidence.

@@ -1773,21 +1773,11 @@ if (target && payload) {
   try {
     const builtinModule = require("node:module");
     builtinModule.syncBuiltinESMExports();
-    if (typeof builtinModule.registerHooks === "function") {
-      builtinModule.registerHooks({
-        load(url, context, nextLoad) {
-          const loaded = nextLoad(url, context);
-          if (!url.startsWith("file:") || normalized(fileURLToPath(url)) !== targetPath) {
-            return loaded;
-          }
-          return { ...loaded, source };
-        },
-      });
-    } else if (
+    if (
       typeof builtinModule.register === "function" &&
-      !process.env.COURT_JESTER_INSTRUMENT_LOADER_REGISTERED
+      process.env.COURT_JESTER_INSTRUMENT_LOADER_PID !== String(process.pid)
     ) {
-      process.env.COURT_JESTER_INSTRUMENT_LOADER_REGISTERED = "1";
+      process.env.COURT_JESTER_INSTRUMENT_LOADER_PID = String(process.pid);
       const hookSource = `
         import fs from "node:fs";
         import path from "node:path";
