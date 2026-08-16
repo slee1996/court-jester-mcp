@@ -1079,13 +1079,50 @@ fn copy_materialization_tree_inner(
     active_directories.remove(&canonical_source);
     result
 }
+fn runtime_tempdir(
+    runtime_profile: crate::types::RuntimeProfile,
+) -> std::io::Result<tempfile::TempDir> {
+    #[cfg(target_os = "macos")]
+    if runtime_profile == crate::types::RuntimeProfile::Isolated {
+        if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
+            let parent = std::path::PathBuf::from(home).join("Library/Caches/court-jester/runtime");
+            if std::fs::create_dir_all(&parent).is_ok() {
+                if let Ok(directory) = tempfile::Builder::new()
+                    .prefix("court-jester-")
+                    .tempdir_in(parent)
+                {
+                    return Ok(directory);
+                }
+            }
+        }
+    }
+    tempfile::tempdir()
+}
+
+fn docker_image_for_harness<'a>(
+    configured_image: &'a str,
+    runtime: &crate::types::HarnessRuntime,
+) -> &'a str {
+    if matches!(
+        runtime,
+        crate::types::HarnessRuntime::BunScript | crate::types::HarnessRuntime::BunTest
+    ) && configured_image == crate::types::DEFAULT_TYPESCRIPT_DOCKER_IMAGE
+    {
+        crate::types::DEFAULT_BUN_DOCKER_IMAGE
+    } else {
+        configured_image
+    }
+}
+
 struct NodePackageResolver {
     _directory: tempfile::TempDir,
     loader: std::path::PathBuf,
 }
 
-fn create_node_package_resolver() -> Result<NodePackageResolver, String> {
-    let directory = tempfile::tempdir()
+fn create_node_package_resolver(
+    runtime_profile: crate::types::RuntimeProfile,
+) -> Result<NodePackageResolver, String> {
+    let directory = runtime_tempdir(runtime_profile)
         .map_err(|error| format!("failed to create Node package resolver: {error}"))?;
     let loader = directory.path().join("package-resolver.mjs");
     std::fs::write(
@@ -1572,9 +1609,12 @@ struct NetworkGuard {
     typescript_loader: std::path::PathBuf,
 }
 
-fn create_network_guard(instrumented_source: Option<&str>) -> Result<NetworkGuard, String> {
-    let directory =
-        tempfile::tempdir().map_err(|error| format!("failed to create network guard: {error}"))?;
+fn create_network_guard(
+    runtime_profile: crate::types::RuntimeProfile,
+    instrumented_source: Option<&str>,
+) -> Result<NetworkGuard, String> {
+    let directory = runtime_tempdir(runtime_profile)
+        .map_err(|error| format!("failed to create network guard: {error}"))?;
     let python_sitecustomize = directory.path().join("sitecustomize.py");
     let node_preload = directory.path().join("network-guard.cjs");
     let instrumentation_preload = directory.path().join("instrumentation-preload.cjs");
@@ -1734,6 +1774,25 @@ if (target && payload) {
   const originalReadFileSync = fs.readFileSync.bind(fs);
   const originalReadFile = fs.readFile.bind(fs);
   const source = originalReadFileSync(payload);
+  if (globalThis.Bun && typeof globalThis.Bun.plugin === "function") {
+    const escapedTargetPath = targetPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const loader = targetPath.endsWith(".tsx")
+      ? "tsx"
+      : targetPath.endsWith(".jsx")
+        ? "jsx"
+        : targetPath.endsWith(".js") || targetPath.endsWith(".mjs") || targetPath.endsWith(".cjs")
+          ? "js"
+          : "ts";
+    globalThis.Bun.plugin({
+      name: "court-jester-instrumentation",
+      setup(build) {
+        build.onLoad({ filter: new RegExp(`^${escapedTargetPath}$`) }, () => ({
+          contents: source.toString("utf8"),
+          loader,
+        }));
+      },
+    });
+  }
   function normalized(value) {
     try {
       if (value instanceof URL) value = fileURLToPath(value);
@@ -2172,6 +2231,14 @@ function compilerOptionsFor(filename) {
 export async function load(url, context, nextLoad) {
   if (!url.startsWith("file:")) return nextLoad(url, context);
   const filename = fileURLToPath(url);
+  if (filename.endsWith(".json")) {
+    const value = JSON.parse(fs.readFileSync(filename, "utf8"));
+    return {
+      format: "module",
+      source: `export default ${JSON.stringify(value)};\n`,
+      shortCircuit: true,
+    };
+  }
   if (filename.endsWith(".d.ts") || !/\.[cm]?tsx?$/.test(filename)) {
     return nextLoad(url, context);
   }
@@ -3078,6 +3145,33 @@ fn harness_diagnostics(
             limits: Some(limits.clone()),
         });
     }
+    let incompatible_native_dependency = if process
+        .stderr
+        .contains("Prisma Client could not locate the Query Engine for runtime")
+        && process.stderr.contains("the actual deployment required")
+    {
+        Some(
+            "project Prisma Client was generated for a platform incompatible with the selected runtime"
+                .to_string(),
+        )
+    } else if process.stderr.contains("esbuild") && process.stderr.contains("another platform") {
+        Some(
+            "project esbuild binary is incompatible with the selected runtime platform".to_string(),
+        )
+    } else {
+        None
+    };
+    if let Some(message) = incompatible_native_dependency {
+        diagnostics.push(FailureDiagnostic {
+            domain: FailureDomain::Environment,
+            kind: FailureKind::ModuleLoad,
+            component: DiagnosticComponent::ModuleLoader,
+            impact: DiagnosticImpact::Blocking,
+            message,
+            process: process.termination.clone(),
+            limits: Some(limits.clone()),
+        });
+    }
 
     if limits.network_policy == NetworkPolicy::Deny
         && process
@@ -3379,7 +3473,7 @@ async fn run_harness_in_docker(
     network_guard: Option<&NetworkGuard>,
     limits: crate::types::SandboxOptions<'_>,
 ) -> ExecutionResult {
-    let image = limits.docker_image.unwrap_or_default();
+    let image = docker_image_for_harness(limits.docker_image.unwrap_or_default(), &harness.runtime);
     let started = Instant::now();
     match docker_output(&["image", "inspect", image]).await {
         Ok(output) if output.status.success() => {}
@@ -3393,7 +3487,7 @@ async fn run_harness_in_docker(
     }
 
     let mirror = if root.is_none() {
-        match tempfile::tempdir() {
+        match runtime_tempdir(crate::types::RuntimeProfile::Isolated) {
             Ok(directory) => Some(directory),
             Err(error) => {
                 return launch_failure(format!(
@@ -3489,13 +3583,46 @@ async fn run_harness_in_docker(
         Err(error) => return launch_failure(error),
     };
     #[cfg(unix)]
-    if dependency_workspace.join("node_modules").is_dir() {
-        let workspace_node_modules = project_root.join("node_modules");
-        if std::fs::symlink_metadata(&workspace_node_modules).is_err() {
-            if let Err(error) = std::os::unix::fs::symlink(
-                std::path::Path::new(DOCKER_DEPENDENCY_WORKSPACE).join("node_modules"),
-                &workspace_node_modules,
-            ) {
+    {
+        let mut dependency_links = vec![(
+            dependency_workspace.join("node_modules"),
+            project_root.join("node_modules"),
+            std::path::Path::new(DOCKER_DEPENDENCY_WORKSPACE).join("node_modules"),
+        )];
+        if let Some(target_relative) = context
+            .target_package_root
+            .strip_prefix(dependency_workspace)
+            .ok()
+            .or_else(|| {
+                context
+                    .target_package_root
+                    .strip_prefix(&context.workspace_root)
+                    .ok()
+            })
+            .filter(|relative| !relative.as_os_str().is_empty())
+        {
+            dependency_links.push((
+                dependency_workspace
+                    .join(target_relative)
+                    .join("node_modules"),
+                project_root.join(target_relative).join("node_modules"),
+                std::path::Path::new(DOCKER_DEPENDENCY_WORKSPACE)
+                    .join(target_relative)
+                    .join("node_modules"),
+            ));
+        }
+        for (host_source, host_link, container_target) in dependency_links {
+            if !host_source.is_dir() || std::fs::symlink_metadata(&host_link).is_ok() {
+                continue;
+            }
+            if let Some(parent) = host_link.parent() {
+                if let Err(error) = std::fs::create_dir_all(parent) {
+                    return launch_failure(format!(
+                        "docker setup failed preparing project dependency link: {error}"
+                    ));
+                }
+            }
+            if let Err(error) = std::os::unix::fs::symlink(container_target, &host_link) {
                 return launch_failure(format!(
                     "docker setup failed linking project dependencies: {error}"
                 ));
@@ -3670,7 +3797,7 @@ async fn run_harness_in_docker(
     ) && harness.kind != crate::types::HarnessKind::PortabilityProbe
         && !container_node_resolver_roots.is_empty()
     {
-        match create_node_package_resolver() {
+        match create_node_package_resolver(crate::types::RuntimeProfile::Isolated) {
             Ok(resolver) => Some(resolver),
             Err(error) => return launch_failure(error),
         }
@@ -3782,6 +3909,23 @@ async fn run_harness_in_docker(
             artifact,
         ],
     };
+    if limits.instrumented_source.is_some() {
+        let preload_index = match harness.runtime {
+            crate::types::HarnessRuntime::BunScript | crate::types::HarnessRuntime::BunTest => {
+                Some(2)
+            }
+            _ => None,
+        };
+        if let Some(index) = preload_index {
+            command.splice(
+                index..index,
+                [
+                    "--preload".to_string(),
+                    "/court-jester/instrumentation-preload.cjs".to_string(),
+                ],
+            );
+        }
+    }
     if node_package_resolver.is_some() {
         if let Some(node_options) =
             configure_docker_node_loader(harness.runtime, container_package_resolver, &mut command)
@@ -4007,7 +4151,7 @@ pub async fn execute_harness(
                     process,
                 };
             }
-            let temporary = match tempfile::tempdir() {
+            let temporary = match runtime_tempdir(limits.runtime_profile) {
                 Ok(directory) => directory,
                 Err(error) => {
                     let process =
@@ -4178,16 +4322,22 @@ pub async fn execute_harness(
         HarnessRuntime::Jest => "jest",
         HarnessRuntime::RepoTest => "npm",
     };
-    let mut executable = match which_binary(&path_env, executable_name) {
-        Some(path) => std::path::PathBuf::from(path),
-        None => {
-            let process = launch_failure(format!(
-                "required runtime '{executable_name}' is unavailable"
-            ));
-            return HarnessExecution {
-                diagnostics: process.diagnostics.clone(),
-                process,
-            };
+    let mut executable = if limits.runtime_profile == RuntimeProfile::Isolated
+        && harness.runtime != HarnessRuntime::Vitest
+    {
+        std::path::PathBuf::from(executable_name)
+    } else {
+        match which_binary(&path_env, executable_name) {
+            Some(path) => std::path::PathBuf::from(path),
+            None => {
+                let process = launch_failure(format!(
+                    "required runtime '{executable_name}' is unavailable"
+                ));
+                return HarnessExecution {
+                    diagnostics: process.diagnostics.clone(),
+                    process,
+                };
+            }
         }
     };
     let mut args = Vec::<std::ffi::OsString>::new();
@@ -4261,7 +4411,7 @@ pub async fn execute_harness(
         HarnessRuntime::NodeScript | HarnessRuntime::NodeTest | HarnessRuntime::TsxScript
     ) && harness.kind != HarnessKind::PortabilityProbe
     {
-        match create_node_package_resolver() {
+        match create_node_package_resolver(limits.runtime_profile) {
             Ok(resolver) => {
                 let package_relative = context
                     .target_package_root
@@ -4333,7 +4483,7 @@ pub async fn execute_harness(
     }
     let runtime_guard =
         if effective_network == NetworkPolicy::Deny || limits.instrumented_source.is_some() {
-            match create_network_guard(limits.instrumented_source) {
+            match create_network_guard(limits.runtime_profile, limits.instrumented_source) {
                 Ok(guard) => Some(guard),
                 Err(error) => {
                     let process = launch_failure(error);
@@ -4560,15 +4710,94 @@ pub async fn execute_harness(
 #[cfg(test)]
 mod tests {
     use super::{
-        configure_docker_node_loader, copy_materialization_tree, create_node_package_resolver,
-        docker_dependency_mapping, docker_path_mapping, docker_project_module_path,
-        harness_diagnostics, has_typescript_type_only_relative_imports, virtual_env_bin,
+        configure_docker_node_loader, copy_materialization_tree, create_network_guard,
+        create_node_package_resolver, docker_dependency_mapping, docker_image_for_harness,
+        docker_path_mapping, docker_project_module_path, harness_diagnostics,
+        has_typescript_type_only_relative_imports, runtime_tempdir, virtual_env_bin,
         vitest_project_entrypoint, which_binary,
     };
     use crate::types::{
         DiagnosticComponent, DiagnosticImpact, ExecutionLimits, ExecutionResult, FailureDomain,
         FailureKind, NetworkPolicy, RuntimeProfile, TestAdapter,
     };
+
+    #[test]
+    fn default_typescript_image_selects_bun_for_bun_harnesses() {
+        assert_eq!(
+            docker_image_for_harness(
+                crate::types::DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+                &crate::types::HarnessRuntime::BunTest,
+            ),
+            crate::types::DEFAULT_BUN_DOCKER_IMAGE
+        );
+        assert_eq!(
+            docker_image_for_harness(
+                "custom-typescript:latest",
+                &crate::types::HarnessRuntime::BunTest,
+            ),
+            "custom-typescript:latest"
+        );
+        assert_eq!(
+            docker_image_for_harness(
+                crate::types::DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+                &crate::types::HarnessRuntime::NodeScript,
+            ),
+            crate::types::DEFAULT_TYPESCRIPT_DOCKER_IMAGE
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn isolated_runtime_temporary_directories_use_docker_shared_home() {
+        let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+            return;
+        };
+        let directory = runtime_tempdir(RuntimeProfile::Isolated).unwrap();
+        let expected_parent =
+            std::path::PathBuf::from(home).join("Library/Caches/court-jester/runtime");
+
+        assert!(directory.path().starts_with(expected_parent));
+        assert!(directory.path().is_dir());
+    }
+
+    #[test]
+    fn typescript_loader_supplies_json_module_semantics_without_import_attributes() {
+        let project = tempfile::tempdir().unwrap();
+        let entrypoint = project.path().join("entry.mjs");
+        let data = project.path().join("tenant.json");
+        let typescript = project.path().join("typescript.mjs");
+        std::fs::write(
+            &entrypoint,
+            "import tenant from './tenant.json';\nconsole.log(tenant.marker);\n",
+        )
+        .unwrap();
+        std::fs::write(&data, r#"{"marker":"loader-json-ok"}"#).unwrap();
+        std::fs::write(
+            &typescript,
+            "export default { findConfigFile() {}, sys: {}, ModuleKind: {}, ScriptTarget: {}, ModuleResolutionKind: {}, ImportsNotUsedAsValues: {}, transpileModule(source) { return { outputText: source }; } };\n",
+        )
+        .unwrap();
+        let guard = create_network_guard(RuntimeProfile::LocalTrusted, None).unwrap();
+
+        let output = std::process::Command::new("node")
+            .arg("--no-warnings")
+            .arg("--experimental-loader")
+            .arg(&guard.typescript_loader)
+            .arg(&entrypoint)
+            .env("COURT_JESTER_TYPESCRIPT_MODULE", &typescript)
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "loader-json-ok"
+        );
+    }
 
     #[cfg(unix)]
     #[test]
@@ -4712,7 +4941,7 @@ mod tests {
         )
         .unwrap();
 
-        let resolver = create_node_package_resolver().unwrap();
+        let resolver = create_node_package_resolver(RuntimeProfile::LocalTrusted).unwrap();
         let output = std::process::Command::new("node")
             .arg("--no-warnings")
             .arg("--experimental-loader")

@@ -3,7 +3,8 @@ use court_jester::tools::sandbox::{build_instrumentation_overlay, execute, execu
 use court_jester::types::{
     ContextRequest, FailureDomain, HarnessArtifact, HarnessKind, HarnessRuntime, HarnessSpec,
     InstrumentationMode, Language, NetworkPolicy, ProcessTerminationKind, RuntimeProfile,
-    SandboxOptions, SourceMode, TestRunner,
+    SandboxOptions, SourceMode, TestRunner, DEFAULT_BUN_DOCKER_IMAGE,
+    DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
 };
 
 fn sandbox_options<'a>(
@@ -528,6 +529,75 @@ async fn generated_harness_resolves_extensionless_imports_from_workspace_symlink
     assert_eq!(result.stdout.trim(), "workspace-extensionless-ok");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn generated_harness_loads_json_imported_by_workspace_package() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path();
+    let target = workspace.join("packages/api");
+    let shared = workspace.join("packages/shared");
+    let source = target.join("src/index.ts");
+    let shared_link = target.join("node_modules/@acme/shared");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(shared.join("src")).unwrap();
+    std::fs::create_dir_all(shared_link.parent().unwrap()).unwrap();
+    std::fs::write(workspace.join("package.json"), r#"{"private":true}"#).unwrap();
+    std::fs::write(target.join("package.json"), r#"{"type":"module"}"#).unwrap();
+    std::fs::write(&source, "export const target = true;\n").unwrap();
+    std::fs::write(
+        shared.join("package.json"),
+        r#"{"name":"@acme/shared","type":"module","exports":"./src/index.ts"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        shared.join("src/index.ts"),
+        "import tenant from './tenant.json';\nexport const marker = tenant.marker;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        shared.join("src/tenant.json"),
+        r#"{"marker":"workspace-json-ok"}"#,
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("../../../shared", &shared_link).unwrap();
+
+    let context = resolve_execution_context(ContextRequest {
+        invocation_dir: workspace,
+        explicit_project_dir: Some(workspace),
+        target_file: Some(&source),
+        test_file: None,
+        language: Language::TypeScript,
+        virtual_file_path: None,
+    })
+    .unwrap();
+    let result = execute_harness(
+        &context,
+        HarnessSpec {
+            kind: HarnessKind::GeneratedVerifier,
+            runtime: HarnessRuntime::NodeScript,
+            test_adapter: None,
+            source_mode: SourceMode::TypeScript,
+            artifact: HarnessArtifact::Generated {
+                code: "import { marker } from '@acme/shared';\nconsole.log(marker);\n".into(),
+                relative_path: ".court-jester/generated/execute.ts".into(),
+            },
+            args: Vec::new(),
+            network: NetworkPolicy::Deny,
+        },
+        sandbox_options(
+            10.0,
+            128,
+            Some(workspace.to_str().unwrap()),
+            Some(source.to_str().unwrap()),
+        ),
+    )
+    .await
+    .process;
+
+    assert_eq!(result.exit_code, Some(0), "result: {result:?}");
+    assert_eq!(result.stdout.trim(), "workspace-json-ok");
+}
+
 async fn execute_typescript_alias_probe(
     tsconfig: &str,
     modules: &[(&str, &str)],
@@ -614,6 +684,22 @@ async fn generated_node_harness_loads_project_json_without_import_attributes() {
 
     assert_eq!(result.exit_code, Some(0), "result: {result:?}");
     assert_eq!(result.stdout.trim(), "json-import-ok");
+}
+
+#[tokio::test]
+async fn generated_node_harness_loads_json_through_project_alias() {
+    let result = execute_typescript_alias_probe(
+        r#"{"compilerOptions":{"baseUrl":".","paths":{"@shared/*":["packages/shared/src/*"]}}}"#,
+        &[(
+            "packages/shared/src/generated/tenant-config.json",
+            r#"{"tenant":"aliased-json-ok"}"#,
+        )],
+        "import tenant from '@shared/generated/tenant-config.json';\nconsole.log(tenant.tenant);\n",
+    )
+    .await;
+
+    assert_eq!(result.exit_code, Some(0), "result: {result:?}");
+    assert_eq!(result.stdout.trim(), "aliased-json-ok");
 }
 
 #[tokio::test]
@@ -1905,4 +1991,109 @@ async fn isolated_typescript_preserves_pnpm_workspace_symlinks() {
         existing.process.stderr
     );
     assert_eq!(existing.process.stdout.trim(), "pnpm-topology-ok");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn isolated_bun_test_resolves_leaf_package_pnpm_dependencies() {
+    let docker_available = std::process::Command::new("docker")
+        .arg("info")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    let image_available = std::process::Command::new("docker")
+        .args(["image", "inspect", DEFAULT_BUN_DOCKER_IMAGE])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !docker_available || !image_available {
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path();
+    let package = workspace.join("packages/app");
+    let source = package.join("src/index.ts");
+    let test_file = package.join("tests/dependency.test.ts");
+    let store_package =
+        workspace.join("node_modules/.pnpm/pnpm-fixture@1.0.0/node_modules/pnpm-fixture");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(test_file.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(package.join("node_modules")).unwrap();
+    std::fs::create_dir_all(&store_package).unwrap();
+    std::fs::write(
+        workspace.join("package.json"),
+        r#"{"private":true,"workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("package.json"),
+        r#"{"name":"app","type":"module"}"#,
+    )
+    .unwrap();
+    std::fs::write(&source, "export const source = true;\n").unwrap();
+    std::fs::write(
+        store_package.join("package.json"),
+        r#"{"name":"pnpm-fixture","type":"module","exports":"./index.js"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        store_package.join("index.js"),
+        "export const marker = 'bun-pnpm-ok';\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        "../../../node_modules/.pnpm/pnpm-fixture@1.0.0/node_modules/pnpm-fixture",
+        package.join("node_modules/pnpm-fixture"),
+    )
+    .unwrap();
+    std::fs::write(
+        &test_file,
+        "import { expect, test } from 'bun:test';\nimport { marker } from 'pnpm-fixture';\ntest('dependency', () => expect(marker).toBe('bun-pnpm-ok'));\n",
+    )
+    .unwrap();
+
+    let context = resolve_execution_context(ContextRequest {
+        invocation_dir: workspace,
+        explicit_project_dir: Some(workspace),
+        target_file: Some(&source),
+        test_file: Some(&test_file),
+        language: Language::TypeScript,
+        virtual_file_path: None,
+    })
+    .unwrap();
+    let workspace_text = workspace.to_string_lossy();
+    let source_text = source.to_string_lossy();
+    let execution = execute_harness(
+        &context,
+        HarnessSpec {
+            kind: HarnessKind::AuthoritativeTest,
+            runtime: HarnessRuntime::BunTest,
+            source_mode: SourceMode::TypeScript,
+            artifact: HarnessArtifact::Existing {
+                relative_path: "packages/app/tests/dependency.test.ts".into(),
+            },
+            network: NetworkPolicy::Deny,
+            args: vec![],
+            test_adapter: None,
+        },
+        SandboxOptions {
+            timeout_seconds: 10.0,
+            memory_mb: 128,
+            runtime_profile: RuntimeProfile::Isolated,
+            network_policy: NetworkPolicy::Deny,
+            harness_args: &[],
+            docker_image: Some(DEFAULT_TYPESCRIPT_DOCKER_IMAGE),
+            project_dir: Some(workspace_text.as_ref()),
+            source_file: Some(source_text.as_ref()),
+            instrumentation_target: None,
+            instrumented_source: None,
+        },
+    )
+    .await;
+
+    assert_eq!(
+        execution.process.exit_code,
+        Some(0),
+        "stderr: {}",
+        execution.process.stderr
+    );
 }

@@ -1881,6 +1881,7 @@ fn coverage_counts(entries: &[FuzzFunctionCoverage]) -> serde_json::Value {
     for status in [
         FuzzFunctionStatus::CheckedDirect,
         FuzzFunctionStatus::ReachedViaFactory,
+        FuzzFunctionStatus::ReachedViaAuthoritativeTest,
         FuzzFunctionStatus::CheckedViaFactory,
         FuzzFunctionStatus::CheckedViaCaller,
         FuzzFunctionStatus::CheckedViaAuthoritativeTest,
@@ -2033,7 +2034,7 @@ pub fn final_verdict(
     // Typed causes outrank the lossy stage status: a gating target cause
     // remains a failure even when the process also reported a resource or
     // harness termination, while a blocking non-target cause is inconclusive.
-    let diagnostics = diagnostics_from_stages(stages);
+    let diagnostics = diagnostics_from_relevant_stages(stages, coverage, evidence);
     if diagnostics
         .iter()
         .any(|diagnostic| diagnostic.impact == DiagnosticImpact::Gating)
@@ -2046,10 +2047,10 @@ pub fn final_verdict(
     {
         return (VerificationVerdict::Inconclusive, strength);
     }
-    if stages
-        .iter()
-        .any(|stage| stage.status == StageStatus::Failed)
-    {
+    if stages.iter().any(|stage| {
+        !generated_execution_is_superseded(stage, coverage, evidence)
+            && stage.status == StageStatus::Failed
+    }) {
         return (VerificationVerdict::Fail, strength);
     }
     if coverage_has_gap(coverage, gate)
@@ -2057,10 +2058,11 @@ pub fn final_verdict(
             && evidence.valid_invocations == 0
             && evidence.evaluated_oracles == 0)
         || stages.iter().any(|stage| {
-            stage.status == StageStatus::Inconclusive
-                || (stage.name == "execute"
-                    && stage.status == StageStatus::Skipped
-                    && !evidence.authoritative_test_completed)
+            !generated_execution_is_superseded(stage, coverage, evidence)
+                && (stage.status == StageStatus::Inconclusive
+                    || (stage.name == "execute"
+                        && stage.status == StageStatus::Skipped
+                        && !evidence.authoritative_test_completed))
         })
     {
         return (VerificationVerdict::Inconclusive, strength);
@@ -5673,7 +5675,7 @@ pub async fn verify(
         test_detail["test_runner_selected"] = serde_json::to_value(selected_test_runner).unwrap();
         stages.push(VerificationStage {
             name: "test".into(),
-            status: if !prepared.overlay.supported {
+            status: if !prepared.overlay.supported || has_non_target_blocker {
                 StageStatus::Inconclusive
             } else if test_ok {
                 StageStatus::Passed
@@ -5691,7 +5693,10 @@ pub async fn verify(
             },
         });
 
-        if !opts.tests_only && prepared.overlay.supported && test_ok {
+        if !opts.tests_only
+            && prepared.overlay.supported
+            && (test_ok || !entered_surfaces.is_empty())
+        {
             let authoritative_source = candidate_test_source_file_owned
                 .as_deref()
                 .unwrap_or("<inline>")
@@ -5704,14 +5709,32 @@ pub async fn verify(
                         {
                             for function in &mut coverage_functions {
                                 let surface_id = format!("{}:{}", function.function, function.line);
-                                if function.required && entered_surfaces.contains(&surface_id) {
+                                if !function.required || !entered_surfaces.contains(&surface_id) {
+                                    continue;
+                                }
+                                if test_ok {
                                     function.status =
                                         FuzzFunctionStatus::CheckedViaAuthoritativeTest;
-                                    function.invocation_path = InvocationPath::AuthoritativeTest {
-                                        source_file: authoritative_source.clone(),
-                                    };
                                     function.reason = None;
+                                } else if !matches!(
+                                    function.status,
+                                    FuzzFunctionStatus::CheckedDirect
+                                        | FuzzFunctionStatus::CheckedViaFactory
+                                        | FuzzFunctionStatus::CheckedViaCaller
+                                        | FuzzFunctionStatus::CheckedViaAuthoritativeTest
+                                ) {
+                                    function.status =
+                                        FuzzFunctionStatus::ReachedViaAuthoritativeTest;
+                                    function.reason = Some(
+                                        "authoritative test reached the exact surface before test completion"
+                                            .into(),
+                                    );
+                                } else {
+                                    continue;
                                 }
+                                function.invocation_path = InvocationPath::AuthoritativeTest {
+                                    source_file: authoritative_source.clone(),
+                                };
                             }
                             let all_required_checked = coverage_functions
                                 .iter()
@@ -5744,26 +5767,53 @@ pub async fn verify(
                 .as_deref()
                 .unwrap_or("<inline>")
                 .to_string();
-            let coverage_functions = required_functions.iter().map(|function| {
-                let surface_id = format!("{}:{}", function.name, function.line);
-                let checked = prepared.overlay.supported && test_ok && entered_surfaces.contains(&surface_id);
-                FuzzFunctionCoverage {
-                    function: function.name.clone(),
-                    line: function.line,
-                    end_line: function.end_line,
-                    status: if checked { FuzzFunctionStatus::CheckedViaAuthoritativeTest } else { FuzzFunctionStatus::SkippedNoFuzzableSurface },
-                    required: true,
-                    invocation_path: InvocationPath::AuthoritativeTest { source_file: authoritative_source.clone() },
-                    is_exported: true,
-                    reason: (!checked).then(|| if !prepared.overlay.supported {
-                        prepared.overlay.reason.clone().unwrap_or_else(|| "authoritative-test instrumentation is unsupported".into())
-                    } else if !test_ok {
-                        "authoritative test did not complete successfully".into()
+            let coverage_functions = required_functions
+                .iter()
+                .map(|function| {
+                    let surface_id = format!("{}:{}", function.name, function.line);
+                    let reached =
+                        prepared.overlay.supported && entered_surfaces.contains(&surface_id);
+                    let checked = reached && test_ok;
+                    let status = if checked {
+                        FuzzFunctionStatus::CheckedViaAuthoritativeTest
+                    } else if reached {
+                        FuzzFunctionStatus::ReachedViaAuthoritativeTest
                     } else {
-                        "authoritative test did not emit the exact target_entered surface id".into()
-                    }),
-                }
-            }).collect::<Vec<_>>();
+                        FuzzFunctionStatus::SkippedNoFuzzableSurface
+                    };
+                    let reason = if checked {
+                        None
+                    } else if reached {
+                        Some(
+                            "authoritative test reached the exact surface before test completion"
+                                .into(),
+                        )
+                    } else if !prepared.overlay.supported {
+                        Some(prepared.overlay.reason.clone().unwrap_or_else(|| {
+                            "authoritative-test instrumentation is unsupported".into()
+                        }))
+                    } else if !test_ok {
+                        Some("authoritative test did not complete successfully".into())
+                    } else {
+                        Some(
+                            "authoritative test did not emit the exact target_entered surface id"
+                                .into(),
+                        )
+                    };
+                    FuzzFunctionCoverage {
+                        function: function.name.clone(),
+                        line: function.line,
+                        end_line: function.end_line,
+                        status,
+                        required: true,
+                        invocation_path: InvocationPath::AuthoritativeTest {
+                            source_file: authoritative_source.clone(),
+                        },
+                        is_exported: true,
+                        reason,
+                    }
+                })
+                .collect::<Vec<_>>();
             let all_required_checked = !coverage_functions.is_empty()
                 && coverage_functions.iter().all(|function| {
                     function.status == FuzzFunctionStatus::CheckedViaAuthoritativeTest
@@ -5938,16 +5988,46 @@ fn diagnostic_from_stage(
                 None
             }
         }
-        "coverage" => Some(simple(
-            FailureDomain::VerifierHarness,
-            FailureKind::ContractViolation,
-            DiagnosticComponent::FuzzHarness,
-            if coverage_gate == CoverageGate::ChangedExports {
-                DiagnosticImpact::Blocking
-            } else {
-                DiagnosticImpact::Advisory
-            },
-        )),
+        "coverage" => {
+            let required_functions = detail
+                .and_then(|value| value.get("functions"))
+                .and_then(|value| value.as_array())
+                .into_iter()
+                .flatten()
+                .filter(|function| {
+                    function
+                        .get("required")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false)
+                })
+                .collect::<Vec<_>>();
+            let every_required_surface_accounted_for = !required_functions.is_empty()
+                && required_functions.iter().all(|function| {
+                    matches!(
+                        function.get("status").and_then(|value| value.as_str()),
+                        Some(
+                            "checked_direct"
+                                | "checked_via_factory"
+                                | "checked_via_caller"
+                                | "checked_via_authoritative_test"
+                                | "reached_via_factory"
+                                | "reached_via_authoritative_test"
+                        )
+                    )
+                });
+            (!every_required_surface_accounted_for).then(|| {
+                simple(
+                    FailureDomain::VerifierHarness,
+                    FailureKind::ContractViolation,
+                    DiagnosticComponent::FuzzHarness,
+                    if coverage_gate == CoverageGate::ChangedExports {
+                        DiagnosticImpact::Blocking
+                    } else {
+                        DiagnosticImpact::Advisory
+                    },
+                )
+            })
+        }
         "portability" => Some(simple(
             FailureDomain::Environment,
             FailureKind::ToolFailure,
@@ -6289,9 +6369,35 @@ fn annotate_stage_diagnostics(stages: &mut [VerificationStage], coverage_gate: C
     }
 }
 
-fn diagnostics_from_stages(stages: &[VerificationStage]) -> Vec<FailureDiagnostic> {
+fn generated_execution_is_superseded(
+    stage: &VerificationStage,
+    coverage: &CoverageSummary,
+    evidence: &VerificationEvidence,
+) -> bool {
+    if stage.name != "execute"
+        || !evidence.authoritative_test_completed
+        || coverage.required == 0
+        || coverage.behaviorally_checked < coverage.required
+    {
+        return false;
+    }
+    let diagnostics = diagnostics_from_stage_detail(stage.detail.as_ref());
+    !diagnostics.is_empty()
+        && diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.domain != FailureDomain::TargetCode)
+}
+
+fn diagnostics_from_relevant_stages(
+    stages: &[VerificationStage],
+    coverage: &CoverageSummary,
+    evidence: &VerificationEvidence,
+) -> Vec<FailureDiagnostic> {
     let mut diagnostics = Vec::new();
     for stage in stages {
+        if generated_execution_is_superseded(stage, coverage, evidence) {
+            continue;
+        }
         for diagnostic in diagnostics_from_stage_detail(stage.detail.as_ref()) {
             append_unique_diagnostic(&mut diagnostics, diagnostic);
         }
@@ -6339,10 +6445,10 @@ fn build_report(mut stages: Vec<VerificationStage>, gate: CoverageGate) -> Verif
     // This keeps old stage JSON readable while ensuring every failed or
     // inconclusive stage has a typed, deduplicated provenance record.
     annotate_stage_diagnostics(&mut stages, gate);
-    let diagnostics = diagnostics_from_stages(&stages);
     let mut summary = compute_report_summary(&stages);
-    summary.diagnostics = DiagnosticsSummary::from_diagnostics(&diagnostics);
     let evidence = evidence_from_stages(&stages);
+    let diagnostics = diagnostics_from_relevant_stages(&stages, &summary.coverage, &evidence);
+    summary.diagnostics = DiagnosticsSummary::from_diagnostics(&diagnostics);
     let (verdict, strength) = final_verdict(&stages, &summary.coverage, gate, &evidence);
     let outcome_matrix = verification_outcome_matrix(&stages);
     stages.push(VerificationStage {
@@ -6426,7 +6532,9 @@ fn coverage_summary_from_stages(stages: &[VerificationStage]) -> CoverageSummary
                     | "checked_via_caller"
                     | "checked_via_authoritative_test",
                 ) if required => summary.behaviorally_checked += 1,
-                Some("reached_via_factory") if required => summary.reached_only += 1,
+                Some("reached_via_factory" | "reached_via_authoritative_test") if required => {
+                    summary.reached_only += 1
+                }
                 Some("blocked_module_load") => summary.blocked += 1,
                 Some(
                     "skipped_no_fuzzable_surface"

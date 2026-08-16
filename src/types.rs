@@ -406,6 +406,7 @@ impl SandboxOptions<'_> {
 
 pub const DEFAULT_PYTHON_DOCKER_IMAGE: &str = "python:3.12-slim";
 pub const DEFAULT_TYPESCRIPT_DOCKER_IMAGE: &str = "node:24-bookworm-slim";
+pub const DEFAULT_BUN_DOCKER_IMAGE: &str = "oven/bun:1.3.14";
 
 impl Language {
     pub fn parse(s: &str) -> Option<Self> {
@@ -1106,6 +1107,7 @@ pub enum InvocationPath {
 pub enum FuzzFunctionStatus {
     CheckedDirect,
     ReachedViaFactory,
+    ReachedViaAuthoritativeTest,
     CheckedViaFactory,
     CheckedViaCaller,
     CheckedViaAuthoritativeTest,

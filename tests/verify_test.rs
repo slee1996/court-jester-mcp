@@ -4,12 +4,12 @@ use court_jester::tools::verify::{
 };
 use court_jester::types::{
     ComplexityMetric, CoverageGate, CoverageSummary, DiagnosticComponent, DiagnosticImpact,
-    ExecuteGate, FailureDomain, FailureKind, FindingCategory, FindingConfidence, FindingSeverity,
-    FindingsSummary, FuzzFunctionCoverage, FuzzFunctionStatus, InferredOracleGate,
+    ExecuteGate, FailureDiagnostic, FailureDomain, FailureKind, FindingCategory, FindingConfidence,
+    FindingSeverity, FindingsSummary, FuzzFunctionCoverage, FuzzFunctionStatus, InferredOracleGate,
     InputClassification, Language, NetworkPolicy, OracleKind, OracleProvenance, ReplayOutcome,
     ReportLevel, ReportSummary, RuntimeProfile, StageStatus, TestRunner, VerificationEvidence,
     VerificationReport, VerificationStage, VerificationStrength, VerificationVerdict,
-    DEFAULT_PYTHON_DOCKER_IMAGE, DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+    DEFAULT_BUN_DOCKER_IMAGE, DEFAULT_PYTHON_DOCKER_IMAGE, DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -354,6 +354,33 @@ fn complete_authoritative_tests_supersede_skipped_generated_execution() {
             VerificationVerdict::Pass,
             VerificationStrength::AuthoritativeTests
         )
+    );
+
+    let mut blocked_generated = stages.clone();
+    blocked_generated[1].status = StageStatus::Inconclusive;
+    blocked_generated[1].detail = Some(serde_json::json!({
+        "diagnostics": [FailureDiagnostic {
+            domain: FailureDomain::VerifierHarness,
+            kind: FailureKind::HarnessProtocol,
+            component: DiagnosticComponent::FuzzHarness,
+            impact: DiagnosticImpact::Blocking,
+            message: "generated harness emitted no bootstrap event".into(),
+            process: None,
+            limits: None,
+        }]
+    }));
+    assert_eq!(
+        final_verdict(
+            &blocked_generated,
+            &coverage,
+            CoverageGate::ChangedExports,
+            &evidence,
+        ),
+        (
+            VerificationVerdict::Pass,
+            VerificationStrength::AuthoritativeTests
+        ),
+        "complete authoritative evidence must supersede a non-target generated harness blocker"
     );
 }
 
@@ -5053,6 +5080,104 @@ test("denied operations", () => {
 }
 
 #[tokio::test]
+async fn bun_native_dependency_failure_preserves_authoritative_reachability() {
+    let dir = tempfile::tempdir().unwrap();
+    let tool_dir = dir.path().join("node_modules").join(".bin");
+    install_fake_tool_at(
+        &tool_dir,
+        "bun",
+        r#"#!/bin/sh
+cat >&2 <<'EOF'
+bun test v1.3.14
+{"event":"target_entered","surface_id":"add:1"}
+PrismaClientInitializationError: Prisma Client could not locate the Query Engine for runtime "linux-arm64-openssl-3.0.x".
+This happened because Prisma Client was generated for "darwin-arm64", but the actual deployment required "linux-arm64-openssl-3.0.x".
+
+(fail) add > uses the database fixture
+
+ 0 pass
+ 1 fail
+Ran 1 test across 1 file.
+EOF
+exit 1
+"#,
+    );
+
+    let src_dir = dir.path().join("src");
+    let tests_dir = dir.path().join("tests");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::create_dir_all(&tests_dir).unwrap();
+    let source_path = src_dir.join("math.ts");
+    let test_path = tests_dir.join("unit.test.ts");
+    let code = "export function add(a: number, b: number): number { return a + b; }\n";
+    let tests = r#"
+import { test, expect } from "bun:test";
+import { add } from "../src/math.ts";
+
+test("add", () => {
+  expect(add(2, 3)).toBe(5);
+});
+"#;
+    std::fs::write(&source_path, code).unwrap();
+    std::fs::write(&test_path, tests).unwrap();
+    let source_file = source_path.to_string_lossy().into_owned();
+    let test_file = test_path.to_string_lossy().into_owned();
+    let project_dir = dir.path().to_string_lossy().into_owned();
+    let mut opts = default_opts(Some(tests));
+    opts.test_source_file = Some(&test_file);
+    opts.test_runner = TestRunner::Bun;
+    opts.tests_only = true;
+    opts.project_dir = Some(&project_dir);
+    opts.source_file = Some(&source_file);
+    opts.network = NetworkPolicy::Allow;
+
+    let report = verify(code, &Language::TypeScript, opts).await;
+
+    assert_eq!(
+        report.verdict,
+        VerificationVerdict::Inconclusive,
+        "a platform-incompatible project dependency is not target code: {report:#?}"
+    );
+    assert!(
+        report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.domain == FailureDomain::Environment
+                && diagnostic.kind == FailureKind::ModuleLoad
+        }),
+        "expected an environment module-load diagnostic: {:#?}",
+        report.diagnostics
+    );
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.domain != FailureDomain::TargetCode),
+        "native dependency mismatch must not become a target assertion: {:#?}",
+        report.diagnostics
+    );
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.kind != FailureKind::ContractViolation),
+        "exact authoritative reachability satisfies the coverage contract: {:#?}",
+        report.diagnostics
+    );
+    assert_eq!(report.summary.coverage.behaviorally_checked, 0);
+    assert_eq!(report.summary.coverage.reached_only, 1);
+    let coverage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "coverage")
+        .and_then(|stage| stage.detail.as_ref())
+        .and_then(|detail| detail["functions"].as_array())
+        .expect("per-surface coverage");
+    assert_eq!(
+        coverage[0]["status"].as_str(),
+        Some("reached_via_authoritative_test")
+    );
+}
+
+#[tokio::test]
 async fn python_test_stage_executes_original_test_file_when_code_matches_disk() {
     let dir = tempfile::tempdir().unwrap();
     let src_dir = dir.path().join("src");
@@ -6090,6 +6215,103 @@ assert.equal(increment(1), 2);
         arrow["status"].as_str(),
         Some("checked_via_authoritative_test")
     );
+}
+
+#[tokio::test]
+async fn tests_only_bun_test_emits_exact_target_surface_and_passes() {
+    if !std::process::Command::new("bun")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        return;
+    }
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("increment.ts");
+    let test_source = project.path().join("increment.test.ts");
+    let code = "export function increment(value: number): number {\n  return value + 1;\n}\n";
+    let tests = r#"import { expect, test } from "bun:test";
+import { increment } from "./increment";
+
+test("increments", () => {
+  expect(increment(1)).toBe(2);
+});
+"#;
+    fs::write(&source, code).unwrap();
+    fs::write(&test_source, tests).unwrap();
+
+    let mut opts = default_opts(Some(tests));
+    opts.tests_only = true;
+    opts.project_dir = project.path().to_str();
+    opts.source_file = source.to_str();
+    opts.test_source_file = test_source.to_str();
+    opts.test_runner = TestRunner::Auto;
+
+    let report = verify(code, &Language::TypeScript, opts).await;
+
+    assert_eq!(report.verdict, VerificationVerdict::Pass, "{report:#?}");
+    assert_eq!(report.strength, VerificationStrength::AuthoritativeTests);
+    assert_eq!(report.summary.coverage.required, 1);
+    assert_eq!(report.summary.coverage.behaviorally_checked, 1);
+    let entered = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "test")
+        .and_then(|stage| stage.detail.as_ref())
+        .and_then(|detail| detail["target_entered_surfaces"].as_array())
+        .expect("Bun target entry events");
+    assert_eq!(entered, &vec![serde_json::json!("increment:1")]);
+}
+
+#[tokio::test]
+async fn tests_only_bun_test_is_instrumented_in_isolated_runtime() {
+    let docker_available = std::process::Command::new("docker")
+        .arg("info")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    let image_available = std::process::Command::new("docker")
+        .args(["image", "inspect", DEFAULT_BUN_DOCKER_IMAGE])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !docker_available || !image_available {
+        return;
+    }
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("increment.ts");
+    let test_source = project.path().join("increment.test.ts");
+    let code = "export function increment(value: number): number {\n  return value + 1;\n}\n";
+    let tests = r#"import { expect, test } from "bun:test";
+import { increment } from "./increment";
+
+test("increments", () => {
+  expect(increment(1)).toBe(2);
+});
+"#;
+    fs::write(&source, code).unwrap();
+    fs::write(&test_source, tests).unwrap();
+
+    let mut opts = default_opts(Some(tests));
+    opts.tests_only = true;
+    opts.project_dir = project.path().to_str();
+    opts.source_file = source.to_str();
+    opts.test_source_file = test_source.to_str();
+    opts.test_runner = TestRunner::Auto;
+    opts.runtime_profile = RuntimeProfile::Isolated;
+
+    let report = verify(code, &Language::TypeScript, opts).await;
+
+    assert_eq!(report.verdict, VerificationVerdict::Pass, "{report:#?}");
+    assert_eq!(report.strength, VerificationStrength::AuthoritativeTests);
+    assert_eq!(report.summary.coverage.required, 1);
+    assert_eq!(report.summary.coverage.behaviorally_checked, 1);
+    let entered = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "test")
+        .and_then(|stage| stage.detail.as_ref())
+        .and_then(|detail| detail["target_entered_surfaces"].as_array())
+        .expect("isolated Bun target entry events");
+    assert_eq!(entered, &vec![serde_json::json!("increment:1")]);
 }
 
 #[tokio::test]

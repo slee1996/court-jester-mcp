@@ -4,6 +4,25 @@ This changelog tracks user-visible verifier semantics, report-shape changes, and
 
 ## Unreleased
 
+## 0.2.10 - 2026-08-15
+
+Runtime and evidence-correctness release for reopened issues #9, #21, and #29. See [docs/release-notes-0.2.10.md](docs/release-notes-0.2.10.md) for the complete change list and validation evidence.
+
+### Isolated execution
+
+- Docker harness support files now live in a stable runtime directory under the Docker-shared macOS home, and every guard or resolver owns its temporary artifacts through process completion. Isolated doctor checks no longer hand Docker an already-removed `/var/folders` bind source.
+- Isolated Bun authoritative tests use a pinned Bun container image and project-package dependency mapping instead of requiring a host Bun installation.
+
+### TypeScript project loading
+
+- The runtime loader implements JSON-module semantics for direct, aliased, and nested workspace imports without requiring `with { type: "json" }`, while preserving TypeScript path aliases and package resolution.
+- Bun project-runner instrumentation is preloaded in both local and isolated execution, so authoritative tests emit exact exported-surface reachability without rewriting source files.
+
+### Evidence and diagnostics
+
+- Successful authoritative tests with exact target-entry evidence supersede unrelated generated-harness blockers; genuine non-target runtime blockers remain visible without erasing authoritative coverage.
+- Coverage distinguishes exact authoritative reach from generated calls and reports platform-incompatible native dependencies as environment failures rather than target-code contract violations.
+
 ## 0.2.9 - 2026-08-15
 
 Publication retry for 0.2.8 after its Node 24 regression exposed an incompatibility between synchronous load hooks and the project resolver's asynchronous loader chain. See [docs/release-notes-0.2.9.md](docs/release-notes-0.2.9.md) for the complete change list and validation evidence.
