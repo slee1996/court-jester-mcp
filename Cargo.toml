@@ -1,6 +1,6 @@
 [package]
 name = "court-jester"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2021"
 license = "MIT"
 description = "Confidence-calibrated verification for changed Python and TypeScript code"

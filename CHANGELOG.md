@@ -4,6 +4,15 @@ This changelog tracks user-visible verifier semantics, report-shape changes, and
 
 ## Unreleased
 
+## 0.2.8 - 2026-08-15
+
+Publication retry for 0.2.7 after Linux Node 24 exposed that native TypeScript loading can bypass patched `fs` exports. See [docs/release-notes-0.2.8.md](docs/release-notes-0.2.8.md) for the complete change list and validation evidence.
+
+### Project-runner instrumentation
+
+- Authoritative target instrumentation now registers Node's synchronous module-load hook on Node 24+ and a guarded asynchronous hook on older supported Node versions, so native TypeScript module loading receives the instrumented source without rewriting the repository.
+- A module-import regression verifies that the loaded export comes from the in-memory payload while the source file remains byte-for-byte unchanged.
+
 ## 0.2.7 - 2026-08-15
 
 Project-native verification release for the reopened authoritative-runner defect and the cross-cutting adapter backlog in issue #29. See [docs/release-notes-0.2.7.md](docs/release-notes-0.2.7.md) for validation evidence.

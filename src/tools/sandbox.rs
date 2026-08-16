@@ -1726,7 +1726,7 @@ globalThis.__COURT_JESTER_NETWORK_GUARD__ = true;
 "use strict";
 const fs = require("node:fs");
 const path = require("node:path");
-const { fileURLToPath } = require("node:url");
+const { fileURLToPath, pathToFileURL } = require("node:url");
 const target = process.env.COURT_JESTER_INSTRUMENT_TARGET;
 const payload = process.env.COURT_JESTER_INSTRUMENT_PAYLOAD;
 if (target && payload) {
@@ -1771,7 +1771,42 @@ if (target && payload) {
     };
   }
   try {
-    require("node:module").syncBuiltinESMExports();
+    const builtinModule = require("node:module");
+    builtinModule.syncBuiltinESMExports();
+    if (typeof builtinModule.registerHooks === "function") {
+      builtinModule.registerHooks({
+        load(url, context, nextLoad) {
+          const loaded = nextLoad(url, context);
+          if (!url.startsWith("file:") || normalized(fileURLToPath(url)) !== targetPath) {
+            return loaded;
+          }
+          return { ...loaded, source };
+        },
+      });
+    } else if (
+      typeof builtinModule.register === "function" &&
+      !process.env.COURT_JESTER_INSTRUMENT_LOADER_REGISTERED
+    ) {
+      process.env.COURT_JESTER_INSTRUMENT_LOADER_REGISTERED = "1";
+      const hookSource = `
+        import fs from "node:fs";
+        import path from "node:path";
+        import { fileURLToPath } from "node:url";
+        const targetPath = path.resolve(process.env.COURT_JESTER_INSTRUMENT_TARGET);
+        const source = fs.readFileSync(process.env.COURT_JESTER_INSTRUMENT_PAYLOAD);
+        export async function load(url, context, nextLoad) {
+          const loaded = await nextLoad(url, context);
+          if (!url.startsWith("file:") || path.resolve(fileURLToPath(url)) !== targetPath) {
+            return loaded;
+          }
+          return { ...loaded, source };
+        }
+      `;
+      builtinModule.register(
+        `data:text/javascript,${encodeURIComponent(hookSource)}`,
+        pathToFileURL(__filename).href,
+      );
+    }
   } catch {}
 }
 "#,

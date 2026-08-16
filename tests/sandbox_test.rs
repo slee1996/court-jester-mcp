@@ -400,7 +400,7 @@ async fn generated_typescript_harness_resolves_scoped_package_from_target_packag
 }
 
 #[tokio::test]
-async fn typescript_instrumentation_intercepts_reads_without_rewriting_source() {
+async fn typescript_instrumentation_intercepts_module_load_without_rewriting_source() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path();
     let source = workspace.join("target.ts");
@@ -418,7 +418,10 @@ async fn typescript_instrumentation_intercepts_reads_without_rewriting_source() 
         virtual_file_path: None,
     })
     .unwrap();
-    let source_file = source.to_string_lossy().into_owned();
+    let source_file = std::fs::canonicalize(&source)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
     let mut limits = sandbox_options(
         10.0,
         128,
@@ -428,7 +431,7 @@ async fn typescript_instrumentation_intercepts_reads_without_rewriting_source() 
     limits.instrumentation_target = Some(&source_file);
     limits.instrumented_source = Some(instrumented);
     let harness = format!(
-        "import {{ readFileSync }} from 'node:fs';\nprocess.stdout.write(readFileSync({}, 'utf8'));\n",
+        "import {{ pathToFileURL }} from 'node:url';\nconst {{ marker }} = await import(pathToFileURL({}).href);\nprocess.stdout.write(marker);\n",
         serde_json::to_string(&source_file).unwrap()
     );
 
@@ -452,7 +455,7 @@ async fn typescript_instrumentation_intercepts_reads_without_rewriting_source() 
     .process;
 
     assert_eq!(result.exit_code, Some(0), "result: {result:?}");
-    assert_eq!(result.stdout, instrumented);
+    assert_eq!(result.stdout, "instrumented");
     assert_eq!(std::fs::read_to_string(&source).unwrap(), original);
 }
 
