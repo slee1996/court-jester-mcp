@@ -1080,10 +1080,10 @@ fn copy_materialization_tree_inner(
     result
 }
 fn runtime_tempdir(
-    runtime_profile: crate::types::RuntimeProfile,
+    _runtime_profile: crate::types::RuntimeProfile,
 ) -> std::io::Result<tempfile::TempDir> {
     #[cfg(target_os = "macos")]
-    if runtime_profile == crate::types::RuntimeProfile::Isolated {
+    if _runtime_profile == crate::types::RuntimeProfile::Isolated {
         if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
             let parent = std::path::PathBuf::from(home).join("Library/Caches/court-jester/runtime");
             if std::fs::create_dir_all(&parent).is_ok() {
@@ -4713,8 +4713,8 @@ mod tests {
         configure_docker_node_loader, copy_materialization_tree, create_network_guard,
         create_node_package_resolver, docker_dependency_mapping, docker_image_for_harness,
         docker_path_mapping, docker_project_module_path, harness_diagnostics,
-        has_typescript_type_only_relative_imports, runtime_tempdir, virtual_env_bin,
-        vitest_project_entrypoint, which_binary,
+        has_typescript_type_only_relative_imports, virtual_env_bin, vitest_project_entrypoint,
+        which_binary,
     };
     use crate::types::{
         DiagnosticComponent, DiagnosticImpact, ExecutionLimits, ExecutionResult, FailureDomain,
@@ -4752,7 +4752,7 @@ mod tests {
         let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
             return;
         };
-        let directory = runtime_tempdir(RuntimeProfile::Isolated).unwrap();
+        let directory = super::runtime_tempdir(RuntimeProfile::Isolated).unwrap();
         let expected_parent =
             std::path::PathBuf::from(home).join("Library/Caches/court-jester/runtime");
 

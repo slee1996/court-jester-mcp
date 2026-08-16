@@ -4,6 +4,10 @@ This changelog tracks user-visible verifier semantics, report-shape changes, and
 
 ## Unreleased
 
+## 0.2.11 - 2026-08-15
+
+Publication retry for 0.2.10 after its Linux Clippy gate exposed macOS-only helper names imported on every test target. The runtime fix is unchanged; platform-specific test references and the runtime-profile parameter are now warning-free on Linux. See [docs/release-notes-0.2.11.md](docs/release-notes-0.2.11.md) for the complete change list and validation evidence.
+
 ## 0.2.10 - 2026-08-15
 
 Runtime and evidence-correctness release for reopened issues #9, #21, and #29. See [docs/release-notes-0.2.10.md](docs/release-notes-0.2.10.md) for the complete change list and validation evidence.
