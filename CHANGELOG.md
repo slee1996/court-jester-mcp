@@ -4,6 +4,14 @@ This changelog tracks user-visible verifier semantics, report-shape changes, and
 
 ## Unreleased
 
+## 0.2.5 - 2026-08-15
+
+Publication retry for the correctness backlog after concurrent child-process integration tests produced a second CI-only false failure. See [docs/release-notes-0.2.5.md](docs/release-notes-0.2.5.md) for the complete change list and validation evidence.
+
+### Release validation
+
+- Rust integration targets now run one test at a time in both canonical local recipes and CI, preventing resource-sensitive Node sandbox tests from changing product verdicts under scheduler contention.
+
 ## 0.2.4 - 2026-08-15
 
 Publication retry for the 0.2.3 correctness backlog after the first tag exposed a CI-only test flake. See [docs/release-notes-0.2.4.md](docs/release-notes-0.2.4.md) for the complete change list and validation evidence.

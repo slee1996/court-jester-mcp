@@ -22,7 +22,7 @@ build-debug:
 
 # Run the Rust integration test suite.
 test:
-    cargo test
+    cargo test -- --test-threads=1
 
 # End-to-end smoke test: help/version plus optional verify call.
 smoke: build
@@ -57,10 +57,10 @@ clippy:
 
 # Validate every local gate required before creating a release tag.
 release-check:
-    python3 scripts/check_release.py --tag v0.2.4
+    python3 scripts/check_release.py --tag v0.2.5
     cargo fmt --all -- --check
     cargo clippy --locked --all-targets -- -D warnings
-    cargo test --locked --tests
+    cargo test --locked --tests -- --test-threads=1
     python3 -m unittest bench.test_run_matrix bench.test_runner bench.test_summarize_runs bench.test_evidence
     python3 -m unittest discover -s tests -p 'release_test.py'
     cargo build --locked --release --bin court-jester

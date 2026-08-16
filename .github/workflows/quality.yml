@@ -45,7 +45,7 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Run Rust integration targets
-        run: cargo test --locked --tests
+        run: cargo test --locked --tests -- --test-threads=1
 
       - name: Run benchmark unit tests
         run: python3 -m unittest bench.test_run_matrix bench.test_runner bench.test_summarize_runs bench.test_evidence
