@@ -4,6 +4,28 @@ This changelog tracks user-visible verifier semantics, report-shape changes, and
 
 ## Unreleased
 
+## 0.2.7 - 2026-08-15
+
+Project-native verification release for the reopened authoritative-runner defect and the cross-cutting adapter backlog in issue #29. See [docs/release-notes-0.2.7.md](docs/release-notes-0.2.7.md) for validation evidence.
+
+### Project-native TypeScript execution
+
+- Verification now selects an explicit project adapter and reports each exported surface's execution strategy before launching a harness.
+- Repository Vitest tests execute at their original workspace path with the repository's package graph, aliases, globals, Nuxt auto-import stubs, and native runner semantics intact.
+- Authoritative source instrumentation is injected in memory instead of rewriting the target repository or its generated framework files.
+- The portable Vitest coordinator resolves workspace and Nuxt aliases, preserves bounded workers and network/process guards, and falls back from host-incompatible native config dependencies without abandoning the project runtime.
+
+### Runtime and synthesis correctness
+
+- Generated TypeScript execution handles imported aliases, readonly arrays, schema-inferred objects, constructor-like interfaces, default initializers, decorators, and pnpm workspace layouts without corrupting source or escaping configured roots.
+- Python harnesses import targets under a non-main identity, synthesize `Protocol` inputs, and report externally terminated Ruff processes as environment failures rather than lint findings.
+
+### Evidence and reporting
+
+- Reports include the selected adapter capability contract, per-surface strategy, and an orthogonal outcome matrix for static analysis, generated execution, authoritative tests, and portability.
+- Authoritative project tests receive behavioral credit only for exact target-entry events; missing or partial target reach remains explicit and inconclusive.
+
+
 ## 0.2.6 - 2026-08-15
 
 Workspace-package runtime follow-up for issue #21. See [docs/release-notes-0.2.6.md](docs/release-notes-0.2.6.md) for validation evidence.

@@ -556,9 +556,14 @@ fn python_type_is_simple_helper_input(
             .map(str::trim)
             .filter(|branch| *branch != "None")
             .all(|branch| python_type_is_simple_helper_input(Some(branch), type_defs)),
-        _ if starts_with_any(t, &["list[", "List[", "tuple[", "Tuple["]) => {
+        _ if is_python_sequence_type(t)
+            || starts_with_any(t, &["tuple[", "Tuple[", "set[", "Set["]) =>
+        {
             let inner = extract_generic_arg(t);
-            python_type_is_simple_helper_input(Some(&inner), type_defs)
+            split_top_level_args(&inner, ',')
+                .into_iter()
+                .filter(|branch| *branch != "...")
+                .all(|branch| python_type_is_simple_helper_input(Some(branch), type_defs))
         }
         _ if type_defs.contains_key(t) => false,
         _ => false,
@@ -1065,6 +1070,12 @@ else:
     code.push_str(PYTHON_FUZZ_EPILOGUE);
     FuzzPlan { code, coverage }
 }
+fn python_class_is_runtime_instantiable(class: &ClassInfo) -> bool {
+    !class
+        .bases
+        .iter()
+        .any(|base| base.split('[').next().unwrap_or(base).rsplit('.').next() == Some("Protocol"))
+}
 
 fn python_generator(type_ann: Option<&str>, type_defs: &HashMap<&str, &ClassInfo>) -> String {
     let t = match type_ann {
@@ -1085,7 +1096,7 @@ fn python_generator(type_ann: Option<&str>, type_defs: &HashMap<&str, &ClassInfo
         "bytes" => "_fuzz_bytes()".into(),
         "Any" => "_fuzz_any()".into(),
         _ if is_python_mapping_type(t) && !t.contains('[') => "_fuzz_dict()".into(),
-        _ if starts_with_any(t, &["list[", "List["]) => {
+        _ if is_python_sequence_type(t) => {
             let inner = extract_generic_arg(t);
             let gen = python_generator(Some(&inner), type_defs);
             format!("[{gen} for _ in range(_fuzz_int_range(0, 5))]")
@@ -1103,8 +1114,18 @@ fn python_generator(type_ann: Option<&str>, type_defs: &HashMap<&str, &ClassInfo
         }
         _ if starts_with_any(t, &["tuple[", "Tuple["]) => {
             let inner = extract_generic_arg(t);
-            let gen = python_generator(Some(&inner), type_defs);
-            format!("({gen},)")
+            let item_types = split_top_level_args(&inner, ',');
+            if item_types.len() == 2 && item_types[1] == "..." {
+                let gen = python_generator(Some(item_types[0]), type_defs);
+                format!("tuple({gen} for _ in range(_fuzz_int_range(0, 5)))")
+            } else {
+                let values = item_types
+                    .into_iter()
+                    .map(|item| python_generator(Some(item), type_defs))
+                    .collect::<Vec<_>>();
+                let trailing_comma = if values.len() == 1 { "," } else { "" };
+                format!("({}{trailing_comma})", values.join(", "))
+            }
         }
         _ if starts_with_any(t, &["set[", "Set["]) => {
             let inner = extract_generic_arg(t);
@@ -1146,7 +1167,9 @@ fn python_generator(type_ann: Option<&str>, type_defs: &HashMap<&str, &ClassInfo
         "datetime" | "date" => "__import__('datetime').datetime(2020, 1, 1)".into(),
         _ if type_defs.contains_key(t) => {
             let class = type_defs[t];
-            if class.fields.is_empty() {
+            if !python_class_is_runtime_instantiable(class) {
+                "_fuzz_none()".into()
+            } else if class.fields.is_empty() {
                 format!("{t}()")
             } else {
                 let args: Vec<String> = class
@@ -1401,6 +1424,39 @@ fn should_require_ts_nonempty_string(
         && param_types
             .iter()
             .any(|param_type| ts_has_object_like_input_type(param_type, type_defs))
+}
+
+fn is_python_sequence_type(type_name: &str) -> bool {
+    let trimmed = type_name.trim();
+    matches!(
+        trimmed,
+        "list"
+            | "List"
+            | "Sequence"
+            | "Iterable"
+            | "Collection"
+            | "typing.Sequence"
+            | "typing.Iterable"
+            | "typing.Collection"
+            | "collections.abc.Sequence"
+            | "collections.abc.Iterable"
+            | "collections.abc.Collection"
+    ) || starts_with_any(
+        trimmed,
+        &[
+            "list[",
+            "List[",
+            "Sequence[",
+            "Iterable[",
+            "Collection[",
+            "typing.Sequence[",
+            "typing.Iterable[",
+            "typing.Collection[",
+            "collections.abc.Sequence[",
+            "collections.abc.Iterable[",
+            "collections.abc.Collection[",
+        ],
+    )
 }
 
 fn is_python_mapping_type(type_name: &str) -> bool {
@@ -4800,6 +4856,22 @@ fn python_edge_type_name(type_ann: Option<&str>) -> &'static str {
         _ => "",
     }
 }
+fn ts_object_type_allows_empty(type_ann: &str, type_defs: &TsNamedTypes<'_>) -> bool {
+    let trimmed = type_ann.trim();
+    if let Some(resolved) = ts_resolve_alias_text(trimmed, type_defs) {
+        return ts_object_type_allows_empty(&resolved, type_defs);
+    }
+    if trimmed.starts_with("Record<") {
+        return true;
+    }
+    if let Some(class) = ts_class_def(trimmed, type_defs) {
+        return class.fields.iter().all(|field| field.optional);
+    }
+    looks_like_ts_object_type(trimmed)
+        && extract_ts_object_type_fields_from_text(trimmed)
+            .iter()
+            .all(|field| field.optional)
+}
 
 fn ts_edge_type_name(type_ann: Option<&str>, type_defs: &TsNamedTypes<'_>) -> &'static str {
     let t = match type_ann {
@@ -4824,8 +4896,15 @@ fn ts_edge_type_name(type_ann: Option<&str>, type_defs: &TsNamedTypes<'_>) -> &'
             ""
         }
         Some(t) if t.starts_with("Record<") => "object",
-        Some(t) if looks_like_ts_object_type(t) => "object",
-        Some(t) if ts_class_def(t, type_defs).is_some() => "object",
+        Some(t) if looks_like_ts_object_type(t) && ts_object_type_allows_empty(t, type_defs) => {
+            "object"
+        }
+        Some(t)
+            if ts_class_def(t, type_defs).is_some()
+                && ts_object_type_allows_empty(t, type_defs) =>
+        {
+            "object"
+        }
         _ => "",
     }
 }

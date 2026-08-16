@@ -592,6 +592,73 @@ fn python_mapping_annotation_generates_mapping_input() {
 }
 
 #[test]
+fn python_standard_container_and_scalar_annotations_generate_runnable_inputs() {
+    let analysis = make_analysis(
+        vec![
+            func(
+                "consume_sequence",
+                vec![("values", Some("Sequence[str]"))],
+                Some("int"),
+            ),
+            func(
+                "consume_tuple",
+                vec![("value", Some("tuple[str, int]"))],
+                Some("str"),
+            ),
+            func(
+                "consume_scalars",
+                vec![("enabled", Some("bool")), ("ratio", Some("float"))],
+                Some("float"),
+            ),
+        ],
+        vec![],
+    );
+    let code = synthesize_calls(&analysis, &Language::Python);
+    for name in ["consume_sequence", "consume_tuple", "consume_scalars"] {
+        assert!(
+            code.contains(&format!("_target_entered(\"{name}:1\"")),
+            "{name} should have a generated fuzz block:\n{code}"
+        );
+    }
+    assert!(
+        code.contains("[_fuzz_str() for _ in range(_fuzz_int_range(0, 5))]")
+            && code.contains("(_fuzz_str(), _fuzz_int())")
+            && code.contains("[_fuzz_bool(), _fuzz_float()]"),
+        "standard annotations must generate matching container and scalar domains:\n{code}"
+    );
+    assert!(
+        !code.contains("_all_inputs.append([None])"),
+        "supported standard annotations must not degrade to None-only inputs:\n{code}"
+    );
+}
+#[test]
+fn python_protocol_parameters_are_not_instantiated() {
+    let code = r#"
+from typing import Protocol
+
+class PresignClient(Protocol):
+    def presign(self, key: str) -> str: ...
+
+def create_url(client: PresignClient, key: str) -> str:
+    return client.presign(key)
+"#;
+    let analysis = analyze(code, &Language::Python);
+    let plan = synthesize_plan(&analysis, &Language::Python);
+
+    assert!(
+        !plan.code.contains("PresignClient()"),
+        "typing.Protocol classes cannot be instantiated at runtime:\n{}",
+        plan.code
+    );
+    let coverage = plan
+        .coverage
+        .iter()
+        .find(|entry| entry.function == "create_url")
+        .expect("create_url coverage");
+    assert_eq!(coverage.status, FuzzFunctionStatus::SkippedUnsupportedType);
+}
+
+#[test]
 fn python_no_idempotency_for_different_types() {
     let a = make_analysis(
         vec![func(
@@ -1886,6 +1953,88 @@ fn typescript_fuzzes_resolved_alias_params() {
     assert!(
         !fuzz_call.contains("[\"object\"]"),
         "resolved alias arrays should not inherit object edge cases, got: {fuzz_call}"
+    );
+}
+
+#[test]
+fn typescript_imported_object_alias_generates_required_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let types_path = dir.path().join("model.ts");
+    std::fs::write(&types_path, "export type Profile = { name: string; };").unwrap();
+    let source_path = dir.path().join("target.ts");
+    let source = r#"
+import type { Profile } from "./model";
+export function displayProfile(profile: Profile): string {
+    return profile.name.trim();
+}
+"#;
+    std::fs::write(&source_path, source).unwrap();
+
+    let mut analysis = analyze(source, &Language::TypeScript);
+    let referenced =
+        court_jester::tools::analyze::referenced_type_names_for_functions(&analysis.functions);
+    let imported = court_jester::tools::analyze::resolve_imported_types_for_names(
+        &analysis,
+        source_path.to_str().unwrap(),
+        &Language::TypeScript,
+        &referenced,
+    );
+    analysis.classes.extend(imported.classes);
+    analysis.aliases.extend(imported.aliases);
+
+    let code = synthesize_calls(&analysis, &Language::TypeScript);
+    let fuzz_call = code
+        .lines()
+        .find(|line| line.contains("_fuzzOne(\"displayProfile\""))
+        .expect("displayProfile fuzz call should exist");
+    assert!(
+        fuzz_call.contains("({ name:"),
+        "resolved object aliases must generate their required fields, got: {fuzz_call}"
+    );
+    assert!(
+        !fuzz_call.contains("[\"object\"]"),
+        "required-field aliases must not receive the invalid empty-object edge case, got: {fuzz_call}"
+    );
+}
+
+#[test]
+fn typescript_imported_alias_uses_local_binding_for_fuzz_synthesis() {
+    let dir = tempfile::tempdir().unwrap();
+    let types_path = dir.path().join("types.ts");
+    std::fs::write(
+        &types_path,
+        "export type PathValue = string | number | ReadonlyArray<string | number>;\n",
+    )
+    .unwrap();
+    let source_path = dir.path().join("target.ts");
+    let source = r#"
+import type { PathValue as ImportedPathValue } from "./types";
+export function flattenPathArgs(values: ReadonlyArray<ImportedPathValue>): string {
+    return values.flat().join("/");
+}
+"#;
+    std::fs::write(&source_path, source).unwrap();
+
+    let mut analysis = analyze(source, &Language::TypeScript);
+    let referenced =
+        court_jester::tools::analyze::referenced_type_names_for_functions(&analysis.functions);
+    let imported = court_jester::tools::analyze::resolve_imported_types_for_names(
+        &analysis,
+        source_path.to_str().unwrap(),
+        &Language::TypeScript,
+        &referenced,
+    );
+    analysis.classes.extend(imported.classes);
+    analysis.aliases.extend(imported.aliases);
+
+    let code = synthesize_calls(&analysis, &Language::TypeScript);
+    let fuzz_call = code
+        .lines()
+        .find(|line| line.contains("_fuzzOne(\"flattenPathArgs\""))
+        .expect("the imported local alias should remain synthesizable");
+    assert!(
+        fuzz_call.contains("_fuzzStr()") && fuzz_call.contains("_fuzzNum()"),
+        "the local alias must expand to its imported domain: {fuzz_call}"
     );
 }
 

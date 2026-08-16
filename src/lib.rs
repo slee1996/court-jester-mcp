@@ -145,6 +145,24 @@ fn has_package_marker(dir: &Path) -> bool {
     dir.join("package.json").is_file() || dir.join("pyproject.toml").is_file()
 }
 
+fn has_workspace_marker(dir: &Path) -> bool {
+    if dir.join("pnpm-workspace.yaml").is_file() || dir.join("lerna.json").is_file() {
+        return true;
+    }
+    std::fs::read_to_string(dir.join("package.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|manifest| manifest.get("workspaces").cloned())
+        .is_some()
+}
+
+fn declared_workspace_root(explicit_root: &Path) -> PathBuf {
+    ancestors(explicit_root)
+        .into_iter()
+        .find(|dir| has_workspace_marker(dir))
+        .unwrap_or_else(|| explicit_root.to_path_buf())
+}
+
 fn dependency_marker(dir: &Path) -> bool {
     dir.join("node_modules").is_dir() || dir.join(".venv").is_dir()
 }
@@ -287,7 +305,7 @@ pub fn resolve_execution_context(
         .unwrap_or(&invocation_dir);
 
     let workspace_root = if let Some(root) = explicit_root {
-        root
+        declared_workspace_root(&root)
     } else {
         let target_dependencies = ancestors(target_parent)
             .into_iter()
@@ -390,6 +408,7 @@ pub fn resolve_execution_context(
     Ok(ExecutionContext {
         invocation_dir,
         workspace_root,
+        materialization_source_root: None,
         target_package_root,
         test_package_root,
         dependency_roots: dependencies,

@@ -1395,7 +1395,7 @@ fn visit_typescript(
                 if let Some((qualified_name, call_target)) =
                     ts_exported_class_method_surface(node, source)
                 {
-                    (qualified_name, true, Some(call_target))
+                    (qualified_name, true, call_target)
                 } else if node
                     .parent()
                     .is_some_and(|parent| parent.kind() == "object")
@@ -1848,7 +1848,7 @@ fn numeric_literal_expr(raw: &str) -> Option<String> {
 fn ts_exported_class_method_surface(
     node: &tree_sitter::Node,
     source: &[u8],
-) -> Option<(String, String)> {
+) -> Option<(String, Option<String>)> {
     let parent = node.parent()?;
     if parent.kind() != "class_body" {
         return None;
@@ -1864,14 +1864,20 @@ fn ts_exported_class_method_surface(
     let class_name = class_node
         .child_by_field_name("name")
         .map(|n| text(&n, source))?;
-    let method_name = node.child_by_field_name("name").map(|n| text(&n, source))?;
+    let method_name_node = node.child_by_field_name("name")?;
+    let method_name = text(&method_name_node, source);
     if method_name.is_empty() || method_name == "constructor" || method_name.starts_with('#') {
         return None;
     }
+    let prefix = std::str::from_utf8(&source[node.start_byte()..method_name_node.start_byte()])
+        .unwrap_or_default();
+    let is_accessor = prefix
+        .split_whitespace()
+        .any(|token| matches!(token, "get" | "set"));
 
     Some((
         format!("{class_name}#{method_name}"),
-        format!("(new {class_name}()).{method_name}"),
+        (!is_accessor).then(|| format!("(new {class_name}()).{method_name}")),
     ))
 }
 
@@ -2921,7 +2927,10 @@ fn resolve_imported_types_for_request(
         .cloned()
         .collect();
 
-    let mut requests_by_path: HashMap<String, (std::path::PathBuf, ImportRequest)> = HashMap::new();
+    let mut requests_by_path: HashMap<
+        String,
+        (std::path::PathBuf, ImportRequest, HashMap<String, String>),
+    > = HashMap::new();
     for import in &analysis.imports {
         let parsed = match parse_import(&import.statement, language) {
             Some(parsed) => parsed,
@@ -2939,14 +2948,30 @@ fn resolve_imported_types_for_request(
             Some(path) => path,
             None => continue,
         };
+        let aliases = parsed
+            .bindings
+            .iter()
+            .filter_map(|binding| match binding {
+                ParsedImportBinding::Named {
+                    local_name,
+                    exported_name,
+                } if local_name != exported_name && unresolved_names.contains(local_name) => {
+                    Some((exported_name.clone(), local_name.clone()))
+                }
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
         let key = resolved.to_string_lossy().to_string();
         requests_by_path
             .entry(key)
-            .and_modify(|(_, existing)| merge_import_request(existing, &request))
-            .or_insert((resolved, request));
+            .and_modify(|(_, existing, existing_aliases)| {
+                merge_import_request(existing, &request);
+                existing_aliases.extend(aliases.clone());
+            })
+            .or_insert((resolved, request, aliases));
     }
 
-    for (path_key, (resolved, request)) in requests_by_path {
+    for (path_key, (resolved, request, import_aliases)) in requests_by_path {
         let delta = match note_import_request(&mut state.processed_requests, &path_key, &request) {
             Some(delta) => delta,
             None => continue,
@@ -2980,6 +3005,20 @@ fn resolve_imported_types_for_request(
         let imported = analyze_with_context(&code, &imported_context);
         let nested =
             resolve_imported_types_for_request(&imported, &resolved, language, delta, state);
+        for class in &nested.classes {
+            if let Some(local_name) = import_aliases.get(&class.name) {
+                let mut local_class = class.clone();
+                local_class.name = local_name.clone();
+                resolved_types.classes.push(local_class);
+            }
+        }
+        for alias in &nested.aliases {
+            if let Some(local_name) = import_aliases.get(&alias.name) {
+                let mut local_alias = alias.clone();
+                local_alias.name = local_name.clone();
+                resolved_types.aliases.push(local_alias);
+            }
+        }
         resolved_types.classes.extend(nested.classes);
         resolved_types.aliases.extend(nested.aliases);
     }

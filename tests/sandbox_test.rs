@@ -21,6 +21,8 @@ fn sandbox_options<'a>(
         docker_image: None,
         project_dir,
         source_file,
+        instrumentation_target: None,
+        instrumented_source: None,
     }
 }
 
@@ -395,6 +397,63 @@ async fn generated_typescript_harness_resolves_scoped_package_from_target_packag
         assert_eq!(bun.exit_code, Some(0), "stderr: {}", bun.stderr);
         assert_eq!(bun.stdout.trim(), "prisma-workspace-ok");
     }
+}
+
+#[tokio::test]
+async fn typescript_instrumentation_intercepts_reads_without_rewriting_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path();
+    let source = workspace.join("target.ts");
+    let original = "export const marker = 'original';\n";
+    let instrumented = "export const marker = 'instrumented';\n";
+    std::fs::write(workspace.join("package.json"), r#"{"type":"module"}"#).unwrap();
+    std::fs::write(&source, original).unwrap();
+
+    let context = resolve_execution_context(ContextRequest {
+        invocation_dir: workspace,
+        explicit_project_dir: Some(workspace),
+        target_file: Some(&source),
+        test_file: None,
+        language: Language::TypeScript,
+        virtual_file_path: None,
+    })
+    .unwrap();
+    let source_file = source.to_string_lossy().into_owned();
+    let mut limits = sandbox_options(
+        10.0,
+        128,
+        Some(workspace.to_str().unwrap()),
+        Some(&source_file),
+    );
+    limits.instrumentation_target = Some(&source_file);
+    limits.instrumented_source = Some(instrumented);
+    let harness = format!(
+        "import {{ readFileSync }} from 'node:fs';\nprocess.stdout.write(readFileSync({}, 'utf8'));\n",
+        serde_json::to_string(&source_file).unwrap()
+    );
+
+    let result = execute_harness(
+        &context,
+        HarnessSpec {
+            kind: HarnessKind::Standalone,
+            runtime: HarnessRuntime::NodeScript,
+            test_adapter: None,
+            source_mode: SourceMode::TypeScript,
+            artifact: HarnessArtifact::Generated {
+                code: harness,
+                relative_path: ".court-jester/generated/instrumentation.ts".into(),
+            },
+            args: Vec::new(),
+            network: NetworkPolicy::Deny,
+        },
+        limits,
+    )
+    .await
+    .process;
+
+    assert_eq!(result.exit_code, Some(0), "result: {result:?}");
+    assert_eq!(result.stdout, instrumented);
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), original);
 }
 
 #[cfg(unix)]
@@ -1591,6 +1650,8 @@ fn sandbox_options_reject_invalid_limits_and_profile_overrides() {
         docker_image: None,
         project_dir: None,
         source_file: None,
+        instrumentation_target: None,
+        instrumented_source: None,
     };
     assert!(invalid_timeout.validate().is_err());
     let invalid_image = SandboxOptions {
@@ -1602,6 +1663,8 @@ fn sandbox_options_reject_invalid_limits_and_profile_overrides() {
         docker_image: Some("-bad:image"),
         project_dir: None,
         source_file: None,
+        instrumentation_target: None,
+        instrumented_source: None,
     };
     assert!(invalid_image.validate().is_err());
     let isolated_without_image = SandboxOptions {
@@ -1613,6 +1676,8 @@ fn sandbox_options_reject_invalid_limits_and_profile_overrides() {
         docker_image: None,
         project_dir: None,
         source_file: None,
+        instrumentation_target: None,
+        instrumented_source: None,
     };
     assert!(isolated_without_image.validate().is_err());
     let isolated_with_network = SandboxOptions {
@@ -1624,6 +1689,8 @@ fn sandbox_options_reject_invalid_limits_and_profile_overrides() {
         docker_image: Some("python:3.12-slim"),
         project_dir: None,
         source_file: None,
+        instrumentation_target: None,
+        instrumented_source: None,
     };
     assert!(isolated_with_network.validate().is_err());
 }
@@ -1687,6 +1754,8 @@ async fn isolated_python_execution_is_guarded_and_uses_selected_image() {
         docker_image: Some("python:3.12-slim"),
         project_dir: None,
         source_file: None,
+        instrumentation_target: None,
+        instrumented_source: None,
     };
     let result = execute("print('isolated')", &Language::Python, options).await;
     assert_eq!(result.exit_code, Some(0), "stderr: {}", result.stderr);
@@ -1784,6 +1853,8 @@ async fn isolated_typescript_preserves_pnpm_workspace_symlinks() {
             docker_image: Some(image),
             project_dir: Some(project_dir.as_ref()),
             source_file: Some(source_file.as_ref()),
+            instrumentation_target: None,
+            instrumented_source: None,
         },
     )
     .await;
@@ -1818,6 +1889,8 @@ async fn isolated_typescript_preserves_pnpm_workspace_symlinks() {
             docker_image: Some(image),
             project_dir: Some(project_dir.as_ref()),
             source_file: Some(source_file.as_ref()),
+            instrumentation_target: None,
+            instrumented_source: None,
         },
     )
     .await;

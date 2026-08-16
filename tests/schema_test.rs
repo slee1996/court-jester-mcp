@@ -67,6 +67,38 @@ fn bun_junit_adapter_preserves_public_variant_and_serde_value() {
         adapter
     );
 }
+#[test]
+fn project_adapter_contract_preserves_capability_and_strategy_values() {
+    let adapter = ProjectAdapterContract {
+        kind: ProjectAdapterKind::Nuxt,
+        root: "/workspace/apps/client".into(),
+        package_root: "/workspace/apps/client".into(),
+        workspace_root: "/workspace".into(),
+        dependency_roots: vec!["/workspace".into()],
+        effective_config: Some("/workspace/apps/client/.nuxt/tsconfig.json".into()),
+        selected_runner: Some(ProjectRuntimeAdapterKind::Nuxt),
+        rationale: vec!["Nuxt configuration selected the adapter".into()],
+        capabilities: ProjectAdapterCapabilities {
+            authoritative_source_overlay: true,
+            package_runtime: true,
+            project_test_runner: true,
+            framework_auto_import_runtime: true,
+        },
+    };
+    let value = serde_json::to_value(&adapter).unwrap();
+    assert_eq!(value["kind"], "nuxt");
+    assert_eq!(value["capabilities"]["framework_auto_import_runtime"], true);
+    assert_eq!(value["selected_runner"], "nuxt");
+    assert_eq!(value["workspace_root"], "/workspace");
+    assert_eq!(
+        serde_json::to_value(SurfaceExecutionStrategy::FrameworkRuntime).unwrap(),
+        "framework_runtime"
+    );
+    assert_eq!(
+        serde_json::from_value::<ProjectAdapterContract>(value).unwrap(),
+        adapter
+    );
+}
 
 #[test]
 fn harness_event_parser_enforces_version_order_bounds_and_deduplication() {

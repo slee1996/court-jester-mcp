@@ -255,6 +255,34 @@ export class Reorderer {
         Some("(new Reorderer()).reorder")
     );
 }
+#[test]
+fn typescript_exported_accessors_are_properties_not_callable_methods() {
+    let code = "\
+export class Choice {
+  private selected = false;
+  get isDefault(): boolean {
+    return this.selected;
+  }
+  set isDefault(value: boolean) {
+    this.selected = value;
+  }
+}
+";
+    let analysis = analyze(code, &Language::TypeScript);
+    let accessors = analysis
+        .functions
+        .iter()
+        .filter(|function| function.name == "Choice#isDefault")
+        .collect::<Vec<_>>();
+    assert_eq!(accessors.len(), 2);
+    assert!(accessors.iter().all(|function| function.is_exported));
+    assert!(
+        accessors
+            .iter()
+            .all(|function| function.invocation_target.is_none()),
+        "property accessors must not be emitted as function calls: {accessors:#?}"
+    );
+}
 
 #[test]
 fn typescript_factory_functions_record_returned_callables() {

@@ -56,6 +56,8 @@ pub struct SourceContext {
 pub struct ExecutionContext {
     pub invocation_dir: std::path::PathBuf,
     pub workspace_root: std::path::PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialization_source_root: Option<std::path::PathBuf>,
     pub target_package_root: std::path::PathBuf,
     pub test_package_root: Option<std::path::PathBuf>,
     pub dependency_roots: Vec<std::path::PathBuf>,
@@ -355,6 +357,10 @@ pub struct SandboxOptions<'a> {
     pub docker_image: Option<&'a str>,
     pub project_dir: Option<&'a str>,
     pub source_file: Option<&'a str>,
+    /// Absolute original source path to intercept for in-memory instrumentation.
+    pub instrumentation_target: Option<&'a str>,
+    /// Instrumented source returned by the runner transform; never written into the project.
+    pub instrumented_source: Option<&'a str>,
 }
 
 impl SandboxOptions<'_> {
@@ -385,6 +391,11 @@ impl SandboxOptions<'_> {
             && self.network_policy == NetworkPolicy::Allow
         {
             return Err("isolated runtime profile requires network denial".into());
+        }
+        if self.instrumentation_target.is_some() != self.instrumented_source.is_some() {
+            return Err(
+                "instrumentation target and instrumented source must be provided together".into(),
+            );
         }
         if self.runtime_profile == RuntimeProfile::Isolated && self.docker_image.is_none() {
             return Err("isolated runtime profile requires a docker image".into());
@@ -1121,6 +1132,85 @@ pub struct FuzzFunctionCoverage {
     pub is_exported: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectAdapterKind {
+    Standalone,
+    Nuxt,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectRuntimeAdapterKind {
+    PlainPython,
+    PlainTypeScript,
+    Bun,
+    VitestVite,
+    Nuxt,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectAdapterCapabilities {
+    pub authoritative_source_overlay: bool,
+    pub package_runtime: bool,
+    pub project_test_runner: bool,
+    pub framework_auto_import_runtime: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectAdapterContract {
+    pub kind: ProjectAdapterKind,
+    pub root: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub package_root: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub workspace_root: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependency_roots: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_config: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_runner: Option<ProjectRuntimeAdapterKind>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rationale: Vec<String>,
+    pub capabilities: ProjectAdapterCapabilities,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceExecutionStrategy {
+    GeneratedHarness,
+    FrameworkRuntime,
+    AuthoritativeProjectRunner,
+    StaticOnly,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SurfaceExecutionPlan {
+    pub surface_id: String,
+    pub strategy: SurfaceExecutionStrategy,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsupported_requirements: Vec<String>,
+    pub expected_evidence: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OrthogonalOutcome {
+    Passed,
+    Failed,
+    Blocked,
+    NotRun,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerificationOutcomeMatrix {
+    pub static_analysis: OrthogonalOutcome,
+    pub generated_execution: OrthogonalOutcome,
+    pub authoritative_tests: OrthogonalOutcome,
+    pub portability: OrthogonalOutcome,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

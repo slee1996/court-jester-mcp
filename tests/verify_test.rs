@@ -1,13 +1,14 @@
 use court_jester::tools::verify::{
-    load_persisted_report, parse_findings, replay_report, report_human_summary, report_json_value,
-    verify, VerifyOptions,
+    final_verdict, load_persisted_report, parse_findings, replay_report, report_human_summary,
+    report_json_value, verify, VerifyOptions,
 };
 use court_jester::types::{
     ComplexityMetric, CoverageGate, CoverageSummary, DiagnosticComponent, DiagnosticImpact,
     ExecuteGate, FailureDomain, FailureKind, FindingCategory, FindingConfidence, FindingSeverity,
-    FindingsSummary, InferredOracleGate, InputClassification, Language, NetworkPolicy, OracleKind,
-    OracleProvenance, ReplayOutcome, ReportLevel, ReportSummary, RuntimeProfile, StageStatus,
-    TestRunner, VerificationReport, VerificationStage, VerificationStrength, VerificationVerdict,
+    FindingsSummary, FuzzFunctionCoverage, FuzzFunctionStatus, InferredOracleGate,
+    InputClassification, Language, NetworkPolicy, OracleKind, OracleProvenance, ReplayOutcome,
+    ReportLevel, ReportSummary, RuntimeProfile, StageStatus, TestRunner, VerificationEvidence,
+    VerificationReport, VerificationStage, VerificationStrength, VerificationVerdict,
     DEFAULT_PYTHON_DOCKER_IMAGE, DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
 };
 use std::fs;
@@ -281,8 +282,8 @@ async fn syntax_error_short_circuits() {
             .iter()
             .map(|stage| stage.name.as_str())
             .collect::<Vec<_>>(),
-        ["parse", "execute"],
-        "parse failure should skip later work while reporting omitted execution"
+        ["parse", "execute", "outcome_matrix"],
+        "parse failure should skip later work while reporting omitted execution and outcomes"
     );
     assert_eq!(report.stages[0].status, StageStatus::Failed);
     assert_eq!(report.stages[1].status, StageStatus::Skipped);
@@ -307,6 +308,53 @@ async fn with_passing_tests() {
         .stages
         .iter()
         .any(|s| s.name == "test" && s.status == StageStatus::Passed));
+}
+
+#[test]
+fn complete_authoritative_tests_supersede_skipped_generated_execution() {
+    let stages = vec![
+        VerificationStage {
+            name: "parse".into(),
+            status: StageStatus::Passed,
+            duration_ms: 0,
+            detail: None,
+            message: None,
+        },
+        VerificationStage {
+            name: "execute".into(),
+            status: StageStatus::Skipped,
+            duration_ms: 0,
+            detail: None,
+            message: Some("no generated cases".into()),
+        },
+        VerificationStage {
+            name: "test".into(),
+            status: StageStatus::Passed,
+            duration_ms: 0,
+            detail: None,
+            message: None,
+        },
+    ];
+    let coverage = CoverageSummary {
+        required: 2,
+        behaviorally_checked: 2,
+        ..Default::default()
+    };
+    let evidence = VerificationEvidence {
+        parsed: true,
+        static_checks_completed: true,
+        authoritative_test_completed: true,
+        authoritative_test_covered_surfaces: 2,
+        ..Default::default()
+    };
+
+    assert_eq!(
+        final_verdict(&stages, &coverage, CoverageGate::ChangedExports, &evidence),
+        (
+            VerificationVerdict::Pass,
+            VerificationStrength::AuthoritativeTests
+        )
+    );
 }
 
 #[tokio::test]
@@ -2408,6 +2456,63 @@ __COURT_JESTER_FINDINGS_JSON__
     assert_eq!(finding.oracle.kind, OracleKind::RuntimeContract);
     assert_eq!(finding.oracle.provenance, OracleProvenance::LanguageRuntime);
     assert_eq!(finding.input_classification, InputClassification::Valid);
+    let events = [
+        serde_json::json!({
+            "protocol_version": 1,
+            "sequence": 0,
+            "event": "bootstrap_started"
+        }),
+        serde_json::json!({
+            "protocol_version": 1,
+            "sequence": 1,
+            "event": "target_resolved",
+            "data": {"module": "generated"}
+        }),
+        serde_json::json!({
+            "protocol_version": 1,
+            "sequence": 2,
+            "event": "target_ready"
+        }),
+        serde_json::json!({
+            "protocol_version": 1,
+            "sequence": 3,
+            "event": "unit_started",
+            "data": {
+                "surface_id": "boom:1",
+                "iteration": 0,
+                "input_classification": "valid",
+                "input_origin": "generated"
+            }
+        }),
+        serde_json::json!({
+            "protocol_version": 1,
+            "sequence": 4,
+            "event": "finding",
+            "data": {"finding": finding}
+        }),
+        serde_json::json!({
+            "protocol_version": 1,
+            "sequence": 5,
+            "event": "unit_completed",
+            "data": {
+                "surface_id": "boom:1",
+                "iteration": 0,
+                "outcome": "target_exception"
+            }
+        }),
+    ];
+    let event_stdout = format!(
+        "{}\n__COURT_JESTER_FINDINGS_JSON__\n[truncated",
+        events
+            .iter()
+            .map(|event| format!("__COURT_JESTER_EVENT_JSON__{event}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let event_findings =
+        parse_findings(&event_stdout).expect("event findings must survive a truncated aggregate");
+    assert_eq!(event_findings.len(), 1);
+    assert_eq!(event_findings[0].location.function, "boom");
 }
 
 #[test]
@@ -4408,15 +4513,102 @@ describe("AnalyticsPage", () => {
         !vitest_log_text.contains("arg=--reporter=junit"),
         "must not inject an incomplete JUnit reporter, got:\n{vitest_log_text}"
     );
+    let canonical_test = std::fs::canonicalize(&test_path).unwrap();
     assert!(
         vitest_log_text
             .lines()
-            .any(|line| line.ends_with("src/pages/AnalyticsPage.test.tsx")),
-        "expected the .test.tsx artifact, got:\n{vitest_log_text}"
+            .any(|line| line == format!("arg={}", canonical_test.display())),
+        "expected the original project test path rather than a mirrored copy, got:\n{vitest_log_text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&source_path).unwrap(),
+        code,
+        "authoritative instrumentation must not rewrite the project source"
     );
     assert!(
         !node_log.exists(),
         "Node/plain script must not run a Vitest authoritative test"
+    );
+}
+
+#[tokio::test]
+async fn auto_seed_executes_adjacent_project_test_and_credits_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let tool_dir = dir.path().join("node_modules").join(".bin");
+    let vitest_log = dir.path().join("vitest.log");
+    install_fake_tool_at(
+        &tool_dir,
+        "vitest",
+        &format!(
+            r#"#!/bin/sh
+printf 'runner=vitest\n' > "{}"
+for arg in "$@"; do printf 'arg=%s\n' "$arg" >> "{}"; done
+printf '%s\n' '{{"event":"target_entered","surface_id":"formatValue:2"}}' >&2
+cat <<'EOF'
+{{"numTotalTestSuites":1,"numPassedTestSuites":1,"numFailedTestSuites":0,"numTotalTests":1,"numPassedTests":1,"numFailedTests":0,"success":true}}
+EOF
+exit 0
+"#,
+            vitest_log.display(),
+            vitest_log.display(),
+        ),
+    );
+
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"devDependencies":{"vitest":"3.2.4"}}"#,
+    )
+    .unwrap();
+    let source_path = dir.path().join("formatValue.ts");
+    let test_path = dir.path().join("formatValue.test.ts");
+    let code = "import type { ExternalThing } from \"external-package\";\nexport function formatValue(value: ExternalThing): string { return String(value); }\n";
+    std::fs::write(&source_path, code).unwrap();
+    std::fs::write(
+        &test_path,
+        "import { formatValue } from \"./formatValue\";\ntest(\"formats\", () => expect(formatValue({} as never)).toBe(\"[object Object]\"));\n",
+    )
+    .unwrap();
+
+    let source_file = source_path.to_string_lossy().into_owned();
+    let project_dir = dir.path().to_string_lossy().into_owned();
+    let mut opts = default_opts(None);
+    opts.project_dir = Some(&project_dir);
+    opts.source_file = Some(&source_file);
+    opts.network = NetworkPolicy::Allow;
+
+    let report = verify(code, &Language::TypeScript, opts).await;
+    let test_stage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "test")
+        .expect("auto-seeding should add an authoritative test stage");
+    assert_eq!(
+        test_stage.status,
+        StageStatus::Passed,
+        "{:#?}",
+        report.stages
+    );
+    let coverage_stage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "coverage")
+        .expect("coverage stage should be present");
+    let coverage: Vec<FuzzFunctionCoverage> =
+        serde_json::from_value(coverage_stage.detail.as_ref().unwrap()["functions"].clone())
+            .unwrap();
+    let function = coverage
+        .iter()
+        .find(|function| function.function == "formatValue")
+        .unwrap();
+    assert_eq!(
+        function.status,
+        FuzzFunctionStatus::CheckedViaAuthoritativeTest
+    );
+    assert!(
+        std::fs::read_to_string(&vitest_log)
+            .unwrap()
+            .contains("formatValue.test.ts"),
+        "the discovered adjacent test file must be passed to Vitest"
     );
 }
 
@@ -4917,9 +5109,10 @@ assert Path(__file__).name == "test_app.py"
     };
     let report = verify(code, &Language::Python, opts).await;
 
-    assert!(
-        report.verdict == VerificationVerdict::Pass,
-        "report: {:#?}",
+    assert_eq!(
+        report.verdict,
+        VerificationVerdict::Inconclusive,
+        "a passing uninstrumented Python script must not imply exact surface coverage: {:#?}",
         report.stages
     );
     assert!(!report.stages.iter().any(|s| s.name == "execute"));
@@ -4927,6 +5120,12 @@ assert Path(__file__).name == "test_app.py"
         .stages
         .iter()
         .any(|s| s.name == "test" && s.status == StageStatus::Passed));
+    let coverage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "coverage")
+        .expect("tests-only coverage stage");
+    assert_eq!(coverage.status, StageStatus::Inconclusive);
 }
 
 #[tokio::test]
@@ -6099,7 +6298,207 @@ export function useCounter() {
         "coverage must explain the environment blocker: {function:#?}"
     );
 }
+#[tokio::test]
+async fn nuxt_adapter_loads_installed_vue_auto_import_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let vue_dir = dir.path().join("node_modules").join("vue");
+    std::fs::create_dir_all(&vue_dir).unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"dependencies":{"nuxt":"3.15.4","vue":"3.5.13"}}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("nuxt.config.ts"), "export default {};\n").unwrap();
+    std::fs::write(
+        vue_dir.join("package.json"),
+        r#"{"name":"vue","type":"module","exports":"./index.js"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        vue_dir.join("index.js"),
+        "export function ref(value) { return { value }; }\n",
+    )
+    .unwrap();
+    let source_path = dir.path().join("useCounter.ts");
+    let code = r#"
+export function useCounter(): number {
+  return ref(4).value;
+}
+"#;
+    std::fs::write(&source_path, code).unwrap();
 
+    let mut opts = default_opts(None);
+    opts.project_dir = Some(dir.path().to_str().unwrap());
+    opts.source_file = Some(source_path.to_str().unwrap());
+    let report = verify(code, &Language::TypeScript, opts).await;
+
+    let execute = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("execute stage");
+    assert_eq!(
+        execute.status,
+        StageStatus::Passed,
+        "installed Nuxt/Vue runtime should satisfy framework auto-imports: {:#?}",
+        execute.detail
+    );
+    let coverage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "coverage")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("coverage detail");
+    assert!(coverage["functions"].as_array().is_some_and(|functions| {
+        functions.iter().any(|function| {
+            function["function"] == "useCounter" && function["status"] == "checked_direct"
+        })
+    }));
+    let adapter = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "project_adapter")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("project adapter detail");
+    assert_eq!(adapter["adapter"]["kind"], "nuxt");
+    assert_eq!(
+        adapter["adapter"]["capabilities"]["framework_auto_import_runtime"],
+        true
+    );
+    assert_eq!(adapter["surfaces"][0]["strategy"], "framework_runtime");
+    let outcomes = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "outcome_matrix")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("outcome matrix");
+    assert_eq!(outcomes["static_analysis"], "passed");
+    assert_eq!(outcomes["generated_execution"], "passed");
+    assert_eq!(outcomes["authoritative_tests"], "not_run");
+}
+
+#[tokio::test]
+async fn nuxt_adapter_defers_generated_execution_to_authoritative_project_test() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"dependencies":{"nuxt":"3.15.4"}}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("nuxt.config.ts"), "export default {};\n").unwrap();
+    let source_path = dir.path().join("useCounter.ts");
+    let code = r#"
+export function useCounter(value: number): number {
+  return value + 1;
+}
+"#;
+    std::fs::write(&source_path, code).unwrap();
+    let test_path = dir.path().join("useCounter.test.ts");
+    let tests = r#"
+import assert from "node:assert/strict";
+import { useCounter } from "./useCounter.ts";
+
+assert.equal(useCounter(4), 5);
+"#;
+    std::fs::write(&test_path, tests).unwrap();
+
+    let mut opts = default_opts(Some(tests));
+    opts.project_dir = Some(dir.path().to_str().unwrap());
+    opts.source_file = Some(source_path.to_str().unwrap());
+    opts.test_source_file = Some(test_path.to_str().unwrap());
+    let report = verify(code, &Language::TypeScript, opts).await;
+
+    let execute = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("execute stage");
+    assert_eq!(execute.status, StageStatus::Skipped);
+    assert_eq!(
+        execute.detail.as_ref().unwrap()["reason"],
+        "project_runner_selected"
+    );
+    let test = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "test")
+        .expect("test stage");
+    assert_eq!(
+        test.status,
+        StageStatus::Passed,
+        "the project test runner must own Nuxt execution: {:#?}",
+        test.detail
+    );
+    let coverage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "coverage")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("coverage detail");
+    assert!(coverage["functions"].as_array().is_some_and(|functions| {
+        functions.iter().any(|function| {
+            function["function"] == "useCounter"
+                && function["status"] == "checked_via_authoritative_test"
+        })
+    }));
+    let adapter = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "project_adapter")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("project adapter detail");
+    assert_eq!(
+        adapter["surfaces"][0]["strategy"],
+        "authoritative_project_runner"
+    );
+    assert_eq!(
+        report.verdict,
+        VerificationVerdict::Pass,
+        "the authoritative Nuxt test must satisfy the runtime contract: {:#?}",
+        report.stages
+    );
+}
+
+#[tokio::test]
+async fn adapter_selects_execution_strategy_per_exported_surface() {
+    let code = r#"
+import type { ExternalContext } from "external-package";
+
+export function increment(value: number): number {
+  return value + 1;
+}
+
+export function readExternal(context: ExternalContext): string {
+  return context.token;
+}
+"#;
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+    let surfaces = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "project_adapter")
+        .and_then(|stage| stage.detail.as_ref())
+        .and_then(|detail| detail["surfaces"].as_array())
+        .expect("surface execution plans");
+    let increment = surfaces
+        .iter()
+        .find(|surface| surface["surface_id"] == "increment:4")
+        .expect("increment plan");
+    assert_eq!(increment["strategy"], "generated_harness");
+    assert_eq!(increment["expected_evidence"], "property_checked");
+    let external = surfaces
+        .iter()
+        .find(|surface| surface["surface_id"] == "readExternal:8")
+        .expect("external plan");
+    assert_eq!(external["strategy"], "static_only");
+    assert_eq!(external["expected_evidence"], "static_checked");
+    assert!(
+        external["unsupported_requirements"]
+            .as_array()
+            .is_some_and(|requirements| !requirements.is_empty()),
+        "static-only plans must explain the missing capability: {external:#?}"
+    );
+}
 #[tokio::test]
 async fn ordinary_reference_error_remains_a_target_crash_outside_nuxt() {
     let code = r#"

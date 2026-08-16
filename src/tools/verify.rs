@@ -65,6 +65,8 @@ fn sandbox_options<'a>(
         docker_image,
         project_dir,
         source_file,
+        instrumentation_target: None,
+        instrumented_source: None,
     }
 }
 
@@ -321,7 +323,145 @@ fn nuxt_context_root(context: &ExecutionContext) -> Option<PathBuf> {
     }
     None
 }
+fn context_has_node_package(context: &ExecutionContext, package: &str) -> bool {
+    std::iter::once(&context.target_package_root)
+        .chain(context.dependency_roots.iter())
+        .chain(std::iter::once(&context.workspace_root))
+        .any(|root| {
+            root.join("node_modules")
+                .join(package)
+                .join("package.json")
+                .is_file()
+        })
+}
 
+fn nuxt_runtime_prelude(context: &ExecutionContext) -> Option<&'static str> {
+    nuxt_context_root(context)?;
+    context_has_node_package(context, "vue").then_some(
+        "import * as __court_jester_vue_runtime from \"vue\";\n\
+         Object.assign(globalThis, __court_jester_vue_runtime);\n",
+    )
+}
+
+fn project_adapter_contract(context: &ExecutionContext) -> ProjectAdapterContract {
+    let nuxt_root = nuxt_context_root(context);
+    let root = nuxt_root
+        .clone()
+        .unwrap_or_else(|| context.target_package_root.clone());
+    let effective_config = [
+        root.join(".nuxt/tsconfig.json"),
+        root.join("tsconfig.json"),
+        root.join("pyproject.toml"),
+        root.join("package.json"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+    .map(|path| path.to_string_lossy().into_owned());
+    let selected_runner = if nuxt_root.is_some() {
+        ProjectRuntimeAdapterKind::Nuxt
+    } else {
+        match context.target_source.language {
+            Language::Python => ProjectRuntimeAdapterKind::PlainPython,
+            Language::TypeScript if context_declares_vitest(context) => {
+                ProjectRuntimeAdapterKind::VitestVite
+            }
+            Language::TypeScript => ProjectRuntimeAdapterKind::PlainTypeScript,
+        }
+    };
+    ProjectAdapterContract {
+        kind: if nuxt_root.is_some() {
+            ProjectAdapterKind::Nuxt
+        } else {
+            ProjectAdapterKind::Standalone
+        },
+        root: root.to_string_lossy().into_owned(),
+        package_root: context.target_package_root.to_string_lossy().into_owned(),
+        workspace_root: context.workspace_root.to_string_lossy().into_owned(),
+        dependency_roots: context
+            .dependency_roots
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect(),
+        effective_config,
+        selected_runner: Some(selected_runner),
+        rationale: if nuxt_root.is_some() {
+            vec!["Nuxt package metadata or configuration selected the Nuxt/Vite adapter".into()]
+        } else {
+            vec!["language and project package metadata selected the standalone adapter".into()]
+        },
+        capabilities: ProjectAdapterCapabilities {
+            authoritative_source_overlay: context.target_source.source_file.is_some(),
+            package_runtime: context.target_package_root.is_dir(),
+            project_test_runner: context.test_source.is_some() || context_declares_vitest(context),
+            framework_auto_import_runtime: nuxt_runtime_prelude(context).is_some(),
+        },
+    }
+}
+
+fn surface_execution_plans(
+    functions: &[FunctionInfo],
+    adapter: &ProjectAdapterContract,
+    planned_coverage: &[FuzzFunctionCoverage],
+    tests_only: bool,
+    has_authoritative_test: bool,
+) -> Vec<SurfaceExecutionPlan> {
+    let planned = planned_coverage
+        .iter()
+        .map(|entry| ((entry.function.as_str(), entry.line), entry))
+        .collect::<HashMap<_, _>>();
+    functions
+        .iter()
+        .filter(|function| function.is_exported)
+        .map(|function| {
+            let generated_supported = planned
+                .get(&(function.name.as_str(), function.line))
+                .is_some_and(|entry| {
+                    matches!(
+                        entry.status,
+                        FuzzFunctionStatus::CheckedDirect
+                            | FuzzFunctionStatus::CheckedViaFactory
+                            | FuzzFunctionStatus::CheckedViaCaller
+                    )
+                });
+            let strategy = if tests_only
+                || (adapter.kind == ProjectAdapterKind::Nuxt && has_authoritative_test)
+                || (!generated_supported && has_authoritative_test)
+            {
+                SurfaceExecutionStrategy::AuthoritativeProjectRunner
+            } else if adapter.kind == ProjectAdapterKind::Nuxt {
+                SurfaceExecutionStrategy::FrameworkRuntime
+            } else if generated_supported {
+                SurfaceExecutionStrategy::GeneratedHarness
+            } else {
+                SurfaceExecutionStrategy::StaticOnly
+            };
+            let unsupported_requirements =
+                if matches!(strategy, SurfaceExecutionStrategy::StaticOnly) {
+                    vec![planned
+                        .get(&(function.name.as_str(), function.line))
+                        .and_then(|entry| entry.reason.clone())
+                        .unwrap_or_else(|| {
+                            "no safe generated, project-test, or framework runner is available"
+                                .into()
+                        })]
+                } else {
+                    Vec::new()
+                };
+            SurfaceExecutionPlan {
+                surface_id: format!("{}:{}", function.name, function.line),
+                strategy,
+                unsupported_requirements,
+                expected_evidence: match strategy {
+                    SurfaceExecutionStrategy::GeneratedHarness => "property_checked",
+                    SurfaceExecutionStrategy::AuthoritativeProjectRunner => "authoritative_tests",
+                    SurfaceExecutionStrategy::FrameworkRuntime => "runtime_smoke",
+                    SurfaceExecutionStrategy::StaticOnly => "static_checked",
+                }
+                .into(),
+            }
+        })
+        .collect()
+}
 fn nuxt_config_disables_auto_imports(root: &Path) -> bool {
     fn object_disables_auto_imports(node: tree_sitter::Node<'_>, source: &str) -> bool {
         if node.kind() != "object" {
@@ -590,6 +730,9 @@ fn normalize_nuxt_runtime_stdout(
     let mut retained_lines = Vec::new();
     let mut lines = stdout.lines();
     while let Some(line) = lines.next() {
+        if line.starts_with(sandbox::HARNESS_EVENT_SENTINEL) {
+            continue;
+        }
         if line == "__COURT_JESTER_FINDINGS_JSON__" {
             let _ = lines.next();
             continue;
@@ -730,11 +873,11 @@ fn instrument_source_for_surfaces(
                 instrumented.insert(target.surface_id.clone());
             }
             Language::TypeScript if body.kind() == "statement_block" => {
-                insertions.push((body.start_byte() + 1, format!("\nconsole.error(JSON.stringify({{event: 'target_entered', surface_id: '{}'}}));", target.surface_id)));
+                insertions.push((body.start_byte() + 1, format!("\nglobalThis.process.stderr.write(JSON.stringify({{event: 'target_entered', surface_id: '{}'}}) + \"\\n\");", target.surface_id)));
                 instrumented.insert(target.surface_id.clone());
             }
             Language::TypeScript if callable.kind() == "arrow_function" => {
-                insertions.push((body.start_byte(), format!("{{ console.error(JSON.stringify({{event: 'target_entered', surface_id: '{}'}})); return ", target.surface_id)));
+                insertions.push((body.start_byte(), format!("{{ globalThis.process.stderr.write(JSON.stringify({{event: 'target_entered', surface_id: '{}'}}) + \"\\n\"); return ", target.surface_id)));
                 insertions.push((body.end_byte(), "; }".into()));
                 instrumented.insert(target.surface_id.clone());
             }
@@ -876,6 +1019,7 @@ struct PreparedAuthoritativeTest {
     code: String,
     project_dir: Option<String>,
     source_file: Option<String>,
+    instrumented_source: Option<String>,
     overlay: InstrumentationOverlay,
 }
 
@@ -904,12 +1048,26 @@ fn mirror_test_overlay(
             }
             continue;
         }
-        symlink(entry.path(), destination_root.join(&relative)).map_err(|error| {
-            format!(
-                "failed to link instrumentation overlay '{}': {error}",
-                relative.display()
-            )
-        })?;
+        let destination = destination_root.join(&relative);
+        if entry
+            .file_type()
+            .map_err(|error| format!("failed to inspect overlay entry: {error}"))?
+            .is_file()
+        {
+            std::fs::copy(entry.path(), destination).map_err(|error| {
+                format!(
+                    "failed to copy instrumentation overlay '{}': {error}",
+                    relative.display()
+                )
+            })?;
+        } else {
+            symlink(entry.path(), destination).map_err(|error| {
+                format!(
+                    "failed to link instrumentation overlay '{}': {error}",
+                    relative.display()
+                )
+            })?;
+        }
     }
     Ok(())
 }
@@ -992,6 +1150,7 @@ fn prepare_authoritative_test(
                 code: tests.into(),
                 project_dir: project_dir.map(str::to_string),
                 source_file: test_source_file.map(str::to_string),
+                instrumented_source: None,
                 overlay,
             };
         }
@@ -1002,6 +1161,7 @@ fn prepare_authoritative_test(
             code: format!("{instrumented}\n\n{tests}"),
             project_dir: project_dir.map(str::to_string),
             source_file: source_file.map(str::to_string),
+            instrumented_source: None,
             overlay,
         };
     }
@@ -1021,6 +1181,7 @@ fn prepare_authoritative_test(
             code: tests.into(),
             project_dir: None,
             source_file: test_source_file.map(str::to_string),
+            instrumented_source: None,
             overlay,
         };
     };
@@ -1032,6 +1193,7 @@ fn prepare_authoritative_test(
             code: tests.into(),
             project_dir: Some(project.to_string_lossy().into_owned()),
             source_file: test_source_file.map(str::to_string),
+            instrumented_source: None,
             overlay,
         };
     };
@@ -1059,9 +1221,22 @@ fn prepare_authoritative_test(
             code: tests.into(),
             project_dir: Some(project.to_string_lossy().into_owned()),
             source_file: test_source_file.map(str::to_string),
+            instrumented_source: None,
             overlay,
         };
     };
+    if *language == Language::TypeScript {
+        if let Some(test_path) = test_path {
+            return PreparedAuthoritativeTest {
+                _root: None,
+                code: tests.into(),
+                project_dir: Some(project.to_string_lossy().into_owned()),
+                source_file: Some(test_path.to_string_lossy().into_owned()),
+                instrumented_source: Some(instrumented),
+                overlay,
+            };
+        }
+    }
     let root = match tempfile::tempdir() {
         Ok(root) => root,
         Err(error) => {
@@ -1072,6 +1247,7 @@ fn prepare_authoritative_test(
                 code: tests.into(),
                 project_dir: Some(project.to_string_lossy().into_owned()),
                 source_file: test_source_file.map(str::to_string),
+                instrumented_source: None,
                 overlay,
             };
         }
@@ -1089,6 +1265,7 @@ fn prepare_authoritative_test(
             code: tests.into(),
             project_dir: Some(project.to_string_lossy().into_owned()),
             source_file: test_source_file.map(str::to_string),
+            instrumented_source: None,
             overlay,
         };
     }
@@ -1114,6 +1291,7 @@ fn prepare_authoritative_test(
         code: tests.into(),
         project_dir: Some(overlay_project),
         source_file: Some(overlay_test),
+        instrumented_source: None,
         overlay,
     }
 }
@@ -1332,6 +1510,62 @@ del __court_jester_bootstrap_sys, __court_jester_bootstrap_types, __court_jester
         }
         Language::TypeScript => code.to_string(),
     }
+}
+
+fn generated_typescript_target_import(
+    context: &ExecutionContext,
+    functions: &[FunctionInfo],
+    classes: &[ClassInfo],
+    coverage: &[FuzzFunctionCoverage],
+) -> Option<String> {
+    let can_bind_selected_surfaces = coverage
+        .iter()
+        .filter(|entry| entry.status == FuzzFunctionStatus::CheckedDirect)
+        .all(|entry| {
+            functions.iter().any(|function| {
+                function.name == entry.function
+                    && function.line == entry.line
+                    && (function.is_exported || function.invocation_target.is_some())
+            })
+        });
+    if !can_bind_selected_surfaces {
+        return None;
+    }
+
+    let source = context.target_source.source_file.as_deref()?;
+    let filename = source.file_name()?.to_str()?;
+    let specifier = serde_json::to_string(&format!("./{filename}")).ok()?;
+    let mut symbols = functions
+        .iter()
+        .filter(|function| function.is_exported && !function.is_method && !function.is_nested)
+        .map(|function| function.name.as_str())
+        .chain(classes.iter().map(|class| class.name.as_str()))
+        .filter(|symbol| {
+            let mut characters = symbol.chars();
+            characters
+                .next()
+                .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+                && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+                && *symbol != "default"
+        })
+        .collect::<Vec<_>>();
+    symbols.sort_unstable();
+    symbols.dedup();
+
+    let runtime_prelude = nuxt_runtime_prelude(context).unwrap_or_default();
+    let mut prelude = format!(
+        "{runtime_prelude}\
+         const __court_jester_target = await import({specifier});\n\
+         const __court_jester_exports = __court_jester_target as Record<string, any>;\n"
+    );
+    for symbol in symbols {
+        let property = serde_json::to_string(symbol).ok()?;
+        let _ = writeln!(
+            prelude,
+            "const {symbol} = __court_jester_exports[{property}] ?? __court_jester_exports.default;"
+        );
+    }
+    Some(prelude)
 }
 
 fn differential_probe(
@@ -1688,7 +1922,7 @@ fn finalize_fuzz_coverage(
     let mut coverage = Vec::with_capacity(analysis_functions.len());
     for func in analysis_functions {
         let key = function_key(func);
-        let entry = if !allowed.contains(&key) {
+        let mut entry = if !allowed.contains(&key) {
             coverage_entry_for_verify(
                 func,
                 FuzzFunctionStatus::SkippedDiffFiltered,
@@ -1733,6 +1967,9 @@ fn finalize_fuzz_coverage(
                 Some("function was not selected for fuzzing".into()),
             )
         };
+        // Nested closures can be API-visible through a factory, but the exact
+        // authoritative-test contract only requires directly exported surfaces.
+        entry.required = func.is_exported && !func.is_nested;
         coverage.push(entry);
     }
 
@@ -1821,7 +2058,9 @@ pub fn final_verdict(
             && evidence.evaluated_oracles == 0)
         || stages.iter().any(|stage| {
             stage.status == StageStatus::Inconclusive
-                || (stage.name == "execute" && stage.status == StageStatus::Skipped)
+                || (stage.name == "execute"
+                    && stage.status == StageStatus::Skipped
+                    && !evidence.authoritative_test_completed)
         })
     {
         return (VerificationVerdict::Inconclusive, strength);
@@ -3864,7 +4103,6 @@ fn authoritative_harness_runtime(
         },
     }
 }
-
 fn authoritative_execution_context(
     context: &ExecutionContext,
     project_dir: Option<&str>,
@@ -3902,13 +4140,22 @@ fn authoritative_execution_context(
         .and_then(Path::parent)
         .map(Path::to_path_buf)
         .or_else(|| Some(target_package_root.clone()));
-    let mut dependency_roots = vec![project.clone()];
+    let mut dependency_roots = Vec::new();
     for root in &context.dependency_roots {
         if let Ok(relative) = root.strip_prefix(original_workspace) {
             let mapped = project.join(relative);
             if !dependency_roots.iter().any(|existing| existing == &mapped) {
                 dependency_roots.push(mapped);
             }
+        }
+    }
+    for root in context
+        .dependency_roots
+        .iter()
+        .chain(std::iter::once(original_workspace))
+    {
+        if !dependency_roots.iter().any(|existing| existing == root) {
+            dependency_roots.push(root.clone());
         }
     }
     let test_source = test_source_file.map(|source_file| SourceContext {
@@ -3919,6 +4166,7 @@ fn authoritative_execution_context(
     });
     let mut resolved = context.clone();
     resolved.invocation_dir = project.clone();
+    resolved.materialization_source_root = Some(original_workspace.clone());
     resolved.workspace_root = project;
     resolved.target_package_root = target_package_root;
     resolved.test_package_root = test_package_root;
@@ -4050,12 +4298,31 @@ pub async fn verify(
         .source_file
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned());
-    let candidate_test_source_file_owned = verification_context
+    let explicit_test_source_file_owned = verification_context
         .candidate
         .test_source
         .as_ref()
         .and_then(|source| source.source_file.as_ref())
         .map(|path| path.to_string_lossy().into_owned());
+    let discovered_test_source_file_owned = (opts.test_code.is_none() && opts.auto_seed)
+        .then(|| {
+            candidate_source_file_owned
+                .as_deref()
+                .and_then(|source| discover_seed_files(source, language).into_iter().next())
+                .map(|path| path.to_string_lossy().into_owned())
+        })
+        .flatten();
+    let candidate_test_source_file_owned = explicit_test_source_file_owned
+        .clone()
+        .or(discovered_test_source_file_owned);
+    let discovered_test_code_owned = (opts.test_code.is_none())
+        .then(|| {
+            candidate_test_source_file_owned
+                .as_deref()
+                .and_then(|path| std::fs::read_to_string(path).ok())
+        })
+        .flatten();
+    let effective_test_code = opts.test_code.or(discovered_test_code_owned.as_deref());
     let candidate_virtual_file_path_owned = verification_context
         .candidate
         .target_source
@@ -4219,8 +4486,11 @@ pub async fn verify(
             None
         },
     });
+    let project_adapter = project_adapter_contract(&verification_context.candidate);
+    let defer_generated_execution_to_project_runner =
+        project_adapter.kind == ProjectAdapterKind::Nuxt && effective_test_code.is_some();
 
-    if opts.tests_only && opts.test_code.is_none() {
+    if opts.tests_only && effective_test_code.is_none() {
         stages.push(VerificationStage {
             name: "test".into(),
             status: StageStatus::Inconclusive,
@@ -4301,7 +4571,7 @@ pub async fn verify(
             &functions_to_fuzz,
             candidate_source_file_owned.as_deref(),
             Some(candidate_project_dir_owned.as_str()),
-            opts.test_code,
+            effective_test_code,
             candidate_test_source_file_owned.as_deref(),
             opts.auto_seed,
         );
@@ -4457,8 +4727,78 @@ pub async fn verify(
         );
         let coverage_ms = synth_start.elapsed().as_millis() as u64;
         let mut module_load_blocked = false;
-        if !fuzz_plan.code.is_empty() {
-            let mut full_code = generated_target_source(code, language);
+        let execution_plans = surface_execution_plans(
+            &analysis.functions,
+            &project_adapter,
+            &fuzz_plan.coverage,
+            opts.tests_only,
+            effective_test_code.is_some(),
+        );
+        stages.push(VerificationStage {
+            name: "project_adapter".into(),
+            status: StageStatus::Passed,
+            duration_ms: 0,
+            detail: Some(serde_json::json!({
+                "adapter": &project_adapter,
+                "surfaces": execution_plans,
+            })),
+            message: None,
+        });
+        if defer_generated_execution_to_project_runner {
+            let mut coverage = finalize_fuzz_coverage(
+                &analysis.functions,
+                &functions_to_fuzz,
+                &fuzz_plan.coverage,
+                false,
+            );
+            for function in &mut coverage {
+                if matches!(
+                    function.status,
+                    FuzzFunctionStatus::CheckedDirect
+                        | FuzzFunctionStatus::ReachedViaFactory
+                        | FuzzFunctionStatus::CheckedViaFactory
+                        | FuzzFunctionStatus::CheckedViaCaller
+                ) {
+                    function.status = FuzzFunctionStatus::SkippedNoFuzzableSurface;
+                    function.reason =
+                        Some("surface delegated to the Nuxt project test runner".into());
+                }
+            }
+            stages.push(VerificationStage {
+                name: "coverage".into(),
+                status: StageStatus::Inconclusive,
+                duration_ms: coverage_ms,
+                detail: Some(serde_json::json!({
+                    "functions": serde_json::to_value(&coverage).unwrap(),
+                    "counts": coverage_counts(&coverage),
+                    "diff_scoped": opts.diff.is_some(),
+                    "seed_input_count": seed_input_count,
+                    "seeded_functions": seeded_function_count,
+                    "seed_sources": seed_sources,
+                    "inferred_fixture_properties": inferred_fixture_properties,
+                    "inferred_context_properties": inferred_context_properties,
+                    "auto_seed": opts.auto_seed,
+                    "verification_plan": &verification_plan,
+                })),
+                message: Some(
+                    "generated execution deferred to the Nuxt project test runner".into(),
+                ),
+            });
+            stages.push(skipped_execute_stage(
+                "project_runner_selected",
+                "Generated execution skipped because the Nuxt project runner owns this surface",
+            ));
+        } else if !fuzz_plan.code.is_empty() {
+            let mut full_code = match language {
+                Language::TypeScript => generated_typescript_target_import(
+                    &verification_context.candidate,
+                    &functions_to_fuzz,
+                    &analysis.classes,
+                    &fuzz_plan.coverage,
+                )
+                .unwrap_or_else(|| generated_target_source(code, language)),
+                Language::Python => generated_target_source(code, language),
+            };
             full_code.push('\n');
             full_code.push_str(&fuzz_plan.code);
             let execute_timeout = execute_timeout_for(language);
@@ -4488,12 +4828,16 @@ pub async fn verify(
             );
             if let Some(blocker) = &nuxt_runtime_blocker {
                 harness_diagnostics.retain(|diagnostic| {
-                    !(diagnostic.domain == FailureDomain::VerifierHarness
-                        && diagnostic.kind == FailureKind::HarnessProtocol)
+                    !matches!(
+                        diagnostic.kind,
+                        FailureKind::HarnessProtocol | FailureKind::NonzeroExit
+                    )
                 });
                 exec_result.diagnostics.retain(|diagnostic| {
-                    !(diagnostic.domain == FailureDomain::VerifierHarness
-                        && diagnostic.kind == FailureKind::HarnessProtocol)
+                    !matches!(
+                        diagnostic.kind,
+                        FailureKind::HarnessProtocol | FailureKind::NonzeroExit
+                    )
                 });
                 exec_result.stdout = normalize_nuxt_runtime_stdout(
                     &exec_result.stdout,
@@ -5145,7 +5489,7 @@ pub async fn verify(
     }
 
     // Stage 5: Test (if test_code provided) — this IS authoritative
-    if let Some(tests) = opts.test_code {
+    if let Some(tests) = effective_test_code {
         let required_candidates = if let Some(diff_text) = opts.diff {
             let ranges = candidate_source_file_owned
                 .as_deref()
@@ -5190,7 +5534,13 @@ pub async fn verify(
             language,
             verification_context.candidate.target_source.mode,
             selected_test_runner,
-            Some(candidate_project_dir_owned.as_str()),
+            Some(
+                verification_context
+                    .candidate
+                    .workspace_root
+                    .to_string_lossy()
+                    .as_ref(),
+            ),
             candidate_source_file_owned.as_deref(),
             candidate_test_source_file_owned.as_deref(),
         );
@@ -5240,6 +5590,15 @@ pub async fn verify(
                             source_mode,
                         ),
                     })
+            } else if let Some(relative_path) = execution_source.and_then(|source| {
+                let source = Path::new(source);
+                source
+                    .is_file()
+                    .then(|| source.strip_prefix(&harness_context.workspace_root).ok())
+                    .flatten()
+                    .map(Path::to_path_buf)
+            }) {
+                HarnessArtifact::Existing { relative_path }
             } else {
                 HarnessArtifact::Generated {
                     code: prepared.code.clone(),
@@ -5251,6 +5610,19 @@ pub async fn verify(
                     ),
                 }
             };
+            let mut limits = sandbox_options(
+                &opts,
+                language,
+                test_timeout(),
+                opts.memory_mb,
+                execution_project,
+                execution_source,
+            );
+            limits.instrumentation_target = prepared
+                .instrumented_source
+                .as_ref()
+                .and(candidate_source_file_owned.as_deref());
+            limits.instrumented_source = prepared.instrumented_source.as_deref();
             sandbox::execute_harness(
                 &harness_context,
                 HarnessSpec {
@@ -5262,14 +5634,7 @@ pub async fn verify(
                     args: Vec::new(),
                     network: opts.network,
                 },
-                sandbox_options(
-                    &opts,
-                    language,
-                    test_timeout(),
-                    opts.memory_mb,
-                    execution_project,
-                    execution_source,
-                ),
+                limits,
             )
             .await
             .process
@@ -5325,6 +5690,54 @@ pub async fn verify(
                 Some(test_result.stderr.clone())
             },
         });
+
+        if !opts.tests_only && prepared.overlay.supported && test_ok {
+            let authoritative_source = candidate_test_source_file_owned
+                .as_deref()
+                .unwrap_or("<inline>")
+                .to_string();
+            if let Some(coverage_stage) = stages.iter_mut().find(|stage| stage.name == "coverage") {
+                if let Some(detail) = coverage_stage.detail.as_mut() {
+                    if let Some(functions_value) = detail.get("functions").cloned() {
+                        if let Ok(mut coverage_functions) =
+                            serde_json::from_value::<Vec<FuzzFunctionCoverage>>(functions_value)
+                        {
+                            for function in &mut coverage_functions {
+                                let surface_id = format!("{}:{}", function.function, function.line);
+                                if function.required && entered_surfaces.contains(&surface_id) {
+                                    function.status =
+                                        FuzzFunctionStatus::CheckedViaAuthoritativeTest;
+                                    function.invocation_path = InvocationPath::AuthoritativeTest {
+                                        source_file: authoritative_source.clone(),
+                                    };
+                                    function.reason = None;
+                                }
+                            }
+                            let all_required_checked = coverage_functions
+                                .iter()
+                                .filter(|function| function.required)
+                                .all(|function| {
+                                    matches!(
+                                        function.status,
+                                        FuzzFunctionStatus::CheckedDirect
+                                            | FuzzFunctionStatus::CheckedViaAuthoritativeTest
+                                    )
+                                });
+                            detail["counts"] =
+                                serde_json::to_value(coverage_counts(&coverage_functions)).unwrap();
+                            detail["functions"] =
+                                serde_json::to_value(&coverage_functions).unwrap();
+                            detail["authoritative_test_source"] =
+                                serde_json::Value::String(authoritative_source);
+                            if all_required_checked {
+                                coverage_stage.status = StageStatus::Passed;
+                                coverage_stage.message = None;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         if opts.tests_only {
             let authoritative_source = candidate_test_source_file_owned
@@ -5885,6 +6298,41 @@ fn diagnostics_from_stages(stages: &[VerificationStage]) -> Vec<FailureDiagnosti
     }
     diagnostics
 }
+fn orthogonal_outcome(stages: &[VerificationStage], names: &[&str]) -> OrthogonalOutcome {
+    let matching = stages
+        .iter()
+        .filter(|stage| names.contains(&stage.name.as_str()))
+        .collect::<Vec<_>>();
+    if matching.is_empty()
+        || matching
+            .iter()
+            .all(|stage| stage.status == StageStatus::Skipped)
+    {
+        return OrthogonalOutcome::NotRun;
+    }
+    if matching
+        .iter()
+        .any(|stage| stage.status == StageStatus::Failed)
+    {
+        return OrthogonalOutcome::Failed;
+    }
+    if matching
+        .iter()
+        .any(|stage| stage.status == StageStatus::Inconclusive)
+    {
+        return OrthogonalOutcome::Blocked;
+    }
+    OrthogonalOutcome::Passed
+}
+
+fn verification_outcome_matrix(stages: &[VerificationStage]) -> VerificationOutcomeMatrix {
+    VerificationOutcomeMatrix {
+        static_analysis: orthogonal_outcome(stages, &["parse", "complexity", "lint"]),
+        generated_execution: orthogonal_outcome(stages, &["execute"]),
+        authoritative_tests: orthogonal_outcome(stages, &["test"]),
+        portability: orthogonal_outcome(stages, &["portability"]),
+    }
+}
 
 fn build_report(mut stages: Vec<VerificationStage>, gate: CoverageGate) -> VerificationReport {
     // Normalize stage-local causes before computing the report-level verdict.
@@ -5896,6 +6344,16 @@ fn build_report(mut stages: Vec<VerificationStage>, gate: CoverageGate) -> Verif
     summary.diagnostics = DiagnosticsSummary::from_diagnostics(&diagnostics);
     let evidence = evidence_from_stages(&stages);
     let (verdict, strength) = final_verdict(&stages, &summary.coverage, gate, &evidence);
+    let outcome_matrix = verification_outcome_matrix(&stages);
+    stages.push(VerificationStage {
+        name: "outcome_matrix".into(),
+        status: StageStatus::Passed,
+        duration_ms: 0,
+        detail: Some(
+            serde_json::to_value(outcome_matrix).unwrap_or_else(|_| serde_json::json!({})),
+        ),
+        message: None,
+    });
     VerificationReport {
         schema_version: REPORT_SCHEMA_VERSION,
         stages,
@@ -6612,7 +7070,19 @@ fn write_report(
 }
 
 /// Parse schema-v3 findings emitted by the generated harness.
+///
+/// Prefer the bounded event stream: the trailing aggregate can be truncated
+/// when a target produces many detailed failures, while each event remains an
+/// independently framed result.
 pub fn parse_findings(stdout: &str) -> Option<Vec<VerificationFinding>> {
+    if stdout.contains(sandbox::HARNESS_EVENT_SENTINEL) {
+        if let Ok(summary) = sandbox::parse_harness_events(stdout) {
+            if !summary.findings.is_empty() {
+                return Some(summary.findings);
+            }
+        }
+    }
+
     let marker = "__COURT_JESTER_FINDINGS_JSON__";
     let idx = stdout.rfind(marker)?;
     let json_str = stdout[idx + marker.len()..].trim();
@@ -7096,6 +7566,8 @@ pub async fn replay_report_with_options(
             docker_image: (runtime_profile == RuntimeProfile::Isolated).then_some(docker_image),
             project_dir: base_root.path().to_str(),
             source_file: Some(&base_entry),
+            instrumentation_target: None,
+            instrumented_source: None,
         };
         let candidate_options = SandboxOptions {
             timeout_seconds: replay_timeout,
@@ -7106,6 +7578,8 @@ pub async fn replay_report_with_options(
             docker_image: (runtime_profile == RuntimeProfile::Isolated).then_some(docker_image),
             project_dir: candidate_root.path().to_str(),
             source_file: Some(&candidate_entry),
+            instrumentation_target: None,
+            instrumented_source: None,
         };
         base_options.validate()?;
         candidate_options.validate()?;
@@ -7238,6 +7712,8 @@ pub async fn replay_report_with_options(
         docker_image: (runtime_profile == RuntimeProfile::Isolated).then_some(docker_image),
         project_dir,
         source_file,
+        instrumentation_target: None,
+        instrumented_source: None,
     };
     options.validate()?;
     let execution = sandbox::execute(&code, &language, options).await;
@@ -7283,4 +7759,60 @@ pub async fn replay_report_with_options(
         outcome,
         execution,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typescript_surface_events_bypass_captured_console_error() {
+        let code = "function parseSort(value) { return value.trim(); }\n";
+        let analysis = analyze::analyze(code, &Language::TypeScript);
+        let functions = analysis.functions.iter().collect::<Vec<_>>();
+        let instrumented = instrument_source_for_surfaces(
+            code,
+            &functions,
+            &Language::TypeScript,
+            SourceMode::TypeScript,
+        )
+        .unwrap();
+        let script =
+            format!("console.error = () => {{}};\n{instrumented}\nparseSort('name:asc');\n");
+        let output = std::process::Command::new("node")
+            .args(["--input-type=module", "--eval", &script])
+            .output()
+            .expect("Node must execute the instrumented target");
+
+        assert!(output.status.success(), "{output:#?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            parse_target_entered_events(&stderr).contains("parseSort:1"),
+            "surface events must remain observable when a test runner captures console.error: {stderr:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authoritative_overlay_copies_regular_workspace_files() {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source.path().join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\n",
+        )
+        .unwrap();
+
+        mirror_test_overlay(source.path(), destination.path(), Path::new(""), &[]).unwrap();
+
+        let lockfile = destination.path().join("pnpm-lock.yaml");
+        assert!(lockfile.is_file());
+        assert!(
+            !std::fs::symlink_metadata(lockfile)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "regular workspace files must remain regular in the generated overlay"
+        );
+    }
 }

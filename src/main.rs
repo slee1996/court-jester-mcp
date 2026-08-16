@@ -1560,6 +1560,7 @@ async fn run_doctor(args: &CliArgs) -> Result<court_jester::types::DoctorReport,
             let context = court_jester::types::ExecutionContext {
                 invocation_dir: project_path.clone(),
                 workspace_root: project_path.clone(),
+                materialization_source_root: None,
                 target_package_root: project_path.clone(),
                 test_package_root: None,
                 dependency_roots: Vec::new(),
@@ -1581,6 +1582,8 @@ async fn run_doctor(args: &CliArgs) -> Result<court_jester::types::DoctorReport,
                 docker_image: Some(image),
                 project_dir: Some(project_dir_owned.as_str()),
                 source_file: None,
+                instrumentation_target: None,
+                instrumented_source: None,
             };
             let runtime = match source_mode {
                 court_jester::types::SourceMode::Python => {
@@ -1988,6 +1991,8 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
                 docker_image,
                 project_dir: Some(project_dir_owned.as_str()),
                 source_file: Some(file.as_str()),
+                instrumentation_target: None,
+                instrumented_source: None,
             };
             options.validate()?;
             let source_mode = context.target_source.mode;

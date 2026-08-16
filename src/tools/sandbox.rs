@@ -973,6 +973,8 @@ fn materialization_entry_is_ignored(
                 | "__pycache__"
                 | ".pytest_cache"
                 | ".mypy_cache"
+                | ".venv"
+                | "venv"
                 | ".ruff_cache"
                 | "dist"
                 | "build"
@@ -987,20 +989,38 @@ fn materialization_entry_is_ignored(
 fn copy_materialization_tree(
     source: &std::path::Path,
     destination: &std::path::Path,
+    trusted_source_root: Option<&std::path::Path>,
 ) -> std::io::Result<()> {
     let source_root = std::fs::canonicalize(source)?;
+    let trusted_source_root = trusted_source_root.map(std::fs::canonicalize).transpose()?;
     let mut active_directories = HashSet::new();
-    copy_materialization_tree_inner(source, destination, &source_root, &mut active_directories)
+    copy_materialization_tree_inner(
+        source,
+        destination,
+        &source_root,
+        trusted_source_root.as_deref(),
+        &mut active_directories,
+    )
+}
+
+fn materialization_path_is_allowed(
+    path: &std::path::Path,
+    source_root: &std::path::Path,
+    trusted_source_root: Option<&std::path::Path>,
+) -> bool {
+    path.starts_with(source_root)
+        || trusted_source_root.is_some_and(|trusted| path.starts_with(trusted))
 }
 
 fn copy_materialization_tree_inner(
     source: &std::path::Path,
     destination: &std::path::Path,
     source_root: &std::path::Path,
+    trusted_source_root: Option<&std::path::Path>,
     active_directories: &mut HashSet<std::path::PathBuf>,
 ) -> std::io::Result<()> {
     let canonical_source = std::fs::canonicalize(source)?;
-    if !canonical_source.starts_with(source_root)
+    if !materialization_path_is_allowed(&canonical_source, source_root, trusted_source_root)
         || !active_directories.insert(canonical_source.clone())
     {
         return Ok(());
@@ -1022,7 +1042,7 @@ fn copy_materialization_tree_inner(
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(error) => return Err(error),
                 };
-                if !resolved.starts_with(source_root) {
+                if !materialization_path_is_allowed(&resolved, source_root, trusted_source_root) {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::PermissionDenied,
                         format!(
@@ -1036,6 +1056,7 @@ fn copy_materialization_tree_inner(
                         &resolved,
                         &destination_path,
                         source_root,
+                        trusted_source_root,
                         active_directories,
                     )?;
                 } else if resolved.is_file() {
@@ -1046,6 +1067,7 @@ fn copy_materialization_tree_inner(
                     &source_path,
                     &destination_path,
                     source_root,
+                    trusted_source_root,
                     active_directories,
                 )?;
             } else if file_type.is_file() {
@@ -1543,15 +1565,30 @@ struct NetworkGuard {
     _directory: tempfile::TempDir,
     python_sitecustomize: std::path::PathBuf,
     node_preload: std::path::PathBuf,
+    instrumentation_preload: std::path::PathBuf,
+    instrumented_source: Option<std::path::PathBuf>,
     vitest_coordinator: std::path::PathBuf,
+    portable_vitest_coordinator: std::path::PathBuf,
+    typescript_loader: std::path::PathBuf,
 }
 
-fn create_network_guard() -> Result<NetworkGuard, String> {
+fn create_network_guard(instrumented_source: Option<&str>) -> Result<NetworkGuard, String> {
     let directory =
         tempfile::tempdir().map_err(|error| format!("failed to create network guard: {error}"))?;
     let python_sitecustomize = directory.path().join("sitecustomize.py");
     let node_preload = directory.path().join("network-guard.cjs");
+    let instrumentation_preload = directory.path().join("instrumentation-preload.cjs");
+    let instrumented_source_path = instrumented_source
+        .map(|source| {
+            let path = directory.path().join("instrumented-target.ts");
+            std::fs::write(&path, source)
+                .map(|_| path)
+                .map_err(|error| format!("failed to write instrumentation source: {error}"))
+        })
+        .transpose()?;
     let vitest_coordinator = directory.path().join("vitest-coordinator.mjs");
+    let portable_vitest_coordinator = directory.path().join("portable-vitest-coordinator.mjs");
+    let typescript_loader = directory.path().join("typescript-loader.mjs");
     std::fs::write(
         &python_sitecustomize,
         r#"
@@ -1684,15 +1721,73 @@ globalThis.__COURT_JESTER_NETWORK_GUARD__ = true;
     )
     .map_err(|error| format!("failed to write Node network guard: {error}"))?;
     std::fs::write(
+        &instrumentation_preload,
+        r#"
+"use strict";
+const fs = require("node:fs");
+const path = require("node:path");
+const { fileURLToPath } = require("node:url");
+const target = process.env.COURT_JESTER_INSTRUMENT_TARGET;
+const payload = process.env.COURT_JESTER_INSTRUMENT_PAYLOAD;
+if (target && payload) {
+  const targetPath = path.resolve(target);
+  const originalReadFileSync = fs.readFileSync.bind(fs);
+  const originalReadFile = fs.readFile.bind(fs);
+  const source = originalReadFileSync(payload);
+  function normalized(value) {
+    try {
+      if (value instanceof URL) value = fileURLToPath(value);
+      if (Buffer.isBuffer(value)) value = value.toString();
+      return typeof value === "string" ? path.resolve(value) : "";
+    } catch {
+      return "";
+    }
+  }
+  function rendered(options) {
+    const encoding = typeof options === "string" ? options : options?.encoding;
+    return encoding ? source.toString(encoding) : Buffer.from(source);
+  }
+  fs.readFileSync = function courtJesterReadFileSync(filename, options) {
+    return normalized(filename) === targetPath
+      ? rendered(options)
+      : originalReadFileSync(filename, options);
+  };
+  fs.readFile = function courtJesterReadFile(filename, options, callback) {
+    if (typeof options === "function") {
+      callback = options;
+      options = undefined;
+    }
+    if (normalized(filename) !== targetPath) {
+      return originalReadFile(filename, options, callback);
+    }
+    queueMicrotask(() => callback(null, rendered(options)));
+  };
+  if (fs.promises?.readFile) {
+    const originalPromiseReadFile = fs.promises.readFile.bind(fs.promises);
+    fs.promises.readFile = async function courtJesterPromiseReadFile(filename, options) {
+      return normalized(filename) === targetPath
+        ? rendered(options)
+        : originalPromiseReadFile(filename, options);
+    };
+  }
+  try {
+    require("node:module").syncBuiltinESMExports();
+  } catch {}
+}
+"#,
+    )
+    .map_err(|error| format!("failed to write instrumentation preload: {error}"))?;
+    std::fs::write(
         &vitest_coordinator,
         r#"
 import { pathToFileURL } from "node:url";
 
-const [entrypoint, guard, ...args] = process.argv.slice(2);
-if (!entrypoint || !guard) {
-  throw new Error("court-jester Vitest coordinator requires an entrypoint and worker guard");
+const [entrypoint, guard, instrumentation, ...args] = process.argv.slice(2);
+if (!entrypoint || !guard || !instrumentation) {
+  throw new Error("court-jester Vitest coordinator requires an entrypoint, worker guard, and instrumentation preload");
 }
-const preload = `--require=${guard}`;
+await import(pathToFileURL(instrumentation).href);
+const preload = `--require=${guard} --require=${instrumentation}`;
 process.env.NODE_OPTIONS = process.env.NODE_OPTIONS
   ? `${preload} ${process.env.NODE_OPTIONS}`
   : preload;
@@ -1701,11 +1796,384 @@ await import(pathToFileURL(entrypoint).href);
 "#,
     )
     .map_err(|error| format!("failed to write Vitest coordinator: {error}"))?;
+    std::fs::write(
+        &portable_vitest_coordinator,
+        r#"
+import { fileURLToPath, pathToFileURL } from "node:url";
+import fs from "node:fs";
+import path from "node:path";
+
+const [vitestModule, typescriptModule, testFile, guard, instrumentation, ...extraFilters] = process.argv.slice(2);
+if (!vitestModule || !typescriptModule || !testFile || !guard || !instrumentation) {
+  throw new Error("court-jester portable Vitest coordinator requires runner, compiler, test, guard, and instrumentation paths");
+}
+await import(pathToFileURL(instrumentation).href);
+const [vitestNamespace, typescriptNamespace] = await Promise.all([
+  import(pathToFileURL(vitestModule).href),
+  import(pathToFileURL(typescriptModule).href),
+]);
+const { startVitest } = vitestNamespace;
+const vitestMajor = Number.parseInt(String(vitestNamespace.version || "0").split(".", 1)[0], 10);
+const ts = typescriptNamespace.default || typescriptNamespace;
+let compilerOptions = {};
+const configPath = ts.findConfigFile(process.cwd(), ts.sys.fileExists, "tsconfig.json");
+if (configPath) {
+  const loaded = ts.readConfigFile(configPath, ts.sys.readFile);
+  if (!loaded.error) {
+    compilerOptions = ts.parseJsonConfigFileContent(
+      loaded.config,
+      ts.sys,
+      path.dirname(configPath),
+    ).options;
+  }
+}
+Object.assign(compilerOptions, {
+  module: ts.ModuleKind.ESNext,
+  target: ts.ScriptTarget.ES2022,
+  moduleResolution: ts.ModuleResolutionKind.Bundler,
+  experimentalDecorators: true,
+  emitDecoratorMetadata: false,
+  useDefineForClassFields: false,
+  sourceMap: false,
+  inlineSourceMap: true,
+  inlineSources: true,
+  verbatimModuleSyntax: false,
+  importsNotUsedAsValues: ts.ImportsNotUsedAsValues.Remove,
+  preserveValueImports: false,
+});
+function resolveWorkspaceFile(base) {
+  for (const candidate of [
+    base,
+    `${base}.ts`,
+    `${base}.tsx`,
+    `${base}.js`,
+    path.join(base, "index.ts"),
+    path.join(base, "index.tsx"),
+    path.join(base, "index.js"),
+  ]) {
+    if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+  }
+  return null;
+}
+function workspacePackageMap(workspace) {
+  const packages = new Map();
+  for (const parent of ["packages", "apps"]) {
+    const directory = path.join(workspace, parent);
+    if (!fs.existsSync(directory)) continue;
+    for (const name of fs.readdirSync(directory)) {
+      const root = path.join(directory, name);
+      const manifestPath = path.join(root, "package.json");
+      if (!fs.existsSync(manifestPath)) continue;
+      try {
+        const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+        if (typeof manifest.name === "string") packages.set(manifest.name, root);
+      } catch {}
+    }
+  }
+  return packages;
+}
+const workspacePackages = workspacePackageMap("/workspace");
+function exportedDeclarationName(statement, exportedName) {
+  if (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)
+      || ts.isEnumDeclaration(statement)) {
+    const exported = statement.modifiers?.some(
+      (modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword,
+    );
+    return exported && statement.name?.text === exportedName
+      ? exportedName
+      : null;
+  }
+  if (ts.isVariableStatement(statement)
+      && statement.modifiers?.some(
+        (modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword,
+      )) {
+    return statement.declarationList.declarations.some(
+      (declaration) => ts.isIdentifier(declaration.name)
+        && declaration.name.text === exportedName,
+    ) ? exportedName : null;
+  }
+  return null;
+}
+function relativeExportFile(importer, specifier) {
+  if (!specifier.startsWith(".")) return null;
+  return resolveWorkspaceFile(path.resolve(path.dirname(importer), specifier));
+}
+function findExportedSymbol(filename, exportedName, visited = new Set()) {
+  const key = `${filename}\0${exportedName}`;
+  if (visited.has(key)) return null;
+  visited.add(key);
+  let source;
+  try {
+    source = fs.readFileSync(filename, "utf8");
+  } catch {
+    return null;
+  }
+  const parsed = ts.createSourceFile(
+    filename,
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+    filename.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
+  );
+  for (const statement of parsed.statements) {
+    if (exportedDeclarationName(statement, exportedName)) {
+      return { filename, importedName: exportedName };
+    }
+    if (!ts.isExportDeclaration(statement)) continue;
+    const moduleName = statement.moduleSpecifier
+      && ts.isStringLiteral(statement.moduleSpecifier)
+      ? statement.moduleSpecifier.text
+      : null;
+    const target = moduleName ? relativeExportFile(filename, moduleName) : null;
+    if (statement.exportClause && ts.isNamedExports(statement.exportClause)) {
+      for (const element of statement.exportClause.elements) {
+        if (element.name.text !== exportedName) continue;
+        const importedName = element.propertyName?.text || element.name.text;
+        return target
+          ? { filename: target, importedName }
+          : { filename, importedName };
+      }
+    } else if (!statement.exportClause && target) {
+      const resolved = findExportedSymbol(target, exportedName, visited);
+      if (resolved) return resolved;
+    }
+  }
+  return null;
+}
+function narrowWorkspaceImports(source, filename) {
+  const parsed = ts.createSourceFile(
+    filename,
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+    filename.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
+  );
+  const replacements = [];
+  for (const statement of parsed.statements) {
+    if (!ts.isImportDeclaration(statement)
+        || !ts.isStringLiteral(statement.moduleSpecifier)
+        || !statement.importClause
+        || statement.importClause.isTypeOnly
+        || !statement.importClause.namedBindings
+        || !ts.isNamedImports(statement.importClause.namedBindings)) {
+      continue;
+    }
+    const packageRoot = workspacePackages.get(statement.moduleSpecifier.text);
+    if (!packageRoot) continue;
+    const manifest = JSON.parse(
+      fs.readFileSync(path.join(packageRoot, "package.json"), "utf8"),
+    );
+    const sourceEntry = typeof manifest.source === "string"
+      ? manifest.source
+      : "src/index.ts";
+    const entrypoint = resolveWorkspaceFile(path.resolve(packageRoot, sourceEntry));
+    if (!entrypoint) continue;
+    const runtimeImports = statement.importClause.namedBindings.elements.filter(
+      (element) => !element.isTypeOnly,
+    );
+    const resolved = runtimeImports.map((element) => ({
+      element,
+      target: findExportedSymbol(
+        entrypoint,
+        element.propertyName?.text || element.name.text,
+      ),
+    }));
+    if (resolved.some((entry) => !entry.target)) continue;
+    const byTarget = new Map();
+    for (const { element, target } of resolved) {
+      const imports = byTarget.get(target.filename) || [];
+      const localName = element.name.text;
+      imports.push(target.importedName === localName
+        ? target.importedName
+        : `${target.importedName} as ${localName}`);
+      byTarget.set(target.filename, imports);
+    }
+    const replacement = [...byTarget].map(([target, imports]) =>
+      `import { ${imports.join(", ")} } from ${JSON.stringify(target)};`
+    ).join("\n");
+    replacements.push({
+      start: statement.getStart(parsed),
+      end: statement.end,
+      replacement,
+    });
+  }
+  let narrowed = source;
+  for (const replacement of replacements.reverse()) {
+    narrowed = narrowed.slice(0, replacement.start)
+      + replacement.replacement
+      + narrowed.slice(replacement.end);
+  }
+  return narrowed;
+}
+
+const workspaceResolver = {
+  name: "court-jester-workspace-resolver",
+  enforce: "pre",
+  resolveId(specifier) {
+    for (const [packageName, packageRoot] of workspacePackages) {
+      if (specifier === packageName) {
+        const manifest = JSON.parse(
+          fs.readFileSync(path.join(packageRoot, "package.json"), "utf8"),
+        );
+        const sourceEntry = typeof manifest.source === "string" ? manifest.source : "src/index.ts";
+        return resolveWorkspaceFile(path.resolve(packageRoot, sourceEntry));
+      }
+      if (specifier.startsWith(`${packageName}/`)) {
+        return resolveWorkspaceFile(
+          path.join(packageRoot, specifier.slice(packageName.length + 1)),
+        );
+      }
+    }
+    return null;
+  },
+};
+const transform = {
+  name: "court-jester-typescript-transform",
+  enforce: "pre",
+  transform(source, id) {
+    const withoutQuery = id.split("?", 1)[0];
+    const filename = withoutQuery.startsWith("file:")
+      ? fileURLToPath(withoutQuery)
+      : withoutQuery;
+    if (!filename.startsWith("/workspace/")
+        || filename.endsWith(".d.ts")
+        || !/\.[cm]?[jt]sx?$/.test(filename)) {
+      return null;
+    }
+    if (!/\.[cm]?tsx?$/.test(filename)) {
+      return { code: source, map: null };
+    }
+    const output = ts.transpileModule(narrowWorkspaceImports(source, filename), {
+      compilerOptions,
+      fileName: filename,
+      reportDiagnostics: false,
+    });
+    return { code: output.outputText, map: null };
+  },
+};
+const preload = `--require=${guard}`;
+process.env.NODE_OPTIONS = process.env.NODE_OPTIONS
+  ? `${preload} ${process.env.NODE_OPTIONS}`
+  : preload;
+const normalizedTestFile = path.isAbsolute(testFile)
+  ? path.relative("/workspace", testFile)
+  : testFile;
+const filters = [normalizedTestFile, ...extraFilters];
+const options = {
+  run: true,
+  reporters: ["json"],
+  cache: false,
+  threads: false,
+  pool: "forks",
+  maxWorkers: 1,
+  minWorkers: 1,
+};
+const viteOverrides = {
+  root: process.cwd(),
+  esbuild: false,
+  cacheDir: "/tmp/court-jester-vite",
+  plugins: [workspaceResolver, transform],
+};
+async function runVitest(overrides) {
+  return vitestMajor >= 1
+    ? startVitest("test", filters, options, overrides)
+    : startVitest(filters, options, overrides);
+}
+let started;
+try {
+  started = await runVitest(viteOverrides);
+} catch (error) {
+  const message = String(error?.stack || error);
+  if (!message.includes("esbuild") || !message.includes("another platform")) throw error;
+  process.stderr.write(
+    "court-jester project config requires a host-incompatible native dependency; using the portable Vite transform\n",
+  );
+  started = await runVitest({ ...viteOverrides, configFile: false });
+}
+if (started === false) process.exitCode = 1;
+"#,
+    )
+    .map_err(|error| format!("failed to write portable Vitest coordinator: {error}"))?;
+    std::fs::write(
+        &typescript_loader,
+        r#"
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+const typescriptModule = process.env.COURT_JESTER_TYPESCRIPT_MODULE;
+if (!typescriptModule) {
+  throw new Error("court-jester TypeScript loader requires COURT_JESTER_TYPESCRIPT_MODULE");
+}
+const typescriptNamespace = await import(pathToFileURL(typescriptModule).href);
+const ts = typescriptNamespace.default || typescriptNamespace;
+const compilerOptionsByDirectory = new Map();
+
+function compilerOptionsFor(filename) {
+  const directory = path.dirname(filename);
+  if (compilerOptionsByDirectory.has(directory)) {
+    return compilerOptionsByDirectory.get(directory);
+  }
+  let compilerOptions = {};
+  const configPath = ts.findConfigFile(directory, ts.sys.fileExists, "tsconfig.json");
+  if (configPath) {
+    const loaded = ts.readConfigFile(configPath, ts.sys.readFile);
+    if (!loaded.error) {
+      compilerOptions = ts.parseJsonConfigFileContent(
+        loaded.config,
+        ts.sys,
+        path.dirname(configPath),
+      ).options;
+    }
+  }
+  Object.assign(compilerOptions, {
+    module: ts.ModuleKind.ESNext,
+    target: ts.ScriptTarget.ES2022,
+    moduleResolution: ts.ModuleResolutionKind.Bundler,
+    experimentalDecorators: true,
+    emitDecoratorMetadata: false,
+    useDefineForClassFields: false,
+    sourceMap: false,
+    inlineSourceMap: true,
+    inlineSources: true,
+    verbatimModuleSyntax: false,
+    importsNotUsedAsValues: ts.ImportsNotUsedAsValues.Remove,
+    preserveValueImports: false,
+  });
+  compilerOptionsByDirectory.set(directory, compilerOptions);
+  return compilerOptions;
+}
+
+export async function load(url, context, nextLoad) {
+  if (!url.startsWith("file:")) return nextLoad(url, context);
+  const filename = fileURLToPath(url);
+  if (filename.endsWith(".d.ts") || !/\.[cm]?tsx?$/.test(filename)) {
+    return nextLoad(url, context);
+  }
+  const source = fs.readFileSync(filename, "utf8");
+  const output = ts.transpileModule(source, {
+    compilerOptions: compilerOptionsFor(filename),
+    fileName: filename,
+    reportDiagnostics: false,
+  });
+  return {
+    format: "module",
+    source: output.outputText,
+    shortCircuit: true,
+  };
+}
+"#,
+    )
+    .map_err(|error| format!("failed to write TypeScript runtime loader: {error}"))?;
     Ok(NetworkGuard {
         _directory: directory,
         python_sitecustomize,
         node_preload,
+        instrumentation_preload,
+        instrumented_source: instrumented_source_path,
         vitest_coordinator,
+        portable_vitest_coordinator,
+        typescript_loader,
     })
 }
 
@@ -1856,6 +2324,7 @@ async fn execute_standalone(
             invocation_dir: root.clone(),
             workspace_root: root.clone(),
             target_package_root: root,
+            materialization_source_root: None,
             test_package_root: None,
             dependency_roots: Vec::new(),
             target_source: SourceContext {
@@ -1952,6 +2421,8 @@ async fn execute_standalone(
         docker_image: options.docker_image,
         project_dir: Some(project_dir_owned.as_str()),
         source_file: source_file_owned.as_deref(),
+        instrumentation_target: None,
+        instrumented_source: None,
     };
     execute_harness(&context, harness, limits).await.process
 }
@@ -2761,6 +3232,7 @@ struct DockerDependencyMapping {
     workspace_root: std::path::PathBuf,
     container_roots: Vec<String>,
     node_paths: Vec<String>,
+    node_bin_paths: Vec<String>,
 }
 
 fn docker_dependency_mapping(
@@ -2772,6 +3244,7 @@ fn docker_dependency_mapping(
     let container_workspace = std::path::Path::new(DOCKER_DEPENDENCY_WORKSPACE);
     let mut container_roots = Vec::new();
     let mut node_paths = Vec::new();
+    let mut node_bin_paths = Vec::new();
 
     for dependency in dependency_roots {
         let canonical = match std::fs::canonicalize(dependency) {
@@ -2800,6 +3273,12 @@ fn docker_dependency_mapping(
                     .to_string_lossy()
                     .into_owned(),
             );
+            node_bin_paths.push(
+                std::path::Path::new(&container_root)
+                    .join("node_modules/.bin")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
         }
         container_roots.push(container_root);
     }
@@ -2808,7 +3287,41 @@ fn docker_dependency_mapping(
         workspace_root,
         container_roots,
         node_paths,
+        node_bin_paths,
     })
+}
+
+fn docker_project_module_path(
+    workspace_root: &std::path::Path,
+    dependency_roots: &[std::path::PathBuf],
+    package_relative_paths: &[&std::path::Path],
+) -> Option<String> {
+    let workspace_root = std::fs::canonicalize(workspace_root).ok()?;
+    for package_relative_path in package_relative_paths {
+        for root in dependency_roots {
+            let Ok(canonical_root) = std::fs::canonicalize(root) else {
+                continue;
+            };
+            let Ok(relative_root) = canonical_root.strip_prefix(&workspace_root) else {
+                continue;
+            };
+            let host_path = canonical_root
+                .join("node_modules")
+                .join(package_relative_path);
+            if !host_path.is_file() {
+                continue;
+            }
+            return Some(
+                std::path::Path::new(DOCKER_DEPENDENCY_WORKSPACE)
+                    .join(relative_root)
+                    .join("node_modules")
+                    .join(package_relative_path)
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+    None
 }
 
 fn configure_docker_node_loader(
@@ -2838,6 +3351,7 @@ async fn run_harness_in_docker(
     launch_cwd: &std::path::Path,
     context: &crate::types::ExecutionContext,
     harness: &crate::types::HarnessSpec,
+    network_guard: Option<&NetworkGuard>,
     limits: crate::types::SandboxOptions<'_>,
 ) -> ExecutionResult {
     let image = limits.docker_image.unwrap_or_default();
@@ -2866,7 +3380,11 @@ async fn run_harness_in_docker(
         None
     };
     if let Some(mirror) = mirror.as_ref() {
-        if let Err(error) = copy_materialization_tree(&context.workspace_root, mirror.path()) {
+        if let Err(error) = copy_materialization_tree(
+            &context.workspace_root,
+            mirror.path(),
+            context.materialization_source_root.as_deref(),
+        ) {
             return launch_failure(format!(
                 "docker setup failed materializing project mirror: {error}"
             ));
@@ -2927,8 +3445,12 @@ async fn run_harness_in_docker(
         image.to_string(),
     ];
 
+    let dependency_workspace = context
+        .materialization_source_root
+        .as_deref()
+        .unwrap_or(&context.workspace_root);
     let dependency_mapping =
-        match docker_dependency_mapping(&context.workspace_root, &context.dependency_roots) {
+        match docker_dependency_mapping(dependency_workspace, &context.dependency_roots) {
             Ok(mapping) => mapping,
             Err(error) => return launch_failure(error),
         };
@@ -2937,13 +3459,50 @@ async fn run_harness_in_docker(
             .into_iter()
             .map(std::path::PathBuf::from)
             .collect::<Vec<_>>();
-    let resolver_mapping = match docker_dependency_mapping(&context.workspace_root, &resolver_roots)
-    {
+    let resolver_mapping = match docker_dependency_mapping(dependency_workspace, &resolver_roots) {
         Ok(mapping) => mapping,
         Err(error) => return launch_failure(error),
     };
+    #[cfg(unix)]
+    if dependency_workspace.join("node_modules").is_dir() {
+        let workspace_node_modules = project_root.join("node_modules");
+        if std::fs::symlink_metadata(&workspace_node_modules).is_err() {
+            if let Err(error) = std::os::unix::fs::symlink(
+                std::path::Path::new(DOCKER_DEPENDENCY_WORKSPACE).join("node_modules"),
+                &workspace_node_modules,
+            ) {
+                return launch_failure(format!(
+                    "docker setup failed linking project dependencies: {error}"
+                ));
+            }
+        }
+    }
+    let portable_typescript = docker_project_module_path(
+        dependency_workspace,
+        &context.dependency_roots,
+        &[std::path::Path::new("typescript/lib/typescript.js")],
+    );
+    let use_portable_typescript = portable_typescript.is_some()
+        && matches!(
+            harness.runtime,
+            crate::types::HarnessRuntime::NodeScript | crate::types::HarnessRuntime::NodeTest
+        );
+    let portable_vitest = if harness.runtime == crate::types::HarnessRuntime::Vitest {
+        docker_project_module_path(
+            dependency_workspace,
+            &context.dependency_roots,
+            &[
+                std::path::Path::new("vitest/dist/node.mjs"),
+                std::path::Path::new("vitest/dist/node.js"),
+            ],
+        )
+        .zip(portable_typescript.clone())
+    } else {
+        None
+    };
     let python_paths = dependency_mapping.container_roots;
     let node_paths = dependency_mapping.node_paths;
+    let node_bin_paths = dependency_mapping.node_bin_paths;
     let container_node_resolver_roots = resolver_mapping.container_roots;
     if !python_paths.is_empty() || !container_node_resolver_roots.is_empty() {
         create.insert(create.len() - 1, "--mount".to_string());
@@ -2968,6 +3527,113 @@ async fn run_harness_in_docker(
         create.insert(
             create.len() - 1,
             format!("NODE_PATH={}", node_paths.join(":")),
+        );
+    }
+    if !node_bin_paths.is_empty() {
+        create.insert(create.len() - 1, "-e".to_string());
+        create.insert(
+            create.len() - 1,
+            format!(
+                "PATH={}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                node_bin_paths.join(":")
+            ),
+        );
+    }
+    if portable_vitest.is_some() {
+        let Some(guard) = network_guard else {
+            return launch_failure("portable Vitest execution requires the runtime guard");
+        };
+        for (source, destination) in [
+            (
+                &guard.portable_vitest_coordinator,
+                "/court-jester/portable-vitest-coordinator.mjs",
+            ),
+            (&guard.node_preload, "/court-jester/network-guard.cjs"),
+            (
+                &guard.instrumentation_preload,
+                "/court-jester/instrumentation-preload.cjs",
+            ),
+        ] {
+            create.insert(create.len() - 1, "--mount".to_string());
+            create.insert(
+                create.len() - 1,
+                format!(
+                    "type=bind,src={},dst={destination},readonly",
+                    source.display()
+                ),
+            );
+        }
+    }
+    if limits.instrumented_source.is_some() && portable_vitest.is_none() {
+        let Some(guard) = network_guard else {
+            return launch_failure("instrumented execution requires the runtime guard");
+        };
+        create.insert(create.len() - 1, "--mount".to_string());
+        create.insert(
+            create.len() - 1,
+            format!(
+                "type=bind,src={},dst=/court-jester/instrumentation-preload.cjs,readonly",
+                guard.instrumentation_preload.display()
+            ),
+        );
+    }
+    if let (Some(target), Some(payload)) = (
+        limits.instrumentation_target,
+        network_guard.and_then(|guard| guard.instrumented_source.as_ref()),
+    ) {
+        let target = match std::fs::canonicalize(target) {
+            Ok(target) => target,
+            Err(error) => {
+                return launch_failure(format!("instrumentation target is unavailable: {error}"));
+            }
+        };
+        let workspace = std::fs::canonicalize(&context.workspace_root)
+            .unwrap_or_else(|_| context.workspace_root.clone());
+        let Some(relative) = target
+            .strip_prefix(workspace)
+            .ok()
+            .filter(|relative| !relative.as_os_str().is_empty())
+        else {
+            return launch_failure("instrumentation target is outside the workspace");
+        };
+        create.insert(create.len() - 1, "--mount".to_string());
+        create.insert(
+            create.len() - 1,
+            format!(
+                "type=bind,src={},dst=/court-jester/instrumented-target.ts,readonly",
+                payload.display()
+            ),
+        );
+        for value in [
+            format!(
+                "COURT_JESTER_INSTRUMENT_TARGET={}",
+                std::path::Path::new("/workspace").join(relative).display()
+            ),
+            "COURT_JESTER_INSTRUMENT_PAYLOAD=/court-jester/instrumented-target.ts".to_string(),
+        ] {
+            create.insert(create.len() - 1, "-e".to_string());
+            create.insert(create.len() - 1, value);
+        }
+    }
+    if use_portable_typescript {
+        let Some(guard) = network_guard else {
+            return launch_failure("portable TypeScript execution requires the runtime guard");
+        };
+        create.insert(create.len() - 1, "--mount".to_string());
+        create.insert(
+            create.len() - 1,
+            format!(
+                "type=bind,src={},dst=/court-jester/typescript-loader.mjs,readonly",
+                guard.typescript_loader.display()
+            ),
+        );
+        create.insert(create.len() - 1, "-e".to_string());
+        create.insert(
+            create.len() - 1,
+            format!(
+                "COURT_JESTER_TYPESCRIPT_MODULE={}",
+                portable_typescript.as_deref().unwrap_or_default()
+            ),
         );
     }
 
@@ -3061,12 +3727,26 @@ async fn run_harness_in_docker(
         crate::types::HarnessRuntime::BunTest => {
             vec!["bun".to_string(), "test".to_string(), artifact]
         }
-        crate::types::HarnessRuntime::Vitest => vec![
-            "vitest".to_string(),
-            "run".to_string(),
-            "--reporter=json".to_string(),
-            artifact,
-        ],
+        crate::types::HarnessRuntime::Vitest => {
+            if let Some((vitest_module, typescript_module)) = portable_vitest.as_ref() {
+                vec![
+                    "node".to_string(),
+                    "/court-jester/portable-vitest-coordinator.mjs".to_string(),
+                    vitest_module.clone(),
+                    typescript_module.clone(),
+                    artifact,
+                    "/court-jester/network-guard.cjs".to_string(),
+                    "/court-jester/instrumentation-preload.cjs".to_string(),
+                ]
+            } else {
+                vec![
+                    "vitest".to_string(),
+                    "run".to_string(),
+                    "--reporter=json".to_string(),
+                    artifact,
+                ]
+            }
+        }
         crate::types::HarnessRuntime::Jest => {
             vec!["jest".to_string(), "--json".to_string(), artifact]
         }
@@ -3084,6 +3764,15 @@ async fn run_harness_in_docker(
             create.insert(create.len() - 1, "-e".to_string());
             create.insert(create.len() - 1, node_options);
         }
+    }
+    if use_portable_typescript {
+        command.splice(
+            1..1,
+            [
+                "--experimental-loader".to_string(),
+                "/court-jester/typescript-loader.mjs".to_string(),
+            ],
+        );
     }
     for argument in harness.args.iter().chain(limits.harness_args.iter()) {
         match argument {
@@ -3324,9 +4013,11 @@ pub async fn execute_harness(
                 .is_some_and(|path| std::path::Path::new(path).is_file())
                 || (harness.kind == HarnessKind::Standalone && limits.project_dir.is_some());
             if should_materialize {
-                if let Err(error) =
-                    copy_materialization_tree(&context.workspace_root, &overlay_root)
-                {
+                if let Err(error) = copy_materialization_tree(
+                    &context.workspace_root,
+                    &overlay_root,
+                    context.materialization_source_root.as_deref(),
+                ) {
                     let process =
                         launch_failure(format!("failed to materialize project overlay: {error}"));
                     return HarnessExecution {
@@ -3615,29 +4306,55 @@ pub async fn execute_harness(
             ],
         );
     }
-    let network_guard = if effective_network == NetworkPolicy::Deny {
-        match create_network_guard() {
-            Ok(guard) => Some(guard),
-            Err(error) => {
-                let process = launch_failure(error);
-                return HarnessExecution {
-                    diagnostics: process.diagnostics.clone(),
-                    process,
-                };
+    let runtime_guard =
+        if effective_network == NetworkPolicy::Deny || limits.instrumented_source.is_some() {
+            match create_network_guard(limits.instrumented_source) {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    let process = launch_failure(error);
+                    return HarnessExecution {
+                        diagnostics: process.diagnostics.clone(),
+                        process,
+                    };
+                }
+            }
+        } else {
+            None
+        };
+    if let Some(guard) = runtime_guard.as_ref() {
+        if effective_network == NetworkPolicy::Deny {
+            match harness.source_mode {
+                SourceMode::Python => apply_network_guard(&mut env, &Language::Python, guard),
+                SourceMode::TypeScript | SourceMode::Tsx
+                    if harness.runtime != HarnessRuntime::Vitest =>
+                {
+                    apply_network_guard(&mut env, &Language::TypeScript, guard)
+                }
+                SourceMode::TypeScript | SourceMode::Tsx => {}
             }
         }
-    } else {
-        None
-    };
-    if let Some(guard) = network_guard.as_ref() {
-        match harness.source_mode {
-            SourceMode::Python => apply_network_guard(&mut env, &Language::Python, guard),
-            SourceMode::TypeScript | SourceMode::Tsx
-                if harness.runtime != HarnessRuntime::Vitest =>
+        if let (Some(target), Some(payload)) = (
+            limits.instrumentation_target,
+            guard.instrumented_source.as_ref(),
+        ) {
+            env.push(("COURT_JESTER_INSTRUMENT_TARGET".into(), target.into()));
+            env.push((
+                "COURT_JESTER_INSTRUMENT_PAYLOAD".into(),
+                payload.to_string_lossy().into_owned(),
+            ));
+            if !(matches!(
+                harness.runtime,
+                HarnessRuntime::BunScript | HarnessRuntime::BunTest
+            ) || harness.runtime == HarnessRuntime::Vitest
+                && effective_network == NetworkPolicy::Deny)
             {
-                apply_network_guard(&mut env, &Language::TypeScript, guard)
+                let preload = format!("--require={}", guard.instrumentation_preload.display());
+                if let Some((_, value)) = env.iter_mut().find(|(name, _)| name == "NODE_OPTIONS") {
+                    *value = format!("{preload} {value}");
+                } else {
+                    env.push(("NODE_OPTIONS".into(), preload));
+                }
             }
-            SourceMode::TypeScript | SourceMode::Tsx => {}
         }
         let bun_preload_index = match harness.runtime {
             HarnessRuntime::BunScript => Some(0),
@@ -3645,16 +4362,45 @@ pub async fn execute_harness(
             _ => None,
         };
         if let Some(index) = bun_preload_index {
-            args.splice(
-                index..index,
-                [
+            let mut preloads = Vec::new();
+            if effective_network == NetworkPolicy::Deny {
+                preloads.extend([
                     std::ffi::OsString::from("--preload"),
                     guard.node_preload.clone().into_os_string(),
-                ],
-            );
+                ]);
+            }
+            if limits.instrumented_source.is_some() {
+                preloads.extend([
+                    std::ffi::OsString::from("--preload"),
+                    guard.instrumentation_preload.clone().into_os_string(),
+                ]);
+            }
+            args.splice(index..index, preloads);
             env.retain(|(name, _)| name != "NODE_OPTIONS");
         }
-        if harness.runtime == HarnessRuntime::Vitest {
+        if harness.runtime == HarnessRuntime::Vitest && effective_network == NetworkPolicy::Allow {
+            if let Ok((_, legacy_threads)) = vitest_project_entrypoint(&executable) {
+                if legacy_threads {
+                    args.splice(
+                        2..2,
+                        [
+                            std::ffi::OsString::from("--threads"),
+                            std::ffi::OsString::from("false"),
+                        ],
+                    );
+                } else {
+                    args.splice(
+                        2..2,
+                        [
+                            std::ffi::OsString::from("--pool=forks"),
+                            std::ffi::OsString::from("--maxWorkers=1"),
+                            std::ffi::OsString::from("--minWorkers=1"),
+                        ],
+                    );
+                }
+            }
+        }
+        if harness.runtime == HarnessRuntime::Vitest && effective_network == NetworkPolicy::Deny {
             let (vitest_entrypoint, legacy_threads) = match vitest_project_entrypoint(&executable) {
                 Ok(package) => package,
                 Err(error) => {
@@ -3699,6 +4445,7 @@ pub async fn execute_harness(
                     guard.vitest_coordinator.clone().into_os_string(),
                     vitest_entrypoint.into_os_string(),
                     guard.node_preload.clone().into_os_string(),
+                    guard.instrumentation_preload.clone().into_os_string(),
                 ],
             );
         }
@@ -3728,6 +4475,7 @@ pub async fn execute_harness(
             &plan.cwd,
             context,
             &harness,
+            runtime_guard.as_ref(),
             limits,
         )
         .await
@@ -3788,9 +4536,9 @@ pub async fn execute_harness(
 mod tests {
     use super::{
         configure_docker_node_loader, copy_materialization_tree, create_node_package_resolver,
-        docker_dependency_mapping, docker_path_mapping, harness_diagnostics,
-        has_typescript_type_only_relative_imports, virtual_env_bin, vitest_project_entrypoint,
-        which_binary,
+        docker_dependency_mapping, docker_path_mapping, docker_project_module_path,
+        harness_diagnostics, has_typescript_type_only_relative_imports, virtual_env_bin,
+        vitest_project_entrypoint, which_binary,
     };
     use crate::types::{
         DiagnosticComponent, DiagnosticImpact, ExecutionLimits, ExecutionResult, FailureDomain,
@@ -4044,6 +4792,37 @@ mod tests {
                 "/court-jester/dependencies/node_modules".to_string(),
             ]
         );
+        assert_eq!(
+            mapping.node_bin_paths,
+            vec![
+                "/court-jester/dependencies/packages/app/node_modules/.bin".to_string(),
+                "/court-jester/dependencies/node_modules/.bin".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn docker_project_module_path_prefers_package_local_dependency() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let package = workspace.join("packages/app");
+        let package_module = package.join("node_modules/vitest/dist/node.mjs");
+        let workspace_module = workspace.join("node_modules/vitest/dist/node.mjs");
+        for module in [&package_module, &workspace_module] {
+            std::fs::create_dir_all(module.parent().unwrap()).unwrap();
+            std::fs::write(module, "export const marker = true;\n").unwrap();
+        }
+
+        let module_path = docker_project_module_path(
+            &workspace,
+            &[package.clone(), workspace.clone()],
+            &[std::path::Path::new("vitest/dist/node.mjs")],
+        );
+
+        assert_eq!(
+            module_path.as_deref(),
+            Some("/court-jester/dependencies/packages/app/node_modules/vitest/dist/node.mjs")
+        );
     }
 
     #[test]
@@ -4252,7 +5031,7 @@ mod tests {
         std::fs::write(results_dir.join("report.json"), "{}\n").unwrap();
 
         let destination = tempfile::tempdir().unwrap();
-        copy_materialization_tree(source.path(), destination.path()).unwrap();
+        copy_materialization_tree(source.path(), destination.path(), None).unwrap();
 
         assert!(destination.path().join("keep.py").is_file());
         assert!(destination.path().join("bench/keep.py").is_file());
@@ -4271,10 +5050,45 @@ mod tests {
         .unwrap();
 
         let destination = tempfile::tempdir().unwrap();
-        copy_materialization_tree(source.path(), destination.path()).unwrap();
+        copy_materialization_tree(source.path(), destination.path(), None).unwrap();
 
         assert!(destination.path().join("keep.ts").is_file());
         assert!(!destination.path().join("dangling-link").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materializes_only_explicitly_trusted_external_overlay_links() {
+        let overlay = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let allowed_destination = tempfile::tempdir().unwrap();
+        let denied_destination = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("packages/app")).unwrap();
+        std::fs::write(
+            workspace.path().join("packages/app/index.ts"),
+            "export const value = 1;\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            workspace.path().join("packages"),
+            overlay.path().join("packages"),
+        )
+        .unwrap();
+
+        copy_materialization_tree(
+            overlay.path(),
+            allowed_destination.path(),
+            Some(workspace.path()),
+        )
+        .unwrap();
+        assert!(allowed_destination
+            .path()
+            .join("packages/app/index.ts")
+            .is_file());
+
+        let error =
+            copy_materialization_tree(overlay.path(), denied_destination.path(), None).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[test]

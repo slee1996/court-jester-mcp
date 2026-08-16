@@ -34,6 +34,47 @@ fn monorepo_execution_context_preserves_package_and_dependency_roots() {
 }
 
 #[test]
+fn explicit_package_dir_uses_declared_pnpm_workspace_dependencies() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path();
+    let package = workspace.join("packages/app");
+    let source = package.join("src/index.ts");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(workspace.join("node_modules")).unwrap();
+    std::fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        "packages:\n  - packages/*\n",
+    )
+    .unwrap();
+    std::fs::write(workspace.join("package.json"), "{}\n").unwrap();
+    std::fs::write(package.join("package.json"), "{}\n").unwrap();
+    std::fs::write(&source, "export const answer = 42;\n").unwrap();
+
+    let context = resolve_execution_context(ContextRequest {
+        invocation_dir: workspace,
+        explicit_project_dir: Some(&package),
+        target_file: Some(&source),
+        test_file: None,
+        language: Language::TypeScript,
+        virtual_file_path: None,
+    })
+    .unwrap();
+
+    assert_eq!(
+        context.workspace_root,
+        std::fs::canonicalize(workspace).unwrap()
+    );
+    assert_eq!(
+        context.target_package_root,
+        std::fs::canonicalize(package).unwrap()
+    );
+    assert_eq!(
+        context.dependency_roots,
+        vec![std::fs::canonicalize(workspace).unwrap()]
+    );
+}
+
+#[test]
 fn explicit_project_dir_rejects_external_files() {
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path().join("project");
