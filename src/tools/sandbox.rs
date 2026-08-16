@@ -5176,13 +5176,14 @@ pub async fn execute_harness(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    use super::docker_runtime_user;
     use super::{
         configure_docker_node_loader, configure_docker_typescript_loader,
         copy_materialization_tree, create_network_guard, create_node_package_resolver,
         docker_dependency_mapping, docker_image_for_harness, docker_path_mapping,
-        docker_project_module_path, docker_runtime_user, harness_diagnostics,
-        has_typescript_type_only_relative_imports, insert_docker_environment, virtual_env_bin,
-        vitest_project_entrypoint, which_binary,
+        docker_project_module_path, harness_diagnostics, has_typescript_type_only_relative_imports,
+        insert_docker_environment, virtual_env_bin, vitest_project_entrypoint, which_binary,
     };
     use crate::types::{
         DiagnosticComponent, DiagnosticImpact, ExecutionLimits, ExecutionResult, FailureDomain,

@@ -4,6 +4,10 @@ This changelog tracks user-visible verifier semantics, report-shape changes, and
 
 ## Unreleased
 
+## 0.2.13 - 2026-08-15
+
+Publication retry for the immutable 0.2.12 candidate. Its Linux Clippy gate found a macOS-only test helper imported on every target; the import is now platform-gated without changing the runtime fixes below. See [docs/release-notes-0.2.13.md](docs/release-notes-0.2.13.md) for release evidence.
+
 ## 0.2.12 - 2026-08-15
 
 Isolated runtime and project-runner correctness release for issues #9, #12, #21, #29, #30, and #31. Standalone Docker workspaces now live under the stable shared runtime root, completed generated TypeScript harnesses terminate despite imported open handles, and the portable Vitest path uses one package-owned dependency graph with environment-accurate failure classification. See [docs/release-notes-0.2.12.md](docs/release-notes-0.2.12.md) for the complete change list and validation evidence.
