@@ -4642,6 +4642,7 @@ if (_fuzzTotalFailures > 0) {
   process.exit(1);
 } else {
   console.log("All fuzz tests passed");
+  process.exit(0);
 }
 "#;
 

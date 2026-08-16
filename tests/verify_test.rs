@@ -819,6 +819,38 @@ async fn verify_filters_unused_variable_diagnostics_for_anonymous_inline_snippet
 }
 
 #[tokio::test]
+async fn typescript_generated_harness_exits_after_completion_despite_open_handles() {
+    let code = r#"
+setInterval(() => {}, 60_000);
+
+export function increment(value: number): number {
+  return value + 1;
+}
+"#;
+    let report = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        verify(code, &Language::TypeScript, default_opts(None)),
+    )
+    .await
+    .expect("completed generated harness must terminate without waiting for imported open handles");
+
+    assert_eq!(
+        report.verdict,
+        VerificationVerdict::Pass,
+        "report: {:#?}",
+        report.stages
+    );
+    assert_eq!(
+        report
+            .stages
+            .iter()
+            .find(|stage| stage.name == "execute")
+            .map(|stage| stage.status),
+        Some(StageStatus::Passed)
+    );
+}
+
+#[tokio::test]
 async fn blank_label_output_is_not_failed_by_name_only() {
     let code = r#"
 function secondaryLabel(labels: string[]): string {

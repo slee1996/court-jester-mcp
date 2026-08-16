@@ -1099,6 +1099,12 @@ fn runtime_tempdir(
     tempfile::tempdir()
 }
 
+fn standalone_runtime_tempdir(
+    runtime_profile: crate::types::RuntimeProfile,
+) -> std::io::Result<tempfile::TempDir> {
+    runtime_tempdir(runtime_profile)
+}
+
 fn docker_image_for_harness<'a>(
     configured_image: &'a str,
     runtime: &crate::types::HarnessRuntime,
@@ -2757,7 +2763,7 @@ async fn execute_standalone(
         }
     };
     let standalone_root = if options.project_dir.is_none() && options.source_file.is_none() {
-        Some(match tempfile::tempdir() {
+        Some(match standalone_runtime_tempdir(options.runtime_profile) {
             Ok(root) => root,
             Err(error) => {
                 return launch_failure(format!("failed to create standalone workspace: {error}"));
@@ -5222,6 +5228,20 @@ mod tests {
             return;
         };
         let directory = super::runtime_tempdir(RuntimeProfile::Isolated).unwrap();
+        let expected_parent =
+            std::path::PathBuf::from(home).join("Library/Caches/court-jester/runtime");
+
+        assert!(directory.path().starts_with(expected_parent));
+        assert!(directory.path().is_dir());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn isolated_standalone_temporary_directories_use_docker_shared_home() {
+        let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+            return;
+        };
+        let directory = super::standalone_runtime_tempdir(RuntimeProfile::Isolated).unwrap();
         let expected_parent =
             std::path::PathBuf::from(home).join("Library/Caches/court-jester/runtime");
 

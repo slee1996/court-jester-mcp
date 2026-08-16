@@ -6,7 +6,12 @@ This changelog tracks user-visible verifier semantics, report-shape changes, and
 
 ## 0.2.12 - 2026-08-15
 
-Isolated project-runner correctness release for issues #30 and #31. The portable Vitest path now uses one package-owned dependency graph, preserves project failures unless a positively identified native or mixed-runner fault requires fallback, and retries transient dependency reads outside the TypeScript loader boundary. See [docs/release-notes-0.2.12.md](docs/release-notes-0.2.12.md) for the complete change list and validation evidence.
+Isolated runtime and project-runner correctness release for issues #9, #12, #21, #29, #30, and #31. Standalone Docker workspaces now live under the stable shared runtime root, completed generated TypeScript harnesses terminate despite imported open handles, and the portable Vitest path uses one package-owned dependency graph with environment-accurate failure classification. See [docs/release-notes-0.2.12.md](docs/release-notes-0.2.12.md) for the complete change list and validation evidence.
+
+### Runtime lifecycle
+
+- Standalone isolated workspaces use the Docker-shared macOS runtime directory instead of an ephemeral `/var/folders` alias; default isolated doctor checks retain every bind source through container creation and execution.
+- Generated TypeScript fuzz harnesses terminate successfully after emitting `harness_completed`, so project dependencies that retain timers, database clients, or other event-loop handles cannot convert completed evidence into a timeout.
 
 ### Project-native Vitest
 
@@ -18,6 +23,7 @@ Isolated project-runner correctness release for issues #30 and #31. The portable
 
 - Docker dependency snapshots use package-first resolver roots, keep the retrying package loader outside the TypeScript loader, and retry transient `EACCES` reads without weakening permanent access-denial diagnostics.
 - Docker resolver environment assignments retain explicit `-e` arguments, and dependency blockers take precedence over structured assertion output.
+- Workspace dependencies that resolve to platform-specific native artifacts are reported as environment/module-load blockers after exact target reachability, never as target assertion failures.
 
 ## 0.2.11 - 2026-08-15
 
