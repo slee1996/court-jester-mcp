@@ -4,6 +4,29 @@ This changelog tracks user-visible verifier semantics, report-shape changes, and
 
 ## Unreleased
 
+## 0.2.3 - 2026-08-15
+
+Runtime, synthesis, and reporting correctness release for issues #1, #9, and #15 through #26. See [docs/release-notes-0.2.3.md](docs/release-notes-0.2.3.md) for the complete change list and validation evidence.
+
+### Runtime and project context
+
+- Repository TypeScript tests run through their native Vitest/Jest/Bun coordinator, including aliased or global launcher layouts, bounded workers, mixed log/JSON output, and preserved network/process guards.
+- Isolated doctor artifacts retain Docker Desktop-accessible lexical paths while canonical containment continues to reject symlink escapes.
+- Temporary TypeScript harnesses preserve `tsconfig`/Nuxt alias semantics and classify missing framework auto-import context as inconclusive instead of target-code crashes.
+- Generated and replayed Python harnesses import targets under a non-main module identity, so guarded CLI/server entry points do not execute during verification.
+
+### Synthesis and findings
+
+- TypeScript synthesis respects array element types, default initializers, imported non-null object aliases, alias recursion limits, and supported nullable object unions.
+- Implicit consistency checks are disabled for real nondeterministic/stateful functions while remaining active for pure transforms, shadowed locals, and semantically equal callable containers.
+- JavaScript failure reports preserve `undefined`, `NaN`, positive/negative infinity, and ordinary tag-shaped objects without lossy JSON collisions.
+
+### Diagnostics and stage semantics
+
+- Safe unshadowed `Object.prototype.hasOwnProperty.call` usage no longer triggers `noPrototypeBuiltins`, while unsafe nested, target-owned, and shadowed calls remain findings.
+- Signal-terminated Ruff processes produce actionable environment diagnostics with executable, arguments, target, working directory, and safe rerun guidance.
+- Verification always emits an explicit execute stage when execution cannot run, and MCP failures retain stable messages and diagnostic context rather than returning message-less protocol errors.
+
 ## 0.2.2 - 2026-08-14
 
 Runtime correctness release for the three defects confirmed after 0.2.1. See [docs/release-notes-0.2.2.md](docs/release-notes-0.2.2.md) for the complete change list and validation evidence.

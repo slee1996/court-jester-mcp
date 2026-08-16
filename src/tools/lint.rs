@@ -178,26 +178,90 @@ fn signal_only_unavailable_message(
     tool: &str,
     binary_path: &str,
     status: std::process::ExitStatus,
-    stdout: &str,
-    stderr: &str,
+    _stdout: &str,
+    _stderr: &str,
 ) -> Option<String> {
-    if !stdout.trim().is_empty() || !stderr.trim().is_empty() {
-        return None;
-    }
-
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
 
-        if cfg!(target_os = "macos") && status.signal() == Some(libc::SIGKILL) {
+        if status.signal().is_some() {
             let exit = exit_status_label(status);
+            let remediation = if cfg!(target_os = "macos") && status.signal() == Some(libc::SIGKILL)
+            {
+                format!(
+                        "macOS may have blocked this executable (Gatekeeper/quarantine); try `xattr -dr com.apple.quarantine {binary_path}` or install {tool} in the project"
+                    )
+            } else {
+                format!(
+                        "reinstall {tool} or inspect the host launcher and resource limits before retrying"
+                    )
+            };
             return Some(format!(
-                "{tool} unavailable: '{binary_path}' was terminated with {exit}. macOS may have blocked this executable (Gatekeeper/quarantine); try `xattr -dr com.apple.quarantine {binary_path}` or install {tool} in the project"
+                "{tool} unavailable: '{binary_path}' was terminated with {exit}. This is an environment failure, not a lint violation; {remediation}"
             ));
         }
     }
 
     None
+}
+
+struct LintInvocation<'a> {
+    binary_path: &'a str,
+    arguments: &'a [String],
+    target: &'a str,
+    cwd: Option<&'a Path>,
+}
+
+fn signal_unavailable_message_with_invocation(
+    tool: &str,
+    status: std::process::ExitStatus,
+    stdout: &str,
+    stderr: &str,
+    invocation: &LintInvocation<'_>,
+) -> Option<String> {
+    let failure =
+        signal_only_unavailable_message(tool, invocation.binary_path, status, stdout, stderr)?;
+    Some(format!(
+        "{failure}. Invocation: {}. {}",
+        lint_invocation_context(invocation),
+        lint_invocation_remediation()
+    ))
+}
+
+fn lint_invocation_context(invocation: &LintInvocation<'_>) -> String {
+    let cwd = invocation
+        .cwd
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<unavailable>".to_string());
+    format!(
+        "executable='{}', arguments={:?}, target='{}', cwd='{cwd}'",
+        invocation.binary_path, invocation.arguments, invocation.target
+    )
+}
+
+fn lint_invocation_remediation() -> &'static str {
+    "Re-run this invocation in the shown cwd to distinguish a blocked or damaged executable from host resource limits; stdin content and environment variables are intentionally omitted."
+}
+
+fn lint_launch_failure_message(
+    tool: &str,
+    error: &std::io::Error,
+    invocation: &LintInvocation<'_>,
+) -> String {
+    format!(
+        "{tool} unavailable: failed to launch {}: {error}. This is an environment failure, not a lint violation. {}",
+        lint_invocation_context(invocation),
+        lint_invocation_remediation()
+    )
+}
+
+fn lint_runner_failure_message(failure: String, invocation: &LintInvocation<'_>) -> String {
+    format!(
+        "{failure}. Invocation: {}. This is a lint runner or configuration failure, not a lint violation. {}",
+        lint_invocation_context(invocation),
+        lint_invocation_remediation()
+    )
 }
 
 fn tool_unavailable_message(tool: &str) -> String {
@@ -358,23 +422,35 @@ async fn lint_python(code: &str, opts: &LintOptions<'_>) -> LintResult {
         };
     };
 
-    let mut command = Command::new(&ruff);
-    command.args(["check", "--output-format=json"]);
+    let target = lint_target_path(&Language::Python, opts);
+    let mut arguments = vec!["check".to_string(), "--output-format=json".to_string()];
     if let Some(config_path) = opts.config_path {
-        command.args(["--config", config_path]);
+        arguments.push("--config".to_string());
+        arguments.push(config_path.to_string());
     }
-    let stdin_input = if let Some(source_file) = opts.source_file {
-        command.arg(source_file);
+    let stdin_input = if opts.source_file.is_some() {
+        arguments.push(target.clone());
         None
     } else {
-        let target_path = lint_target_path(&Language::Python, opts);
-        command.args(["--stdin-filename", &target_path, "-"]);
+        arguments.push("--stdin-filename".to_string());
+        arguments.push(target.clone());
+        arguments.push("-".to_string());
         Some(code)
     };
+
+    let cwd = working_dir(opts).or_else(|| std::env::current_dir().ok());
+    let mut command = Command::new(&ruff);
+    command.args(&arguments);
     command.env("PATH", &path);
-    if let Some(dir) = working_dir(opts) {
+    if let Some(dir) = cwd.as_deref() {
         command.current_dir(dir);
     }
+    let invocation = LintInvocation {
+        binary_path: &ruff,
+        arguments: &arguments,
+        target: &target,
+        cwd: cwd.as_deref(),
+    };
 
     let output = run_command(&mut command, stdin_input).await;
 
@@ -383,26 +459,31 @@ async fn lint_python(code: &str, opts: &LintOptions<'_>) -> LintResult {
             let stdout = String::from_utf8_lossy(&out.stdout);
             let stderr = String::from_utf8_lossy(&out.stderr);
             let mut result = parse_ruff_output(&stdout);
-            if result.error.is_some() || (!out.status.success() && result.diagnostics.is_empty()) {
-                if let Some(message) =
-                    signal_only_unavailable_message("ruff", &ruff, out.status, &stdout, &stderr)
-                {
-                    result.error = Some(message);
-                    result.unavailable = true;
-                    result.runner_failed = false;
-                } else {
-                    result.error = Some(tool_failure_message(
-                        "ruff", &ruff, out.status, &stdout, &stderr,
-                    ));
-                    result.runner_failed = true;
-                }
+            if let Some(message) = signal_unavailable_message_with_invocation(
+                "ruff",
+                out.status,
+                &stdout,
+                &stderr,
+                &invocation,
+            ) {
+                result.diagnostics.clear();
+                result.runner_diagnostics.clear();
+                result.error = Some(message);
+                result.unavailable = true;
+                result.runner_failed = false;
+            } else if result.error.is_some()
+                || (!out.status.success() && result.diagnostics.is_empty())
+            {
+                let failure = tool_failure_message("ruff", &ruff, out.status, &stdout, &stderr);
+                result.error = Some(lint_runner_failure_message(failure, &invocation));
+                result.runner_failed = true;
             }
             result
         }
         Err(e) => LintResult {
             diagnostics: vec![],
             runner_diagnostics: vec![],
-            error: Some(format!("ruff not available: {e}")),
+            error: Some(lint_launch_failure_message("ruff", &e, &invocation)),
             unavailable: true,
             runner_failed: false,
         },
@@ -535,6 +616,7 @@ async fn lint_typescript(code: &str, opts: &LintOptions<'_>) -> LintResult {
                     result.runner_failed = true;
                 }
             }
+            filter_safe_borrowed_has_own_property_diagnostics(code, opts, &mut result.diagnostics);
             result
         }
         Err(e) => LintResult {
@@ -660,6 +742,308 @@ fn parse_biome_output(output: &str) -> LintResult {
     }
 }
 
+fn filter_safe_borrowed_has_own_property_diagnostics(
+    code: &str,
+    opts: &LintOptions<'_>,
+    diagnostics: &mut Vec<LintDiagnostic>,
+) {
+    if !diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.rule == "lint/suspicious/noPrototypeBuiltins")
+    {
+        return;
+    }
+    let mut parser = tree_sitter::Parser::new();
+    let lint_path = opts
+        .source_file
+        .or(opts.virtual_file_path)
+        .unwrap_or_default();
+    let grammar = if Path::new(lint_path)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("tsx"))
+    {
+        tree_sitter_typescript::LANGUAGE_TSX.into()
+    } else {
+        tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
+    };
+    if parser.set_language(&grammar).is_err() {
+        return;
+    }
+    let Some(tree) = parser.parse(code, None) else {
+        return;
+    };
+
+    diagnostics.retain(|diagnostic| {
+        diagnostic.rule != "lint/suspicious/noPrototypeBuiltins"
+            || !diagnostic_targets_safe_borrowed_call(code, tree.root_node(), diagnostic)
+    });
+}
+
+fn diagnostic_targets_safe_borrowed_call(
+    code: &str,
+    root: tree_sitter::Node<'_>,
+    diagnostic: &LintDiagnostic,
+) -> bool {
+    if diagnostic.line == 0 || diagnostic.column == 0 {
+        return false;
+    }
+    let point = tree_sitter::Point::new(diagnostic.line - 1, diagnostic.column - 1);
+    let Some(mut node) = root.descendant_for_point_range(point, point) else {
+        return false;
+    };
+
+    loop {
+        if node.kind() == "call_expression" {
+            let callee = node.child_by_field_name("function");
+            if callee.is_some_and(|callee| point_is_within_node(point, callee))
+                && is_safe_borrowed_has_own_property_call(code, node)
+            {
+                return true;
+            }
+        }
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        node = parent;
+    }
+}
+
+fn point_is_within_node(point: tree_sitter::Point, node: tree_sitter::Node<'_>) -> bool {
+    let start = node.start_position();
+    let end = node.end_position();
+    (point.row > start.row || (point.row == start.row && point.column >= start.column))
+        && (point.row < end.row || (point.row == end.row && point.column < end.column))
+}
+
+fn is_safe_borrowed_has_own_property_call(code: &str, call: tree_sitter::Node<'_>) -> bool {
+    let source = code.as_bytes();
+    let Some(call_member) = call.child_by_field_name("function") else {
+        return false;
+    };
+    if call_member.kind() != "member_expression"
+        || call_member
+            .child_by_field_name("property")
+            .and_then(|node| node.utf8_text(source).ok())
+            != Some("call")
+    {
+        return false;
+    }
+
+    let Some(has_own_member) = call_member.child_by_field_name("object") else {
+        return false;
+    };
+    if has_own_member.kind() != "member_expression"
+        || has_own_member
+            .child_by_field_name("property")
+            .and_then(|node| node.utf8_text(source).ok())
+            != Some("hasOwnProperty")
+    {
+        return false;
+    }
+
+    let Some(prototype_member) = has_own_member.child_by_field_name("object") else {
+        return false;
+    };
+    if prototype_member.kind() != "member_expression"
+        || prototype_member
+            .child_by_field_name("property")
+            .and_then(|node| node.utf8_text(source).ok())
+            != Some("prototype")
+    {
+        return false;
+    }
+    let Some(object_identifier) = prototype_member.child_by_field_name("object") else {
+        return false;
+    };
+    object_identifier.kind() == "identifier"
+        && object_identifier.utf8_text(source).ok() == Some("Object")
+        && !object_binding_is_shadowed(call, source)
+}
+
+fn object_binding_is_shadowed(call: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut ancestor = call.parent();
+    while let Some(scope) = ancestor {
+        if is_function_scope(scope)
+            && (node_field_is_object(scope, "name", source)
+                || scope
+                    .child_by_field_name("parameters")
+                    .is_some_and(|parameters| pattern_binds_object(parameters, source))
+                || scope
+                    .child_by_field_name("body")
+                    .is_some_and(|body| subtree_has_object_var(body, source)))
+        {
+            return true;
+        }
+        if matches!(scope.kind(), "program" | "statement_block" | "switch_body")
+            && direct_scope_binds_object(scope, source)
+        {
+            return true;
+        }
+        if scope.kind() == "program" && subtree_has_object_var(scope, source) {
+            return true;
+        }
+        if scope.kind() == "catch_clause"
+            && scope
+                .child_by_field_name("parameter")
+                .is_some_and(|parameter| pattern_binds_object(parameter, source))
+        {
+            return true;
+        }
+        if matches!(scope.kind(), "for_statement" | "for_in_statement")
+            && for_statement_binds_object(scope, source)
+        {
+            return true;
+        }
+        ancestor = scope.parent();
+    }
+    false
+}
+
+fn is_function_scope(node: tree_sitter::Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "function_declaration"
+            | "function_expression"
+            | "generator_function"
+            | "generator_function_declaration"
+            | "arrow_function"
+            | "method_definition"
+    )
+}
+
+fn node_field_is_object(node: tree_sitter::Node<'_>, field: &str, source: &[u8]) -> bool {
+    node.child_by_field_name(field)
+        .and_then(|child| child.utf8_text(source).ok())
+        == Some("Object")
+}
+
+fn any_named_child<'tree>(
+    node: tree_sitter::Node<'tree>,
+    mut predicate: impl FnMut(tree_sitter::Node<'tree>) -> bool,
+) -> bool {
+    let mut cursor = node.walk();
+    let matched = node.named_children(&mut cursor).any(&mut predicate);
+    matched
+}
+
+fn direct_scope_binds_object(scope: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    any_named_child(scope, |child| {
+        declaration_binds_object(child, source)
+            || (scope.kind() == "switch_body"
+                && matches!(child.kind(), "switch_case" | "switch_default")
+                && direct_scope_binds_object(child, source))
+    })
+}
+
+fn declaration_binds_object(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    match node.kind() {
+        "lexical_declaration" | "variable_declaration" => any_named_child(node, |child| {
+            child.kind() == "variable_declarator"
+                && child
+                    .child_by_field_name("name")
+                    .is_some_and(|name| pattern_binds_object(name, source))
+        }),
+        "function_declaration"
+        | "generator_function_declaration"
+        | "class_declaration"
+        | "abstract_class_declaration"
+        | "enum_declaration"
+        | "module"
+        | "internal_module" => node_field_is_object(node, "name", source),
+        "import_alias" => node
+            .named_child(0)
+            .is_some_and(|binding| binding.utf8_text(source).ok() == Some("Object")),
+        "import_statement" => import_binds_object(node, source),
+        "ambient_declaration" | "export_statement" => {
+            any_named_child(node, |child| declaration_binds_object(child, source))
+        }
+        _ => false,
+    }
+}
+
+fn import_binds_object(import: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    if import
+        .utf8_text(source)
+        .is_ok_and(|text| text.trim_start().starts_with("import type "))
+    {
+        return false;
+    }
+    any_named_child(import, |child| {
+        child.kind() == "import_clause" && import_clause_binds_object(child, source)
+    })
+}
+
+fn import_clause_binds_object(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    match node.kind() {
+        "import_specifier" => {
+            if node
+                .utf8_text(source)
+                .is_ok_and(|text| text.trim_start().starts_with("type "))
+            {
+                return false;
+            }
+            node.child_by_field_name("alias")
+                .or_else(|| node.child_by_field_name("name"))
+                .is_some_and(|binding| binding.utf8_text(source).ok() == Some("Object"))
+        }
+        "identifier" => node.utf8_text(source).ok() == Some("Object"),
+        "namespace_import" => {
+            any_named_child(node, |child| child.utf8_text(source).ok() == Some("Object"))
+        }
+        _ => any_named_child(node, |child| import_clause_binds_object(child, source)),
+    }
+}
+
+fn subtree_has_object_var(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    any_named_child(node, |child| {
+        if is_function_scope(child) {
+            return false;
+        }
+        (child.kind() == "variable_declaration" && declaration_binds_object(child, source))
+            || (child.kind() == "for_in_statement"
+                && child
+                    .child_by_field_name("kind")
+                    .and_then(|kind| kind.utf8_text(source).ok())
+                    == Some("var")
+                && child
+                    .child_by_field_name("left")
+                    .is_some_and(|left| pattern_binds_object(left, source)))
+            || subtree_has_object_var(child, source)
+    })
+}
+
+fn for_statement_binds_object(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let declared_left = node.child_by_field_name("kind").is_some()
+        && node
+            .child_by_field_name("left")
+            .is_some_and(|left| pattern_binds_object(left, source));
+    if declared_left {
+        return true;
+    }
+    any_named_child(node, |child| declaration_binds_object(child, source))
+}
+
+fn pattern_binds_object(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    match node.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => {
+            node.utf8_text(source).ok() == Some("Object")
+        }
+        "pair_pattern" => node
+            .child_by_field_name("value")
+            .is_some_and(|value| pattern_binds_object(value, source)),
+        "assignment_pattern" | "object_assignment_pattern" => node
+            .child_by_field_name("left")
+            .is_some_and(|left| pattern_binds_object(left, source)),
+        "required_parameter" | "optional_parameter" => node
+            .child_by_field_name("pattern")
+            .is_some_and(|pattern| pattern_binds_object(pattern, source)),
+        "object_pattern" | "array_pattern" | "rest_pattern" | "formal_parameters" => {
+            any_named_child(node, |child| pattern_binds_object(child, source))
+        }
+        _ => false,
+    }
+}
+
 fn biome_runner_failure_diagnostic(diagnostic: &LintDiagnostic) -> bool {
     let rule = diagnostic.rule.trim().to_ascii_lowercase();
     let severity = diagnostic.severity.trim().to_ascii_lowercase();
@@ -721,23 +1105,20 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn signal_kill_without_output_is_treated_as_unavailable_on_macos() {
+    fn signal_kill_without_output_is_treated_as_unavailable() {
         let status = std::process::Command::new("sh")
             .args(["-c", "kill -9 $$"])
             .status()
             .unwrap();
-        let message = signal_only_unavailable_message("ruff", "/tmp/ruff", status, "", "");
+        let message = signal_only_unavailable_message("ruff", "/tmp/ruff", status, "", "")
+            .expect("expected unavailable message for Unix signal termination");
 
+        assert!(message.contains("ruff unavailable"));
+        assert!(message.contains("/tmp/ruff"));
+        assert!(message.contains("signal 9 (SIGKILL)"));
+        assert!(message.contains("environment failure, not a lint violation"));
         #[cfg(target_os = "macos")]
-        {
-            let message = message.expect("expected unavailable message on macOS");
-            assert!(message.contains("ruff unavailable"));
-            assert!(message.contains("/tmp/ruff"));
-            assert!(message.contains("Gatekeeper/quarantine"));
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        assert!(message.is_none());
+        assert!(message.contains("Gatekeeper/quarantine"));
     }
 
     #[test]

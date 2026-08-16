@@ -608,6 +608,473 @@ fn type_text(node: &tree_sitter::Node, source: &[u8]) -> String {
     raw.trim_start_matches(':').trim().to_string()
 }
 
+fn function_effects(
+    function: &tree_sitter::Node,
+    source: &[u8],
+    language: &Language,
+) -> Vec<FunctionEffect> {
+    fn root_node(mut node: tree_sitter::Node<'_>) -> tree_sitter::Node<'_> {
+        while let Some(parent) = node.parent() {
+            node = parent;
+        }
+        node
+    }
+
+    fn collect_identifiers(
+        node: tree_sitter::Node<'_>,
+        source: &[u8],
+        names: &mut HashSet<String>,
+    ) {
+        if node.kind() == "identifier" {
+            names.insert(text(&node, source).to_string());
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            collect_identifiers(child, source, names);
+        }
+    }
+
+    fn collect_module_state(
+        node: tree_sitter::Node<'_>,
+        source: &[u8],
+        language: &Language,
+        names: &mut HashSet<String>,
+    ) {
+        match language {
+            Language::TypeScript => {
+                if matches!(node.kind(), "lexical_declaration" | "variable_declaration") {
+                    let declaration = text(&node, source).trim_start();
+                    let mutable_declaration =
+                        declaration.starts_with("let ") || declaration.starts_with("var ");
+                    let mut cursor = node.walk();
+                    for child in node.named_children(&mut cursor) {
+                        if child.kind() != "variable_declarator" {
+                            continue;
+                        }
+                        let Some(name) = child.child_by_field_name("name") else {
+                            continue;
+                        };
+                        let mutable_value =
+                            child.child_by_field_name("value").is_some_and(|value| {
+                                matches!(
+                                    value.kind(),
+                                    "object"
+                                        | "array"
+                                        | "new_expression"
+                                        | "call_expression"
+                                        | "await_expression"
+                                )
+                            });
+                        if mutable_declaration || mutable_value {
+                            collect_identifiers(name, source, names);
+                        }
+                    }
+                    return;
+                }
+                if node.kind() != "export_statement" {
+                    return;
+                }
+            }
+            Language::Python => {
+                if matches!(
+                    node.kind(),
+                    "assignment" | "augmented_assignment" | "annotated_assignment"
+                ) {
+                    if let Some(target) = node.child_by_field_name("left") {
+                        collect_identifiers(target, source, names);
+                    }
+                    return;
+                }
+                return;
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            collect_module_state(child, source, language, names);
+        }
+    }
+
+    fn is_callable_node(kind: &str) -> bool {
+        matches!(
+            kind,
+            "function_definition"
+                | "function_declaration"
+                | "function_expression"
+                | "arrow_function"
+                | "method_definition"
+        )
+    }
+
+    fn collect_binding_names(
+        node: tree_sitter::Node<'_>,
+        source: &[u8],
+        names: &mut HashSet<String>,
+    ) {
+        match node.kind() {
+            "identifier" | "shorthand_property_identifier_pattern" => {
+                names.insert(text(&node, source).to_string());
+            }
+            "pair_pattern" => {
+                if let Some(value) = node.child_by_field_name("value") {
+                    collect_binding_names(value, source, names);
+                }
+            }
+            "assignment_pattern" => {
+                if let Some(left) = node.child_by_field_name("left") {
+                    collect_binding_names(left, source, names);
+                }
+            }
+            "rest_pattern"
+            | "list_splat_pattern"
+            | "dictionary_splat_pattern"
+            | "object_pattern"
+            | "array_pattern"
+            | "tuple_pattern"
+            | "list_pattern"
+            | "pattern_list" => {
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    collect_binding_names(child, source, names);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn add_bindings(
+        binding: tree_sitter::Node<'_>,
+        scope: tree_sitter::Node<'_>,
+        source: &[u8],
+        bindings: &mut HashMap<usize, HashSet<String>>,
+    ) {
+        collect_binding_names(binding, source, bindings.entry(scope.id()).or_default());
+    }
+
+    fn collect_local_bindings(
+        node: tree_sitter::Node<'_>,
+        function: tree_sitter::Node<'_>,
+        source: &[u8],
+        language: &Language,
+        bindings: &mut HashMap<usize, HashSet<String>>,
+    ) {
+        if node.id() != function.id() && is_callable_node(node.kind()) {
+            if matches!(node.kind(), "function_definition" | "function_declaration") {
+                if let Some(name) = node.child_by_field_name("name") {
+                    let scope = match language {
+                        Language::TypeScript => ts_declaration_binding_scope(node, function, false),
+                        Language::Python => function,
+                    };
+                    add_bindings(name, scope, source, bindings);
+                }
+            }
+            return;
+        }
+
+        match language {
+            Language::TypeScript => match node.kind() {
+                "variable_declarator" => {
+                    if let Some(name) = node.child_by_field_name("name") {
+                        let function_scoped = node.parent().is_some_and(|declaration| {
+                            declaration.kind() == "variable_declaration"
+                        });
+                        let scope = ts_declaration_binding_scope(node, function, function_scoped);
+                        add_bindings(name, scope, source, bindings);
+                    }
+                }
+                "class_declaration" | "enum_declaration" => {
+                    if let Some(name) = node.child_by_field_name("name") {
+                        let scope = ts_declaration_binding_scope(node, function, false);
+                        add_bindings(name, scope, source, bindings);
+                    }
+                }
+                "catch_clause" => {
+                    if let Some(parameter) = node.child_by_field_name("parameter") {
+                        add_bindings(parameter, node, source, bindings);
+                    }
+                }
+                _ => {}
+            },
+            Language::Python => match node.kind() {
+                "assignment"
+                | "augmented_assignment"
+                | "annotated_assignment"
+                | "named_expression" => {
+                    if let Some(target) = node
+                        .child_by_field_name("left")
+                        .or_else(|| node.child_by_field_name("name"))
+                    {
+                        add_bindings(target, function, source, bindings);
+                    }
+                }
+                "for_statement" => {
+                    if let Some(target) = node.child_by_field_name("left") {
+                        add_bindings(target, function, source, bindings);
+                    }
+                }
+                _ => {}
+            },
+        }
+
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            collect_local_bindings(child, function, source, language, bindings);
+        }
+    }
+
+    fn is_locally_bound(
+        node: tree_sitter::Node<'_>,
+        function: tree_sitter::Node<'_>,
+        name: &str,
+        bindings: &HashMap<usize, HashSet<String>>,
+    ) -> bool {
+        let mut ancestor = Some(node);
+        while let Some(scope) = ancestor {
+            if bindings
+                .get(&scope.id())
+                .is_some_and(|names| names.contains(name))
+            {
+                return true;
+            }
+            if scope.id() == function.id() {
+                break;
+            }
+            ancestor = scope.parent();
+        }
+        false
+    }
+
+    fn mutation_root<'a>(mut node: tree_sitter::Node<'a>, source: &'a [u8]) -> Option<&'a str> {
+        loop {
+            match node.kind() {
+                "identifier" | "this" => return Some(text(&node, source)),
+                "attribute" | "member_expression" | "subscript" | "subscript_expression" => {
+                    node = node
+                        .child_by_field_name("object")
+                        .or_else(|| node.named_child(0))?;
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    fn classify_call(callee: &str) -> Option<FunctionEffect> {
+        let compact = callee
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect::<String>();
+        let lower = compact.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "math.random"
+                | "crypto.randomuuid"
+                | "crypto.getrandomvalues"
+                | "randomuuid"
+                | "uuidv4"
+                | "nanoid"
+                | "os.urandom"
+                | "uuid.uuid4"
+        ) || lower.starts_with("random.")
+            || lower.starts_with("secrets.")
+        {
+            return Some(FunctionEffect::Randomness);
+        }
+        if matches!(
+            lower.as_str(),
+            "date.now"
+                | "performance.now"
+                | "process.hrtime"
+                | "process.hrtime.bigint"
+                | "time.time"
+                | "time.monotonic"
+                | "time.perf_counter"
+                | "time.process_time"
+                | "datetime.now"
+                | "datetime.utcnow"
+                | "date.today"
+        ) {
+            return Some(FunctionEffect::Time);
+        }
+        if matches!(
+            lower.as_str(),
+            "settimeout"
+                | "setinterval"
+                | "setimmediate"
+                | "requestanimationframe"
+                | "time.sleep"
+                | "asyncio.sleep"
+                | "threading.timer"
+        ) || lower.ends_with(".call_later")
+        {
+            return Some(FunctionEffect::Timer);
+        }
+        if lower == "fetch"
+            || lower == "open"
+            || lower == "input"
+            || lower.starts_with("fs.")
+            || lower.starts_with("deno.")
+            || lower.starts_with("bun.file")
+            || lower.starts_with("bun.write")
+            || lower.starts_with("localstorage.")
+            || lower.starts_with("sessionstorage.")
+            || lower.starts_with("requests.")
+            || lower.starts_with("httpx.")
+            || lower.starts_with("urllib.")
+            || lower.starts_with("socket.")
+            || lower.starts_with("process.stdin.")
+            || lower.starts_with("process.stdout.")
+            || lower.starts_with("process.stderr.")
+            || [
+                ".read_text",
+                ".read_bytes",
+                ".write_text",
+                ".write_bytes",
+                ".read_file",
+                ".write_file",
+            ]
+            .iter()
+            .any(|suffix| lower.ends_with(suffix))
+        {
+            return Some(FunctionEffect::Io);
+        }
+        None
+    }
+
+    fn visit_effects(
+        node: tree_sitter::Node<'_>,
+        root: tree_sitter::Node<'_>,
+        source: &[u8],
+        module_state: &HashSet<String>,
+        parameter_names: &HashSet<String>,
+        local_bindings: &HashMap<usize, HashSet<String>>,
+        effects: &mut Vec<FunctionEffect>,
+    ) {
+        if node != root && is_callable_node(node.kind()) {
+            return;
+        }
+
+        if node.kind() == "identifier" {
+            let name = text(&node, source);
+            if module_state.contains(name) && !is_locally_bound(node, root, name, local_bindings) {
+                effects.push(FunctionEffect::MutableState);
+            }
+        }
+
+        if matches!(node.kind(), "call" | "call_expression") {
+            if let Some(callee) = node
+                .child_by_field_name("function")
+                .or_else(|| node.named_child(0))
+            {
+                if let Some(effect) = classify_call(text(&callee, source)) {
+                    effects.push(effect);
+                }
+            }
+        } else if node.kind() == "new_expression"
+            && text(&node, source).trim_start().starts_with("new Date")
+        {
+            effects.push(FunctionEffect::Time);
+        } else if matches!(
+            node.kind(),
+            "assignment_expression"
+                | "augmented_assignment_expression"
+                | "augmented_assignment"
+                | "update_expression"
+        ) {
+            if let Some(target) = node
+                .child_by_field_name("left")
+                .or_else(|| node.child_by_field_name("argument"))
+                .or_else(|| node.named_child(0))
+            {
+                if mutation_root(target, source).is_some_and(|root_name| {
+                    root_name == "this"
+                        || root_name == "self"
+                        || parameter_names.contains(root_name)
+                        || (module_state.contains(root_name)
+                            && !is_locally_bound(target, root, root_name, local_bindings))
+                }) {
+                    effects.push(FunctionEffect::MutableState);
+                }
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            visit_effects(
+                child,
+                root,
+                source,
+                module_state,
+                parameter_names,
+                local_bindings,
+                effects,
+            );
+        }
+    }
+
+    let mut module_state = HashSet::new();
+    let root = root_node(*function);
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        collect_module_state(child, source, language, &mut module_state);
+    }
+
+    let mut parameter_names = HashSet::new();
+    if let Some(parameters) = function.child_by_field_name("parameters") {
+        let mut cursor = parameters.walk();
+        for parameter in parameters.named_children(&mut cursor) {
+            let binding = match language {
+                Language::TypeScript => parameter.child_by_field_name("pattern").or_else(|| {
+                    (parameter.kind() == "rest_pattern")
+                        .then(|| parameter.named_child(0))
+                        .flatten()
+                }),
+                Language::Python => match parameter.kind() {
+                    "identifier" => Some(parameter),
+                    "typed_parameter" => parameter.named_child(0),
+                    "default_parameter" | "typed_default_parameter" => {
+                        parameter.child_by_field_name("name")
+                    }
+                    "list_splat" | "dictionary_splat" => parameter.named_child(0),
+                    _ => None,
+                },
+            };
+            if let Some(binding) = binding {
+                collect_binding_names(binding, source, &mut parameter_names);
+            }
+        }
+    }
+
+    let mut local_bindings = HashMap::new();
+    local_bindings
+        .entry(function.id())
+        .or_insert_with(HashSet::new)
+        .extend(parameter_names.iter().cloned());
+    if let Some(body) = function.child_by_field_name("body") {
+        collect_local_bindings(body, *function, source, language, &mut local_bindings);
+    }
+
+    let mut effects = Vec::new();
+    visit_effects(
+        *function,
+        *function,
+        source,
+        &module_state,
+        &parameter_names,
+        &local_bindings,
+        &mut effects,
+    );
+    effects.sort_by_key(|effect| match effect {
+        FunctionEffect::Randomness => 0,
+        FunctionEffect::Time => 1,
+        FunctionEffect::Timer => 2,
+        FunctionEffect::Io => 3,
+        FunctionEffect::MutableState => 4,
+    });
+    effects.dedup();
+    effects
+}
+
 // ── Python ──────────────────────────────────────────────────────────────────
 
 fn visit_python(
@@ -636,6 +1103,7 @@ fn visit_python(
                 name,
                 params,
                 return_type,
+                type_parameters: vec![],
                 line: node.start_position().row + 1,
                 end_line: node.end_position().row + 1,
                 complexity: metrics.cyclomatic,
@@ -646,6 +1114,7 @@ fn visit_python(
                 is_nested: func_depth > 0,
                 is_exported,
                 declared_properties: vec![],
+                effects: function_effects(node, source, &Language::Python),
                 invocation_target: None,
                 returned_callables: vec![],
             });
@@ -900,6 +1369,7 @@ fn visit_typescript(
                 name,
                 params,
                 return_type,
+                type_parameters: extract_ts_type_parameters(node, source),
                 line: node.start_position().row + 1,
                 end_line: node.end_position().row + 1,
                 complexity: metrics.cyclomatic,
@@ -910,6 +1380,7 @@ fn visit_typescript(
                 is_nested: func_depth > 0,
                 is_exported: ts_is_exported(node),
                 declared_properties: vec![],
+                effects: function_effects(node, source, &Language::TypeScript),
                 invocation_target: None,
                 returned_callables,
             });
@@ -958,6 +1429,7 @@ fn visit_typescript(
                 name,
                 params,
                 return_type,
+                type_parameters: extract_ts_type_parameters(node, source),
                 line: node.start_position().row + 1,
                 end_line: node.end_position().row + 1,
                 complexity: metrics.cyclomatic,
@@ -968,6 +1440,7 @@ fn visit_typescript(
                 is_nested: func_depth > 0,
                 is_exported,
                 declared_properties: vec![],
+                effects: function_effects(node, source, &Language::TypeScript),
                 invocation_target,
                 returned_callables,
             });
@@ -991,6 +1464,7 @@ fn visit_typescript(
                         name,
                         params,
                         return_type,
+                        type_parameters: extract_ts_type_parameters(&value, source),
                         line: node.start_position().row + 1,
                         end_line: node.end_position().row + 1,
                         complexity: metrics.cyclomatic,
@@ -1001,6 +1475,7 @@ fn visit_typescript(
                         is_nested: func_depth > 0,
                         is_exported: ts_is_exported(node),
                         declared_properties: vec![],
+                        effects: function_effects(&value, source, &Language::TypeScript),
                         invocation_target: None,
                         returned_callables,
                     });
@@ -1540,6 +2015,7 @@ fn push_ts_surfaced_callable(
         name: format!("{base_name}.{method_name}"),
         params,
         return_type,
+        type_parameters: extract_ts_type_parameters(callable_node, source),
         line: property_node.start_position().row + 1,
         end_line: property_node.end_position().row + 1,
         complexity: metrics.cyclomatic,
@@ -1550,6 +2026,7 @@ fn push_ts_surfaced_callable(
         is_nested,
         is_exported: true,
         declared_properties: vec![],
+        effects: function_effects(callable_node, source, &Language::TypeScript),
         invocation_target: Some(format!("{invocation_root}.{method_name}")),
         returned_callables: vec![],
     });
@@ -2097,6 +2574,99 @@ fn extract_ts_object_type_fields(object_type: &tree_sitter::Node, source: &[u8])
     fields
 }
 
+fn infer_ts_default_type(value: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    match value.kind() {
+        "string" | "template_string" => Some("string".into()),
+        "number" => Some(
+            if text(value, source).trim().ends_with('n') {
+                "bigint"
+            } else {
+                "number"
+            }
+            .into(),
+        ),
+        "true" | "false" => Some("boolean".into()),
+        "parenthesized_expression" => value
+            .named_child(0)
+            .and_then(|inner| infer_ts_default_type(&inner, source)),
+        "unary_expression" => {
+            let raw = text(value, source).trim();
+            if !raw.starts_with(['-', '+']) {
+                return None;
+            }
+            value
+                .named_child(0)
+                .and_then(|inner| infer_ts_default_type(&inner, source))
+                .filter(|inferred| matches!(inferred.as_str(), "number" | "bigint"))
+        }
+        "array" => {
+            let mut element_types = Vec::new();
+            let mut cursor = value.walk();
+            for element in value.named_children(&mut cursor) {
+                let inferred = infer_ts_default_type(&element, source)?;
+                if !element_types.contains(&inferred) {
+                    element_types.push(inferred);
+                }
+            }
+            match element_types.as_slice() {
+                [] => Some("never[]".into()),
+                [element] => Some(format!("{element}[]")),
+                elements => Some(format!("Array<{}>", elements.join(" | "))),
+            }
+        }
+        "object" => {
+            let mut fields = Vec::new();
+            let mut cursor = value.walk();
+            for member in value.named_children(&mut cursor) {
+                if member.kind() != "pair" {
+                    return None;
+                }
+                let key = member.child_by_field_name("key")?;
+                if key.kind() == "computed_property_name" {
+                    return None;
+                }
+                let field_value = member.child_by_field_name("value")?;
+                let field_type = infer_ts_default_type(&field_value, source)?;
+                fields.push(format!("{}: {field_type}", text(&key, source)));
+            }
+            Some(format!("{{ {} }}", fields.join("; ")))
+        }
+        _ => None,
+    }
+}
+
+fn inferred_ts_default_type(
+    explicit_type: Option<String>,
+    default_value: Option<&tree_sitter::Node>,
+    source: &[u8],
+) -> Option<String> {
+    explicit_type.or_else(|| default_value.and_then(|value| infer_ts_default_type(value, source)))
+}
+
+fn extract_ts_type_parameters(func: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let Some(parameters) = func.child_by_field_name("type_parameters") else {
+        return vec![];
+    };
+    let mut names = vec![];
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        let name = if matches!(parameter.kind(), "identifier" | "type_identifier") {
+            Some(parameter)
+        } else {
+            parameter
+                .child_by_field_name("name")
+                .or_else(|| parameter.named_child(0))
+        };
+        if let Some(name) = name {
+            let name = text(&name, source).trim();
+            if !name.is_empty() {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
+}
+
 fn extract_ts_params(func: &tree_sitter::Node, source: &[u8]) -> Vec<ParamInfo> {
     let params_node = match func.child_by_field_name("parameters") {
         Some(n) => n,
@@ -2115,12 +2685,15 @@ fn extract_ts_params(func: &tree_sitter::Node, source: &[u8]) -> Vec<ParamInfo> 
                     .unwrap_or_default();
                 let variadic = raw_name.starts_with("...");
                 let name = raw_name.trim_start_matches("...").to_string();
-                let type_ann = child
-                    .child_by_field_name("type")
-                    .map(|n| type_text(&n, source));
-                let default_value = child
-                    .child_by_field_name("value")
-                    .map(|n| text(&n, source).to_string());
+                let default_node = child.child_by_field_name("value");
+                let type_ann = inferred_ts_default_type(
+                    child
+                        .child_by_field_name("type")
+                        .map(|n| type_text(&n, source)),
+                    default_node.as_ref(),
+                    source,
+                );
+                let default_value = default_node.map(|n| text(&n, source).to_string());
                 let optional =
                     child.kind() == "optional_parameter" || default_value.is_some() || variadic;
                 params.push(ParamInfo {

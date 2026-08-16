@@ -18,7 +18,7 @@ const TS_TYPE_RECURSION_LIMIT: usize = 8;
 /// 1. No crashes on any valid input
 /// 2. Return type matches annotation (where checkable)
 /// 3. Idempotency where applicable (string→string, etc.)
-/// 4. Consistency (same input → same output)
+/// 4. Consistency for statically effect-free callables (same input → same output)
 pub fn synthesize_calls(analysis: &AnalysisResult, language: &Language) -> String {
     synthesize_plan(analysis, language).code
 }
@@ -288,6 +288,10 @@ fn likely_intentionally_nondeterministic(func: &FunctionInfo) -> bool {
         .any(|cue| lower.contains(cue))
 }
 
+fn supports_implicit_consistency(func: &FunctionInfo) -> bool {
+    func.effects.is_empty() && !likely_intentionally_nondeterministic(func)
+}
+
 const SIMPLE_HELPER_NAME_CUES: &[&str] = &[
     "parse",
     "read",
@@ -498,6 +502,18 @@ fn ts_seed_rows(func: &FunctionInfo, seed_inputs: &PlannedSeedInputs) -> String 
                     .join(", ")
             )
         })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn ts_default_omission_rows(params: &[&ParamInfo], generated_parts: &[String]) -> String {
+    params
+        .iter()
+        .enumerate()
+        .filter(|(index, param)| {
+            param.default_value.is_some() && params[index + 1..].iter().all(|later| later.optional)
+        })
+        .map(|(index, _)| format!("[{}]", generated_parts[..index].join(", ")))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -1613,14 +1629,14 @@ fn python_idempotency_check(
 }
 
 fn python_consistency_check(func: &FunctionInfo, call_args: &[String]) -> String {
-    if likely_intentionally_nondeterministic(func) {
+    if !supports_implicit_consistency(func) {
         return String::new();
     }
 
     // Run the same input twice, verify same output
     let call = call_args.join(", ");
     format!(
-        "        _repeat_args = _copy.deepcopy(_args)\n        _result_b = _materialize_if_iterator({name}({call}))\n        assert _nan_eq(_result, _result_b), f\"Inconsistent: {{repr(_result)}} != {{repr(_result_b)}}\"",
+        "        _repeat_args = _copy.deepcopy(_args)\n        _result_b = _materialize_if_iterator({name}({call}))\n        assert _consistency_eq(_result, _result_b), f\"Inconsistent: {{repr(_result)}} != {{repr(_result_b)}}\"",
         name = func.name,
     )
 }
@@ -2221,6 +2237,47 @@ def _nan_eq(a, b):
         if math.isnan(a) and math.isnan(b): return True
     return a == b
 
+def _callable_consistency_key(value):
+    return (
+        getattr(value, "__module__", type(value).__module__),
+        getattr(value, "__qualname__", getattr(value, "__name__", type(value).__qualname__)),
+    )
+
+def _consistency_eq(a, b):
+    """Compare semantic values without treating fresh callable/object identity as output drift."""
+    a = _materialize_if_iterator(a)
+    b = _materialize_if_iterator(b)
+    if type(a) is not type(b):
+        return False
+    if callable(a) or callable(b):
+        return (
+            callable(a)
+            and callable(b)
+            and _callable_consistency_key(a) == _callable_consistency_key(b)
+        )
+    if isinstance(a, (list, tuple)):
+        return len(a) == len(b) and all(_consistency_eq(x, y) for x, y in zip(a, b))
+    if isinstance(a, dict):
+        return a.keys() == b.keys() and all(_consistency_eq(a[key], b[key]) for key in a)
+    if isinstance(a, (set, frozenset)):
+        if len(a) != len(b):
+            return False
+        unmatched = list(b)
+        for item_a in a:
+            for index, item_b in enumerate(unmatched):
+                if _consistency_eq(item_a, item_b):
+                    unmatched.pop(index)
+                    break
+            else:
+                return False
+        return True
+    if getattr(type(a), "__eq__", None) is object.__eq__:
+        return True
+    try:
+        return _nan_eq(a, b)
+    except Exception:
+        return True
+
 def _contains_nullish(value):
     if value is None:
         return True
@@ -2366,13 +2423,8 @@ fn synthesize_typescript(
             ));
             continue;
         }
-        coverage.push(coverage_entry(
-            func,
-            FuzzFunctionStatus::CheckedDirect,
-            None,
-        ));
-        selected_functions.push(func);
         let ret_type = func.return_type.as_deref().unwrap_or("");
+
         let param_types: Vec<String> = callable_params
             .iter()
             .map(|p| {
@@ -2384,22 +2436,49 @@ fn synthesize_typescript(
             .collect();
         let contract = infer_ts_contract(func, &param_types, ret_type, type_defs);
 
-        let mut generated_parts: Vec<String> = callable_params
+        let Some(mut generated_parts) = callable_params
             .iter()
             .enumerate()
             .map(|(idx, p)| {
                 ts_generator_for_param(contract, p.type_annotation.as_deref(), type_defs, idx, func)
             })
-            .collect();
+            .collect::<Option<Vec<_>>>()
+        else {
+            coverage.push(coverage_entry(
+                func,
+                FuzzFunctionStatus::SkippedUnsupportedType,
+                Some(
+                    "one or more parameters use unsupported or unresolved TypeScript types".into(),
+                ),
+            ));
+            continue;
+        };
         if let Some(rest) = positional_variadic {
             let rest_annotation = rest.type_annotation.as_deref().map(ts_rest_item_annotation);
-            let item_generator =
-                ts_generator_for_param(contract, rest_annotation.as_deref(), type_defs, 0, func);
+            let Some(item_generator) =
+                ts_generator_for_param(contract, rest_annotation.as_deref(), type_defs, 0, func)
+            else {
+                coverage.push(coverage_entry(
+                    func,
+                    FuzzFunctionStatus::SkippedUnsupportedType,
+                    Some(
+                        "one or more parameters use unsupported or unresolved TypeScript types"
+                            .into(),
+                    ),
+                ));
+                continue;
+            };
             generated_parts.push(format!(
                 "...Array.from({{ length: _fuzzIntRange(0, 2) }}, () => {})",
                 item_generator
             ));
         }
+        coverage.push(coverage_entry(
+            func,
+            FuzzFunctionStatus::CheckedDirect,
+            None,
+        ));
+        selected_functions.push(func);
         let gen_list = generated_parts.join(", ");
 
         let mut properties: Vec<&str> = vec![];
@@ -2408,7 +2487,7 @@ fn synthesize_typescript(
                 properties.push(property);
             }
         };
-        if !likely_intentionally_nondeterministic(func) {
+        if supports_implicit_consistency(func) {
             push_property("consistent");
         }
 
@@ -2558,11 +2637,12 @@ fn synthesize_typescript(
                 format!("{property_row}, {seed_rows}")
             };
         }
+        let default_omission_rows = ts_default_omission_rows(&callable_params, &generated_parts);
 
         code.push_str(&format!(
             r#"
 {{
-  const _fuzzOk = _fuzzOne("{name}", {iters}, () => [{gen_list}], (args: unknown[]) => {call_expr}, {typecheck}, [{param_type_list}], [{properties_list}], [{seed_rows}], [{declared_properties_list}], {source_line});
+  const _fuzzOk = _fuzzOne("{name}", {iters}, () => [{gen_list}], (args: unknown[]) => {call_expr}, {typecheck}, [{param_type_list}], [{properties_list}], [{seed_rows}], [{default_omission_rows}], [{declared_properties_list}], {source_line});
 {query_string_semantic_check}
 {query_string_parser_semantic_check}
 {defaults_semantic_check}
@@ -2580,6 +2660,7 @@ fn synthesize_typescript(
             call_expr = ts_call_with_spread(func, "...args"),
             typecheck = ts_type_check_fn(ret_type),
             seed_rows = seed_rows,
+            default_omission_rows = default_omission_rows,
             query_string_semantic_check = query_string_semantic_check,
             query_string_parser_semantic_check = query_string_parser_semantic_check,
             defaults_semantic_check = defaults_semantic_check,
@@ -2651,11 +2732,14 @@ fn synthesize_typescript_factory_exercise(
         if !ts_params_are_fuzzable(func, &callable_params, type_defs) {
             continue;
         }
-        let factory_args = callable_params
+        let Some(factory_args) = callable_params
             .iter()
             .map(|param| ts_generator(param.type_annotation.as_deref(), type_defs))
-            .collect::<Vec<_>>()
-            .join(", ");
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        let factory_args = factory_args.join(", ");
 
         let known_specs = func
             .returned_callables
@@ -2667,7 +2751,7 @@ fn synthesize_typescript_factory_exercise(
                     .iter()
                     .filter(|param| !param.is_variadic())
                     .map(|param| ts_generator(param.type_annotation.as_deref(), type_defs))
-                    .collect::<Vec<_>>()
+                    .collect::<Option<Vec<_>>>()?
                     .join(", ");
                 let key = serde_json::to_string(callable).ok()?;
                 let surface =
@@ -2741,8 +2825,16 @@ fn ts_type_seen(stack: &[String], type_name: &str) -> bool {
     stack.iter().any(|item| item == type_name)
 }
 
-fn ts_generator(type_ann: Option<&str>, type_defs: &TsNamedTypes<'_>) -> String {
-    ts_generator_with_stack(type_ann, type_defs, &mut Vec::new(), 0)
+fn ts_generator(type_ann: Option<&str>, type_defs: &TsNamedTypes<'_>) -> Option<String> {
+    if !ts_type_is_fuzzable(type_ann, type_defs) {
+        return None;
+    }
+    Some(ts_generator_with_stack(
+        type_ann,
+        type_defs,
+        &mut Vec::new(),
+        0,
+    ))
 }
 
 fn ts_generator_with_stack(
@@ -2778,20 +2870,33 @@ fn ts_generator_with_stack(
         "string" => "_fuzzStr()".into(),
         "boolean" => "_fuzzBool()".into(),
         "any" | "unknown" => "_fuzzAny()".into(),
+        "object" => "_fuzzObject()".into(),
         _ if t.ends_with("[]") => {
-            let inner = &t[..t.len() - 2];
-            let gen = ts_generator_with_stack(Some(inner), type_defs, stack, depth + 1);
-            format!("Array.from({{length: _fuzzIntRange(0,5)}}, () => {gen})")
+            let inner = t[..t.len() - 2].trim();
+            if inner == "never" {
+                "[]".into()
+            } else {
+                let gen = ts_generator_with_stack(Some(inner), type_defs, stack, depth + 1);
+                format!("Array.from({{length: _fuzzIntRange(0,5)}}, () => {gen})")
+            }
         }
         _ if t.starts_with("Array<") => {
             let inner = extract_generic_arg(t);
-            let gen = ts_generator_with_stack(Some(&inner), type_defs, stack, depth + 1);
-            format!("Array.from({{length: _fuzzIntRange(0,5)}}, () => {gen})")
+            if inner.trim() == "never" {
+                "[]".into()
+            } else {
+                let gen = ts_generator_with_stack(Some(&inner), type_defs, stack, depth + 1);
+                format!("Array.from({{length: _fuzzIntRange(0,5)}}, () => {gen})")
+            }
         }
         _ if t.starts_with("ReadonlyArray<") => {
             let inner = extract_generic_arg(t);
-            let gen = ts_generator_with_stack(Some(&inner), type_defs, stack, depth + 1);
-            format!("Array.from({{length: _fuzzIntRange(0,5)}}, () => {gen})")
+            if inner.trim() == "never" {
+                "[]".into()
+            } else {
+                let gen = ts_generator_with_stack(Some(&inner), type_defs, stack, depth + 1);
+                format!("Array.from({{length: _fuzzIntRange(0,5)}}, () => {gen})")
+            }
         }
         _ if t.starts_with("Set<") || t.starts_with("ReadonlySet<") => {
             let inner = extract_generic_arg(t);
@@ -2954,7 +3059,10 @@ fn ts_params_are_fuzzable(
     let ret_type = func.return_type.as_deref().unwrap_or("").trim();
     !target_type.is_empty()
         && ret_type == target_type
-        && is_ts_type_param_like(target_type)
+        && func
+            .type_parameters
+            .iter()
+            .any(|parameter| parameter == target_type)
         && params[1..]
             .iter()
             .all(|param| ts_type_is_fuzzable(param.type_annotation.as_deref(), type_defs))
@@ -3005,11 +3113,11 @@ fn ts_type_is_fuzzable_with_stack(
         None => return true,
     };
     if depth >= TS_TYPE_RECURSION_LIMIT {
-        return true;
+        return false;
     }
     if let Some(TsNamedTypeRef::Alias(alias)) = type_defs.get(t) {
         if ts_type_seen(stack, t) {
-            return true;
+            return false;
         }
         stack.push(t.to_string());
         let fuzzable = ts_type_is_fuzzable_with_stack(
@@ -3023,10 +3131,11 @@ fn ts_type_is_fuzzable_with_stack(
     }
 
     match t {
-        "number" | "string" | "boolean" | "any" | "unknown" | "null" | "undefined" | "Date"
-        | "RegExp" | "Map" | "Set" | "Error" | "Buffer" | "Uint8Array" | "ArrayBuffer" | "URL"
-        | "URLSearchParams" | "Request" | "Response" | "Headers" | "FormData"
+        "number" | "string" | "boolean" | "object" | "any" | "unknown" | "null" | "undefined"
+        | "Date" | "RegExp" | "Map" | "Set" | "Error" | "Buffer" | "Uint8Array" | "ArrayBuffer"
+        | "URL" | "URLSearchParams" | "Request" | "Response" | "Headers" | "FormData"
         | "AbortController" | "Promise" => true,
+        "never[]" => true,
         _ if t.ends_with("[]") => {
             let inner = &t[..t.len() - 2];
             ts_type_is_fuzzable_with_stack(Some(inner), type_defs, stack, depth + 1)
@@ -3088,7 +3197,7 @@ fn ts_type_is_fuzzable_with_stack(
                 ts_type_is_fuzzable_with_stack(Some(&inner), type_defs, stack, depth + 1)
             } else if let Some(class) = ts_class_def(t, type_defs) {
                 if ts_type_seen(stack, t) {
-                    return true;
+                    return false;
                 }
                 stack.push(t.to_string());
                 let fuzzable = class.fields.iter().all(|field| {
@@ -3102,7 +3211,7 @@ fn ts_type_is_fuzzable_with_stack(
                 stack.pop();
                 fuzzable
             } else {
-                !t.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                ts_literal_expr(t).is_some()
             }
         }
     }
@@ -3125,20 +3234,25 @@ fn ts_generator_for_param(
     type_defs: &TsNamedTypes<'_>,
     index: usize,
     func: &FunctionInfo,
-) -> String {
+) -> Option<String> {
     if contract == Some(ContractKind::QueryStringParser) && index > 0 {
-        return "\"extended\"".to_string();
+        return Some("\"extended\"".to_string());
     }
     if contract == Some(ContractKind::Comparator)
         && is_semver_like_version_type(type_ann, type_defs)
     {
-        return "_fuzzSemverVersion()".to_string();
+        return Some("_fuzzSemverVersion()".to_string());
     }
     if index == 0
         && likely_defaults_semantics(&func.name)
-        && type_ann.is_some_and(is_ts_type_param_like)
+        && type_ann.is_some_and(|type_ann| {
+            let type_ann = type_ann.trim();
+            func.type_parameters
+                .iter()
+                .any(|parameter| parameter == type_ann)
+        })
     {
-        return "_fuzzObject()".to_string();
+        return Some("_fuzzObject()".to_string());
     }
     ts_generator(type_ann, type_defs)
 }
@@ -4100,9 +4214,75 @@ function _clipText(value: unknown, limit = _FUZZ_TEXT_LIMIT): string {
   return `${text.slice(0, limit)}... [truncated ${text.length - limit} chars]`;
 }
 
+function _isReservedReproObject(value: Record<string, unknown>): boolean {
+  const keys = Object.keys(value);
+  if (keys.length === 1 && value.type === "undefined") return true;
+  if (
+    keys.length === 2
+    && value.type === "number"
+    && keys.includes("value")
+    && (value.value === "NaN" || value.value === "Infinity" || value.value === "-Infinity")
+  ) return true;
+  return keys.length === 2 && value.type === "object" && keys.includes("value");
+}
+
+function _reproJsonValue(value: unknown, ancestors = new Set<object>()): unknown {
+  if (value === undefined) return { type: "undefined" };
+  if (typeof value === "number") {
+    if (Number.isNaN(value)) return { type: "number", value: "NaN" };
+    if (value === Infinity) return { type: "number", value: "Infinity" };
+    if (value === -Infinity) return { type: "number", value: "-Infinity" };
+    return value;
+  }
+  if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+  if (Array.isArray(value)) {
+    if (ancestors.has(value)) throw new TypeError("circular repro value");
+    ancestors.add(value);
+    try { return value.map((item) => _reproJsonValue(item, ancestors)); }
+    finally { ancestors.delete(value); }
+  }
+  if (typeof value === "object") {
+    if (ancestors.has(value)) throw new TypeError("circular repro value");
+    ancestors.add(value);
+    try {
+      const encoded = Object.fromEntries(Object.keys(value).map((key) => [key, _reproJsonValue((value as Record<string, unknown>)[key], ancestors)]));
+      return _isReservedReproObject(encoded) ? { type: "object", value: encoded } : encoded;
+    } finally { ancestors.delete(value); }
+  }
+  return null;
+}
+
+function _reproExpression(value: unknown, ancestors = new Set<object>()): string {
+  if (value === undefined) return "undefined";
+  if (typeof value === "number") {
+    if (Number.isNaN(value)) return "NaN";
+    if (value === Infinity) return "Infinity";
+    if (value === -Infinity) return "-Infinity";
+    if (Object.is(value, -0)) return "-0";
+    return String(value);
+  }
+  if (value === null) return "null";
+  if (typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
+  if (typeof value === "bigint") return `${value}n`;
+  if (Array.isArray(value)) {
+    if (ancestors.has(value)) throw new TypeError("circular repro value");
+    ancestors.add(value);
+    try { return `[${value.map((item) => _reproExpression(item, ancestors)).join(",")}]`; }
+    finally { ancestors.delete(value); }
+  }
+  if (typeof value === "object") {
+    if (ancestors.has(value)) throw new TypeError("circular repro value");
+    ancestors.add(value);
+    try {
+      return `{${Object.keys(value).map((key) => `[${JSON.stringify(key)}]:${_reproExpression((value as Record<string, unknown>)[key], ancestors)}`).join(",")}}`;
+    } finally { ancestors.delete(value); }
+  }
+  return String(value);
+}
+
 function _shortJson(value: unknown, limit = _FUZZ_TEXT_LIMIT): string {
   try {
-    return _clipText(JSON.stringify(value), limit);
+    return _clipText(_reproExpression(value), limit);
   } catch {
     return _clipText(value, limit);
   }
@@ -4196,11 +4376,17 @@ function _findingId(name: string): string {
   return `fuzz:${symbol}:${ordinal}`;
 }
 function _reproCase(args: unknown[], inputText: string | null = null): Record<string, unknown> {
-  return { arguments: args.map((value) => ({ expression: _shortJson(value), json_value: (() => { try { JSON.stringify(value); return value; } catch { return null; } })() })), input_text: inputText };
+  return {
+    arguments: args.map((value) => ({
+      expression: _shortJson(value),
+      json_value: (() => { try { return _reproJsonValue(value); } catch { return null; } })(),
+    })),
+    input_text: inputText,
+  };
 }
 function _shrinkCandidates(value: unknown): unknown[] {
   const out: unknown[] = []; const seen = new Set<string>();
-  const add = (candidate: unknown): void => { let key: string; try { key = JSON.stringify(candidate); } catch { key = String(candidate); } if (!seen.has(key)) { seen.add(key); out.push(candidate); } };
+  const add = (candidate: unknown): void => { let key: string; try { key = JSON.stringify(_reproJsonValue(candidate)); } catch { key = String(candidate); } if (!seen.has(key)) { seen.add(key); out.push(candidate); } };
   if (typeof value === "string") { add(""); add(value.slice(0, 1)); add(value.trim()); for (let step = Math.floor(value.length / 2); step > 0; step = Math.floor(step / 2)) for (let start = 0; start < value.length; start += step) add(value.slice(0, start) + value.slice(start + step)); }
   else if (typeof value === "number") { if (Number.isNaN(value) || !Number.isFinite(value)) add(value); else { add(0); add(1); add(-1); for (let current = value; current && Math.abs(current) > Number.EPSILON; current /= 2) add(current); } }
   else if (Array.isArray(value)) { add([]); for (const item of value) add([item]); for (let step = Math.floor(value.length / 2); step > 0; step = Math.floor(step / 2)) for (let start = 0; start < value.length; start += step) add(value.slice(0, start).concat(value.slice(start + step))); value.forEach((item, index) => _shrinkCandidates(item).forEach((shrunk) => { const copy = value.slice(); copy[index] = shrunk; add(copy); })); }
@@ -4243,6 +4429,7 @@ function _fuzzOne(
   paramTypes: string[] = [],
   properties: string[] = [],
   seedRows: unknown[][] = [],
+  defaultOmissionRows: unknown[][] = [],
   declaredProperties: string[] = [],
   sourceLine = 0,
 ): boolean {
@@ -4251,6 +4438,9 @@ function _fuzzOne(
   const allInputs: unknown[][] = [];
   for (const seed of seedRows) {
     allInputs.push(seed);
+  }
+  for (const omission of defaultOmissionRows) {
+    allInputs.push(omission);
   }
   for (let pi = 0; pi < paramTypes.length; pi++) {
     for (const ev of _edgeCasesFor(paramTypes[pi])) {
@@ -4628,6 +4818,11 @@ fn ts_edge_type_name(type_ann: Option<&str>, type_defs: &TsNamedTypes<'_>) -> &'
         Some("string") => "string",
         Some("string[]") | Some("Array<string>") => "string_array",
         Some(t) if is_string_array_like_type(t) => "string_array",
+        Some(t)
+            if t.ends_with("[]") || t.starts_with("Array<") || t.starts_with("ReadonlyArray<") =>
+        {
+            ""
+        }
         Some(t) if t.starts_with("Record<") => "object",
         Some(t) if looks_like_ts_object_type(t) => "object",
         Some(t) if ts_class_def(t, type_defs).is_some() => "object",
@@ -4838,10 +5033,9 @@ fn synthesize_typescript_involution_checks(
 
     for (enc, dec) in &pairs {
         let param = enc.params.iter().find(|p| !p.is_variadic()).unwrap();
-        if !ts_type_is_fuzzable(param.type_annotation.as_deref(), type_defs) {
+        let Some(gen) = ts_generator(param.type_annotation.as_deref(), type_defs) else {
             continue;
-        }
-        let gen = ts_generator(param.type_annotation.as_deref(), type_defs);
+        };
 
         code.push_str("\n// Involution roundtrip: ");
         code.push_str(&enc.name);

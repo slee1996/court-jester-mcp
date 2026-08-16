@@ -211,6 +211,416 @@ fn context_declares_vitest(context: &ExecutionContext) -> bool {
     false
 }
 
+const NUXT_CONFIG_FILENAMES: &[&str] = &[
+    "nuxt.config.ts",
+    "nuxt.config.js",
+    "nuxt.config.mjs",
+    "nuxt.config.cjs",
+];
+
+const NUXT_GENERATED_IMPORT_FILES: &[&str] = &[".nuxt/imports.d.ts", ".nuxt/types/imports.d.ts"];
+
+const NUXT_BUILTIN_AUTO_IMPORTS: &[&str] = &[
+    "computed",
+    "customRef",
+    "effectScope",
+    "inject",
+    "isProxy",
+    "isReactive",
+    "isReadonly",
+    "isRef",
+    "markRaw",
+    "nextTick",
+    "onActivated",
+    "onBeforeMount",
+    "onBeforeUnmount",
+    "onBeforeUpdate",
+    "onDeactivated",
+    "onErrorCaptured",
+    "onMounted",
+    "onServerPrefetch",
+    "onUnmounted",
+    "onUpdated",
+    "provide",
+    "reactive",
+    "readonly",
+    "ref",
+    "shallowReactive",
+    "shallowReadonly",
+    "shallowRef",
+    "toRaw",
+    "toRef",
+    "toRefs",
+    "triggerRef",
+    "unref",
+    "watch",
+    "watchEffect",
+    "watchPostEffect",
+    "watchSyncEffect",
+    "useAsyncData",
+    "useCookie",
+    "useError",
+    "useFetch",
+    "useHead",
+    "useHydration",
+    "useLazyAsyncData",
+    "useLazyFetch",
+    "useNuxtApp",
+    "useRequestEvent",
+    "useRequestHeaders",
+    "useRoute",
+    "useRouter",
+    "useRuntimeConfig",
+    "useSeoMeta",
+    "useState",
+];
+
+fn package_json_declares_nuxt(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(package) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    [
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+    ]
+    .iter()
+    .any(|section| {
+        package
+            .get(section)
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|dependencies| dependencies.contains_key("nuxt"))
+    })
+}
+
+fn nuxt_context_root(context: &ExecutionContext) -> Option<PathBuf> {
+    let start = context
+        .target_source
+        .source_file
+        .as_deref()
+        .and_then(Path::parent)
+        .unwrap_or(context.target_package_root.as_path());
+    for directory in start.ancestors() {
+        if !directory.starts_with(&context.workspace_root) {
+            break;
+        }
+        if NUXT_CONFIG_FILENAMES
+            .iter()
+            .any(|name| directory.join(name).is_file())
+            || package_json_declares_nuxt(&directory.join("package.json"))
+        {
+            return Some(directory.to_path_buf());
+        }
+        if directory == context.workspace_root {
+            break;
+        }
+    }
+    None
+}
+
+fn nuxt_config_disables_auto_imports(root: &Path) -> bool {
+    fn object_disables_auto_imports(node: tree_sitter::Node<'_>, source: &str) -> bool {
+        if node.kind() != "object" {
+            return false;
+        }
+        let mut cursor = node.walk();
+        let disabled = node.named_children(&mut cursor).any(|property| {
+            if property.kind() != "pair" {
+                return false;
+            }
+            let key = property
+                .child_by_field_name("key")
+                .and_then(|key| key.utf8_text(source.as_bytes()).ok())
+                .map(|key| key.trim_matches(['\'', '"']));
+            key == Some("autoImport")
+                && property
+                    .child_by_field_name("value")
+                    .is_some_and(|value| value.kind() == "false")
+        });
+        disabled
+    }
+
+    fn config_disables_auto_imports(node: tree_sitter::Node<'_>, source: &str) -> bool {
+        if node.kind() == "pair" {
+            let key = node
+                .child_by_field_name("key")
+                .and_then(|key| key.utf8_text(source.as_bytes()).ok())
+                .map(|key| key.trim_matches(['\'', '"']));
+            if key == Some("imports")
+                && node
+                    .child_by_field_name("value")
+                    .is_some_and(|value| object_disables_auto_imports(value, source))
+            {
+                return true;
+            }
+        }
+        let mut cursor = node.walk();
+        let disabled = node
+            .named_children(&mut cursor)
+            .any(|child| config_disables_auto_imports(child, source));
+        disabled
+    }
+
+    let mut parser = Parser::new();
+    let grammar = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+    if parser.set_language(&grammar).is_err() {
+        return false;
+    }
+    NUXT_CONFIG_FILENAMES.iter().any(|filename| {
+        let Ok(source) = std::fs::read_to_string(root.join(filename)) else {
+            return false;
+        };
+        parser
+            .parse(&source, None)
+            .is_some_and(|tree| config_disables_auto_imports(tree.root_node(), &source))
+    })
+}
+
+fn text_contains_identifier(text: &str, identifier: &str) -> bool {
+    text.match_indices(identifier).any(|(start, _)| {
+        let identifier_byte =
+            |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$';
+        let before = start
+            .checked_sub(1)
+            .and_then(|index| text.as_bytes().get(index));
+        let after = text.as_bytes().get(start + identifier.len());
+        before.is_none_or(|byte| !identifier_byte(*byte))
+            && after.is_none_or(|byte| !identifier_byte(*byte))
+    })
+}
+
+fn nuxt_generated_import_declares(root: &Path, identifier: &str) -> bool {
+    NUXT_GENERATED_IMPORT_FILES.iter().any(|relative| {
+        std::fs::read_to_string(root.join(relative))
+            .is_ok_and(|text| text_contains_identifier(&text, identifier))
+    })
+}
+
+fn nuxt_auto_import_source_exists(directory: &Path, identifier: &str, depth: usize) -> bool {
+    if depth == 0 {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let Ok(file_type) = entry.file_type() else {
+            return false;
+        };
+        let path = entry.path();
+        if file_type.is_dir() {
+            return nuxt_auto_import_source_exists(&path, identifier, depth - 1);
+        }
+        if !file_type.is_file()
+            || !matches!(
+                path.extension().and_then(|extension| extension.to_str()),
+                Some("ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs")
+            )
+        {
+            return false;
+        }
+        let stem_matches = path.file_stem().and_then(|stem| stem.to_str()) == Some(identifier);
+        let index_parent_matches = path.file_stem().and_then(|stem| stem.to_str()) == Some("index")
+            && path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                == Some(identifier);
+        stem_matches || index_parent_matches
+    })
+}
+
+fn nuxt_project_auto_import_declares(root: &Path, identifier: &str) -> bool {
+    ["composables", "utils"]
+        .iter()
+        .any(|directory| nuxt_auto_import_source_exists(&root.join(directory), identifier, 8))
+}
+
+fn missing_reference_identifier(message: &str) -> Option<&str> {
+    let identifier = message.strip_suffix(" is not defined")?;
+    (!identifier.is_empty()
+        && identifier
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$'))
+    .then_some(identifier)
+}
+
+fn missing_reference_global(finding: &VerificationFinding) -> Option<&str> {
+    if finding.severity != FindingSeverity::Crash
+        || finding.error_type.as_deref() != Some("ReferenceError")
+    {
+        return None;
+    }
+    missing_reference_identifier(&finding.message)
+}
+
+fn missing_reference_global_in_stderr(stderr: &str) -> Option<&str> {
+    stderr.lines().find_map(|line| {
+        let (_, message) = line.split_once("ReferenceError:")?;
+        missing_reference_identifier(message.trim())
+    })
+}
+
+fn nuxt_framework_global(root: &Path, identifier: &str) -> bool {
+    NUXT_BUILTIN_AUTO_IMPORTS.contains(&identifier)
+        || nuxt_generated_import_declares(root, identifier)
+        || nuxt_project_auto_import_declares(root, identifier)
+}
+
+#[derive(Debug)]
+struct NuxtRuntimeBlocker {
+    missing_globals: Vec<String>,
+    affected_surfaces: HashSet<String>,
+    affected_findings: usize,
+    blocked_before_harness: bool,
+}
+
+impl NuxtRuntimeBlocker {
+    fn blocks_surface(&self, surface: &str) -> bool {
+        if self.blocked_before_harness {
+            return true;
+        }
+        let root = surface
+            .strip_suffix(" (factory->nested)")
+            .or_else(|| surface.strip_suffix(" (factory)"))
+            .unwrap_or(surface);
+        self.affected_surfaces
+            .iter()
+            .any(|affected| affected == root || affected.starts_with(&format!("{root}().")))
+    }
+
+    fn diagnostic(&self) -> FailureDiagnostic {
+        FailureDiagnostic {
+            domain: FailureDomain::Environment,
+            kind: FailureKind::ContextResolution,
+            component: DiagnosticComponent::FuzzHarness,
+            impact: DiagnosticImpact::Blocking,
+            message: format!(
+                "Nuxt auto-import runtime unavailable for generated verification harness: {}. Run the target through a Nuxt test/runtime setup.",
+                self.missing_globals.join(", ")
+            ),
+            process: None,
+            limits: None,
+        }
+    }
+}
+
+fn take_nuxt_runtime_failures(
+    context: &ExecutionContext,
+    findings: &mut Vec<VerificationFinding>,
+    stderr: &str,
+) -> Option<NuxtRuntimeBlocker> {
+    let root = nuxt_context_root(context)?;
+    if nuxt_config_disables_auto_imports(&root) {
+        return None;
+    }
+    let mut missing_globals = HashSet::new();
+    let mut affected_surfaces = HashSet::new();
+    let mut affected_findings = 0;
+    findings.retain(|finding| {
+        let Some(identifier) = missing_reference_global(finding) else {
+            return true;
+        };
+        if !nuxt_framework_global(&root, identifier) {
+            return true;
+        }
+        missing_globals.insert(identifier.to_string());
+        affected_surfaces.insert(finding.location.function.clone());
+        affected_findings += 1;
+        false
+    });
+    let blocked_before_harness = if affected_findings == 0 {
+        let identifier = missing_reference_global_in_stderr(stderr)?;
+        if !nuxt_framework_global(&root, identifier) {
+            return None;
+        }
+        missing_globals.insert(identifier.to_string());
+        true
+    } else {
+        false
+    };
+    let mut missing_globals = missing_globals.into_iter().collect::<Vec<_>>();
+    missing_globals.sort();
+    Some(NuxtRuntimeBlocker {
+        missing_globals,
+        affected_surfaces,
+        affected_findings,
+        blocked_before_harness,
+    })
+}
+
+fn apply_nuxt_runtime_coverage(
+    coverage: &mut [FuzzFunctionCoverage],
+    blocker: &NuxtRuntimeBlocker,
+) {
+    for function in coverage {
+        let blocked = blocker.blocks_surface(&function.function)
+            || matches!(
+                &function.invocation_path,
+                InvocationPath::Factory { factory, .. } if blocker.blocks_surface(factory)
+            );
+        if blocked
+            && matches!(
+                function.status,
+                FuzzFunctionStatus::CheckedDirect
+                    | FuzzFunctionStatus::ReachedViaFactory
+                    | FuzzFunctionStatus::CheckedViaFactory
+                    | FuzzFunctionStatus::CheckedViaCaller
+                    | FuzzFunctionStatus::BlockedModuleLoad
+            )
+        {
+            function.status = FuzzFunctionStatus::SkippedNoFuzzableSurface;
+            function.reason = Some(format!(
+                "Nuxt auto-import runtime unavailable in generated harness: {}",
+                blocker.missing_globals.join(", ")
+            ));
+        }
+    }
+}
+
+fn normalize_nuxt_runtime_stdout(
+    stdout: &str,
+    retained_findings: &[VerificationFinding],
+    blocker: &NuxtRuntimeBlocker,
+) -> String {
+    let mut retained_lines = Vec::new();
+    let mut lines = stdout.lines();
+    while let Some(line) = lines.next() {
+        if line == "__COURT_JESTER_FINDINGS_JSON__" {
+            let _ = lines.next();
+            continue;
+        }
+        let target_crash_summary = line
+            .strip_prefix("FUZZ ")
+            .and_then(|rest| rest.split_once(':').map(|(surface, _)| surface))
+            .is_some_and(|surface| blocker.blocks_surface(surface));
+        let repeated_crash = line.trim_start().starts_with("CRASH ")
+            && blocker
+                .missing_globals
+                .iter()
+                .any(|global| line.contains(&format!("{global} is not defined")));
+        if !target_crash_summary && !repeated_crash {
+            retained_lines.push(line.to_string());
+        }
+    }
+    retained_lines.push(format!(
+        "ENVIRONMENT Nuxt auto-import runtime unavailable: {}",
+        blocker.missing_globals.join(", ")
+    ));
+    if !retained_findings.is_empty() {
+        retained_lines.push("__COURT_JESTER_FINDINGS_JSON__".into());
+        retained_lines.push(
+            serde_json::to_string(retained_findings)
+                .expect("verification findings always serialize"),
+        );
+    }
+    retained_lines.join("\n")
+}
+
 fn err_execution_result(message: &str) -> ExecutionResult {
     ExecutionResult {
         stdout: String::new(),
@@ -902,6 +1312,28 @@ fn differential_case(function: &FunctionInfo, language: &Language) -> Option<Dif
     differential_case_from_arguments(function, &arguments, language)
 }
 
+fn generated_target_source(code: &str, language: &Language) -> String {
+    match language {
+        Language::Python => {
+            let source_literal =
+                serde_json::to_string(code).expect("serializing a Rust string cannot fail");
+            format!(
+                r#"import sys as __court_jester_bootstrap_sys, types as __court_jester_bootstrap_types
+__court_jester_bootstrap_name = ((__package__ + ".") if __package__ else "") + "__court_jester_target__"
+__court_jester_bootstrap_module = __court_jester_bootstrap_types.ModuleType(__court_jester_bootstrap_name)
+__court_jester_bootstrap_module.__file__ = __file__
+__court_jester_bootstrap_module.__package__ = __package__
+__court_jester_bootstrap_sys.modules[__court_jester_bootstrap_name] = __court_jester_bootstrap_module
+exec(compile({source_literal}, __file__, "exec"), __court_jester_bootstrap_module.__dict__, __court_jester_bootstrap_module.__dict__)
+globals().update(__court_jester_bootstrap_module.__dict__)
+del __court_jester_bootstrap_sys, __court_jester_bootstrap_types, __court_jester_bootstrap_name, __court_jester_bootstrap_module
+"#
+            )
+        }
+        Language::TypeScript => code.to_string(),
+    }
+}
+
 fn differential_probe(
     code: &str,
     function: &FunctionInfo,
@@ -919,7 +1351,7 @@ fn differential_probe(
         })
         .collect::<Vec<_>>()
         .join(", ");
-    let mut probe = String::from(code);
+    let mut probe = generated_target_source(code, language);
     match language {
         Language::Python => {
             probe.push_str("\nimport contextlib as _cj_contextlib, io as _cj_io, json as _cj_json, math as _cj_math, re as _cj_re\n");
@@ -1387,9 +1819,10 @@ pub fn final_verdict(
         || (!evidence.authoritative_test_completed
             && evidence.valid_invocations == 0
             && evidence.evaluated_oracles == 0)
-        || stages
-            .iter()
-            .any(|stage| stage.status == StageStatus::Inconclusive)
+        || stages.iter().any(|stage| {
+            stage.status == StageStatus::Inconclusive
+                || (stage.name == "execute" && stage.status == StageStatus::Skipped)
+        })
     {
         return (VerificationVerdict::Inconclusive, strength);
     }
@@ -3545,6 +3978,24 @@ fn authoritative_artifact_path(
             PathBuf::from(format!(".court-jester/generated/authoritative.{extension}"))
         })
 }
+fn skipped_execute_stage(reason: &str, message: &str) -> VerificationStage {
+    VerificationStage {
+        name: "execute".into(),
+        status: StageStatus::Skipped,
+        duration_ms: 0,
+        detail: Some(serde_json::json!({
+            "skipped": true,
+            "reason": reason,
+            "generated_cases": 0,
+            "valid_invocations": 0,
+            "evaluated_oracles": 0,
+            "no_inputs_reached": 0,
+            "findings": [],
+            "suppressed_findings": [],
+        })),
+        message: Some(message.into()),
+    }
+}
 
 /// Run the full verification pipeline: parse → complexity → lint → synthesize+execute → test.
 pub async fn verify(
@@ -3570,6 +4021,12 @@ pub async fn verify(
                 })),
                 message: Some("Unable to resolve source or project context".into()),
             });
+            if !opts.tests_only {
+                stages.push(skipped_execute_stage(
+                    "context_unavailable",
+                    "Execution skipped because verification context could not be resolved",
+                ));
+            }
             return finalize_report(
                 build_report(stages, opts.coverage_gate),
                 opts.output_dir,
@@ -3644,6 +4101,12 @@ pub async fn verify(
             detail: Some(serde_json::to_value(&analysis).unwrap()),
             message: Some(message),
         });
+        if !opts.tests_only {
+            stages.push(skipped_execute_stage(
+                "parse_failed",
+                "Execution skipped because the source did not parse",
+            ));
+        }
         return finalize_report(
             build_report(stages, opts.coverage_gate),
             opts.output_dir,
@@ -3995,7 +4458,9 @@ pub async fn verify(
         let coverage_ms = synth_start.elapsed().as_millis() as u64;
         let mut module_load_blocked = false;
         if !fuzz_plan.code.is_empty() {
-            let full_code = format!("{code}\n{}", fuzz_plan.code);
+            let mut full_code = generated_target_source(code, language);
+            full_code.push('\n');
+            full_code.push_str(&fuzz_plan.code);
             let execute_timeout = execute_timeout_for(language);
 
             let start = Instant::now();
@@ -4013,8 +4478,32 @@ pub async fn verify(
                 candidate_source_file_owned.as_deref(),
             )
             .await;
-            let harness_diagnostics = harness_execution.diagnostics;
-            let exec_result = harness_execution.process;
+            let mut harness_diagnostics = harness_execution.diagnostics;
+            let mut exec_result = harness_execution.process;
+            let mut generated_failures = parse_findings(&exec_result.stdout).unwrap_or_default();
+            let nuxt_runtime_blocker = take_nuxt_runtime_failures(
+                &verification_context.candidate,
+                &mut generated_failures,
+                &exec_result.stderr,
+            );
+            if let Some(blocker) = &nuxt_runtime_blocker {
+                harness_diagnostics.retain(|diagnostic| {
+                    !(diagnostic.domain == FailureDomain::VerifierHarness
+                        && diagnostic.kind == FailureKind::HarnessProtocol)
+                });
+                exec_result.diagnostics.retain(|diagnostic| {
+                    !(diagnostic.domain == FailureDomain::VerifierHarness
+                        && diagnostic.kind == FailureKind::HarnessProtocol)
+                });
+                exec_result.stdout = normalize_nuxt_runtime_stdout(
+                    &exec_result.stdout,
+                    &generated_failures,
+                    blocker,
+                );
+                let diagnostic = blocker.diagnostic();
+                exec_result.diagnostics.push(diagnostic.clone());
+                harness_diagnostics.push(diagnostic);
+            }
             let exec_ms = start.elapsed().as_millis() as u64;
             let launch_runtime = match exec_runtime.as_deref() {
                 Some("bun") | Some("bun-test") => HarnessRuntime::BunScript,
@@ -4050,12 +4539,15 @@ pub async fn verify(
                     }
                 }),
             };
-            module_load_blocked = matches!(language, Language::TypeScript)
-                && is_typescript_module_load_error(&exec_result.stderr)
-                && !exec_result
-                    .stdout
-                    .lines()
-                    .any(|line| line.starts_with("FUZZ "));
+            module_load_blocked = nuxt_runtime_blocker
+                .as_ref()
+                .is_some_and(|blocker| blocker.blocked_before_harness)
+                || (matches!(language, Language::TypeScript)
+                    && is_typescript_module_load_error(&exec_result.stderr)
+                    && !exec_result
+                        .stdout
+                        .lines()
+                        .any(|line| line.starts_with("FUZZ ")));
             let mut coverage = finalize_fuzz_coverage(
                 &analysis.functions,
                 &functions_to_fuzz,
@@ -4063,6 +4555,9 @@ pub async fn verify(
                 module_load_blocked,
             );
             apply_runtime_coverage_proof(&mut coverage, &exec_result.stderr);
+            if let Some(blocker) = &nuxt_runtime_blocker {
+                apply_nuxt_runtime_coverage(&mut coverage, blocker);
+            }
             stages.push(VerificationStage {
                 name: "coverage".into(),
                 status: StageStatus::Passed,
@@ -4280,7 +4775,7 @@ pub async fn verify(
                 });
             }
 
-            let mut failures = parse_findings(&exec_result.stdout).unwrap_or_default();
+            let mut failures = generated_failures;
             failures.extend(differential_findings);
             for finding in &mut failures {
                 finding.launch_context = Some(launch_context.clone());
@@ -4355,7 +4850,9 @@ pub async fn verify(
                     matches!(
                         outcome.status,
                         FuzzOutcomeStatus::Passed | FuzzOutcomeStatus::Crashed
-                    )
+                    ) && !nuxt_runtime_blocker
+                        .as_ref()
+                        .is_some_and(|blocker| blocker.blocks_surface(&outcome.function))
                 })
                 .count();
             let completed_functions: HashSet<&str> = fuzz_outcomes
@@ -4364,7 +4861,9 @@ pub async fn verify(
                     matches!(
                         outcome.status,
                         FuzzOutcomeStatus::Passed | FuzzOutcomeStatus::Crashed
-                    )
+                    ) && !nuxt_runtime_blocker
+                        .as_ref()
+                        .is_some_and(|blocker| blocker.blocks_surface(&outcome.function))
                 })
                 .map(|outcome| outcome.function.as_str())
                 .collect();
@@ -4532,10 +5031,19 @@ pub async fn verify(
             if let Some(stage) = portability_stage {
                 stages.push(stage);
             }
+            let environment_setup = nuxt_runtime_blocker.as_ref().map(|blocker| {
+                serde_json::json!({
+                    "framework": "nuxt",
+                    "classification": "missing_nuxt_auto_import_runtime",
+                    "missing_globals": blocker.missing_globals,
+                    "affected_findings": blocker.affected_findings,
+                })
+            });
             let mut detail = serde_json::json!({
                 "execution": exec_result,
                 "runtime": exec_runtime,
                 "module_load_blocked": module_load_blocked,
+                "environment_setup": environment_setup,
                 "valid_invocations": valid_invocations,
                 "evaluated_oracles": evaluated_oracles,
                 "no_inputs_reached": no_inputs_reached,
@@ -4593,6 +5101,8 @@ pub async fn verify(
                 detail: Some(detail),
                 message: if exec_ok {
                     None
+                } else if let Some(blocker) = &nuxt_runtime_blocker {
+                    Some(blocker.diagnostic().message)
                 } else {
                     Some(exec_result.stderr.clone())
                 },
@@ -4622,7 +5132,16 @@ pub async fn verify(
                 })),
                 message: None,
             });
+            stages.push(skipped_execute_stage(
+                "no_fuzzable_targets",
+                "Execution skipped because no fuzzable targets produced runnable cases",
+            ));
         }
+    } else if !opts.tests_only {
+        stages.push(skipped_execute_stage(
+            "no_analyzed_functions",
+            "Execution skipped because no functions were available to fuzz",
+        ));
     }
 
     // Stage 5: Test (if test_code provided) — this IS authoritative
@@ -5558,6 +6077,9 @@ fn minimal_stage_view(stage: &VerificationStage) -> serde_json::Value {
             })),
             "execute" => Some(serde_json::json!({
                 "runtime": detail.get("runtime").cloned().unwrap_or(serde_json::Value::Null),
+                "skipped": detail.get("skipped").cloned().unwrap_or(serde_json::Value::Bool(false)),
+                "reason": detail.get("reason").cloned().unwrap_or(serde_json::Value::Null),
+                "generated_cases": detail.get("generated_cases").cloned().unwrap_or(serde_json::Value::Null),
                 "valid_invocations": detail.get("valid_invocations").cloned().unwrap_or_else(|| serde_json::Value::from(0)),
                 "evaluated_oracles": detail.get("evaluated_oracles").cloned().unwrap_or_else(|| serde_json::Value::from(0)),
                 "no_inputs_reached": detail.get("no_inputs_reached").cloned().unwrap_or_else(|| serde_json::Value::from(0)),
@@ -6692,7 +7214,10 @@ pub async fn replay_report_with_options(
     let code = if source.is_empty() {
         finding.repro.snippet.clone()
     } else {
-        format!("{source}\n{}", finding.repro.snippet)
+        let mut code = generated_target_source(&source, &language);
+        code.push('\n');
+        code.push_str(&finding.repro.snippet);
+        code
     };
     let source_file = source_file_owned.as_deref();
     let project_dir_owned = dependency_project_dir.map(ToOwned::to_owned).or_else(|| {

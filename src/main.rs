@@ -2038,7 +2038,7 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
 mod tests {
     use super::{parse_ci_gates, parse_flags, resolve_complexity_threshold, run_ci_for_repo};
     use court_jester::types::{
-        ComplexityMetric, ExecuteGate, ReportLevel, SummaryFormat, TestRunner,
+        ComplexityMetric, ExecuteGate, ReportLevel, StageStatus, SummaryFormat, TestRunner,
     };
     use std::fs;
     use std::path::Path;
@@ -2192,6 +2192,20 @@ mod tests {
         assert_eq!(result.checked_files, 1);
         assert_eq!(result.files.len(), 1);
         assert_eq!(result.files[0].file, "sample.py");
-        assert_eq!(result.files[0].failing_gates, vec!["parse".to_string()]);
+        assert_eq!(
+            result.files[0].failing_gates,
+            vec!["parse".to_string(), "execute".to_string()]
+        );
+        let execute = result.files[0]
+            .report
+            .stages
+            .iter()
+            .find(|stage| stage.name == "execute")
+            .expect("parse failure should report skipped execution");
+        assert_eq!(execute.status, StageStatus::Skipped);
+        assert_eq!(
+            execute.detail.as_ref().unwrap()["reason"].as_str(),
+            Some("parse_failed")
+        );
     }
 }

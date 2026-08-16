@@ -544,12 +544,27 @@ pub struct ParamInfo {
     pub variadic: Option<VariadicKind>,
 }
 
+/// Statically observed behavior that makes repeat-call output equality an
+/// invalid implicit oracle. Explicit source-declared properties remain active.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum FunctionEffect {
+    Randomness,
+    Time,
+    Timer,
+    Io,
+    MutableState,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionInfo {
     pub name: String,
     pub params: Vec<ParamInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_type: Option<String>,
+    /// Type parameters declared directly by this callable (for example `T` in `fn<T>`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub type_parameters: Vec<String>,
     pub line: usize,
     pub end_line: usize,
     pub complexity: usize,
@@ -567,6 +582,9 @@ pub struct FunctionInfo {
     pub is_exported: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub declared_properties: Vec<String>,
+    /// Effects found in this function's own body (nested callable bodies excluded).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effects: Vec<FunctionEffect>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub invocation_target: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

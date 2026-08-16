@@ -398,6 +398,86 @@ fn which_binary(path_env: &str, binary: &str) -> Option<String> {
     None
 }
 
+fn vitest_package_entrypoint(
+    package_dir: &std::path::Path,
+    expected_entrypoint: Option<&std::path::Path>,
+) -> Result<(std::path::PathBuf, bool), String> {
+    let package_dir = std::fs::canonicalize(package_dir)
+        .map_err(|error| format!("failed to resolve the Vitest package: {error}"))?;
+    let manifest = std::fs::read_to_string(package_dir.join("package.json"))
+        .map_err(|error| format!("failed to read the Vitest package manifest: {error}"))?;
+    let package: serde_json::Value = serde_json::from_str(&manifest)
+        .map_err(|error| format!("failed to parse the Vitest package manifest: {error}"))?;
+    if package.get("name").and_then(serde_json::Value::as_str) != Some("vitest") {
+        return Err("Vitest package manifest has an unexpected package name".into());
+    }
+    let bin = package
+        .get("bin")
+        .and_then(|value| {
+            value
+                .as_str()
+                .or_else(|| value.get("vitest").and_then(serde_json::Value::as_str))
+        })
+        .ok_or_else(|| {
+            "Vitest package manifest does not declare its JavaScript entrypoint".to_string()
+        })?;
+    let entrypoint = std::fs::canonicalize(package_dir.join(bin))
+        .map_err(|error| format!("failed to resolve the Vitest JavaScript entrypoint: {error}"))?;
+    if !entrypoint.starts_with(&package_dir) {
+        return Err("Vitest JavaScript entrypoint escapes its package directory".into());
+    }
+    if expected_entrypoint.is_some_and(|expected| entrypoint != expected) {
+        return Err("Vitest launcher target does not match its package manifest entrypoint".into());
+    }
+    let legacy_threads = package
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|version| version.split('.').next())
+        .and_then(|major| major.parse::<u64>().ok())
+        == Some(0);
+    Ok((entrypoint, legacy_threads))
+}
+
+fn vitest_project_entrypoint(
+    executable: &std::path::Path,
+) -> Result<(std::path::PathBuf, bool), String> {
+    let canonical_executable = std::fs::canonicalize(executable)
+        .map_err(|error| format!("failed to resolve the Vitest executable: {error}"))?;
+    let canonical_package = canonical_executable.ancestors().skip(1).find(|directory| {
+        let parent = directory.parent();
+        directory.file_name() != Some(std::ffi::OsStr::new(".bin"))
+            && (parent.and_then(std::path::Path::file_name)
+                == Some(std::ffi::OsStr::new("node_modules"))
+                || (parent
+                    .and_then(std::path::Path::file_name)
+                    .and_then(std::ffi::OsStr::to_str)
+                    .is_some_and(|name| name.starts_with('@'))
+                    && parent
+                        .and_then(std::path::Path::parent)
+                        .and_then(std::path::Path::file_name)
+                        == Some(std::ffi::OsStr::new("node_modules"))))
+    });
+    if let Some(package_dir) = canonical_package {
+        return vitest_package_entrypoint(package_dir, Some(&canonical_executable));
+    }
+
+    let metadata = std::fs::symlink_metadata(executable)
+        .map_err(|error| format!("failed to inspect the Vitest executable: {error}"))?;
+    if metadata.file_type().is_symlink() {
+        return Err("Vitest launcher symlink does not resolve into a Vitest package".into());
+    }
+
+    let bin_dir = executable
+        .parent()
+        .filter(|directory| directory.file_name() == Some(std::ffi::OsStr::new(".bin")))
+        .ok_or_else(|| "Vitest executable is not inside node_modules/.bin".to_string())?;
+    let node_modules = bin_dir
+        .parent()
+        .filter(|directory| directory.file_name() == Some(std::ffi::OsStr::new("node_modules")))
+        .ok_or_else(|| "Vitest executable is not inside node_modules/.bin".to_string())?;
+    vitest_package_entrypoint(&node_modules.join("vitest"), None)
+}
+
 fn is_valid_python_module_name(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
@@ -985,7 +1065,7 @@ fn create_node_package_resolver() -> Result<NodePackageResolver, String> {
     std::fs::write(
         &loader,
         r##"
-import { readFileSync, realpathSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -1038,6 +1118,249 @@ function containsPath(root, candidate) {
     && relative !== ".."
     && !path.isAbsolute(relative));
 }
+const unsupportedAliasPrefix =
+  "court-jester unsupported TypeScript path alias configuration:";
+let cachedPathConfiguration;
+
+function parseJsonConfig(configPath) {
+  const source = readFileSync(configPath, "utf8");
+  let withoutComments = "";
+  let quote = "";
+  let escaped = false;
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    const next = source[index + 1];
+    if (quote) {
+      withoutComments += character;
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === quote) quote = "";
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      withoutComments += character;
+      continue;
+    }
+    if (character === "/" && next === "/") {
+      while (index < source.length && source[index] !== "\n") index += 1;
+      withoutComments += "\n";
+      continue;
+    }
+    if (character === "/" && next === "*") {
+      index += 2;
+      while (index < source.length && !(source[index] === "*" && source[index + 1] === "/")) {
+        if (source[index] === "\n") withoutComments += "\n";
+        index += 1;
+      }
+      index += 1;
+      continue;
+    }
+    if (index !== 0 || character !== "\uFEFF") withoutComments += character;
+  }
+
+  let output = "";
+  quote = "";
+  escaped = false;
+  for (let index = 0; index < withoutComments.length; index += 1) {
+    const character = withoutComments[index];
+    if (quote) {
+      output += character;
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === quote) quote = "";
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      output += character;
+      continue;
+    }
+    if (character === ",") {
+      let next = index + 1;
+      while (next < withoutComments.length && /\s/.test(withoutComments[next])) next += 1;
+      if (withoutComments[next] === "}" || withoutComments[next] === "]") continue;
+    }
+    output += character;
+  }
+  return JSON.parse(output);
+}
+
+function unsupportedAlias(message) {
+  throw new Error(`${unsupportedAliasPrefix} ${message}`);
+}
+
+function resolveConfigExtends(configPath, value) {
+  if (typeof value !== "string" || !value.startsWith(".")) {
+    unsupportedAlias(`only project-relative tsconfig extends are supported (${configPath})`);
+  }
+  let candidate = path.resolve(path.dirname(configPath), value);
+  if (!path.extname(candidate)) candidate += ".json";
+  const resolved = realPathOrSelf(candidate);
+  if (!containsPath(overlayRoot, resolved)) {
+    unsupportedAlias(`tsconfig extends escapes the project mirror (${value})`);
+  }
+  return resolved;
+}
+
+function readPathConfiguration(configPath, visited = new Set()) {
+  const resolvedConfig = realPathOrSelf(configPath);
+  if (!containsPath(overlayRoot, resolvedConfig)) {
+    unsupportedAlias(`tsconfig escapes the project mirror (${configPath})`);
+  }
+  if (visited.has(resolvedConfig)) {
+    unsupportedAlias(`cyclic tsconfig extends (${configPath})`);
+  }
+  visited.add(resolvedConfig);
+  let config;
+  try {
+    config = parseJsonConfig(resolvedConfig);
+  } catch (error) {
+    unsupportedAlias(`cannot parse ${configPath}: ${error.message}`);
+  }
+  let aliases = new Map();
+  let baseUrl;
+  if (config.extends !== undefined) {
+    const inherited = readPathConfiguration(
+      resolveConfigExtends(resolvedConfig, config.extends),
+      visited,
+    );
+    aliases = new Map(inherited.aliases);
+    baseUrl = inherited.baseUrl;
+  }
+  const compilerOptions = config.compilerOptions || {};
+  if (compilerOptions.paths !== undefined
+      && (typeof compilerOptions.paths !== "object" || Array.isArray(compilerOptions.paths))) {
+    unsupportedAlias(`compilerOptions.paths must be an object (${configPath})`);
+  }
+  if (compilerOptions.baseUrl !== undefined) {
+    if (typeof compilerOptions.baseUrl !== "string") {
+      unsupportedAlias(`compilerOptions.baseUrl must be a string (${configPath})`);
+    }
+    baseUrl = path.resolve(path.dirname(resolvedConfig), compilerOptions.baseUrl);
+    if (!containsPath(overlayRoot, baseUrl)) {
+      unsupportedAlias(`baseUrl escapes the project mirror (${configPath})`);
+    }
+  }
+  const mappingBase = baseUrl || path.dirname(resolvedConfig);
+  for (const [pattern, targets] of Object.entries(compilerOptions.paths || {})) {
+    if ((pattern.match(/\*/g) || []).length > 1
+        || !Array.isArray(targets)
+        || targets.length === 0
+        || targets.some((target) => typeof target !== "string"
+          || (target.match(/\*/g) || []).length > 1)) {
+      unsupportedAlias(`unsupported path mapping '${pattern}' (${configPath})`);
+    }
+    for (const target of targets) {
+      const staticPrefix = path.resolve(mappingBase, target.split("*", 1)[0]);
+      if (!containsPath(overlayRoot, staticPrefix)) {
+        unsupportedAlias(`path mapping '${pattern}' escapes the project mirror`);
+      }
+    }
+    aliases.set(pattern, { base: mappingBase, targets });
+  }
+  visited.delete(resolvedConfig);
+  return { aliases, baseUrl };
+}
+
+function configuredPathResolution() {
+  if (cachedPathConfiguration !== undefined) return cachedPathConfiguration;
+  let directory = overlayTargetRoot;
+  while (directory && containsPath(overlayRoot, directory)) {
+    for (const name of ["tsconfig.json", "jsconfig.json"]) {
+      const candidate = path.join(directory, name);
+      let isFile = false;
+      try {
+        isFile = statSync(candidate).isFile();
+      } catch {}
+      if (isFile) {
+        cachedPathConfiguration = readPathConfiguration(candidate);
+        return cachedPathConfiguration;
+      }
+    }
+    if (directory === overlayRoot) break;
+    directory = path.dirname(directory);
+  }
+  cachedPathConfiguration = { aliases: new Map(), baseUrl: undefined };
+  return cachedPathConfiguration;
+}
+
+function matchPathAlias(pattern, specifier) {
+  const star = pattern.indexOf("*");
+  if (star < 0) return pattern === specifier ? "" : undefined;
+  const prefix = pattern.slice(0, star);
+  const suffix = pattern.slice(star + 1);
+  if (!specifier.startsWith(prefix) || !specifier.endsWith(suffix)) return undefined;
+  return specifier.slice(prefix.length, specifier.length - suffix.length);
+}
+
+function resolveAliasFile(candidate) {
+  const candidates = [
+    candidate,
+    ...[".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json"].map(
+      (extension) => `${candidate}${extension}`,
+    ),
+    ...["index.ts", "index.tsx", "index.js", "index.jsx", "index.mjs", "index.cjs"].map(
+      (name) => path.join(candidate, name),
+    ),
+  ];
+  for (const possible of candidates) {
+    if (!containsPath(overlayRoot, possible)) {
+      unsupportedAlias("resolved path alias escapes the project mirror");
+    }
+    try {
+      const resolved = realpathSync(possible);
+      if (!containsPath(overlayRoot, resolved)) {
+        unsupportedAlias("resolved path alias escapes the project mirror");
+      }
+      if (statSync(resolved).isFile()) return resolved;
+    } catch {}
+  }
+  return undefined;
+}
+
+function resolvePathAlias(specifier) {
+  const configuration = configuredPathResolution();
+  let selected;
+  for (const [pattern, entry] of configuration.aliases) {
+    const wildcard = matchPathAlias(pattern, specifier);
+    if (wildcard === undefined) continue;
+    const star = pattern.indexOf("*");
+    if (star < 0) {
+      selected = { entry, wildcard };
+      break;
+    }
+    if (!selected || star > selected.prefixLength) {
+      selected = { entry, wildcard, prefixLength: star };
+    }
+  }
+  if (selected) {
+    for (const target of selected.entry.targets) {
+      const relative = target.includes("*")
+        ? target.replace("*", selected.wildcard)
+        : target;
+      const resolved = resolveAliasFile(path.resolve(selected.entry.base, relative));
+      if (resolved) return resolved;
+    }
+  }
+  return configuration.baseUrl
+    ? resolveAliasFile(path.resolve(configuration.baseUrl, specifier))
+    : undefined;
+}
+function isExplicitPathAliasSpecifier(specifier) {
+  return specifier.startsWith("~/")
+    || specifier.startsWith("~~/")
+    || specifier.startsWith("@/")
+    || specifier.startsWith("@@/")
+    || specifier.startsWith("#");
+}
+
+function aliasResolution(specifier) {
+  const alias = resolvePathAlias(specifier);
+  return alias
+    ? { url: pathToFileURL(alias).href, shortCircuit: true }
+    : undefined;
+}
 
 function isInsideNodeModules(candidate) {
   return candidate.split(path.sep).includes("node_modules");
@@ -1065,10 +1388,14 @@ function packageWasNotFound(error, packageName) {
 }
 
 export async function resolve(specifier, context, nextResolve) {
+  const parentPath = overlayParentPath(context);
+  if (parentPath && isExplicitPathAliasSpecifier(specifier)) {
+    const alias = aliasResolution(specifier);
+    if (alias) return alias;
+  }
   if (!isPackageSpecifier(specifier)) {
     return nextResolve(specifier, context);
   }
-  const parentPath = overlayParentPath(context);
   if (!parentPath) {
     return nextResolve(specifier, context);
   }
@@ -1081,6 +1408,8 @@ export async function resolve(specifier, context, nextResolve) {
       if (isInsideNodeModules(parentPath) || !packageWasNotFound(error, packageName)) {
         throw error;
       }
+      const alias = aliasResolution(specifier);
+      if (alias) return alias;
       if (parentPath === generatedArtifact) {
         const mappedParentURL = sourceParentURL(parentPath);
         if (mappedParentURL !== context.parentURL) {
@@ -1116,10 +1445,17 @@ export async function resolve(specifier, context, nextResolve) {
   const resolutionRoot = packageName === targetSelfReferenceName
     ? overlayTargetRoot
     : targetRoot;
-  return nextResolve(specifier, {
-    ...context,
-    parentURL: pathToFileURL(path.join(resolutionRoot, "package.json")).href,
-  });
+  try {
+    return await nextResolve(specifier, {
+      ...context,
+      parentURL: pathToFileURL(path.join(resolutionRoot, "package.json")).href,
+    });
+  } catch (error) {
+    if (!packageWasNotFound(error, packageName)) throw error;
+    const alias = aliasResolution(specifier);
+    if (alias) return alias;
+    throw error;
+  }
 }
 "##,
     )
@@ -1986,6 +2322,139 @@ async fn run_launch_command(
     .await
 }
 
+fn structured_test_failure(output: &str) -> bool {
+    const MAX_SCAN_BYTES: usize = 16 * 1024 * 1024;
+    const MAX_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
+    const MAX_JSON_DEPTH: usize = 256;
+    const MAX_REPORTER_CANDIDATES: usize = 16;
+
+    fn contains_failure(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Array(values) => values.iter().any(contains_failure),
+            serde_json::Value::Object(fields) => fields.iter().any(|(key, value)| {
+                matches!(
+                    (key.as_str(), value),
+                    ("status", serde_json::Value::String(status)) if status == "failed"
+                ) || matches!(
+                    (key.as_str(), value),
+                    ("pass", serde_json::Value::Bool(false))
+                ) || contains_failure(value)
+            }),
+            _ => false,
+        }
+    }
+
+    fn reporter_failure(value: &serde_json::Value) -> bool {
+        let Some(fields) = value.as_object() else {
+            return false;
+        };
+        let has_test_results = fields
+            .get("testResults")
+            .is_some_and(serde_json::Value::is_array);
+        let has_summary = fields
+            .get("success")
+            .is_some_and(serde_json::Value::is_boolean)
+            && [
+                "numTotalTests",
+                "numPassedTests",
+                "numFailedTests",
+                "numTotalTestSuites",
+                "numPassedTestSuites",
+                "numFailedTestSuites",
+            ]
+            .iter()
+            .any(|key| fields.get(*key).is_some_and(serde_json::Value::is_number));
+        if !has_test_results && !has_summary {
+            return false;
+        }
+
+        fields.get("success").and_then(serde_json::Value::as_bool) == Some(false)
+            || ["numFailedTests", "numFailedTestSuites"].iter().any(|key| {
+                fields
+                    .get(*key)
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|count| count > 0)
+            })
+            || contains_failure(value)
+    }
+
+    let mut scan_start = output.len().saturating_sub(MAX_SCAN_BYTES);
+    while !output.is_char_boundary(scan_start) {
+        scan_start += 1;
+    }
+    let output = &output[scan_start..];
+    let bytes = output.as_bytes();
+    let mut stack: Vec<(u8, usize, bool)> = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut string_start = 0;
+    let mut reporter_candidates = 0;
+
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+                let token = &bytes[string_start..index];
+                if matches!(
+                    token,
+                    b"testResults" | b"numFailedTests" | b"numFailedTestSuites"
+                ) {
+                    if let Some(frame) = stack.last_mut() {
+                        frame.2 = true;
+                    }
+                }
+            }
+            continue;
+        }
+
+        match byte {
+            b'"' if !stack.is_empty() => {
+                in_string = true;
+                string_start = index + 1;
+            }
+            b'{' | b'[' => {
+                if stack.len() == MAX_JSON_DEPTH {
+                    stack.clear();
+                } else {
+                    stack.push((byte, index, false));
+                }
+            }
+            b'}' | b']' => {
+                let expected = if byte == b'}' { b'{' } else { b'[' };
+                let Some(&(opening, start, has_reporter_marker)) = stack.last() else {
+                    continue;
+                };
+                if opening != expected {
+                    stack.clear();
+                    continue;
+                }
+                stack.pop();
+
+                let document_len = index + 1 - start;
+                if opening != b'{'
+                    || !has_reporter_marker
+                    || document_len > MAX_DOCUMENT_BYTES
+                    || reporter_candidates == MAX_REPORTER_CANDIDATES
+                {
+                    continue;
+                }
+                let candidate = &output[start..=index];
+                reporter_candidates += 1;
+                if serde_json::from_str(candidate).is_ok_and(|value| reporter_failure(&value)) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    false
+}
+
 fn harness_diagnostics(
     adapter: Option<TestAdapter>,
     process: &ExecutionResult,
@@ -2049,6 +2518,23 @@ fn harness_diagnostics(
                 limits: Some(limits.clone()),
             });
         }
+    }
+    const UNSUPPORTED_ALIAS_PREFIX: &str =
+        "court-jester unsupported TypeScript path alias configuration:";
+    if let Some(message) = process
+        .stderr
+        .lines()
+        .find(|line| line.contains(UNSUPPORTED_ALIAS_PREFIX))
+    {
+        diagnostics.push(FailureDiagnostic {
+            domain: FailureDomain::Environment,
+            kind: FailureKind::ModuleLoad,
+            component: DiagnosticComponent::ModuleLoader,
+            impact: DiagnosticImpact::Blocking,
+            message: message.trim_start_matches("Error: ").trim().to_string(),
+            process: process.termination.clone(),
+            limits: Some(limits.clone()),
+        });
     }
 
     if limits.network_policy == NetworkPolicy::Deny
@@ -2157,8 +2643,7 @@ fn harness_diagnostics(
             });
         }
         TestAdapter::VitestJson | TestAdapter::JestJson => {
-            let structured_failure = process.stdout.contains("\"status\":\"failed\"")
-                || process.stdout.contains("\"pass\":false");
+            let structured_failure = structured_test_failure(&process.stdout);
             if structured_failure {
                 diagnostics.push(FailureDiagnostic {
                     domain: FailureDomain::TargetCode,
@@ -2200,7 +2685,7 @@ fn docker_path_mapping(
 ) -> Result<DockerPathMapping, String> {
     let source_root = std::fs::canonicalize(source_root)
         .map_err(|error| format!("docker source root is unavailable: {error}"))?;
-    let project_root = std::fs::canonicalize(project_root)
+    std::fs::canonicalize(project_root)
         .map_err(|error| format!("docker project mirror is unavailable: {error}"))?;
     let host_artifact = std::fs::canonicalize(host_artifact)
         .map_err(|error| format!("docker harness artifact is unavailable: {error}"))?;
@@ -2217,7 +2702,7 @@ fn docker_path_mapping(
         .map_err(|_| "docker harness working directory is outside the project mirror")?;
 
     Ok(DockerPathMapping {
-        project_root,
+        project_root: project_root.to_path_buf(),
         container_artifact: std::path::Path::new("/workspace").join(artifact_relative),
         container_cwd: std::path::Path::new("/workspace").join(cwd_relative),
     })
@@ -3122,8 +3607,16 @@ pub async fn execute_harness(
             env.retain(|(name, _)| name != "NODE_OPTIONS");
         }
         if harness.runtime == HarnessRuntime::Vitest {
-            let vitest_entrypoint =
-                std::fs::canonicalize(&executable).unwrap_or_else(|_| executable.clone());
+            let (vitest_entrypoint, legacy_threads) = match vitest_project_entrypoint(&executable) {
+                Ok(package) => package,
+                Err(error) => {
+                    let process = launch_failure(error);
+                    return HarnessExecution {
+                        diagnostics: process.diagnostics.clone(),
+                        process,
+                    };
+                }
+            };
             let Some(node) = which_binary(&path_env, "node") else {
                 let process = launch_failure(
                     "required runtime 'node' is unavailable for the Vitest coordinator",
@@ -3134,14 +3627,24 @@ pub async fn execute_harness(
                 };
             };
             executable = node.into();
-            args.splice(
-                2..2,
-                [
-                    std::ffi::OsString::from("--pool=forks"),
-                    std::ffi::OsString::from("--maxWorkers=1"),
-                    std::ffi::OsString::from("--minWorkers=1"),
-                ],
-            );
+            if legacy_threads {
+                args.splice(
+                    2..2,
+                    [
+                        std::ffi::OsString::from("--threads"),
+                        std::ffi::OsString::from("false"),
+                    ],
+                );
+            } else {
+                args.splice(
+                    2..2,
+                    [
+                        std::ffi::OsString::from("--pool=forks"),
+                        std::ffi::OsString::from("--maxWorkers=1"),
+                        std::ffi::OsString::from("--minWorkers=1"),
+                    ],
+                );
+            }
             args.splice(
                 0..0,
                 [
@@ -3197,6 +3700,10 @@ pub async fn execute_harness(
             .termination
             .as_ref()
             .is_some_and(|termination| matches!(termination.kind, ProcessTerminationKind::Exited))
+        && !diagnostics.iter().any(|diagnostic| {
+            diagnostic.domain == FailureDomain::Environment
+                && diagnostic.kind == FailureKind::ModuleLoad
+        })
     {
         let combined = format!("{}\n{}", process.stdout, process.stderr);
         match parse_harness_events(&combined) {
@@ -3233,9 +3740,122 @@ pub async fn execute_harness(
 mod tests {
     use super::{
         configure_docker_node_loader, copy_materialization_tree, create_node_package_resolver,
-        docker_dependency_mapping, docker_path_mapping, has_typescript_type_only_relative_imports,
-        virtual_env_bin, which_binary,
+        docker_dependency_mapping, docker_path_mapping, harness_diagnostics,
+        has_typescript_type_only_relative_imports, virtual_env_bin, vitest_project_entrypoint,
+        which_binary,
     };
+    use crate::types::{
+        DiagnosticComponent, DiagnosticImpact, ExecutionLimits, ExecutionResult, FailureDomain,
+        FailureKind, NetworkPolicy, RuntimeProfile, TestAdapter,
+    };
+
+    #[cfg(unix)]
+    #[test]
+    fn vitest_project_entrypoint_uses_manifest_ownership_for_npm_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let node_modules = dir.path().join("node_modules");
+        let package_dir = node_modules.join("vitest-alias");
+        let tool_dir = node_modules.join(".bin");
+        std::fs::create_dir_all(package_dir.join("dist")).unwrap();
+        std::fs::create_dir_all(&tool_dir).unwrap();
+        std::fs::write(
+            package_dir.join("package.json"),
+            r#"{"name":"vitest","version":"3.2.4","bin":{"vitest":"./dist/vitest.mjs"}}"#,
+        )
+        .unwrap();
+        std::fs::write(package_dir.join("dist/vitest.mjs"), "process.exit(0);\n").unwrap();
+        let launcher = tool_dir.join("vitest");
+        std::os::unix::fs::symlink("../vitest-alias/dist/vitest.mjs", &launcher).unwrap();
+
+        let (entrypoint, legacy_threads) = vitest_project_entrypoint(&launcher).unwrap();
+
+        assert_eq!(
+            entrypoint,
+            std::fs::canonicalize(package_dir.join("dist/vitest.mjs")).unwrap()
+        );
+        assert!(!legacy_threads);
+
+        std::fs::write(
+            package_dir.join("package.json"),
+            r#"{"name":"not-vitest","version":"3.2.4","bin":{"vitest":"./dist/vitest.mjs"}}"#,
+        )
+        .unwrap();
+        assert!(
+            vitest_project_entrypoint(&launcher).is_err(),
+            "the manifest name must establish Vitest package ownership"
+        );
+    }
+
+    #[test]
+    fn vitest_pretty_printed_json_failure_is_a_target_assertion() {
+        let process = ExecutionResult {
+            stdout: r#"{
+  "testResults": [
+    {
+      "assertionResults": [
+        {
+          "status": "failed"
+        }
+      ]
+    }
+  ]
+}"#
+            .into(),
+            stderr: String::new(),
+            exit_code: Some(1),
+            duration_ms: 1,
+            timed_out: false,
+            memory_error: false,
+            termination: None,
+            diagnostics: Vec::new(),
+        };
+        let limits = ExecutionLimits {
+            timeout_seconds: 1.0,
+            memory_mb: 128,
+            runtime_profile: RuntimeProfile::LocalTrusted,
+            network_policy: NetworkPolicy::Allow,
+        };
+
+        let diagnostics = harness_diagnostics(Some(TestAdapter::VitestJson), &process, &limits);
+
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(diagnostics[0].domain, FailureDomain::TargetCode);
+        assert_eq!(diagnostics[0].kind, FailureKind::AssertionFailure);
+        assert_eq!(
+            diagnostics[0].component,
+            DiagnosticComponent::AuthoritativeTestRunner
+        );
+        assert_eq!(diagnostics[0].impact, DiagnosticImpact::Gating);
+
+        let logged_process = ExecutionResult {
+            stdout: format!(
+                "setup log before reporter\n{}\nwarning after reporter",
+                process.stdout
+            ),
+            ..process.clone()
+        };
+        for adapter in [TestAdapter::VitestJson, TestAdapter::JestJson] {
+            let diagnostics = harness_diagnostics(Some(adapter), &logged_process, &limits);
+            assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+            assert_eq!(diagnostics[0].domain, FailureDomain::TargetCode);
+            assert_eq!(diagnostics[0].kind, FailureKind::AssertionFailure);
+            assert_eq!(diagnostics[0].impact, DiagnosticImpact::Gating);
+        }
+
+        for stdout in ["not json", r#"{"message":"runner crashed"}"#] {
+            let non_result = ExecutionResult {
+                stdout: stdout.into(),
+                ..process.clone()
+            };
+            let diagnostics =
+                harness_diagnostics(Some(TestAdapter::VitestJson), &non_result, &limits);
+
+            assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+            assert_eq!(diagnostics[0].domain, FailureDomain::VerifierHarness);
+            assert_eq!(diagnostics[0].kind, FailureKind::HarnessProtocol);
+            assert_eq!(diagnostics[0].impact, DiagnosticImpact::Blocking);
+        }
+    }
 
     #[test]
     fn generated_harness_resolver_prefers_target_owned_package_over_ambient_ancestor() {
@@ -3313,10 +3933,7 @@ mod tests {
         let mapping =
             docker_path_mapping(&alias_root, &alias_root, &artifact, &alias_root).unwrap();
 
-        assert_eq!(
-            mapping.project_root,
-            std::fs::canonicalize(&source_root).unwrap()
-        );
+        assert_eq!(mapping.project_root, alias_root);
         assert_eq!(
             mapping.container_artifact,
             std::path::Path::new("/workspace/.court-jester/doctor.py")

@@ -105,11 +105,27 @@ fn lint_reports_python_runner_failure() {
         &Language::Python,
     ));
 
-    assert!(result.error.is_some(), "lint runner failure should surface");
+    assert!(result.runner_failed);
+    assert!(!result.unavailable);
     assert!(
         result.diagnostics.is_empty(),
         "runner failure is not a lint finding"
     );
+    let error = result.error.expect("lint runner failure should surface");
+    for expected in [
+        "bad ruff config",
+        tool_dir.path().join("ruff").to_string_lossy().as_ref(),
+        "arguments=[\"check\", \"--output-format=json\", \"--stdin-filename\", \"snippet.py\", \"-\"]",
+        "target='snippet.py'",
+        "cwd='",
+        "runner or configuration failure, not a lint violation",
+        "Re-run this invocation",
+    ] {
+        assert!(
+            error.contains(expected),
+            "expected {expected:?} in error, got: {error}"
+        );
+    }
 }
 
 #[test]
@@ -248,39 +264,112 @@ fn lint_reports_typescript_internal_error_as_runner_failure() {
     );
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 #[test]
-fn lint_reports_signal_kill_with_actionable_hint() {
+fn lint_reports_signal_kill_with_actionable_invocation() {
     let _guard = path_lock().lock().unwrap_or_else(|e| e.into_inner());
-    let tool_dir = install_fake_tool("ruff", "#!/bin/sh\nkill -9 $$\n");
-    let _path = EnvVarGuard::prepend_path(tool_dir.path());
+    let project = tempfile::tempdir().unwrap();
+    let tool_dir = project.path().join(".venv").join("bin");
+    let ruff = install_fake_tool_at(
+        &tool_dir,
+        "ruff",
+        "#!/bin/sh\nprintf '[{\"code\":\"F401\",\"message\":\"partial\",\"location\":{\"row\":1,\"column\":1}}]'\nkill -9 $$\n",
+    );
+    let source = project.path().join("module.py");
+    let config = project.path().join("ruff.toml");
+    fs::write(&source, "def add(a: int, b: int) -> int:\n    return a + b").unwrap();
+    fs::write(&config, "[lint]\n").unwrap();
 
     let runtime = tokio::runtime::Runtime::new().unwrap();
-    let result = runtime.block_on(lint(
+    let result = runtime.block_on(lint_with_options(
         "def add(a: int, b: int) -> int:\n    return a + b",
         &Language::Python,
+        LintOptions {
+            source_file: Some(source.to_str().unwrap()),
+            project_dir: Some(project.path().to_str().unwrap()),
+            config_path: Some(config.to_str().unwrap()),
+            virtual_file_path: None,
+        },
     ));
 
     assert!(
         result.unavailable,
         "signal-killed ruff should be treated as unavailable"
     );
+    assert!(
+        !result.runner_failed,
+        "signal termination is an environment failure, not a lint runner violation"
+    );
+    assert!(
+        result.diagnostics.is_empty(),
+        "partial output from a terminated run must not become lint violations"
+    );
     let error = result
         .error
         .expect("signal kill should surface an unavailable message");
-    assert!(
-        error.contains("signal 9"),
-        "expected signal number in error, got: {error}"
-    );
-    assert!(
-        error.contains(tool_dir.path().join("ruff").to_string_lossy().as_ref()),
-        "expected executable path in error, got: {error}"
-    );
+    for expected in [
+        "signal 9 (SIGKILL)",
+        ruff.to_string_lossy().as_ref(),
+        "arguments=[\"check\", \"--output-format=json\", \"--config\"",
+        config.to_string_lossy().as_ref(),
+        source.to_string_lossy().as_ref(),
+        &format!("target='{}'", source.display()),
+        &format!("cwd='{}'", project.path().display()),
+        "environment failure, not a lint violation",
+        "Re-run this invocation",
+    ] {
+        assert!(
+            error.contains(expected),
+            "expected {expected:?} in error, got: {error}"
+        );
+    }
     #[cfg(target_os = "macos")]
     assert!(
         error.contains("Gatekeeper/quarantine"),
-        "expected macOS hint in error, got: {error}"
+        "expected macOS remediation in error, got: {error}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn lint_reports_launch_failure_with_actionable_invocation() {
+    let project = tempfile::tempdir().unwrap();
+    let tool_dir = project.path().join(".venv").join("bin");
+    let ruff = tool_dir.join("ruff");
+    fs::create_dir_all(&tool_dir).unwrap();
+    fs::write(&ruff, "#!/bin/sh\nexit 0\n").unwrap();
+    let source = project.path().join("module.py");
+    fs::write(&source, "def answer() -> int:\n    return 42\n").unwrap();
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let result = runtime.block_on(lint_with_options(
+        "def answer() -> int:\n    return 42\n",
+        &Language::Python,
+        LintOptions {
+            source_file: Some(source.to_str().unwrap()),
+            project_dir: Some(project.path().to_str().unwrap()),
+            config_path: None,
+            virtual_file_path: None,
+        },
+    ));
+
+    assert!(result.unavailable);
+    assert!(!result.runner_failed);
+    let error = result.error.expect("launch failure should be actionable");
+    for expected in [
+        "failed to launch",
+        ruff.to_string_lossy().as_ref(),
+        "arguments=[\"check\", \"--output-format=json\"",
+        &format!("target='{}'", source.display()),
+        &format!("cwd='{}'", project.path().display()),
+        "environment failure, not a lint violation",
+        "Re-run this invocation",
+    ] {
+        assert!(
+            error.contains(expected),
+            "expected {expected:?} in error, got: {error}"
+        );
+    }
 }
 
 #[test]
@@ -399,6 +488,107 @@ exit 1
     assert!(log.contains("arg=--config-path"));
     assert_log_contains_path(&log, "arg=", &config_path);
     assert_log_contains_path(&log, "arg=", &source_path);
+}
+
+#[test]
+fn lint_filters_only_safe_borrowed_has_own_property_calls() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let tool_dir = project_dir.path().join("node_modules").join(".bin");
+
+    install_fake_tool_at(
+        &tool_dir,
+        "biome",
+        r#"#!/bin/sh
+cat <<'EOF'
+{"diagnostics":[
+  {"category":"lint/suspicious/noPrototypeBuiltins","description":"Do not access Object.prototype method 'hasOwnProperty' from target object.","severity":"warning","location":{"start":{"line":1,"column":14}}},
+  {"category":"lint/suspicious/noPrototypeBuiltins","description":"Do not access Object.prototype method 'hasOwnProperty' from target object.","severity":"warning","location":{"start":{"line":2,"column":16}}}
+]}
+EOF
+exit 1
+"#,
+    );
+
+    let code = "const safe = Object.prototype.hasOwnProperty.call(target, key);\n\
+const unsafe = target.hasOwnProperty(key);\n";
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let result = runtime.block_on(lint_with_options(
+        code,
+        &Language::TypeScript,
+        LintOptions {
+            source_file: None,
+            project_dir: Some(project_dir.path().to_str().unwrap()),
+            config_path: None,
+            virtual_file_path: Some("src/ownership.ts"),
+        },
+    ));
+
+    assert!(
+        result.error.is_none(),
+        "lint findings are not runner errors"
+    );
+    assert_eq!(
+        result.diagnostics.len(),
+        1,
+        "the safe borrowed call should be filtered without hiding the unsafe target-owned call"
+    );
+    assert_eq!(result.diagnostics[0].line, 2);
+    assert_eq!(
+        result.diagnostics[0].rule,
+        "lint/suspicious/noPrototypeBuiltins"
+    );
+}
+
+#[test]
+fn lint_keeps_nested_unsafe_and_shadowed_object_has_own_property_diagnostics() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let tool_dir = project_dir.path().join("node_modules").join(".bin");
+
+    install_fake_tool_at(
+        &tool_dir,
+        "biome",
+        r#"#!/bin/sh
+cat <<'EOF'
+{"diagnostics":[
+  {"category":"lint/suspicious/noPrototypeBuiltins","description":"outer safe borrowed call","severity":"warning","location":{"start":{"line":1,"column":16}}},
+  {"category":"lint/suspicious/noPrototypeBuiltins","description":"nested unsafe target-owned call","severity":"warning","location":{"start":{"line":1,"column":53}}},
+  {"category":"lint/suspicious/noPrototypeBuiltins","description":"locally shadowed Object call","severity":"warning","location":{"start":{"line":4,"column":20}}}
+]}
+EOF
+exit 1
+"#,
+    );
+
+    let code = "const nested = Object.prototype.hasOwnProperty.call(target.hasOwnProperty(\"x\"), \"y\");\n\
+{\n\
+  const Object = customObject;\n\
+  const shadowed = Object.prototype.hasOwnProperty.call(target, key);\n\
+}\n";
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let result = runtime.block_on(lint_with_options(
+        code,
+        &Language::TypeScript,
+        LintOptions {
+            source_file: None,
+            project_dir: Some(project_dir.path().to_str().unwrap()),
+            config_path: None,
+            virtual_file_path: Some("src/ownership.ts"),
+        },
+    ));
+
+    assert!(
+        result.error.is_none(),
+        "lint findings are not runner errors"
+    );
+    assert_eq!(
+        result
+            .diagnostics
+            .iter()
+            .map(|diagnostic| (diagnostic.line, diagnostic.column))
+            .collect::<Vec<_>>(),
+        vec![(1, 53), (4, 20)],
+        "only the diagnostic on the unshadowed safe borrowed callee should be filtered"
+    );
 }
 
 #[test]

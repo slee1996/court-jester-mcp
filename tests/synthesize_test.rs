@@ -1,3 +1,4 @@
+use court_jester::tools::analyze::analyze;
 use court_jester::tools::domain::{build_verification_plan, safe_dependency_substitute};
 use court_jester::tools::synthesize::{
     synthesize_calls, synthesize_plan, synthesize_plan_for_verification,
@@ -37,6 +38,7 @@ fn func(name: &str, params: Vec<(&str, Option<&str>)>, ret: Option<&str>) -> Fun
             })
             .collect(),
         return_type: ret.map(|s| s.to_string()),
+        type_parameters: vec![],
         line: 1,
         end_line: 1,
         complexity: 1,
@@ -47,6 +49,7 @@ fn func(name: &str, params: Vec<(&str, Option<&str>)>, ret: Option<&str>) -> Fun
         is_nested: false,
         is_exported: true,
         declared_properties: vec![],
+        effects: vec![],
         invocation_target: None,
         returned_callables: vec![],
     }
@@ -81,6 +84,7 @@ fn kwonly_func(
         name: name.to_string(),
         params,
         return_type: ret.map(|s| s.to_string()),
+        type_parameters: vec![],
         line: 1,
         end_line: 1,
         complexity: 1,
@@ -91,6 +95,7 @@ fn kwonly_func(
         is_nested: false,
         is_exported: true,
         declared_properties: vec![],
+        effects: vec![],
         invocation_target: None,
         returned_callables: vec![],
     }
@@ -328,6 +333,56 @@ fn python_no_idempotency_from_name_only() {
     assert!(
         !code.contains("_result2 = clean_text(_result)"),
         "a function name alone must not activate the idempotency oracle, got: {code}"
+    );
+}
+
+#[test]
+fn python_callable_results_do_not_use_object_identity_for_consistency() {
+    let source = "def build_tools(world: str) -> list:\n    def search(query: str) -> str:\n        return query\n    return [search]\n";
+    let analysis = analyze(source, &Language::Python);
+    let code = synthesize_calls(&analysis, &Language::Python);
+    assert!(
+        code.contains("assert _consistency_eq(_result, _result_b)"),
+        "implicit consistency must ignore fresh callable identity, got: {code}"
+    );
+
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("callable_consistency.py");
+    std::fs::write(&script, format!("{source}\n{code}")).unwrap();
+    let output = std::process::Command::new("python3")
+        .arg(&script)
+        .output()
+        .expect("python3 should execute the generated callable-output harness");
+    assert!(
+        output.status.success(),
+        "fresh callable outputs must pass implicit consistency:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn python_set_members_use_semantic_consistency_equality() {
+    let source = "def build_members() -> set:\n    def tool() -> str:\n        return \"ok\"\n    return {tool, object()}\n";
+    let analysis = analyze(source, &Language::Python);
+    let code = synthesize_calls(&analysis, &Language::Python);
+    assert!(
+        code.contains("assert _consistency_eq(_result, _result_b)"),
+        "set results must retain semantic consistency checking, got: {code}"
+    );
+
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("set_consistency.py");
+    std::fs::write(&script, format!("{source}\n{code}")).unwrap();
+    let output = std::process::Command::new("python3")
+        .arg(&script)
+        .output()
+        .expect("python3 should execute the generated set-output harness");
+    assert!(
+        output.status.success(),
+        "fresh callable/object set members must pass semantic consistency:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
@@ -676,6 +731,161 @@ fn typescript_generates_fuzz_harness() {
 }
 
 #[test]
+fn typescript_literal_defaults_generate_assignable_values_and_omission_cases() {
+    let analysis = court_jester::tools::analyze::analyze(
+        r#"
+export function normalizeName(value = "world"): string {
+    return value.trim().toLowerCase();
+}
+export function literalDefaults(
+    count = 3,
+    enabled = true,
+    tags = ["primary"],
+    options = { prefix: "/" },
+): unknown {
+    return { count, enabled, tags, options };
+}
+export function unknownDefault(value = makeDefault()): unknown {
+    return value;
+}
+"#,
+        &Language::TypeScript,
+    );
+    let code = synthesize_calls(&analysis, &Language::TypeScript);
+    let fuzz_call = code
+        .lines()
+        .find(|line| line.contains("_fuzzOne(\"normalizeName\""))
+        .expect("inferred string default should be fuzzed");
+
+    assert!(
+        fuzz_call.contains("_fuzzStr()"),
+        "default-inferred string should only use the string generator, got: {fuzz_call}"
+    );
+    assert!(
+        fuzz_call.contains(", [[]],"),
+        "trailing default should be exercised by omitting its argument, got: {fuzz_call}"
+    );
+    let literal_call = code
+        .lines()
+        .find(|line| line.contains("_fuzzOne(\"literalDefaults\""))
+        .expect("primitive, array, and object literal defaults should be fuzzed");
+    for generator in [
+        "_fuzzNum()",
+        "_fuzzBool()",
+        "Array.from({length: _fuzzIntRange(0,5)}, () => _fuzzStr())",
+        "({ prefix: _fuzzStr() })",
+    ] {
+        assert!(
+            literal_call.contains(generator),
+            "default-inferred inputs should remain assignable; missing {generator} in: {literal_call}"
+        );
+    }
+    assert!(
+        !code.contains("_fuzzOne(\"unknownDefault\""),
+        "unknown default inference should remain inconclusive instead of generating invalid inputs"
+    );
+}
+
+#[test]
+fn typescript_never_array_generates_only_empty_array_and_omission() {
+    let analysis = analyze(
+        r#"
+export function size(values = []): number {
+    return values.length;
+}
+export function impossible(value: never): never {
+    return value;
+}
+"#,
+        &Language::TypeScript,
+    );
+    let plan = synthesize_plan(&analysis, &Language::TypeScript);
+    let size_call = plan
+        .code
+        .lines()
+        .find(|line| line.contains("_fuzzOne(\"size\""))
+        .expect("an inferred never[] default should be fuzzed");
+
+    assert!(
+        size_call.contains("() => [[]]"),
+        "never[] must generate only the assignable empty array: {size_call}"
+    );
+    assert!(
+        size_call.contains(", [[]],"),
+        "the empty-array default must also be exercised through omission: {size_call}"
+    );
+    assert!(
+        !plan.code.contains("_fuzzOne(\"impossible\""),
+        "bare never must remain unfuzzable"
+    );
+    assert_eq!(
+        plan.coverage
+            .iter()
+            .find(|entry| entry.function == "impossible")
+            .expect("bare-never coverage entry")
+            .status,
+        FuzzFunctionStatus::SkippedUnsupportedType
+    );
+}
+
+#[test]
+fn typescript_bigint_defaults_fail_closed_without_number_inputs() {
+    let analysis = analyze(
+        r#"
+export function increment(value = 1n): bigint {
+    return value + 1n;
+}
+export function decrement(value = -1n): bigint {
+    return value - 1n;
+}
+export function incrementNumber(value = 1): number {
+    return value + 1;
+}
+"#,
+        &Language::TypeScript,
+    );
+
+    for function_name in ["increment", "decrement"] {
+        let function = analysis
+            .functions
+            .iter()
+            .find(|function| function.name == function_name)
+            .expect("bigint-default function should be analyzed");
+        assert_eq!(
+            function.params[0].type_annotation.as_deref(),
+            Some("bigint"),
+            "bigint default must retain its unsupported type instead of being inferred as number"
+        );
+    }
+    let plan = synthesize_plan(&analysis, &Language::TypeScript);
+    for function_name in ["increment", "decrement"] {
+        assert!(
+            !plan.code.contains(&format!("_fuzzOne(\"{function_name}\"")),
+            "unsupported bigint default must not receive generated number inputs"
+        );
+        let coverage = plan
+            .coverage
+            .iter()
+            .find(|entry| entry.function == function_name)
+            .expect("bigint-default function should have coverage");
+        assert_eq!(
+            coverage.status,
+            FuzzFunctionStatus::SkippedUnsupportedType,
+            "unsupported bigint default should fail closed"
+        );
+    }
+    let number_call = plan
+        .code
+        .lines()
+        .find(|line| line.contains("_fuzzOne(\"incrementNumber\""))
+        .expect("normal numeric default should remain fuzzed");
+    assert!(
+        number_call.contains("_fuzzNum()"),
+        "normal numeric default should remain inferred as number: {number_call}"
+    );
+}
+
+#[test]
 fn typescript_literal_union_params_generate_declared_domain_values() {
     let a = make_analysis(
         vec![func(
@@ -734,6 +944,99 @@ fn typescript_zero_arg_entropy_helper_skips_consistency_property() {
     assert!(
         !fuzz_call.contains("\"consistent\""),
         "entropy helper should not get consistency checks, got: {fuzz_call}"
+    );
+}
+
+#[test]
+fn typescript_lexical_shadowing_retains_implicit_consistency() {
+    let analysis = analyze(
+        r#"
+let value = 0
+export function normalizeParam(value: string): string { return value.trim() }
+export function normalizeLocal(input: string): string { const value = input; return value.trim() }
+"#,
+        &Language::TypeScript,
+    );
+    let code = synthesize_calls(&analysis, &Language::TypeScript);
+
+    for name in ["normalizeParam", "normalizeLocal"] {
+        let function = analysis
+            .functions
+            .iter()
+            .find(|function| function.name == name)
+            .unwrap_or_else(|| panic!("{name} analysis should exist"));
+        assert!(
+            function.effects.is_empty(),
+            "{name} shadows module state and must remain pure, got: {:?}",
+            function.effects
+        );
+        let fuzz_call = code
+            .lines()
+            .find(|line| line.contains(&format!("_fuzzOne(\"{name}\"")))
+            .unwrap_or_else(|| panic!("{name} fuzz call should exist"));
+        assert!(
+            fuzz_call.contains("\"consistent\""),
+            "{name} must retain implicit consistency, got: {fuzz_call}"
+        );
+    }
+}
+
+#[test]
+fn typescript_body_effects_skip_implicit_consistency_while_pure_transforms_keep_it() {
+    let analysis = analyze(
+        r#"
+let lease = 0
+export function randomToken(prefix: string): string { return `${prefix}-${Math.random()}` }
+export function timestampMetric(name: string): string { return `${name}-${performance.now()}` }
+export function currentTimestamp(name: string): string { return `${name}-${Date.now()}` }
+export function scheduleMetric(name: string): number { return setTimeout(() => console.log(name), 10) as unknown as number }
+export function acquireLease(stream: string): string { lease += 1; return `${stream}-${lease}` }
+export async function loadRemote(url: string): Promise<string> { return await fetch(url).then(r => r.text()) }
+export function normalizeLabel(label: string): string { return label.trim().toLowerCase() }
+"#,
+        &Language::TypeScript,
+    );
+    let effects = |name: &str| {
+        analysis
+            .functions
+            .iter()
+            .find(|function| function.name == name)
+            .unwrap_or_else(|| panic!("{name} analysis should exist"))
+            .effects
+            .as_slice()
+    };
+    assert_eq!(effects("randomToken"), &[FunctionEffect::Randomness]);
+    assert_eq!(effects("timestampMetric"), &[FunctionEffect::Time]);
+    assert_eq!(effects("currentTimestamp"), &[FunctionEffect::Time]);
+    assert_eq!(effects("scheduleMetric"), &[FunctionEffect::Timer]);
+    assert_eq!(effects("acquireLease"), &[FunctionEffect::MutableState]);
+    assert_eq!(effects("loadRemote"), &[FunctionEffect::Io]);
+    assert!(effects("normalizeLabel").is_empty());
+    let code = synthesize_calls(&analysis, &Language::TypeScript);
+    let fuzz_call = |name: &str| {
+        code.lines()
+            .find(|line| line.contains(&format!("_fuzzOne(\"{name}\"")))
+            .unwrap_or_else(|| panic!("{name} fuzz call should exist"))
+    };
+
+    for name in [
+        "randomToken",
+        "timestampMetric",
+        "currentTimestamp",
+        "scheduleMetric",
+        "acquireLease",
+        "loadRemote",
+    ] {
+        assert!(
+            !fuzz_call(name).contains("\"consistent\""),
+            "{name} has body effects and must not receive implicit consistency: {}",
+            fuzz_call(name)
+        );
+    }
+    assert!(
+        fuzz_call("normalizeLabel").contains("\"consistent\""),
+        "pure transform must retain implicit consistency: {}",
+        fuzz_call("normalizeLabel")
     );
 }
 
@@ -1316,16 +1619,16 @@ fn typescript_semver_caret_gets_zero_major_semantics() {
 
 #[test]
 fn typescript_defaults_gets_null_and_inherited_semantics() {
-    let a = make_analysis(
-        vec![func(
-            "defaults",
-            vec![
-                ("object", Some("T")),
-                ("...sources", Some("Array<object | null | undefined>")),
-            ],
-            Some("T"),
-        )],
-        vec![],
+    let a = analyze(
+        r#"
+export function defaults<T>(
+    object: T,
+    ...sources: Array<object | null | undefined>
+): T {
+    return Object.assign(object, ...sources);
+}
+"#,
+        &Language::TypeScript,
     );
     let (plan, code) = synthesize_with_advisory_contract(
         &a,
@@ -1336,7 +1639,7 @@ fn typescript_defaults_gets_null_and_inherited_semantics() {
     assert_advisory_contract(&plan, "defaults", "defaults_semantics");
     assert_advisory_semantic_probe(&code, "defaults");
     assert!(
-        code.contains("_fuzzOne(\"defaults\", 30, () => [_fuzzObject(), Array.from"),
+        code.contains("_fuzzOne(\"defaults\", 30, () => [_fuzzObject(), ...Array.from"),
         "defaults must retain runtime checking with object-shaped generated input, got: {code}"
     );
     assert!(
@@ -1350,6 +1653,35 @@ fn typescript_defaults_gets_null_and_inherited_semantics() {
     assert!(
         code.contains("Object.create(_defaultsProto)"),
         "defaults probe must exercise inherited enumerable keys, got: {code}"
+    );
+}
+
+#[test]
+fn typescript_defaults_skips_unresolved_imported_uppercase_type() {
+    let analysis = analyze(
+        r#"
+import type { Options } from "typed-lib";
+
+export function defaults(value: Options): Options {
+    return { ...value, name: value.name.trim() };
+}
+"#,
+        &Language::TypeScript,
+    );
+
+    let plan = synthesize_plan(&analysis, &Language::TypeScript);
+    assert!(
+        !plan.code.contains("_fuzzOne(\"defaults\""),
+        "an unresolved imported type must not receive generic defaults object inputs, got: {}",
+        plan.code
+    );
+    assert_eq!(
+        plan.coverage[0].status,
+        FuzzFunctionStatus::SkippedUnsupportedType
+    );
+    assert_eq!(
+        plan.coverage[0].reason.as_deref(),
+        Some("one or more parameters use unsupported or unresolved TypeScript types")
     );
 }
 
@@ -1432,6 +1764,90 @@ fn typescript_skips_unresolved_alias_params_in_fuzz() {
 }
 
 #[test]
+fn typescript_skips_aliases_with_unresolved_type_expressions() {
+    let mut analysis = make_analysis(
+        vec![func(
+            "mergeSearchAgentResponses",
+            vec![
+                ("outer", Some("SearchAgentResponse")),
+                ("nested", Some("SearchAgentResponse")),
+            ],
+            Some("SearchAgentResponse"),
+        )],
+        vec![],
+    );
+    analysis.aliases.push(TypeAliasInfo {
+        name: "SearchAgentResponse".into(),
+        type_annotation: "z.infer<typeof SearchAgentResponseSchema>".into(),
+        line: 1,
+    });
+
+    let plan = synthesize_plan(&analysis, &Language::TypeScript);
+    assert!(
+        !plan.code.contains("_fuzzOne(\"mergeSearchAgentResponses\""),
+        "an alias whose type expression cannot be synthesized must be skipped, got: {}",
+        plan.code
+    );
+    assert_eq!(
+        plan.coverage[0].status,
+        FuzzFunctionStatus::SkippedUnsupportedType
+    );
+    assert_eq!(
+        plan.coverage[0].reason.as_deref(),
+        Some("one or more parameters use unsupported or unresolved TypeScript types")
+    );
+}
+
+#[test]
+fn typescript_skips_imported_aliases_that_exhaust_recursion_depth() {
+    let dir = tempfile::tempdir().unwrap();
+    let types_path = dir.path().join("types.ts");
+    std::fs::write(
+        &types_path,
+        r#"
+export type Alias0 = Alias1;
+export type Alias1 = Alias2;
+export type Alias2 = Alias3;
+export type Alias3 = Alias4;
+export type Alias4 = Alias5;
+export type Alias5 = Alias6;
+export type Alias6 = Alias7;
+export type Alias7 = Alias8;
+export type Alias8 = { required: string };
+"#,
+    )
+    .unwrap();
+    let source_path = dir.path().join("main.ts");
+    let source = r#"
+import type { Alias0 } from "./types";
+export function consumeImported(value: Alias0): string {
+  return value.required;
+}
+"#;
+    std::fs::write(&source_path, source).unwrap();
+
+    let mut analysis = analyze(source, &Language::TypeScript);
+    let imported = court_jester::tools::analyze::resolve_imported_types(
+        &analysis,
+        source_path.to_str().unwrap(),
+        &Language::TypeScript,
+    );
+    analysis.classes.extend(imported.classes);
+    analysis.aliases.extend(imported.aliases);
+
+    let plan = synthesize_plan(&analysis, &Language::TypeScript);
+    assert!(
+        !plan.code.contains("_fuzzOne(\"consumeImported\""),
+        "depth-exhausted imported aliases must be skipped instead of receiving an empty object, got: {}",
+        plan.code
+    );
+    assert_eq!(
+        plan.coverage[0].status,
+        FuzzFunctionStatus::SkippedUnsupportedType
+    );
+}
+
+#[test]
 fn typescript_fuzzes_resolved_alias_params() {
     let analysis = AnalysisResult {
         functions: vec![func(
@@ -1474,7 +1890,7 @@ fn typescript_fuzzes_resolved_alias_params() {
 }
 
 #[test]
-fn typescript_recursive_alias_params_do_not_overflow() {
+fn typescript_skips_recursive_alias_params_without_a_terminating_value() {
     let analysis = AnalysisResult {
         functions: vec![func(
             "decorateRequest",
@@ -1512,14 +1928,15 @@ fn typescript_recursive_alias_params_do_not_overflow() {
         source_mode: SourceMode::TypeScript,
         parse_diagnostics: vec![],
     };
-    let code = synthesize_calls(&analysis, &Language::TypeScript);
+    let plan = synthesize_plan(&analysis, &Language::TypeScript);
     assert!(
-        code.contains("_fuzzOne(\"decorateRequest\""),
-        "recursive but object-shaped aliases should remain fuzzable, got: {code}"
+        !plan.code.contains("_fuzzOne(\"decorateRequest\""),
+        "recursive aliases without a type-correct terminal value must be skipped, got: {}",
+        plan.code
     );
-    assert!(
-        code.len() < 60_000,
-        "recursive aliases should be bounded during generator expansion"
+    assert_eq!(
+        plan.coverage[0].status,
+        FuzzFunctionStatus::SkippedUnsupportedType
     );
 }
 
@@ -2042,6 +2459,7 @@ fn python_skips_methods_in_fuzz() {
                     variadic: None,
                 }],
                 return_type: Some("int".to_string()),
+                type_parameters: vec![],
                 line: 2,
                 end_line: 3,
                 complexity: 1,
@@ -2052,6 +2470,7 @@ fn python_skips_methods_in_fuzz() {
                 is_nested: false,
                 is_exported: false,
                 declared_properties: vec![],
+                effects: vec![],
                 invocation_target: None,
                 returned_callables: vec![],
             },

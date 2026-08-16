@@ -86,6 +86,32 @@ fn typescript_function() {
 }
 
 #[test]
+fn typescript_infers_parameter_types_from_literal_defaults() {
+    let code = r#"
+function defaults(
+    text = "world",
+    count = 3,
+    enabled = true,
+    tags = ["primary"],
+    options = { prefix: "/", retries: 2 },
+    unresolved = makeDefault(),
+) {}
+"#;
+    let analysis = analyze(code, &Language::TypeScript);
+    let params = &analysis.functions[0].params;
+
+    assert_eq!(params[0].type_annotation.as_deref(), Some("string"));
+    assert_eq!(params[1].type_annotation.as_deref(), Some("number"));
+    assert_eq!(params[2].type_annotation.as_deref(), Some("boolean"));
+    assert_eq!(params[3].type_annotation.as_deref(), Some("string[]"));
+    assert_eq!(
+        params[4].type_annotation.as_deref(),
+        Some("{ prefix: string; retries: number }")
+    );
+    assert_eq!(params[5].type_annotation, None);
+}
+
+#[test]
 fn typescript_class_and_interface() {
     let code = "class Foo {}\ninterface Bar {}";
     let r = analyze(code, &Language::TypeScript);

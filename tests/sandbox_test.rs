@@ -397,6 +397,265 @@ async fn generated_typescript_harness_resolves_scoped_package_from_target_packag
     }
 }
 
+async fn execute_typescript_alias_probe(
+    tsconfig: &str,
+    modules: &[(&str, &str)],
+    harness_code: &str,
+) -> court_jester::types::ExecutionResult {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path();
+    let source = workspace.join("src/routes/probe.ts");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(workspace.join("tsconfig.json"), tsconfig).unwrap();
+    std::fs::write(&source, "export const route = true;\n").unwrap();
+    for (relative_path, code) in modules {
+        let module = workspace.join(relative_path);
+        std::fs::create_dir_all(module.parent().unwrap()).unwrap();
+        std::fs::write(module, code).unwrap();
+    }
+
+    let context = resolve_execution_context(ContextRequest {
+        invocation_dir: workspace,
+        explicit_project_dir: Some(workspace),
+        target_file: Some(&source),
+        test_file: None,
+        language: Language::TypeScript,
+        virtual_file_path: None,
+    })
+    .unwrap();
+    let project_dir = workspace.to_string_lossy();
+    let source_file = source.to_string_lossy();
+    execute_harness(
+        &context,
+        HarnessSpec {
+            kind: HarnessKind::GeneratedVerifier,
+            runtime: HarnessRuntime::NodeScript,
+            test_adapter: None,
+            source_mode: SourceMode::TypeScript,
+            artifact: HarnessArtifact::Generated {
+                code: harness_code.into(),
+                relative_path: "src/routes/.court-jester-generated-verify.ts".into(),
+            },
+            args: Vec::new(),
+            network: NetworkPolicy::Deny,
+        },
+        sandbox_options(
+            10.0,
+            128,
+            Some(project_dir.as_ref()),
+            Some(source_file.as_ref()),
+        ),
+    )
+    .await
+    .process
+}
+
+#[tokio::test]
+async fn generated_typescript_harness_resolves_base_url_without_paths() {
+    let result = execute_typescript_alias_probe(
+        r#"{"compilerOptions":{"baseUrl":"."}}"#,
+        &[(
+            "src/lib/base-url.ts",
+            "export const marker = 'base-url-only';\n",
+        )],
+        "import { marker } from 'src/lib/base-url';\nconsole.log(marker);\n",
+    )
+    .await;
+
+    assert_eq!(result.exit_code, Some(0), "result: {result:?}");
+    assert_eq!(result.stdout.trim(), "base-url-only");
+}
+
+#[tokio::test]
+async fn generated_typescript_harness_prefers_most_specific_overlapping_path() {
+    let result = execute_typescript_alias_probe(
+        r#"{"compilerOptions":{"paths":{"*":["fallback/*"],"@app/*":["specific/*"]}}}"#,
+        &[
+            (
+                "fallback/@app/value.ts",
+                "export const marker = 'generic';\n",
+            ),
+            (
+                "specific/value.ts",
+                "export const marker = 'most-specific';\n",
+            ),
+        ],
+        "import { marker } from '@app/value';\nconsole.log(marker);\n",
+    )
+    .await;
+
+    assert_eq!(result.exit_code, Some(0), "result: {result:?}");
+    assert_eq!(result.stdout.trim(), "most-specific");
+}
+
+#[tokio::test]
+async fn generated_typescript_harness_preserves_jsonc_strings_when_removing_trailing_commas() {
+    let result = execute_typescript_alias_probe(
+        r#"{
+            // JSONC comments and trailing commas are valid in tsconfig.
+            "compilerOptions": {
+                "paths": {
+                    "punctuation/*": ["src/,]/*",],
+                },
+            },
+        }"#,
+        &[(
+            "src/,]/value.ts",
+            "export const marker = 'jsonc-string-preserved';\n",
+        )],
+        "import { marker } from 'punctuation/value';\nconsole.log(marker);\n",
+    )
+    .await;
+
+    assert_eq!(result.exit_code, Some(0), "result: {result:?}");
+    assert_eq!(result.stdout.trim(), "jsonc-string-preserved");
+}
+
+#[tokio::test]
+async fn generated_typescript_harness_resolves_extended_tsconfig_path_alias_inside_project() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path();
+    let source = workspace.join("src/routes/oauth.ts");
+    let aliased = workspace.join("src/lib/logs.ts");
+    let generated_config = workspace.join(".nuxt/types/tsconfig.json");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(aliased.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(generated_config.parent().unwrap()).unwrap();
+    std::fs::write(
+        workspace.join("tsconfig.json"),
+        r#"{"extends":"./.nuxt/types/tsconfig.json"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &generated_config,
+        r#"{"compilerOptions":{"paths":{"~/*":["../../*"]}}}"#,
+    )
+    .unwrap();
+    std::fs::write(&source, "export const route = true;\n").unwrap();
+    std::fs::write(&aliased, "export const marker = 'tsconfig-alias-ok';\n").unwrap();
+
+    let context = resolve_execution_context(ContextRequest {
+        invocation_dir: workspace,
+        explicit_project_dir: Some(workspace),
+        target_file: Some(&source),
+        test_file: None,
+        language: Language::TypeScript,
+        virtual_file_path: None,
+    })
+    .unwrap();
+    let project_dir = workspace.to_string_lossy();
+    let source_file = source.to_string_lossy();
+    let mut runtimes = vec![HarnessRuntime::NodeScript];
+    if std::process::Command::new("bun")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        runtimes.push(HarnessRuntime::BunScript);
+    }
+    for runtime in runtimes {
+        let result = execute_harness(
+            &context,
+            HarnessSpec {
+                kind: HarnessKind::GeneratedVerifier,
+                runtime,
+                test_adapter: None,
+                source_mode: SourceMode::TypeScript,
+                artifact: HarnessArtifact::Generated {
+                    code: "import { marker } from '~/src/lib/logs';\nconsole.log(marker);\n".into(),
+                    relative_path: "src/routes/.court-jester-generated-verify.ts".into(),
+                },
+                args: Vec::new(),
+                network: NetworkPolicy::Deny,
+            },
+            sandbox_options(
+                10.0,
+                128,
+                Some(project_dir.as_ref()),
+                Some(source_file.as_ref()),
+            ),
+        )
+        .await
+        .process;
+
+        assert_eq!(
+            result.exit_code,
+            Some(0),
+            "runtime {runtime:?}, result: {result:?}"
+        );
+        assert_eq!(result.stdout.trim(), "tsconfig-alias-ok");
+    }
+}
+
+#[tokio::test]
+async fn generated_typescript_harness_rejects_path_alias_outside_project_as_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("project");
+    let outside = dir.path().join("outside");
+    let source = workspace.join("src/index.ts");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(
+        workspace.join("tsconfig.json"),
+        r#"{"compilerOptions":{"paths":{"~/*":["../outside/*"]}}}"#,
+    )
+    .unwrap();
+    std::fs::write(&source, "export const route = true;\n").unwrap();
+    std::fs::write(
+        outside.join("secret.ts"),
+        "export const secret = 'leaked';\n",
+    )
+    .unwrap();
+
+    let context = resolve_execution_context(ContextRequest {
+        invocation_dir: &workspace,
+        explicit_project_dir: Some(&workspace),
+        target_file: Some(&source),
+        test_file: None,
+        language: Language::TypeScript,
+        virtual_file_path: None,
+    })
+    .unwrap();
+    let project_dir = workspace.to_string_lossy();
+    let source_file = source.to_string_lossy();
+    let result = execute_harness(
+        &context,
+        HarnessSpec {
+            kind: HarnessKind::GeneratedVerifier,
+            runtime: HarnessRuntime::NodeScript,
+            test_adapter: None,
+            source_mode: SourceMode::TypeScript,
+            artifact: HarnessArtifact::Generated {
+                code: "import { secret } from '~/secret';\nconsole.log(secret);\n".into(),
+                relative_path: "src/.court-jester-generated-verify.ts".into(),
+            },
+            args: Vec::new(),
+            network: NetworkPolicy::Deny,
+        },
+        sandbox_options(
+            10.0,
+            128,
+            Some(project_dir.as_ref()),
+            Some(source_file.as_ref()),
+        ),
+    )
+    .await
+    .process;
+
+    assert_ne!(result.exit_code, Some(0), "result: {result:?}");
+    assert!(result.diagnostics.iter().any(|diagnostic| {
+        diagnostic.domain == FailureDomain::Environment
+            && diagnostic.kind == court_jester::types::FailureKind::ModuleLoad
+            && diagnostic.component == court_jester::types::DiagnosticComponent::ModuleLoader
+            && diagnostic.message.contains("escapes the project mirror")
+    }));
+    assert!(result
+        .diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic.domain != FailureDomain::VerifierHarness));
+    assert!(!result.stdout.contains("leaked"));
+}
+
 #[tokio::test]
 async fn generated_typescript_harness_resolves_target_package_self_reference() {
     for has_hoisted_node_modules in [false, true] {

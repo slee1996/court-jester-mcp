@@ -188,14 +188,108 @@ async fn good_python_function() {
 }
 
 #[tokio::test]
+async fn python_generated_harness_imports_target_without_running_main_block() {
+    let project = tempfile::tempdir().unwrap();
+    let source_path = project.path().join("target.py");
+    let code = r#"import argparse
+
+def double(value: int) -> int:
+    return value * 2
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--required", required=True)
+    parser.parse_args()
+"#;
+    std::fs::write(&source_path, code).unwrap();
+    let mut opts = default_opts(None);
+    opts.project_dir = Some(project.path().to_str().unwrap());
+    opts.source_file = Some(source_path.to_str().unwrap());
+
+    let report = verify(code, &Language::Python, opts).await;
+
+    let execute = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("generated fuzz harness should execute");
+    assert_eq!(
+        execute.status,
+        StageStatus::Passed,
+        "target CLI main block must not run: {:#?}",
+        execute
+    );
+    let stdout = execute.detail.as_ref().unwrap()["execution"]["stdout"]
+        .as_str()
+        .expect("harness stdout should be recorded");
+    assert!(
+        stdout.contains("FUZZ double:"),
+        "fuzz execution should reach double, got: {stdout}"
+    );
+
+    let coverage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "coverage")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("coverage should be reported");
+    let double = coverage["functions"]
+        .as_array()
+        .and_then(|functions| {
+            functions
+                .iter()
+                .find(|function| function["function"].as_str() == Some("double"))
+        })
+        .expect("double coverage should be reported");
+    assert_eq!(double["status"].as_str(), Some("checked_direct"));
+}
+
+#[tokio::test]
+async fn python_differential_harness_imports_targets_without_running_main_blocks() {
+    let code = r#"def double(value: int) -> int:
+    return value * 2
+
+if __name__ == "__main__":
+    raise RuntimeError("CLI entry point ran")
+"#;
+
+    let report = verify_differential_files(code, code, Language::Python).await;
+    let differential = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .and_then(|stage| stage.detail.as_ref())
+        .and_then(|detail| detail["differential"].as_object())
+        .expect("differential execution should be reported");
+    assert_eq!(differential["enabled"].as_bool(), Some(true));
+    assert_eq!(
+        differential["units"][0]["status"].as_str(),
+        Some("equal"),
+        "candidate and baseline probes should both reach double: {differential:#?}"
+    );
+}
+
+#[tokio::test]
 async fn syntax_error_short_circuits() {
     let code = "def foo(:";
     let report = verify(code, &Language::Python, default_opts(None)).await;
 
     assert!(report.verdict != VerificationVerdict::Pass);
-    assert_eq!(report.stages.len(), 1, "should short-circuit after parse");
-    assert_eq!(report.stages[0].name, "parse");
-    assert!(report.stages[0].status != StageStatus::Passed);
+    assert_eq!(
+        report
+            .stages
+            .iter()
+            .map(|stage| stage.name.as_str())
+            .collect::<Vec<_>>(),
+        ["parse", "execute"],
+        "parse failure should skip later work while reporting omitted execution"
+    );
+    assert_eq!(report.stages[0].status, StageStatus::Failed);
+    assert_eq!(report.stages[1].status, StageStatus::Skipped);
+    assert_eq!(
+        report.stages[1].detail.as_ref().unwrap()["reason"].as_str(),
+        Some("parse_failed")
+    );
 }
 
 #[tokio::test]
@@ -626,6 +720,108 @@ function secondaryLabel(labels: string[]): string {
         exec_stage.status == StageStatus::Passed,
         "array label helper should not fail from name-only nonempty-string inference"
     );
+}
+
+#[tokio::test]
+async fn typescript_record_array_annotation_generates_only_array_arguments() {
+    let code = r#"
+export function countRecords(
+  records: Record<string, unknown>[]
+): number {
+  for (const record of records) {
+    if (record === null || typeof record !== "object" || Array.isArray(record)) {
+      throw new TypeError("records must contain plain objects")
+    }
+  }
+  return records.length
+}
+
+export function countGenericRecords(
+  records: Array<Record<string, unknown>>
+): number {
+  return records.length
+}
+
+export function countReadonlyRecords(
+  records: ReadonlyArray<Record<string, unknown>>
+): number {
+  return records.length
+}
+"#;
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+
+    let parse_stage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "parse")
+        .expect("parse stage should be present");
+    assert_eq!(
+        parse_stage.detail.as_ref().unwrap()["functions"][0]["params"][0]["type_annotation"],
+        "Record<string, unknown>[]"
+    );
+    assert_eq!(
+        report.verdict,
+        VerificationVerdict::Pass,
+        "valid array annotations must never be exercised with scalar arguments: {:#?}",
+        report.stages
+    );
+    let execute_stage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("execute stage should be present");
+    assert_eq!(execute_stage.status, StageStatus::Passed);
+    assert!(execute_stage.detail.as_ref().unwrap()["findings"]
+        .as_array()
+        .is_some_and(Vec::is_empty));
+}
+
+#[tokio::test]
+async fn typescript_empty_array_default_only_generates_assignable_empty_arrays() {
+    let code = r#"
+export function size(values = []): number {
+  if (!Array.isArray(values) || values.length !== 0) {
+    throw new TypeError("values must remain an empty array")
+  }
+  return values.length
+}
+"#;
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+
+    let parse_stage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "parse")
+        .expect("parse stage should be present");
+    assert_eq!(
+        parse_stage.detail.as_ref().unwrap()["functions"][0]["params"][0]["type_annotation"],
+        "never[]"
+    );
+    assert_eq!(
+        report.verdict,
+        VerificationVerdict::Pass,
+        "an inferred empty-array default should be fuzzed only with [] and omission: {:#?}",
+        report.stages
+    );
+    let execute_stage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("execute stage should be present");
+    assert_eq!(execute_stage.status, StageStatus::Passed);
+    let coverage_stage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "coverage")
+        .expect("coverage stage should be present");
+    assert_eq!(
+        coverage_stage.detail.as_ref().unwrap()["functions"][0]["status"],
+        "checked_direct",
+        "the empty-array target must execute fuzz cases"
+    );
+    assert!(execute_stage.detail.as_ref().unwrap()["findings"]
+        .as_array()
+        .is_some_and(Vec::is_empty));
 }
 
 #[tokio::test]
@@ -3052,9 +3248,36 @@ export function ensureScraper(): { enabled: boolean } {
         "report: {:#?}",
         report.stages
     );
-    assert!(
-        !report.stages.iter().any(|stage| stage.name == "execute"),
-        "no-fuzzable-surface function should not synthesize execute work"
+    let execute = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("no-fuzzable-surface verification should report skipped execution");
+    assert_eq!(execute.status, StageStatus::Skipped);
+    let execute_detail = execute
+        .detail
+        .as_ref()
+        .expect("skipped execution should explain why no cases ran");
+    assert_eq!(
+        execute_detail["reason"].as_str(),
+        Some("no_fuzzable_targets")
+    );
+    assert_eq!(execute_detail["generated_cases"].as_u64(), Some(0));
+    let minimal = report_json_value(&report, ReportLevel::Minimal);
+    let minimal_execute = minimal["stages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|stage| stage["name"] == "execute")
+        .expect("minimal report should retain the execute stage");
+    assert_eq!(minimal_execute["status"].as_str(), Some("skipped"));
+    assert_eq!(
+        minimal_execute["detail"]["reason"].as_str(),
+        Some("no_fuzzable_targets")
+    );
+    assert_eq!(
+        minimal_execute["detail"]["generated_cases"].as_u64(),
+        Some(0)
     );
 
     let coverage = report
@@ -4149,26 +4372,68 @@ describe("AnalyticsPage", () => {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
-async fn vitest_coordinator_can_fork_guarded_test_worker_under_default_deny() {
-    let dir = tempfile::tempdir().unwrap();
-    let tool_dir = dir.path().join("node_modules").join(".bin");
-    install_fake_tool_at(
-        &tool_dir,
-        "vitest",
-        r#"#!/usr/bin/env node
-const { fork } = require("node:child_process");
+async fn vitest_coordinator_resolves_project_entrypoint_and_bounds_legacy_and_modern_workers() {
+    for (version, symlinked_launcher, expected_worker_args, forbidden_worker_args) in [
+        (
+            "0.19.1",
+            false,
+            &["--threads", "false"][..],
+            &["--pool=forks", "--maxWorkers=1", "--minWorkers=1"][..],
+        ),
+        (
+            "3.2.4",
+            true,
+            &["--pool=forks", "--maxWorkers=1", "--minWorkers=1"][..],
+            &["--threads", "false"][..],
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let node_modules = dir.path().join("node_modules");
+        let tool_dir = node_modules.join(".bin");
+        let vitest_dir = if symlinked_launcher {
+            let prefix = dir.path().join("prefix");
+            let prefix_bin = prefix.join("bin");
+            let package_dir = prefix.join("lib/node_modules/vitest");
+            std::fs::create_dir_all(&prefix_bin).unwrap();
+            std::fs::create_dir_all(&package_dir).unwrap();
+            std::fs::create_dir_all(&node_modules).unwrap();
+            std::os::unix::fs::symlink(&prefix_bin, &tool_dir).unwrap();
+            std::os::unix::fs::symlink(package_dir.join("vitest.mjs"), prefix_bin.join("vitest"))
+                .unwrap();
+            package_dir
+        } else {
+            install_fake_tool_at(
+                &tool_dir,
+                "vitest",
+                "#!/bin/sh\nbasedir=$(dirname \"$0\")\nexit 91\n",
+            );
+            let package_dir = node_modules.join("vitest");
+            std::fs::create_dir_all(&package_dir).unwrap();
+            package_dir
+        };
+        std::fs::write(
+            vitest_dir.join("package.json"),
+            serde_json::json!({
+                "name": "vitest",
+                "version": version,
+                "type": "module",
+                "bin": { "vitest": "./vitest.mjs" }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let vitest_log = dir.path().join("vitest.log");
+        let entrypoint = r#"
+import { appendFileSync } from "node:fs";
+import { fork } from "node:child_process";
 
 if (globalThis.__COURT_JESTER_NETWORK_GUARD__) {
   console.error("Vitest coordinator unexpectedly received the target guard");
   process.exit(70);
 }
-for (const flag of ["--pool=forks", "--maxWorkers=1", "--minWorkers=1"]) {
-  if (!process.argv.includes(flag)) {
-    console.error(`Vitest coordinator did not bound its worker pool with ${flag}`);
-    process.exit(73);
-  }
-}
+appendFileSync(__LOG__, process.argv.slice(2).map((arg) => `arg=${arg}\n`).join(""));
 const testFile = process.argv.at(-1);
 const worker = fork(testFile, {
   execArgv: ["--no-warnings", "--experimental-transform-types"],
@@ -4179,23 +4444,29 @@ worker.stderr.pipe(process.stderr);
 worker.once("exit", (code, signal) => {
   process.exitCode = signal ? 71 : (code ?? 72);
 });
-"#,
-    );
-    std::fs::write(
-        dir.path().join("vitest.config.ts"),
-        "export default { test: { globals: true } };\n",
-    )
-    .unwrap();
-    std::fs::write(
-        dir.path().join("package.json"),
-        r#"{"name":"guarded-vitest-fixture","type":"module"}"#,
-    )
-    .unwrap();
+"#
+        .replace(
+            "__LOG__",
+            &serde_json::to_string(&vitest_log.to_string_lossy()).unwrap(),
+        );
+        std::fs::write(vitest_dir.join("vitest.mjs"), entrypoint).unwrap();
+        std::fs::write(
+            dir.path().join("vitest.config.ts"),
+            "export default { test: { globals: true } };\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            format!(
+                r#"{{"name":"guarded-vitest-fixture","type":"module","devDependencies":{{"vitest":"{version}"}}}}"#
+            ),
+        )
+        .unwrap();
 
-    let source_path = dir.path().join("target.ts");
-    let test_path = dir.path().join("target.test.ts");
-    let code = "export const targetValue = 1;\n";
-    let tests = r#"
+        let source_path = dir.path().join("target.ts");
+        let test_path = dir.path().join("target.test.ts");
+        let code = "export const targetValue = 1;\n";
+        let tests = r#"
 import { spawnSync } from "node:child_process";
 import { connect } from "node:net";
 
@@ -4225,31 +4496,55 @@ console.log(JSON.stringify({
   success: true,
 }));
 "#;
-    std::fs::write(&source_path, code).unwrap();
-    std::fs::write(&test_path, tests).unwrap();
+        std::fs::write(&source_path, code).unwrap();
+        std::fs::write(&test_path, tests).unwrap();
 
-    let source_file = source_path.to_string_lossy().into_owned();
-    let test_file = test_path.to_string_lossy().into_owned();
-    let project_dir = dir.path().to_string_lossy().into_owned();
-    let mut opts = default_opts(Some(tests));
-    opts.test_source_file = Some(&test_file);
-    opts.test_runner = TestRunner::Auto;
-    opts.tests_only = true;
-    opts.project_dir = Some(&project_dir);
-    opts.source_file = Some(&source_file);
+        let source_file = source_path.to_string_lossy().into_owned();
+        let test_file = test_path.to_string_lossy().into_owned();
+        let project_dir = dir.path().to_string_lossy().into_owned();
+        let mut opts = default_opts(Some(tests));
+        opts.test_source_file = Some(&test_file);
+        opts.test_runner = TestRunner::Auto;
+        opts.tests_only = true;
+        opts.project_dir = Some(&project_dir);
+        opts.source_file = Some(&source_file);
 
-    let report = verify(code, &Language::TypeScript, opts).await;
-    let test_stage = report
-        .stages
-        .iter()
-        .find(|stage| stage.name == "test")
-        .expect("test stage should be present");
-    assert_eq!(
-        test_stage.status,
-        StageStatus::Passed,
-        "unguarded coordinator must fork a guarded test worker: {:#?}",
-        report.stages
-    );
+        let report = verify(code, &Language::TypeScript, opts).await;
+        let test_stage = report
+            .stages
+            .iter()
+            .find(|stage| stage.name == "test")
+            .expect("test stage should be present");
+        assert_eq!(
+            test_stage.status,
+            StageStatus::Passed,
+            "Vitest {version} must launch its JavaScript entrypoint with a guarded worker: {:#?}",
+            report.stages
+        );
+
+        let vitest_args = std::fs::read_to_string(&vitest_log)
+            .unwrap_or_else(|error| panic!("Vitest {version} entrypoint did not run: {error}"));
+        assert!(
+            vitest_args.contains("arg=run") && vitest_args.contains("arg=--reporter=json"),
+            "Vitest {version} must retain structured JSON results, got:\n{vitest_args}"
+        );
+        for expected in expected_worker_args {
+            assert!(
+                vitest_args
+                    .lines()
+                    .any(|line| line == format!("arg={expected}")),
+                "Vitest {version} must bound workers with {expected}, got:\n{vitest_args}"
+            );
+        }
+        for forbidden in forbidden_worker_args {
+            assert!(
+                !vitest_args
+                    .lines()
+                    .any(|line| line == format!("arg={forbidden}")),
+                "Vitest {version} must not receive incompatible worker flag {forbidden}, got:\n{vitest_args}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -4843,6 +5138,46 @@ async fn schema_v3_syntax_error_is_fail_with_parse_only_strength() {
         report.strength,
         court_jester::types::VerificationStrength::ParseOnly
     );
+    let execute = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("parse failure should still report skipped execution");
+    assert_eq!(execute.status, StageStatus::Skipped);
+    assert_eq!(
+        execute.detail.as_ref().unwrap()["reason"].as_str(),
+        Some("parse_failed")
+    );
+}
+
+#[tokio::test]
+async fn context_failure_still_reports_skipped_execute_stage() {
+    let project = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let source = outside.path().join("target.py");
+    let code = "def add(value: int) -> int:\n    return value + 1";
+    fs::write(&source, code).unwrap();
+    let mut opts = default_opts(None);
+    opts.project_dir = project.path().to_str();
+    opts.source_file = source.to_str();
+
+    let report = verify(code, &Language::Python, opts).await;
+
+    assert_eq!(report.verdict, VerificationVerdict::Inconclusive);
+    assert!(report
+        .stages
+        .iter()
+        .any(|stage| stage.name == "context" && stage.status == StageStatus::Inconclusive));
+    let execute = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("context failure should still report skipped execution");
+    assert_eq!(execute.status, StageStatus::Skipped);
+    assert_eq!(
+        execute.detail.as_ref().unwrap()["reason"].as_str(),
+        Some("context_unavailable")
+    );
 }
 
 #[tokio::test]
@@ -4860,6 +5195,15 @@ async fn unsupported_required_export_is_inconclusive_not_pass() {
     );
     assert!(report.summary.coverage.required >= 1);
     assert!(report.summary.coverage.skipped >= 1 || report.summary.coverage.no_inputs_reached >= 1);
+    let execute = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("unsupported required export should report skipped execution");
+    assert_eq!(execute.status, StageStatus::Skipped);
+    let detail = execute.detail.as_ref().unwrap();
+    assert_eq!(detail["reason"].as_str(), Some("no_fuzzable_targets"));
+    assert_eq!(detail["generated_cases"].as_u64(), Some(0));
 }
 
 #[tokio::test]
@@ -4868,6 +5212,15 @@ async fn coverage_none_does_not_manufacture_pass_without_behavioral_evidence() {
     opts.coverage_gate = CoverageGate::None;
     let report = verify("CONSTANT = 1", &Language::Python, opts).await;
     assert_eq!(report.verdict, VerificationVerdict::Inconclusive);
+    let execute = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("verification without functions should report skipped execution");
+    assert_eq!(execute.status, StageStatus::Skipped);
+    let detail = execute.detail.as_ref().unwrap();
+    assert_eq!(detail["reason"].as_str(), Some("no_analyzed_functions"));
+    assert_eq!(detail["generated_cases"].as_u64(), Some(0));
 }
 
 #[tokio::test]
@@ -5172,6 +5525,62 @@ async fn minimal_output_dir_report_loads_and_replays() {
     .await
     .expect("persisted minimal finding should be replayable");
     assert_eq!(replay.outcome, ReplayOutcome::Reproduced, "{replay:#?}");
+}
+
+#[tokio::test]
+async fn persisted_python_replay_ignores_guarded_main() {
+    let project = tempfile::tempdir().unwrap();
+    let output = tempfile::tempdir().unwrap();
+    let source = project.path().join("guarded_cli.py");
+    let code = r#"import argparse
+
+def first_character(value: str) -> str:
+    return value[0]
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--required", required=True)
+    parser.parse_args()
+"#;
+    fs::write(&source, code).unwrap();
+
+    let mut opts = default_opts(None);
+    opts.project_dir = project.path().to_str();
+    opts.source_file = source.to_str();
+    opts.output_dir = output.path().to_str();
+    opts.report_level = ReportLevel::Minimal;
+    let report = verify(code, &Language::Python, opts).await;
+    let report_path = report
+        .report_path
+        .expect("guarded source should persist a report");
+    let persisted = load_persisted_report(&report_path).expect("guarded source report should load");
+    let finding = persisted
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .and_then(|stage| stage.detail.as_ref())
+        .and_then(|detail| detail["findings"].as_array())
+        .and_then(|findings| {
+            findings
+                .iter()
+                .find(|finding| finding["location"]["function"] == "first_character")
+        })
+        .expect("guarded source should retain the actionable finding");
+    let finding_id = finding["id"].as_str().expect("finding id");
+
+    let replay = replay_report(
+        &report_path,
+        finding_id,
+        None,
+        RuntimeProfile::LocalTrusted,
+        DEFAULT_PYTHON_DOCKER_IMAGE,
+        DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+    )
+    .await
+    .expect("guarded source finding should be replayable");
+
+    assert_eq!(replay.outcome, ReplayOutcome::Reproduced, "{replay:#?}");
+    assert_eq!(replay.execution.exit_code, Some(0), "{replay:#?}");
 }
 
 #[tokio::test]
@@ -5551,4 +5960,296 @@ async fn identical_address_bearing_differential_returns_are_disabled_not_regress
                     .any(|finding| finding["category"] == "differential")
             })
     }));
+}
+
+#[tokio::test]
+async fn nuxt_auto_import_reference_error_is_one_environment_blocker() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"devDependencies":{"nuxt":"3.15.4"}}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("nuxt.config.ts"), "export default {};\n").unwrap();
+    let source_path = dir.path().join("useCounter.ts");
+    let code = r#"
+export function useCounter() {
+  return ref(0);
+}
+"#;
+    std::fs::write(&source_path, code).unwrap();
+
+    let mut opts = default_opts(None);
+    opts.project_dir = Some(dir.path().to_str().unwrap());
+    opts.source_file = Some(source_path.to_str().unwrap());
+    let report = verify(code, &Language::TypeScript, opts).await;
+
+    assert_eq!(report.verdict, VerificationVerdict::Inconclusive);
+    let execute = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("execute stage");
+    assert_eq!(execute.status, StageStatus::Inconclusive);
+    let detail = execute.detail.as_ref().expect("execute detail");
+    assert!(
+        detail["findings"].as_array().is_some_and(Vec::is_empty),
+        "a missing Nuxt runtime must not be attributed to target code: {detail:#?}"
+    );
+    assert_eq!(
+        detail["environment_setup"]["classification"].as_str(),
+        Some("missing_nuxt_auto_import_runtime")
+    );
+    assert_eq!(
+        detail["environment_setup"]["missing_globals"]
+            .as_array()
+            .expect("missing globals"),
+        &[serde_json::Value::String("ref".into())]
+    );
+    let environment_diagnostics = detail["diagnostics"]
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .filter(|diagnostic| diagnostic["domain"] == "environment")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        environment_diagnostics.len(),
+        1,
+        "identical setup failures must be deduplicated: {detail:#?}"
+    );
+    let stdout = detail["execution"]["stdout"].as_str().unwrap_or("");
+    assert!(
+        !stdout.contains("CRASHED"),
+        "the reporter-facing result must not retain repeated target crash totals: {stdout}"
+    );
+    assert!(
+        stdout.contains("Nuxt auto-import runtime unavailable: ref"),
+        "the reporter should see one explicit environment result: {stdout}"
+    );
+    let coverage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "coverage")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("coverage detail");
+    let function = coverage["functions"]
+        .as_array()
+        .and_then(|functions| {
+            functions
+                .iter()
+                .find(|function| function["function"] == "useCounter")
+        })
+        .expect("useCounter coverage");
+    assert_eq!(
+        function["status"].as_str(),
+        Some("skipped_no_fuzzable_surface")
+    );
+    assert!(
+        function["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("Nuxt auto-import runtime")),
+        "coverage must explain the environment blocker: {function:#?}"
+    );
+}
+
+#[tokio::test]
+async fn ordinary_reference_error_remains_a_target_crash_outside_nuxt() {
+    let code = r#"
+export function brokenReference(value: number): number {
+  return missingOrdinaryGlobal + value;
+}
+"#;
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+
+    assert_ne!(report.verdict, VerificationVerdict::Pass);
+    let execute = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("execute stage");
+    assert_eq!(execute.status, StageStatus::Failed);
+    let detail = execute.detail.as_ref().expect("execute detail");
+    assert!(
+        detail["environment_setup"].is_null(),
+        "ordinary ReferenceErrors must not be classified as framework setup"
+    );
+    assert!(
+        detail["findings"].as_array().is_some_and(|findings| {
+            findings.iter().any(|finding| {
+                finding["error_type"] == "ReferenceError"
+                    && finding["message"] == "missingOrdinaryGlobal is not defined"
+            })
+        }),
+        "ordinary ReferenceError should remain a target finding: {detail:#?}"
+    );
+}
+
+#[tokio::test]
+async fn nuxt_project_composable_reference_error_is_an_environment_blocker() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"dependencies":{"nuxt":"3.15.4"}}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("nuxt.config.ts"), "export default {};\n").unwrap();
+    let composables = dir.path().join("composables");
+    let feature_dir = composables.join("feature");
+    std::fs::create_dir_all(&feature_dir).unwrap();
+    std::fs::write(
+        composables.join("useProjectApi.ts"),
+        "export function useProjectApi() { return { convert: (value: number) => value }; }\n",
+    )
+    .unwrap();
+    let source_path = feature_dir.join("useFeature.ts");
+    let code = r#"
+export function useFeature(value: number): number {
+  return useProjectApi().convert(value);
+}
+"#;
+    std::fs::write(&source_path, code).unwrap();
+
+    let mut opts = default_opts(None);
+    opts.project_dir = Some(dir.path().to_str().unwrap());
+    opts.source_file = Some(source_path.to_str().unwrap());
+    let report = verify(code, &Language::TypeScript, opts).await;
+
+    assert_eq!(report.verdict, VerificationVerdict::Inconclusive);
+    let detail = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("execute detail");
+    assert!(
+        detail["findings"].as_array().is_some_and(Vec::is_empty),
+        "a project composable auto-import is framework runtime context, not a target crash: {detail:#?}"
+    );
+    assert_eq!(
+        detail["environment_setup"]["missing_globals"]
+            .as_array()
+            .expect("missing globals"),
+        &[serde_json::Value::String("useProjectApi".into())]
+    );
+}
+
+#[tokio::test]
+async fn nuxt_top_level_auto_import_reference_error_is_an_environment_blocker() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"dependencies":{"nuxt":"3.15.4"}}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("nuxt.config.ts"), "export default {};\n").unwrap();
+    let source_path = dir.path().join("useTopLevelCounter.ts");
+    let code = r#"
+const counter = ref(0);
+
+export function addToCounter(value: number): number {
+  return counter.value + value;
+}
+"#;
+    std::fs::write(&source_path, code).unwrap();
+
+    let mut opts = default_opts(None);
+    opts.project_dir = Some(dir.path().to_str().unwrap());
+    opts.source_file = Some(source_path.to_str().unwrap());
+    let report = verify(code, &Language::TypeScript, opts).await;
+
+    assert_eq!(report.verdict, VerificationVerdict::Inconclusive);
+    let execute = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("execute stage");
+    assert_eq!(execute.status, StageStatus::Inconclusive);
+    let detail = execute.detail.as_ref().expect("execute detail");
+    assert_eq!(
+        detail["environment_setup"]["classification"].as_str(),
+        Some("missing_nuxt_auto_import_runtime")
+    );
+    assert_eq!(
+        detail["environment_setup"]["missing_globals"]
+            .as_array()
+            .expect("missing globals"),
+        &[serde_json::Value::String("ref".into())]
+    );
+    assert!(
+        detail["diagnostics"].as_array().is_some_and(|diagnostics| {
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic["domain"] == "environment" && diagnostic["kind"] == "context_resolution"
+            }) && diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic["domain"] != "verifier_harness")
+        }),
+        "pre-bootstrap failure must be one explicit environment diagnostic: {detail:#?}"
+    );
+    let coverage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "coverage")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("coverage detail");
+    let function = coverage["functions"]
+        .as_array()
+        .and_then(|functions| {
+            functions
+                .iter()
+                .find(|function| function["function"] == "addToCounter")
+        })
+        .expect("addToCounter coverage");
+    assert_eq!(
+        function["status"].as_str(),
+        Some("skipped_no_fuzzable_surface")
+    );
+}
+
+#[tokio::test]
+async fn nuxt_disabled_auto_import_reference_error_remains_a_target_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"dependencies":{"nuxt":"3.15.4"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("nuxt.config.ts"),
+        "export default defineNuxtConfig({ imports: { autoImport: false } });\n",
+    )
+    .unwrap();
+    let source_path = dir.path().join("useCounter.ts");
+    let code = r#"
+export function useCounter() {
+  return ref(0);
+}
+"#;
+    std::fs::write(&source_path, code).unwrap();
+
+    let mut opts = default_opts(None);
+    opts.project_dir = Some(dir.path().to_str().unwrap());
+    opts.source_file = Some(source_path.to_str().unwrap());
+    let report = verify(code, &Language::TypeScript, opts).await;
+
+    assert_eq!(report.verdict, VerificationVerdict::Fail);
+    let execute = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("execute stage");
+    assert_eq!(execute.status, StageStatus::Failed);
+    let detail = execute.detail.as_ref().expect("execute detail");
+    assert!(
+        detail["environment_setup"].is_null(),
+        "disabled auto-imports must not hide an unimported target reference: {detail:#?}"
+    );
+    assert!(
+        detail["findings"].as_array().is_some_and(|findings| {
+            findings.iter().any(|finding| {
+                finding["error_type"] == "ReferenceError"
+                    && finding["message"] == "ref is not defined"
+            })
+        }),
+        "the unresolved ref must remain a target crash: {detail:#?}"
+    );
 }
