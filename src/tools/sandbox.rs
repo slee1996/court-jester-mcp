@@ -1114,6 +1114,18 @@ fn docker_image_for_harness<'a>(
     }
 }
 
+fn docker_runtime_user(_has_node_dependency_bind: bool) -> String {
+    #[cfg(target_os = "macos")]
+    if _has_node_dependency_bind {
+        // Docker Desktop can transiently expose read-only pnpm store files with
+        // host-only modes. Root may read the bind but cannot write it.
+        return "0:0".to_string();
+    }
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+    format!("{uid}:{gid}")
+}
+
 struct NodePackageResolver {
     _directory: tempfile::TempDir,
     loader: std::path::PathBuf,
@@ -1562,6 +1574,36 @@ export async function resolve(specifier, context, nextResolve) {
     throw error;
   }
 }
+
+const dependencyReadRetryDelays = [10, 25, 50, 100];
+
+function isProjectDependencyURL(url) {
+  if (!url.startsWith("file:") || !sourceRoot) return false;
+  try {
+    const filename = realPathOrSelf(fileURLToPath(url));
+    return containsPath(sourceRoot, filename)
+      && filename.split(path.sep).includes("node_modules");
+  } catch {
+    return false;
+  }
+}
+
+export async function load(url, context, nextLoad) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await nextLoad(url, context);
+    } catch (error) {
+      if (error?.code !== "EACCES"
+          || !isProjectDependencyURL(url)
+          || attempt === dependencyReadRetryDelays.length) {
+        throw error;
+      }
+      await new Promise((resolveRetry) => {
+        setTimeout(resolveRetry, dependencyReadRetryDelays[attempt]);
+      });
+    }
+  }
+}
 "##,
     )
     .map_err(|error| format!("failed to write Node package resolver: {error}"))?;
@@ -1834,6 +1876,7 @@ if (target && payload) {
     builtinModule.syncBuiltinESMExports();
     if (
       typeof builtinModule.register === "function" &&
+      !process.env.COURT_JESTER_TYPESCRIPT_MODULE &&
       process.env.COURT_JESTER_INSTRUMENT_LOADER_PID !== String(process.pid)
     ) {
       process.env.COURT_JESTER_INSTRUMENT_LOADER_PID = String(process.pid);
@@ -1892,12 +1935,26 @@ if (!vitestModule || !typescriptModule || !testFile || !guard || !instrumentatio
   throw new Error("court-jester portable Vitest coordinator requires runner, compiler, test, guard, and instrumentation paths");
 }
 await import(pathToFileURL(instrumentation).href);
-const [vitestNamespace, typescriptNamespace] = await Promise.all([
-  import(pathToFileURL(vitestModule).href),
-  import(pathToFileURL(typescriptModule).href),
-]);
-const { startVitest } = vitestNamespace;
-const vitestMajor = Number.parseInt(String(vitestNamespace.version || "0").split(".", 1)[0], 10);
+const typescriptNamespace = await import(pathToFileURL(typescriptModule).href);
+let vitestNamespace = {};
+let vitestImportError;
+try {
+  vitestNamespace = await import(pathToFileURL(vitestModule).href);
+} catch (error) {
+  vitestImportError = error;
+}
+let declaredVitestVersion = "0";
+try {
+  const vitestRoot = path.dirname(path.dirname(fs.realpathSync(vitestModule)));
+  declaredVitestVersion = JSON.parse(
+    fs.readFileSync(path.join(vitestRoot, "package.json"), "utf8"),
+  ).version || "0";
+} catch {}
+const startVitest = vitestNamespace.startVitest;
+const vitestMajor = Number.parseInt(
+  String(vitestNamespace.version || declaredVitestVersion).split(".", 1)[0],
+  10,
+);
 const ts = typescriptNamespace.default || typescriptNamespace;
 let compilerOptions = {};
 const configPath = ts.findConfigFile(process.cwd(), ts.sys.fileExists, "tsconfig.json");
@@ -2159,22 +2216,300 @@ const viteOverrides = {
   plugins: [workspaceResolver, transform],
 };
 async function runVitest(overrides) {
+  if (vitestImportError) throw vitestImportError;
+  if (typeof startVitest !== "function") {
+    throw new Error("the selected Vitest package does not export startVitest");
+  }
   return vitestMajor >= 1
     ? startVitest("test", filters, options, overrides)
     : startVitest(filters, options, overrides);
 }
-let started;
-try {
-  started = await runVitest(viteOverrides);
-} catch (error) {
-  const message = String(error?.stack || error);
-  if (!message.includes("esbuild") || !message.includes("another platform")) throw error;
-  process.stderr.write(
-    "court-jester project config requires a host-incompatible native dependency; using the portable Vite transform\n",
-  );
-  started = await runVitest({ ...viteOverrides, configFile: false });
+function capturedWrite(chunks, chunk, encoding, callback) {
+  chunks.push(Buffer.isBuffer(chunk) ? chunk.toString() : String(chunk));
+  const completed = typeof encoding === "function" ? encoding : callback;
+  if (typeof completed === "function") completed();
+  return true;
 }
-if (started === false) process.exitCode = 1;
+async function captureVitest(overrides) {
+  const previousExitCode = process.exitCode;
+  const stdoutWrite = process.stdout.write;
+  const stderrWrite = process.stderr.write;
+  const stdout = [];
+  const stderr = [];
+  process.exitCode = 0;
+  process.stdout.write = (chunk, encoding, callback) =>
+    capturedWrite(stdout, chunk, encoding, callback);
+  process.stderr.write = (chunk, encoding, callback) =>
+    capturedWrite(stderr, chunk, encoding, callback);
+  let result;
+  let error;
+  try {
+    result = await runVitest(overrides);
+  } catch (caught) {
+    error = caught;
+  } finally {
+    process.stdout.write = stdoutWrite;
+    process.stderr.write = stderrWrite;
+  }
+  const exitCode = Number(process.exitCode || 0);
+  process.exitCode = previousExitCode;
+  return {
+    result,
+    error,
+    exitCode,
+    stdout: stdout.join(""),
+    stderr: stderr.join(""),
+  };
+}
+function collectedTestCount(output) {
+  let count = 0;
+  for (const match of output.matchAll(/"numTotalTests"\s*:\s*(\d+)/g)) {
+    count = Math.max(count, Number(match[1]));
+  }
+  return count;
+}
+function nativeToolchainFailure(error) {
+  const message = String(error?.stack || error || "");
+  return [
+    "another platform",
+    "@rollup/rollup-",
+    "@esbuild/",
+    "invalid ELF header",
+    "Exec format Error",
+    "Exec format error",
+    "not a valid Win32 application",
+    "wrong architecture",
+  ].some((fragment) => message.includes(fragment));
+}
+function matchingRunnerFailure(error) {
+  const message = String(error?.stack || error || "");
+  return nativeToolchainFailure(error) || [
+    "Vitest failed to access its internal state",
+    "Vitest was initialized with native Node instead of Vite Node",
+    "customEqualityTesters",
+    "workerState.config",
+  ].some((fragment) => message.includes(fragment));
+}
+function completedVitestAttempt(attempt) {
+  return !attempt.error
+    && attempt.result !== false
+    && (attempt.exitCode === 0 || collectedTestCount(attempt.stdout) > 0);
+}
+function publishVitestAttempt(attempt) {
+  if (attempt.stdout) process.stdout.write(attempt.stdout);
+  if (attempt.stderr) process.stderr.write(attempt.stderr);
+  process.exitCode = attempt.result === false ? 1 : attempt.exitCode;
+}
+function matchingRunnerModule() {
+  const vitestRoot = path.dirname(path.dirname(fs.realpathSync(vitestModule)));
+  const runnerRoots = [
+    path.join(vitestRoot, "node_modules", "@vitest", "runner"),
+    path.join(path.dirname(vitestRoot), "@vitest", "runner"),
+  ];
+  for (const root of runnerRoots) {
+    for (const entry of ["dist/index.js", "dist/index.mjs"]) {
+      const candidate = path.join(root, entry);
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+    }
+  }
+  throw new Error(
+    `matching @vitest/runner is unavailable beside ${fs.realpathSync(vitestModule)}`,
+  );
+}
+function errorText(error) {
+  return String(error?.stack || error?.message || error || "unknown test runner error");
+}
+function assertionStatus(task) {
+  if (task.mode === "skip" || task.mode === "todo") return "pending";
+  if (task.result?.state === "pass") return "passed";
+  if (task.result?.state === "skip" || task.result?.state === "todo") return "pending";
+  return "failed";
+}
+function collectAssertions(task, ancestors, assertions) {
+  if (task.type === "test") {
+    const status = assertionStatus(task);
+    assertions.push({
+      ancestorTitles: ancestors,
+      title: task.name,
+      fullName: [...ancestors, task.name].join(" "),
+      status,
+      duration: task.result?.duration,
+      failureMessages: (task.result?.errors || []).map(errorText),
+    });
+    return;
+  }
+  const nextAncestors = task.type === "suite" && ancestors.length > 0
+    ? [...ancestors, task.name]
+    : task.type === "suite" && task.tasks
+      ? [task.name]
+      : ancestors;
+  for (const child of task.tasks || []) {
+    collectAssertions(child, nextAncestors, assertions);
+  }
+}
+function collectSuiteErrors(task, errors) {
+  if (task.type !== "test" && task.result?.state === "fail") {
+    const taskErrors = (task.result?.errors || []).map(errorText);
+    if (taskErrors.length > 0) {
+      errors.push(...taskErrors);
+    } else {
+      errors.push(`suite ${task.name} failed`);
+    }
+  }
+  for (const child of task.tasks || []) collectSuiteErrors(child, errors);
+}
+function directVitestSummary(files) {
+  const testResults = files.map((file) => {
+    const assertionResults = [];
+    const suiteErrors = [];
+    for (const task of file.tasks || []) {
+      collectAssertions(task, [], assertionResults);
+      collectSuiteErrors(task, suiteErrors);
+    }
+    const fileErrors = [...(file.result?.errors || []).map(errorText), ...suiteErrors];
+    const failed = file.result?.state === "fail"
+      || fileErrors.length > 0
+      || assertionResults.some((assertion) => assertion.status === "failed");
+    return {
+      assertionResults,
+      startTime: file.result?.startTime,
+      endTime: file.result?.startTime && file.result?.duration
+        ? file.result.startTime + file.result.duration
+        : undefined,
+      status: failed ? "failed" : "passed",
+      message: fileErrors.join("\n"),
+      name: file.filepath || file.name,
+    };
+  });
+  const assertions = testResults.flatMap((result) => result.assertionResults);
+  const failedTests = assertions.filter((assertion) => assertion.status === "failed").length;
+  const passedTests = assertions.filter((assertion) => assertion.status === "passed").length;
+  const pendingTests = assertions.length - failedTests - passedTests;
+  const failedSuites = testResults.filter((result) => result.status === "failed").length;
+  const passedSuites = testResults.length - failedSuites;
+  return {
+    numTotalTestSuites: testResults.length,
+    numPassedTestSuites: passedSuites,
+    numFailedTestSuites: failedSuites,
+    numPendingTestSuites: 0,
+    numTotalTests: assertions.length,
+    numPassedTests: passedTests,
+    numFailedTests: failedTests,
+    numPendingTests: pendingTests,
+    success: assertions.length > 0 && failedTests === 0 && failedSuites === 0,
+    testResults,
+  };
+}
+function initializationSummary(error) {
+  return {
+    numTotalTestSuites: 1,
+    numPassedTestSuites: 0,
+    numFailedTestSuites: 1,
+    numPendingTestSuites: 0,
+    numTotalTests: 0,
+    numPassedTests: 0,
+    numFailedTests: 0,
+    numPendingTests: 0,
+    success: false,
+    testResults: [{
+      assertionResults: [],
+      status: "failed",
+      message: errorText(error),
+      name: testFile,
+    }],
+  };
+}
+async function runDirectVitest() {
+  try {
+    if (extraFilters.length > 0) {
+      throw new Error(
+        `matching package runner cannot preserve Vitest filters: ${extraFilters.join(" ")}`,
+      );
+    }
+    const runnerNamespace = await import(pathToFileURL(matchingRunnerModule()).href);
+    if (typeof runnerNamespace.startTests !== "function") {
+      throw new Error("matching @vitest/runner does not export startTests");
+    }
+    const config = {
+      root: process.cwd(),
+      setupFiles: [],
+      passWithNoTests: false,
+      allowOnly: true,
+      sequence: { seed: 1, hooks: "list", setupFiles: "list" },
+      maxConcurrency: 1,
+      testTimeout: 5000,
+      hookTimeout: 10000,
+      retry: 0,
+      clearMocks: false,
+      mockReset: false,
+      restoreMocks: false,
+      unstubGlobals: false,
+      unstubEnvs: false,
+      fakeTimers: {},
+      expect: {},
+    };
+    globalThis.__vitest_worker__ = {
+      config,
+      environment: { name: "node", options: null },
+      filepath: testFile,
+      moduleCache: new Map(),
+      providedContext: {},
+      durations: { environment: 0, prepare: 0 },
+      onCancel: new Promise(() => {}),
+      rpc: {},
+    };
+    let importSequence = 0;
+    const runner = {
+      config,
+      importFile(filepath) {
+        const absolute = path.isAbsolute(filepath) ? filepath : path.resolve(filepath);
+        importSequence += 1;
+        return import(`${pathToFileURL(absolute).href}?court_jester=${importSequence}`);
+      },
+    };
+    const files = await runnerNamespace.startTests([testFile], runner);
+    const summary = directVitestSummary(files);
+    process.stdout.write(`${JSON.stringify(summary)}\n`);
+    process.exitCode = summary.success ? 0 : 1;
+  } catch (error) {
+    process.stdout.write(`${JSON.stringify(initializationSummary(error))}\n`);
+    process.exitCode = 1;
+  }
+}
+
+let attempt = await captureVitest(viteOverrides);
+if (completedVitestAttempt(attempt)) {
+  publishVitestAttempt(attempt);
+} else {
+  const firstFailure = attempt.error
+    || `${attempt.stderr}\n${attempt.stdout}`;
+  if (!nativeToolchainFailure(firstFailure)) {
+    publishVitestAttempt(attempt);
+    if (attempt.error) throw attempt.error;
+  } else {
+    process.stderr.write(
+      "court-jester project config requires a host-incompatible native dependency; retrying without project config\n",
+    );
+    attempt = await captureVitest({ ...viteOverrides, configFile: false });
+    if (completedVitestAttempt(attempt)) {
+      publishVitestAttempt(attempt);
+    } else {
+      const secondFailure = attempt.error
+        || `${attempt.stderr}\n${attempt.stdout}`;
+      if (vitestMajor >= 1 && matchingRunnerFailure(secondFailure)) {
+        process.stderr.write(
+          "court-jester native Vitest dependencies are incompatible with the isolated runtime; using the matching package runner\n",
+        );
+        process.exitCode = 0;
+        await runDirectVitest();
+      } else {
+        publishVitestAttempt(attempt);
+        if (attempt.error) throw attempt.error;
+        process.exitCode = 1;
+      }
+    }
+  }
+}
 "#,
     )
     .map_err(|error| format!("failed to write portable Vitest coordinator: {error}"))?;
@@ -2192,6 +2527,17 @@ if (!typescriptModule) {
 const typescriptNamespace = await import(pathToFileURL(typescriptModule).href);
 const ts = typescriptNamespace.default || typescriptNamespace;
 const compilerOptionsByDirectory = new Map();
+function canonicalPath(filename) {
+  try {
+    return fs.realpathSync(filename);
+  } catch {
+    return path.resolve(filename);
+  }
+}
+const instrumentTarget = process.env.COURT_JESTER_INSTRUMENT_TARGET
+  ? canonicalPath(process.env.COURT_JESTER_INSTRUMENT_TARGET)
+  : null;
+const instrumentPayload = process.env.COURT_JESTER_INSTRUMENT_PAYLOAD || null;
 
 function compilerOptionsFor(filename) {
   const directory = path.dirname(filename);
@@ -2231,6 +2577,14 @@ function compilerOptionsFor(filename) {
 export async function load(url, context, nextLoad) {
   if (!url.startsWith("file:")) return nextLoad(url, context);
   const filename = fileURLToPath(url);
+  const isInstrumentTarget = instrumentTarget === canonicalPath(filename) && instrumentPayload;
+  if (isInstrumentTarget && /\.[cm]?js$/.test(filename)) {
+    const loaded = await nextLoad(url, context);
+    return {
+      ...loaded,
+      source: fs.readFileSync(instrumentPayload, "utf8"),
+    };
+  }
   if (filename.endsWith(".json")) {
     const value = JSON.parse(fs.readFileSync(filename, "utf8"));
     return {
@@ -2239,10 +2593,12 @@ export async function load(url, context, nextLoad) {
       shortCircuit: true,
     };
   }
-  if (filename.endsWith(".d.ts") || !/\.[cm]?tsx?$/.test(filename)) {
+  if (filename.endsWith(".d.ts") || !/\.(?:[cm]?tsx?|[cm]?jsx)$/.test(filename)) {
     return nextLoad(url, context);
   }
-  const source = fs.readFileSync(filename, "utf8");
+  const source = isInstrumentTarget
+    ? fs.readFileSync(instrumentPayload, "utf8")
+    : fs.readFileSync(filename, "utf8");
   const output = ts.transpileModule(source, {
     compilerOptions: compilerOptionsFor(filename),
     fileName: filename,
@@ -2931,7 +3287,13 @@ async fn run_launch_command(
     .await
 }
 
-fn structured_test_failure(output: &str) -> bool {
+#[derive(Debug, PartialEq, Eq)]
+enum StructuredTestFailure {
+    Assertion,
+    Initialization(String),
+}
+
+fn structured_test_failure(output: &str) -> Option<StructuredTestFailure> {
     const MAX_SCAN_BYTES: usize = 16 * 1024 * 1024;
     const MAX_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
     const MAX_JSON_DEPTH: usize = 256;
@@ -2953,10 +3315,22 @@ fn structured_test_failure(output: &str) -> bool {
         }
     }
 
-    fn reporter_failure(value: &serde_json::Value) -> bool {
-        let Some(fields) = value.as_object() else {
-            return false;
-        };
+    fn runner_initialization_message(message: &str) -> bool {
+        [
+            "Vitest failed to access its internal state",
+            "Vitest was initialized with native Node instead of Vite Node",
+            "customEqualityTesters",
+            "workerState.config",
+            "matching @vitest/runner",
+            "matching package runner",
+            "does not export startTests",
+        ]
+        .iter()
+        .any(|fragment| message.contains(fragment))
+    }
+
+    fn reporter_failure(value: &serde_json::Value) -> Option<StructuredTestFailure> {
+        let fields = value.as_object()?;
         let has_test_results = fields
             .get("testResults")
             .is_some_and(serde_json::Value::is_array);
@@ -2974,17 +3348,49 @@ fn structured_test_failure(output: &str) -> bool {
             .iter()
             .any(|key| fields.get(*key).is_some_and(serde_json::Value::is_number));
         if !has_test_results && !has_summary {
-            return false;
+            return None;
         }
 
-        fields.get("success").and_then(serde_json::Value::as_bool) == Some(false)
+        if fields
+            .get("numTotalTests")
+            .and_then(serde_json::Value::as_u64)
+            == Some(0)
+        {
+            let initialization_message = fields
+                .get("testResults")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|results| {
+                    results.iter().find_map(|result| {
+                        result
+                            .get("message")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::trim)
+                            .filter(|message| !message.is_empty())
+                    })
+                })
+                .or_else(|| {
+                    fields
+                        .get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|message| !message.is_empty())
+                });
+            if let Some(message) =
+                initialization_message.filter(|message| runner_initialization_message(message))
+            {
+                return Some(StructuredTestFailure::Initialization(message.to_string()));
+            }
+        }
+
+        (fields.get("success").and_then(serde_json::Value::as_bool) == Some(false)
             || ["numFailedTests", "numFailedTestSuites"].iter().any(|key| {
                 fields
                     .get(*key)
                     .and_then(serde_json::Value::as_u64)
                     .is_some_and(|count| count > 0)
             })
-            || contains_failure(value)
+            || contains_failure(value))
+        .then_some(StructuredTestFailure::Assertion)
     }
 
     let mut scan_start = output.len().saturating_sub(MAX_SCAN_BYTES);
@@ -3053,15 +3459,17 @@ fn structured_test_failure(output: &str) -> bool {
                 }
                 let candidate = &output[start..=index];
                 reporter_candidates += 1;
-                if serde_json::from_str(candidate).is_ok_and(|value| reporter_failure(&value)) {
-                    return true;
+                if let Ok(value) = serde_json::from_str(candidate) {
+                    if let Some(failure) = reporter_failure(&value) {
+                        return Some(failure);
+                    }
                 }
             }
             _ => {}
         }
     }
 
-    false
+    None
 }
 
 fn harness_diagnostics(
@@ -3168,6 +3576,26 @@ fn harness_diagnostics(
             component: DiagnosticComponent::ModuleLoader,
             impact: DiagnosticImpact::Blocking,
             message,
+            process: process.termination.clone(),
+            limits: Some(limits.clone()),
+        });
+    }
+    if let Some(message) = process
+        .stderr
+        .lines()
+        .chain(process.stdout.lines())
+        .find(|line| {
+            line.contains("EACCES")
+                && line.contains("permission denied")
+                && line.contains(DOCKER_DEPENDENCY_WORKSPACE)
+        })
+    {
+        diagnostics.push(FailureDiagnostic {
+            domain: FailureDomain::Environment,
+            kind: FailureKind::ModuleLoad,
+            component: DiagnosticComponent::ModuleLoader,
+            impact: DiagnosticImpact::Blocking,
+            message: message.trim_start_matches("Error: ").trim().to_string(),
             process: process.termination.clone(),
             limits: Some(limits.clone()),
         });
@@ -3279,27 +3707,44 @@ fn harness_diagnostics(
             });
         }
         TestAdapter::VitestJson | TestAdapter::JestJson => {
-            let structured_failure = structured_test_failure(&process.stdout);
-            if structured_failure {
-                diagnostics.push(FailureDiagnostic {
-                    domain: FailureDomain::TargetCode,
-                    kind: FailureKind::AssertionFailure,
-                    component: DiagnosticComponent::AuthoritativeTestRunner,
-                    impact: DiagnosticImpact::Gating,
-                    message: "authoritative test assertion failed".into(),
-                    process: process.termination.clone(),
-                    limits: Some(limits.clone()),
-                });
-            } else {
-                diagnostics.push(FailureDiagnostic {
-                    domain: FailureDomain::VerifierHarness,
-                    kind: FailureKind::HarnessProtocol,
-                    component: DiagnosticComponent::AuthoritativeTestRunner,
-                    impact: DiagnosticImpact::Blocking,
-                    message: "test runner did not emit a recognized structured result".into(),
-                    process: process.termination.clone(),
-                    limits: Some(limits.clone()),
-                });
+            if has_non_target_blocker {
+                return diagnostics;
+            }
+            match structured_test_failure(&process.stdout) {
+                Some(StructuredTestFailure::Initialization(message)) => {
+                    diagnostics.push(FailureDiagnostic {
+                        domain: FailureDomain::Environment,
+                        kind: FailureKind::ModuleLoad,
+                        component: DiagnosticComponent::ModuleLoader,
+                        impact: DiagnosticImpact::Blocking,
+                        message,
+                        process: process.termination.clone(),
+                        limits: Some(limits.clone()),
+                    });
+                }
+                Some(StructuredTestFailure::Assertion) => {
+                    diagnostics.push(FailureDiagnostic {
+                        domain: FailureDomain::TargetCode,
+                        kind: FailureKind::AssertionFailure,
+                        component: DiagnosticComponent::AuthoritativeTestRunner,
+                        impact: DiagnosticImpact::Gating,
+                        message: "authoritative test assertion failed".into(),
+                        process: process.termination.clone(),
+                        limits: Some(limits.clone()),
+                    });
+                }
+                None if has_non_target_blocker => return diagnostics,
+                None => {
+                    diagnostics.push(FailureDiagnostic {
+                        domain: FailureDomain::VerifierHarness,
+                        kind: FailureKind::HarnessProtocol,
+                        component: DiagnosticComponent::AuthoritativeTestRunner,
+                        impact: DiagnosticImpact::Blocking,
+                        message: "test runner did not emit a recognized structured result".into(),
+                        process: process.termination.clone(),
+                        limits: Some(limits.clone()),
+                    });
+                }
             }
         }
     }
@@ -3412,18 +3857,21 @@ fn docker_dependency_mapping(
 
 fn docker_project_module_path(
     workspace_root: &std::path::Path,
+    target_package_root: &std::path::Path,
     dependency_roots: &[std::path::PathBuf],
     package_relative_paths: &[&std::path::Path],
 ) -> Option<String> {
     let workspace_root = std::fs::canonicalize(workspace_root).ok()?;
-    for package_relative_path in package_relative_paths {
-        for root in dependency_roots {
-            let Ok(canonical_root) = std::fs::canonicalize(root) else {
-                continue;
-            };
-            let Ok(relative_root) = canonical_root.strip_prefix(&workspace_root) else {
-                continue;
-            };
+    for root in std::iter::once(target_package_root)
+        .chain(dependency_roots.iter().map(std::path::PathBuf::as_path))
+    {
+        let Ok(canonical_root) = std::fs::canonicalize(root) else {
+            continue;
+        };
+        let Ok(relative_root) = canonical_root.strip_prefix(&workspace_root) else {
+            continue;
+        };
+        for package_relative_path in package_relative_paths {
             let host_path = canonical_root
                 .join("node_modules")
                 .join(package_relative_path);
@@ -3443,13 +3891,20 @@ fn docker_project_module_path(
     None
 }
 
+fn insert_docker_environment(create: &mut Vec<String>, value: String) {
+    let image_index = create.len() - 1;
+    create.splice(image_index..image_index, ["-e".to_string(), value]);
+}
+
 fn configure_docker_node_loader(
     runtime: crate::types::HarnessRuntime,
     loader: &str,
     command: &mut Vec<String>,
 ) -> Option<String> {
     match runtime {
-        crate::types::HarnessRuntime::NodeScript | crate::types::HarnessRuntime::NodeTest => {
+        crate::types::HarnessRuntime::NodeScript
+        | crate::types::HarnessRuntime::NodeTest
+        | crate::types::HarnessRuntime::Vitest => {
             command.splice(
                 1..1,
                 ["--experimental-loader".to_string(), loader.to_string()],
@@ -3461,6 +3916,13 @@ fn configure_docker_node_loader(
         }
         _ => None,
     }
+}
+
+fn configure_docker_typescript_loader(loader: &str, command: &mut Vec<String>) {
+    command.splice(
+        1..1,
+        ["--experimental-loader".to_string(), loader.to_string()],
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3526,8 +3988,12 @@ async fn run_harness_in_docker(
         std::process::id(),
         started.elapsed().as_nanos()
     );
-    let uid = unsafe { libc::getuid() };
-    let gid = unsafe { libc::getgid() };
+    let runtime_user = docker_runtime_user(
+        context
+            .dependency_roots
+            .iter()
+            .any(|root| root.join("node_modules").is_dir()),
+    );
     let mut create = vec![
         "create".to_string(),
         "--name".to_string(),
@@ -3549,7 +4015,7 @@ async fn run_harness_in_docker(
         "--ulimit".to_string(),
         "fsize=10485760:10485760".to_string(),
         "--user".to_string(),
-        format!("{uid}:{gid}"),
+        runtime_user,
         "-e".to_string(),
         "HOME=/tmp".to_string(),
         "-e".to_string(),
@@ -3631,17 +4097,14 @@ async fn run_harness_in_docker(
     }
     let portable_typescript = docker_project_module_path(
         dependency_workspace,
+        &context.target_package_root,
         &context.dependency_roots,
         &[std::path::Path::new("typescript/lib/typescript.js")],
     );
-    let use_portable_typescript = portable_typescript.is_some()
-        && matches!(
-            harness.runtime,
-            crate::types::HarnessRuntime::NodeScript | crate::types::HarnessRuntime::NodeTest
-        );
     let portable_vitest = if harness.runtime == crate::types::HarnessRuntime::Vitest {
         docker_project_module_path(
             dependency_workspace,
+            &context.target_package_root,
             &context.dependency_roots,
             &[
                 std::path::Path::new("vitest/dist/node.mjs"),
@@ -3652,6 +4115,11 @@ async fn run_harness_in_docker(
     } else {
         None
     };
+    let use_portable_typescript = portable_typescript.is_some()
+        && (matches!(
+            harness.runtime,
+            crate::types::HarnessRuntime::NodeScript | crate::types::HarnessRuntime::NodeTest
+        ) || portable_vitest.is_some());
     let python_paths = dependency_mapping.container_roots;
     let node_paths = dependency_mapping.node_paths;
     let node_bin_paths = dependency_mapping.node_bin_paths;
@@ -3789,12 +4257,13 @@ async fn run_harness_in_docker(
         );
     }
 
-    let node_package_resolver = if matches!(
+    let node_package_resolver = if (matches!(
         harness.runtime,
         crate::types::HarnessRuntime::NodeScript
             | crate::types::HarnessRuntime::NodeTest
             | crate::types::HarnessRuntime::TsxScript
-    ) && harness.kind != crate::types::HarnessKind::PortabilityProbe
+    ) || portable_vitest.is_some())
+        && harness.kind != crate::types::HarnessKind::PortabilityProbe
         && !container_node_resolver_roots.is_empty()
     {
         match create_node_package_resolver(crate::types::RuntimeProfile::Isolated) {
@@ -3850,8 +4319,7 @@ async fn run_harness_in_docker(
             ),
         ];
         for value in resolver_environment {
-            create.insert(create.len() - 1, "-e".to_string());
-            create.insert(create.len() - 1, value);
+            insert_docker_environment(&mut create, value);
         }
     }
 
@@ -3930,18 +4398,11 @@ async fn run_harness_in_docker(
         if let Some(node_options) =
             configure_docker_node_loader(harness.runtime, container_package_resolver, &mut command)
         {
-            create.insert(create.len() - 1, "-e".to_string());
-            create.insert(create.len() - 1, node_options);
+            insert_docker_environment(&mut create, node_options);
         }
     }
     if use_portable_typescript {
-        command.splice(
-            1..1,
-            [
-                "--experimental-loader".to_string(),
-                "/court-jester/typescript-loader.mjs".to_string(),
-            ],
-        );
+        configure_docker_typescript_loader("/court-jester/typescript-loader.mjs", &mut command);
     }
     for argument in harness.args.iter().chain(limits.harness_args.iter()) {
         match argument {
@@ -4710,11 +5171,12 @@ pub async fn execute_harness(
 #[cfg(test)]
 mod tests {
     use super::{
-        configure_docker_node_loader, copy_materialization_tree, create_network_guard,
-        create_node_package_resolver, docker_dependency_mapping, docker_image_for_harness,
-        docker_path_mapping, docker_project_module_path, harness_diagnostics,
-        has_typescript_type_only_relative_imports, virtual_env_bin, vitest_project_entrypoint,
-        which_binary,
+        configure_docker_node_loader, configure_docker_typescript_loader,
+        copy_materialization_tree, create_network_guard, create_node_package_resolver,
+        docker_dependency_mapping, docker_image_for_harness, docker_path_mapping,
+        docker_project_module_path, docker_runtime_user, harness_diagnostics,
+        has_typescript_type_only_relative_imports, insert_docker_environment, virtual_env_bin,
+        vitest_project_entrypoint, which_binary,
     };
     use crate::types::{
         DiagnosticComponent, DiagnosticImpact, ExecutionLimits, ExecutionResult, FailureDomain,
@@ -4744,6 +5206,13 @@ mod tests {
             ),
             crate::types::DEFAULT_TYPESCRIPT_DOCKER_IMAGE
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn docker_node_dependency_bind_uses_read_only_root_access_on_macos() {
+        assert_eq!(docker_runtime_user(true), "0:0");
+        assert_ne!(docker_runtime_user(false), "0:0");
     }
 
     #[cfg(target_os = "macos")]
@@ -4908,6 +5377,132 @@ mod tests {
     }
 
     #[test]
+    fn vitest_initialization_exception_without_collected_tests_is_environmental() {
+        let process = ExecutionResult {
+            stdout: r#"{
+  "numTotalTestSuites": 1,
+  "numFailedTestSuites": 1,
+  "numTotalTests": 0,
+  "numFailedTests": 0,
+  "success": false,
+  "testResults": [
+    {
+      "assertionResults": [],
+      "status": "passed",
+      "message": "Cannot read properties of undefined (reading 'customEqualityTesters')",
+      "name": "/workspace/packages/app/src/example.test.ts"
+    }
+  ]
+}"#
+            .into(),
+            stderr: String::new(),
+            exit_code: Some(1),
+            duration_ms: 1,
+            timed_out: false,
+            memory_error: false,
+            termination: None,
+            diagnostics: Vec::new(),
+        };
+        let limits = ExecutionLimits {
+            timeout_seconds: 1.0,
+            memory_mb: 128,
+            runtime_profile: RuntimeProfile::Isolated,
+            network_policy: NetworkPolicy::Deny,
+        };
+
+        let diagnostics = harness_diagnostics(Some(TestAdapter::VitestJson), &process, &limits);
+
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(diagnostics[0].domain, FailureDomain::Environment);
+        assert_eq!(diagnostics[0].kind, FailureKind::ModuleLoad);
+        assert_eq!(diagnostics[0].component, DiagnosticComponent::ModuleLoader);
+        assert_eq!(diagnostics[0].impact, DiagnosticImpact::Blocking);
+        assert!(diagnostics[0].message.contains("customEqualityTesters"));
+    }
+
+    #[test]
+    fn vitest_target_syntax_error_without_collected_tests_is_an_assertion() {
+        let process = ExecutionResult {
+            stdout: r#"{
+  "numTotalTestSuites": 1,
+  "numFailedTestSuites": 1,
+  "numTotalTests": 0,
+  "numFailedTests": 0,
+  "success": false,
+  "testResults": [{
+    "assertionResults": [],
+    "status": "failed",
+    "message": "SyntaxError: Unexpected identifier 'ManyToOneOptions'",
+    "name": "/workspace/packages/db-entities/src/ProductConfiguration.test.ts"
+  }]
+}"#
+            .into(),
+            stderr: String::new(),
+            exit_code: Some(1),
+            duration_ms: 1,
+            timed_out: false,
+            memory_error: false,
+            termination: None,
+            diagnostics: Vec::new(),
+        };
+        let limits = ExecutionLimits {
+            timeout_seconds: 1.0,
+            memory_mb: 128,
+            runtime_profile: RuntimeProfile::Isolated,
+            network_policy: NetworkPolicy::Deny,
+        };
+
+        let diagnostics = harness_diagnostics(Some(TestAdapter::VitestJson), &process, &limits);
+
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(diagnostics[0].domain, FailureDomain::TargetCode);
+        assert_eq!(diagnostics[0].kind, FailureKind::AssertionFailure);
+        assert_eq!(diagnostics[0].impact, DiagnosticImpact::Gating);
+    }
+
+    #[test]
+    fn dependency_permission_error_is_environmental_and_preserves_path() {
+        let inaccessible = "/court-jester/dependencies/node_modules/.pnpm/tinypool/dist/worker.js";
+        let process = ExecutionResult {
+            stdout: r#"{
+  "numTotalTestSuites": 1,
+  "numFailedTestSuites": 1,
+  "numTotalTests": 1,
+  "numFailedTests": 1,
+  "success": false,
+  "testResults": [{
+    "assertionResults": [{"status": "failed"}],
+    "status": "failed",
+    "message": "dependency import failed"
+  }]
+}"#
+            .into(),
+            stderr: format!("Error: EACCES: permission denied, open '{inaccessible}'"),
+            exit_code: Some(1),
+            duration_ms: 1,
+            timed_out: false,
+            memory_error: false,
+            termination: None,
+            diagnostics: Vec::new(),
+        };
+        let limits = ExecutionLimits {
+            timeout_seconds: 1.0,
+            memory_mb: 128,
+            runtime_profile: RuntimeProfile::Isolated,
+            network_policy: NetworkPolicy::Deny,
+        };
+
+        let diagnostics = harness_diagnostics(Some(TestAdapter::VitestJson), &process, &limits);
+
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(diagnostics[0].domain, FailureDomain::Environment);
+        assert_eq!(diagnostics[0].kind, FailureKind::ModuleLoad);
+        assert_eq!(diagnostics[0].component, DiagnosticComponent::ModuleLoader);
+        assert_eq!(diagnostics[0].impact, DiagnosticImpact::Blocking);
+        assert!(diagnostics[0].message.contains(inaccessible));
+    }
+
+    #[test]
     fn generated_harness_resolver_prefers_target_owned_package_over_ambient_ancestor() {
         let directory = tempfile::tempdir().unwrap();
         let target_root = directory.path().join("target-package");
@@ -4968,6 +5563,70 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    #[test]
+    fn node_dependency_loader_retries_transient_access_denial() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let dependency = workspace.join("node_modules/transient-dependency/index.mjs");
+        let harness = workspace.join("harness.mjs");
+        let flaky_loader = directory.path().join("flaky-loader.mjs");
+        let attempt_counter = directory.path().join("attempts");
+        std::fs::create_dir_all(dependency.parent().unwrap()).unwrap();
+        std::fs::write(&dependency, "export const marker = 'readable';\n").unwrap();
+        std::fs::write(
+            &harness,
+            "import { marker } from './node_modules/transient-dependency/index.mjs';\nconsole.log(marker);\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &flaky_loader,
+            r#"
+import fs from "node:fs";
+export async function load(url, context, nextLoad) {
+  if (!url.endsWith("/transient-dependency/index.mjs")) {
+    return nextLoad(url, context);
+  }
+  const counter = process.env.COURT_JESTER_FLAKY_COUNTER;
+  const attempt = fs.existsSync(counter) ? Number(fs.readFileSync(counter, "utf8")) : 0;
+  if (attempt < 2) {
+    fs.writeFileSync(counter, String(attempt + 1));
+    const error = new Error(`EACCES: permission denied, open '${url}'`);
+    error.code = "EACCES";
+    throw error;
+  }
+  return nextLoad(url, context);
+}
+"#,
+        )
+        .unwrap();
+
+        let resolver = create_node_package_resolver(RuntimeProfile::LocalTrusted).unwrap();
+        let output = std::process::Command::new("node")
+            .arg("--no-warnings")
+            .arg("--experimental-loader")
+            .arg(&flaky_loader)
+            .arg("--experimental-loader")
+            .arg(&resolver.loader)
+            .arg(&harness)
+            .env("COURT_JESTER_FLAKY_COUNTER", &attempt_counter)
+            .env("COURT_JESTER_NODE_RESOLUTION_MODE", "existing")
+            .env("COURT_JESTER_NODE_OVERLAY_ROOT", &workspace)
+            .env("COURT_JESTER_NODE_SOURCE_ROOT", &workspace)
+            .env("COURT_JESTER_NODE_TARGET_ROOT", &workspace)
+            .env("COURT_JESTER_NODE_OVERLAY_TARGET_ROOT", &workspace)
+            .env("COURT_JESTER_NODE_GENERATED_ARTIFACT", &harness)
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "readable");
+        assert_eq!(std::fs::read_to_string(attempt_counter).unwrap(), "2");
+    }
+
     #[cfg(unix)]
     #[test]
     fn docker_paths_accept_lexical_alias_for_generated_overlay() {
@@ -5069,7 +5728,8 @@ mod tests {
 
         let module_path = docker_project_module_path(
             &workspace,
-            &[package.clone(), workspace.clone()],
+            &package,
+            &[workspace.clone(), package.clone()],
             &[std::path::Path::new("vitest/dist/node.mjs")],
         );
 
@@ -5077,6 +5737,444 @@ mod tests {
             module_path.as_deref(),
             Some("/court-jester/dependencies/packages/app/node_modules/vitest/dist/node.mjs")
         );
+    }
+    #[test]
+    fn portable_vitest_uses_matching_runner_after_native_toolchain_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let package_modules = directory
+            .path()
+            .join("node_modules/.pnpm/vitest@3.1.3/node_modules");
+        let vitest_root = package_modules.join("vitest");
+        let runner_root = vitest_root.join("node_modules/@vitest/runner");
+        let vitest_module = vitest_root.join("dist/node.js");
+        let runner_module = runner_root.join("dist/index.js");
+        let typescript_module = directory.path().join("typescript.mjs");
+        let test_file = directory.path().join("example.test.mjs");
+        for root in [&vitest_root, &runner_root] {
+            std::fs::create_dir_all(root.join("dist")).unwrap();
+            std::fs::write(root.join("package.json"), r#"{"type":"module"}"#).unwrap();
+        }
+        std::fs::write(
+            &vitest_module,
+            r#"
+export const version = "3.1.3";
+export async function startVitest() {
+  throw new Error("Cannot find module '@rollup/rollup-linux-arm64-gnu'");
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &runner_module,
+            r#"
+export async function startTests(files, runner) {
+  await runner.importFile(files[0]);
+  process.stderr.write("runner=matching-vitest\n");
+  return [{
+    name: files[0],
+    type: "suite",
+    mode: "run",
+    result: { state: "pass", duration: 1 },
+    tasks: [{
+      name: "uses the owning package graph",
+      type: "test",
+      mode: "run",
+      result: { state: "pass", duration: 1 },
+    }],
+  }];
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &typescript_module,
+            r#"
+export default {
+  findConfigFile() { return undefined; },
+  sys: { fileExists() { return false; }, readFile() { return ""; } },
+  ModuleKind: { ESNext: 99 },
+  ScriptTarget: { ES2022: 99 },
+  ModuleResolutionKind: { Bundler: 99 },
+  ImportsNotUsedAsValues: { Remove: 0 },
+};
+"#,
+        )
+        .unwrap();
+        std::fs::write(&test_file, "globalThis.portableVitestTestRan = true;\n").unwrap();
+        let guard = create_network_guard(RuntimeProfile::LocalTrusted, None).unwrap();
+
+        let output = std::process::Command::new("node")
+            .arg(&guard.portable_vitest_coordinator)
+            .arg(&vitest_module)
+            .arg(&typescript_module)
+            .arg(&test_file)
+            .arg(&guard.node_preload)
+            .arg(&guard.instrumentation_preload)
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("runner=matching-vitest"));
+        let summary: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("portable runner JSON summary");
+        assert_eq!(summary["success"], true);
+        assert_eq!(summary["numTotalTests"], 1);
+        assert_eq!(summary["numPassedTests"], 1);
+
+        std::fs::write(
+            &runner_module,
+            r#"
+export async function startTests(files) {
+  return [{
+    name: files[0],
+    type: "suite",
+    mode: "run",
+    result: { state: "pass", duration: 1 },
+    tasks: [{
+      name: "beforeAll lifecycle",
+      type: "suite",
+      mode: "run",
+      result: { state: "fail", duration: 1 },
+      tasks: [{
+        name: "test body",
+        type: "test",
+        mode: "run",
+        result: { state: "pass", duration: 1 },
+      }],
+    }],
+  }];
+}
+"#,
+        )
+        .unwrap();
+        let suite_failure = std::process::Command::new("node")
+            .arg(&guard.portable_vitest_coordinator)
+            .arg(&vitest_module)
+            .arg(&typescript_module)
+            .arg(&test_file)
+            .arg(&guard.node_preload)
+            .arg(&guard.instrumentation_preload)
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(!suite_failure.status.success());
+        let failure_summary: serde_json::Value =
+            serde_json::from_slice(&suite_failure.stdout).expect("suite failure JSON summary");
+        assert_eq!(failure_summary["success"], false);
+        assert_eq!(failure_summary["numFailedTestSuites"], 1);
+        assert!(failure_summary["testResults"][0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("beforeAll lifecycle")));
+
+        let filtered = std::process::Command::new("node")
+            .arg(&guard.portable_vitest_coordinator)
+            .arg(&vitest_module)
+            .arg(&typescript_module)
+            .arg(&test_file)
+            .arg(&guard.node_preload)
+            .arg(&guard.instrumentation_preload)
+            .arg("--grep")
+            .arg("focused case")
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(!filtered.status.success());
+        let filtered_summary: serde_json::Value =
+            serde_json::from_slice(&filtered.stdout).expect("filtered failure JSON summary");
+        assert!(filtered_summary["testResults"][0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("cannot preserve Vitest filters")));
+    }
+
+    #[test]
+    fn portable_vitest_does_not_drop_project_config_for_target_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let vitest_root = directory.path().join("node_modules/vitest");
+        let vitest_module = vitest_root.join("dist/node.js");
+        let typescript_module = directory.path().join("typescript.mjs");
+        let test_file = directory.path().join("target-error.test.mjs");
+        std::fs::create_dir_all(vitest_root.join("dist")).unwrap();
+        std::fs::write(vitest_root.join("package.json"), r#"{"type":"module"}"#).unwrap();
+        std::fs::write(
+            &vitest_module,
+            r#"
+export const version = "3.1.3";
+export async function startVitest() {
+  process.stdout.write(JSON.stringify({
+    numTotalTestSuites: 1,
+    numFailedTestSuites: 1,
+    numTotalTests: 0,
+    numFailedTests: 0,
+    success: false,
+    testResults: [{
+      assertionResults: [],
+      status: "failed",
+      message: "SyntaxError: Unexpected identifier 'ManyToOneOptions'",
+      name: "target-error.test.mjs",
+    }],
+  }) + "\n");
+  return false;
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &typescript_module,
+            r#"
+export default {
+  findConfigFile() { return undefined; },
+  sys: { fileExists() { return false; }, readFile() { return ""; } },
+  ModuleKind: { ESNext: 99 },
+  ScriptTarget: { ES2022: 99 },
+  ModuleResolutionKind: { Bundler: 99 },
+  ImportsNotUsedAsValues: { Remove: 0 },
+};
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &test_file,
+            "throw new Error('must not execute directly');\n",
+        )
+        .unwrap();
+        let guard = create_network_guard(RuntimeProfile::LocalTrusted, None).unwrap();
+
+        let output = std::process::Command::new("node")
+            .arg(&guard.portable_vitest_coordinator)
+            .arg(&vitest_module)
+            .arg(&typescript_module)
+            .arg(&test_file)
+            .arg(&guard.node_preload)
+            .arg(&guard.instrumentation_preload)
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+
+        assert!(!output.status.success());
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("retrying without project config"),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let summary: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("target failure JSON summary");
+        assert_eq!(summary["numTotalTests"], 0);
+        assert!(summary["testResults"][0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Unexpected identifier")));
+
+        std::fs::write(
+            &vitest_module,
+            r#"
+export const version = "3.1.3";
+let attempt = 0;
+export async function startVitest() {
+  attempt += 1;
+  if (attempt === 1) {
+    throw new Error("Cannot find module '@rollup/rollup-linux-arm64-gnu'");
+  }
+  process.stdout.write(JSON.stringify({
+    numTotalTestSuites: 1,
+    numFailedTestSuites: 1,
+    numTotalTests: 0,
+    numFailedTests: 0,
+    success: false,
+    testResults: [{
+      assertionResults: [],
+      status: "failed",
+      message: "Error: Cannot find package 'jsdom' imported from Vitest",
+      name: "target-error.test.mjs",
+    }],
+  }) + "\n");
+  return false;
+}
+"#,
+        )
+        .unwrap();
+        let second_failure = std::process::Command::new("node")
+            .arg(&guard.portable_vitest_coordinator)
+            .arg(&vitest_module)
+            .arg(&typescript_module)
+            .arg(&test_file)
+            .arg(&guard.node_preload)
+            .arg(&guard.instrumentation_preload)
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(!second_failure.status.success());
+        let second_stderr = String::from_utf8_lossy(&second_failure.stderr);
+        assert!(second_stderr.contains("retrying without project config"));
+        assert!(!second_stderr.contains("using the matching package runner"));
+        let second_summary: serde_json::Value = serde_json::from_slice(&second_failure.stdout)
+            .expect("config-free environment failure JSON summary");
+        assert!(second_summary["testResults"][0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Cannot find package 'jsdom'")));
+    }
+
+    #[test]
+    fn typescript_loader_transpiles_instrumented_payload() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.ts");
+        let typescript_module = directory.path().join("typescript.mjs");
+        std::fs::write(&target, "throw new Error('original source executed');\n").unwrap();
+        std::fs::write(
+            &typescript_module,
+            r#"
+export default {
+  findConfigFile() { return undefined; },
+  sys: { fileExists() { return false; }, readFile() { return ""; } },
+  ModuleKind: { ESNext: 99 },
+  ScriptTarget: { ES2022: 99 },
+  ModuleResolutionKind: { Bundler: 99 },
+  ImportsNotUsedAsValues: { Remove: 0 },
+  transpileModule(source) {
+    return { outputText: source.replace(": number", "") };
+  },
+};
+"#,
+        )
+        .unwrap();
+        let guard = create_network_guard(
+            RuntimeProfile::LocalTrusted,
+            Some("const value: number = 3;\nconsole.log(value);\n"),
+        )
+        .unwrap();
+
+        let output = std::process::Command::new("node")
+            .arg("--no-warnings")
+            .arg("--experimental-loader")
+            .arg(&guard.typescript_loader)
+            .arg("--require")
+            .arg(&guard.instrumentation_preload)
+            .arg(&target)
+            .env("COURT_JESTER_TYPESCRIPT_MODULE", &typescript_module)
+            .env("COURT_JESTER_INSTRUMENT_TARGET", &target)
+            .env(
+                "COURT_JESTER_INSTRUMENT_PAYLOAD",
+                guard.instrumented_source.as_ref().unwrap(),
+            )
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "3");
+    }
+
+    #[test]
+    fn typescript_loader_preserves_instrumented_javascript_payload() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.mjs");
+        let typescript_module = directory.path().join("typescript.mjs");
+        std::fs::write(&target, "throw new Error('original source executed');\n").unwrap();
+        std::fs::write(
+            &typescript_module,
+            r#"
+export default {
+  findConfigFile() { return undefined; },
+  sys: { fileExists() { return false; }, readFile() { return ""; } },
+  ModuleKind: { ESNext: 99 },
+  ScriptTarget: { ES2022: 99 },
+  ModuleResolutionKind: { Bundler: 99 },
+  ImportsNotUsedAsValues: { Remove: 0 },
+};
+"#,
+        )
+        .unwrap();
+        let guard = create_network_guard(
+            RuntimeProfile::LocalTrusted,
+            Some("console.log('instrumented-javascript');\n"),
+        )
+        .unwrap();
+
+        let output = std::process::Command::new("node")
+            .arg("--no-warnings")
+            .arg("--experimental-loader")
+            .arg(&guard.typescript_loader)
+            .arg("--require")
+            .arg(&guard.instrumentation_preload)
+            .arg(&target)
+            .env("COURT_JESTER_TYPESCRIPT_MODULE", &typescript_module)
+            .env("COURT_JESTER_INSTRUMENT_TARGET", &target)
+            .env(
+                "COURT_JESTER_INSTRUMENT_PAYLOAD",
+                guard.instrumented_source.as_ref().unwrap(),
+            )
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "instrumented-javascript"
+        );
+    }
+
+    #[test]
+    fn typescript_loader_transpiles_instrumented_jsx_payload() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.jsx");
+        let typescript_module = directory.path().join("typescript.mjs");
+        std::fs::write(&target, "throw new Error('original source executed');\n").unwrap();
+        std::fs::write(
+            &typescript_module,
+            r#"
+export default {
+  findConfigFile() { return undefined; },
+  sys: { fileExists() { return false; }, readFile() { return ""; } },
+  ModuleKind: { ESNext: 99 },
+  ScriptTarget: { ES2022: 99 },
+  ModuleResolutionKind: { Bundler: 99 },
+  ImportsNotUsedAsValues: { Remove: 0 },
+  transpileModule(source) {
+    return { outputText: source.replace("<Widget />", "'jsx'") };
+  },
+};
+"#,
+        )
+        .unwrap();
+        let guard = create_network_guard(
+            RuntimeProfile::LocalTrusted,
+            Some("console.log(<Widget />);\n"),
+        )
+        .unwrap();
+
+        let output = std::process::Command::new("node")
+            .arg("--no-warnings")
+            .arg("--experimental-loader")
+            .arg(&guard.typescript_loader)
+            .arg("--require")
+            .arg(&guard.instrumentation_preload)
+            .arg(&target)
+            .env("COURT_JESTER_TYPESCRIPT_MODULE", &typescript_module)
+            .env("COURT_JESTER_INSTRUMENT_TARGET", &target)
+            .env(
+                "COURT_JESTER_INSTRUMENT_PAYLOAD",
+                guard.instrumented_source.as_ref().unwrap(),
+            )
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "jsx");
     }
 
     #[test]
@@ -5097,6 +6195,69 @@ mod tests {
             Some("NODE_OPTIONS=--experimental-loader=/court-jester/package-resolver.mjs")
         );
         assert_eq!(command, vec!["tsx", "/workspace/.court-jester/execute.tsx"]);
+
+        let mut create = vec!["create".to_string(), "node:24-bookworm-slim".to_string()];
+        insert_docker_environment(&mut create, environment.unwrap());
+        assert_eq!(
+            create,
+            vec![
+                "create",
+                "-e",
+                "NODE_OPTIONS=--experimental-loader=/court-jester/package-resolver.mjs",
+                "node:24-bookworm-slim",
+            ]
+        );
+    }
+
+    #[test]
+    fn docker_vitest_loader_wraps_portable_coordinator() {
+        let mut command = vec![
+            "node".to_string(),
+            "/court-jester/portable-vitest-coordinator.mjs".to_string(),
+        ];
+
+        let environment = configure_docker_node_loader(
+            crate::types::HarnessRuntime::Vitest,
+            "/court-jester/package-resolver.mjs",
+            &mut command,
+        );
+
+        assert_eq!(environment, None);
+        assert_eq!(
+            command,
+            vec![
+                "node",
+                "--experimental-loader",
+                "/court-jester/package-resolver.mjs",
+                "/court-jester/portable-vitest-coordinator.mjs",
+            ]
+        );
+    }
+
+    #[test]
+    fn docker_vitest_package_loader_wraps_typescript_loader() {
+        let mut command = vec![
+            "node".to_string(),
+            "/court-jester/portable-vitest-coordinator.mjs".to_string(),
+        ];
+        configure_docker_node_loader(
+            crate::types::HarnessRuntime::Vitest,
+            "/court-jester/package-resolver.mjs",
+            &mut command,
+        );
+        configure_docker_typescript_loader("/court-jester/typescript-loader.mjs", &mut command);
+
+        assert_eq!(
+            command,
+            vec![
+                "node",
+                "--experimental-loader",
+                "/court-jester/typescript-loader.mjs",
+                "--experimental-loader",
+                "/court-jester/package-resolver.mjs",
+                "/court-jester/portable-vitest-coordinator.mjs",
+            ]
+        );
     }
 
     #[test]

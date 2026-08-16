@@ -19,6 +19,9 @@ Rust toolchain: prefer the `rustup` toolchain when it differs from an older syst
 ## Coding Style & Naming Conventions
 Follow default Rust formatting via `cargo fmt`; use 4-space indentation and keep functions/modules in `snake_case`, types/traits in `PascalCase`, and constants in `SCREAMING_SNAKE_CASE`. Match the existing test style: concise helper builders plus descriptive test names such as `missing_preferred_timezone_fails_verify`. Python in `bench/` should stay simple and script-like, also using `snake_case`.
 
+## Repair Strategy
+Fix defects at the architectural boundary that owns the violated invariant, never by accumulating specimen-specific branches. Start from a failing reproduction, identify the shared resolution, lifecycle, ownership, protocol, or classification rule, and repair that rule once for every caller and runtime profile. When multiple issues cross the same boundary, treat them as evidence of one design flaw and implement one coherent correction; path-, package-, version-, platform-, and error-string special cases that only silence the reported examples are prohibited. Regression coverage must prove both the original failure and adjacent variants, including concurrency or lifetime stress when those are part of the boundary.
+
 ## Testing Guidelines
 Add or update Rust tests in `tests/` for every behavior change. Prefer targeted cases that exercise parse, lint, execute, and verify stages directly. For benchmark changes, run at least `python -m bench.run_matrix --dry-run`; when modifying manifests or evaluators, include a real run summary if practical. Keep generated artifacts out of git; `target/`, `bench/results/`, and `__pycache__/` are already ignored.
 

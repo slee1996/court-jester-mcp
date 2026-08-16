@@ -4,6 +4,21 @@ This changelog tracks user-visible verifier semantics, report-shape changes, and
 
 ## Unreleased
 
+## 0.2.12 - 2026-08-15
+
+Isolated project-runner correctness release for issues #30 and #31. The portable Vitest path now uses one package-owned dependency graph, preserves project failures unless a positively identified native or mixed-runner fault requires fallback, and retries transient dependency reads outside the TypeScript loader boundary. See [docs/release-notes-0.2.12.md](docs/release-notes-0.2.12.md) for the complete change list and validation evidence.
+
+### Project-native Vitest
+
+- The portable coordinator resolves the matching `@vitest/runner` from the selected Vitest package, preserves suite-level lifecycle failures, and refuses direct fallback when filters cannot be represented.
+- Config-free and matching-runner fallbacks require recognized native or Vitest-internal failure signatures; zero-test target failures and missing test environments remain authoritative failures.
+- TypeScript, JSX, and JavaScript instrumentation share the project loader without dropping the in-memory target payload.
+
+### Isolated dependency access
+
+- Docker dependency snapshots use package-first resolver roots, keep the retrying package loader outside the TypeScript loader, and retry transient `EACCES` reads without weakening permanent access-denial diagnostics.
+- Docker resolver environment assignments retain explicit `-e` arguments, and dependency blockers take precedence over structured assertion output.
+
 ## 0.2.11 - 2026-08-15
 
 Publication retry for 0.2.10 after its Linux Clippy gate exposed macOS-only helper names imported on every test target. The runtime fix is unchanged; platform-specific test references and the runtime-profile parameter are now warning-free on Linux. See [docs/release-notes-0.2.11.md](docs/release-notes-0.2.11.md) for the complete change list and validation evidence.
