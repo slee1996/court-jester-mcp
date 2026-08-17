@@ -17,6 +17,7 @@ fn debug_print_synthesized_code() {
             }],
             return_type: Some("number".to_string()),
             type_parameters: vec![],
+            type_parameter_constraints: BTreeMap::new(),
             line: 1,
             end_line: 1,
             complexity: 1,

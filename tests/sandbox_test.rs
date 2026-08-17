@@ -460,6 +460,321 @@ async fn typescript_instrumentation_intercepts_module_load_without_rewriting_sou
     assert_eq!(std::fs::read_to_string(&source).unwrap(), original);
 }
 
+#[tokio::test]
+async fn generated_harness_preserves_materialized_target_import_semantics_and_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path();
+    let source = workspace.join("src/target.ts");
+    let barrel = workspace.join("src/barrel");
+    let registration = workspace.join("node_modules/@fixture/registration");
+    std::fs::create_dir_all(&barrel).unwrap();
+    std::fs::create_dir_all(&registration).unwrap();
+    std::fs::write(workspace.join("package.json"), r#"{"type":"module"}"#).unwrap();
+    std::fs::write(
+        registration.join("package.json"),
+        r#"{"name":"@fixture/registration","type":"module","exports":"./index.js"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        registration.join("index.js"),
+        "globalThis.__overlayOrder ??= [];\n\
+         globalThis.__overlayOrder.push('registration');\n\
+         export class Registration {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        barrel.join("index.ts"),
+        "export * from './first';\nexport * from './second';\n",
+    )
+    .unwrap();
+    std::fs::write(
+        barrel.join("first.ts"),
+        "(globalThis as any).__overlayOrder.push('first');\n\
+         export const selected = 'selected';\n",
+    )
+    .unwrap();
+    std::fs::write(
+        barrel.join("second.ts"),
+        "(globalThis as any).__overlayOrder.push('second');\n\
+         export const second = true;\n",
+    )
+    .unwrap();
+    let source_code = "import { readFileSync } from 'node:fs';\n\
+import { fileURLToPath } from 'node:url';\n\
+import { Registration } from '@fixture/registration';\n\
+import { selected } from './barrel';\n\
+export function value(input: Registration): string { return `${selected}-${String(input)}`; }\n\
+export const evaluationOrder = [...(globalThis as any).__overlayOrder];\n\
+export const materializedSource = readFileSync(fileURLToPath(import.meta.url), 'utf8');\n";
+    std::fs::write(&source, source_code).unwrap();
+
+    let context = resolve_execution_context(ContextRequest {
+        invocation_dir: workspace,
+        explicit_project_dir: Some(workspace),
+        target_file: Some(&source),
+        test_file: None,
+        language: Language::TypeScript,
+        virtual_file_path: None,
+    })
+    .unwrap();
+    let result = execute_harness(
+        &context,
+        HarnessSpec {
+            kind: HarnessKind::GeneratedVerifier,
+            runtime: HarnessRuntime::NodeScript,
+            test_adapter: None,
+            source_mode: SourceMode::TypeScript,
+            artifact: HarnessArtifact::Generated {
+                code: "const target = await import('./target.ts');\n\
+                       console.log(JSON.stringify({ order: target.evaluationOrder, source: target.materializedSource }));\n"
+                    .into(),
+                relative_path: "src/.court-jester-generated-verify.ts".into(),
+            },
+            args: Vec::new(),
+            network: NetworkPolicy::Deny,
+        },
+        sandbox_options(
+            10.0,
+            128,
+            Some(workspace.to_str().unwrap()),
+            Some(source.to_str().unwrap()),
+        ),
+    )
+    .await
+    .process;
+
+    assert_eq!(result.exit_code, Some(0), "result: {result:?}");
+    let observed: serde_json::Value = serde_json::from_str(result.stdout.trim()).unwrap();
+    assert_eq!(
+        observed["order"],
+        serde_json::json!(["registration", "first", "second"])
+    );
+    assert_eq!(observed["source"], source_code);
+    assert_eq!(std::fs::read_to_string(source).unwrap(), source_code);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn isolated_generated_harness_isolates_type_only_imports_and_selected_barrel_export() {
+    let docker_available = std::process::Command::new("docker")
+        .arg("info")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if !docker_available {
+        return;
+    }
+    let image = "node:24-bookworm-slim";
+    let image_available = std::process::Command::new("docker")
+        .args(["image", "inspect", image])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if !image_available {
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path();
+    let source = workspace.join("src/uploadSettings.ts");
+    let runtime_only_source = workspace.join("src/readPrompt.ts");
+    let dependency = workspace.join("node_modules/@resin8/db-entities");
+    let registration = workspace.join("node_modules/@fixture/registration");
+    let native_types = workspace.join("node_modules/@fixture/native-types");
+    let prompts = workspace.join("src/prompts");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&dependency).unwrap();
+    std::fs::create_dir_all(&registration).unwrap();
+    std::fs::create_dir_all(&native_types).unwrap();
+    std::fs::create_dir_all(&prompts).unwrap();
+    std::fs::write(workspace.join("package.json"), r#"{"type":"module"}"#).unwrap();
+    std::fs::write(
+        dependency.join("package.json"),
+        r#"{"name":"@resin8/db-entities","type":"module","exports":"./index.js"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dependency.join("types.js"),
+        "export const Runtime = true;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dependency.join("index.js"),
+        "import { EntityProperty } from './types.js';\n\
+         export class AISettings {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        registration.join("package.json"),
+        r#"{"name":"@fixture/registration","type":"module","exports":"./index.js"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        registration.join("index.js"),
+        "globalThis.__registrationLoaded = true;\nexport class Registration {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        native_types.join("package.json"),
+        r#"{"name":"@fixture/native-types","type":"module","exports":"./index.js"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        native_types.join("index.js"),
+        "export const Runtime = true;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        prompts.join("index.ts"),
+        "export * from './Prompt';\nexport * from './DangerousPrompt';\n",
+    )
+    .unwrap();
+    std::fs::write(
+        prompts.join("Prompt.ts"),
+        "globalThis.__promptLoaded = true;\nexport const prompt = 'prompt';\n",
+    )
+    .unwrap();
+    std::fs::write(
+        prompts.join("DangerousPrompt.ts"),
+        "import { FilterQuery } from '@fixture/native-types';\n\
+         globalThis.__dangerousPromptLoaded = true;\n\
+         export const dangerousPrompt = 'danger';\n\
+         export type PromptFilter = FilterQuery;\n",
+    )
+    .unwrap();
+    let source_code = "import { AISettings } from '@resin8/db-entities';\n\
+import { Registration } from '@fixture/registration';\n\
+import { prompt } from './prompts';\n\
+export function uploadSettings(settings: AISettings, _registration?: Registration): string { return `${settings.name}-${prompt}`; }\n\
+export const registrationLoaded = globalThis.__registrationLoaded === true;\n\
+export const promptLoaded = globalThis.__promptLoaded === true;\n\
+export const dangerousPromptLoaded = globalThis.__dangerousPromptLoaded === true;\n";
+    std::fs::write(&source, source_code).unwrap();
+    let runtime_only_source_code = "import { prompt } from './prompts';\n\
+export function readPrompt(): string { return prompt; }\n\
+export const dangerousPromptLoaded = globalThis.__dangerousPromptLoaded === true;\n";
+    std::fs::write(&runtime_only_source, runtime_only_source_code).unwrap();
+
+    let context = resolve_execution_context(ContextRequest {
+        invocation_dir: workspace,
+        explicit_project_dir: Some(workspace),
+        target_file: Some(&source),
+        test_file: None,
+        language: Language::TypeScript,
+        virtual_file_path: None,
+    })
+    .unwrap();
+    let workspace_text = workspace.to_string_lossy();
+    let source_text = source.to_string_lossy();
+    let execution = execute_harness(
+        &context,
+        HarnessSpec {
+            kind: HarnessKind::GeneratedVerifier,
+            runtime: HarnessRuntime::NodeScript,
+            test_adapter: None,
+            source_mode: SourceMode::TypeScript,
+            artifact: HarnessArtifact::Generated {
+                code: "const target = await import('./uploadSettings.ts');\n\
+                       console.log(JSON.stringify({ value: target.uploadSettings({ name: 'isolated-ok' }), registrationLoaded: target.registrationLoaded, promptLoaded: target.promptLoaded, dangerousPromptLoaded: target.dangerousPromptLoaded }));\n"
+                    .into(),
+                relative_path: "src/.court-jester-generated-verify.ts".into(),
+            },
+            args: Vec::new(),
+            network: NetworkPolicy::Deny,
+        },
+        SandboxOptions {
+            timeout_seconds: 10.0,
+            memory_mb: 128,
+            runtime_profile: RuntimeProfile::Isolated,
+            network_policy: NetworkPolicy::Deny,
+            harness_args: &[],
+            docker_image: Some(image),
+            project_dir: Some(workspace_text.as_ref()),
+            source_file: Some(source_text.as_ref()),
+            instrumentation_target: None,
+            instrumented_source: None,
+        },
+    )
+    .await;
+
+    assert_eq!(
+        execution.process.exit_code,
+        Some(0),
+        "result: {:?}",
+        execution.process
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(execution.process.stdout.trim()).unwrap(),
+        serde_json::json!({
+            "value": "isolated-ok-prompt",
+            "registrationLoaded": true,
+            "promptLoaded": true,
+            "dangerousPromptLoaded": false,
+        })
+    );
+    assert_eq!(std::fs::read_to_string(source).unwrap(), source_code);
+
+    let runtime_only_context = resolve_execution_context(ContextRequest {
+        invocation_dir: workspace,
+        explicit_project_dir: Some(workspace),
+        target_file: Some(&runtime_only_source),
+        test_file: None,
+        language: Language::TypeScript,
+        virtual_file_path: None,
+    })
+    .unwrap();
+    let runtime_only_source_text = runtime_only_source.to_string_lossy();
+    let runtime_only_execution = execute_harness(
+        &runtime_only_context,
+        HarnessSpec {
+            kind: HarnessKind::GeneratedVerifier,
+            runtime: HarnessRuntime::NodeScript,
+            test_adapter: None,
+            source_mode: SourceMode::TypeScript,
+            artifact: HarnessArtifact::Generated {
+                code: "const target = await import('./readPrompt.ts');\n\
+                       console.log(JSON.stringify({ value: target.readPrompt(), dangerousPromptLoaded: target.dangerousPromptLoaded }));\n"
+                    .into(),
+                relative_path: "src/.court-jester-generated-verify.ts".into(),
+            },
+            args: Vec::new(),
+            network: NetworkPolicy::Deny,
+        },
+        SandboxOptions {
+            timeout_seconds: 10.0,
+            memory_mb: 128,
+            runtime_profile: RuntimeProfile::Isolated,
+            network_policy: NetworkPolicy::Deny,
+            harness_args: &[],
+            docker_image: Some(image),
+            project_dir: Some(workspace_text.as_ref()),
+            source_file: Some(runtime_only_source_text.as_ref()),
+            instrumentation_target: None,
+            instrumented_source: None,
+        },
+    )
+    .await;
+
+    assert_eq!(
+        runtime_only_execution.process.exit_code,
+        Some(0),
+        "redirect-only result: {:?}",
+        runtime_only_execution.process
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(runtime_only_execution.process.stdout.trim())
+            .unwrap(),
+        serde_json::json!({
+            "value": "prompt",
+            "dangerousPromptLoaded": false,
+        })
+    );
+    assert_eq!(
+        std::fs::read_to_string(runtime_only_source).unwrap(),
+        runtime_only_source_code
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn generated_harness_resolves_extensionless_imports_from_workspace_symlink() {

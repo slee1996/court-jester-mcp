@@ -4,6 +4,10 @@ This changelog tracks user-visible verifier semantics, report-shape changes, and
 
 ## Unreleased
 
+## 0.2.15 - 2026-08-15
+
+Artifact-equivalence repair for issues #41–#47. TypeScript verification now resolves `keyof typeof` domains through workspace-package re-exports, applies constrained generic domains, keeps multiline union arms inside their declared field, synthesizes callback return shapes, retains valid per-surface planned calls when sibling surfaces are unsupported, and supplies real `URL` instances for platform-typed inputs. Generated TypeScript overlays erase type-only target dependencies and route named barrel imports to their exporting leaves without evaluating unrelated runtime branches. Corpus mutation preserves required object keys, container shape, and `URL` internal slots, so generated valid-input campaigns no longer report target crashes caused by the harness itself. Project-runner failures caused by lost Vitest globals and exact sandbox process-spawn denials are now blocking environment diagnostics rather than target assertion failures. See [docs/release-notes-0.2.15.md](docs/release-notes-0.2.15.md) for the full red/green evidence.
+
 ## 0.2.14 - 2026-08-15
 
 Deep fuzz-campaign release. Predicate-aware guard seeds, retained-corpus mutation, oracle-preserving fixed-point shrinking, broader metamorphic checks, and stateful factory action sequences expand the deterministic Python and TypeScript search. Installed Atheris or Jazzer.js engines and an external plateau seed proposer are available as explicit opt-ins; their findings retain the normal sandbox, diagnostic, minimization, replay, and report semantics. A seeded evaluation lane detected all seven mutations while both clean controls remained finding-free. See [docs/release-notes-0.2.14.md](docs/release-notes-0.2.14.md) for the full behavior and evidence.

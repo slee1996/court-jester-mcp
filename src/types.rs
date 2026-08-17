@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -583,6 +584,8 @@ pub struct ParamInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PredicateSeed {
     pub parameter: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub property_path: Vec<String>,
     pub value: serde_json::Value,
     pub line: usize,
 }
@@ -608,6 +611,9 @@ pub struct FunctionInfo {
     /// Type parameters declared directly by this callable (for example `T` in `fn<T>`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub type_parameters: Vec<String>,
+    /// TypeScript constraints keyed by the callable-local type parameter name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub type_parameter_constraints: BTreeMap<String, String>,
     pub line: usize,
     pub end_line: usize,
     pub complexity: usize,
@@ -635,6 +641,109 @@ pub struct FunctionInfo {
     pub invocation_target: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub returned_callables: Vec<String>,
+}
+
+fn ts_constraint_is_atomic(constraint: &str) -> bool {
+    let constraint = constraint.trim();
+    if constraint.is_empty() {
+        return true;
+    }
+
+    let mut delimiters = Vec::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for character in constraint.chars() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"' | '`') {
+            quote = Some(character);
+            continue;
+        }
+        match character {
+            '(' | '[' | '{' | '<' => delimiters.push(character),
+            ')' => {
+                if delimiters.pop() != Some('(') {
+                    return false;
+                }
+            }
+            ']' => {
+                if delimiters.pop() != Some('[') {
+                    return false;
+                }
+            }
+            '}' => {
+                if delimiters.pop() != Some('{') {
+                    return false;
+                }
+            }
+            '>' if delimiters.last() == Some(&'<') => {
+                delimiters.pop();
+            }
+            _ if delimiters.is_empty()
+                && (character.is_whitespace()
+                    || matches!(character, '|' | '&' | '=' | '?' | ':' | ',')) =>
+            {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    quote.is_none() && delimiters.is_empty()
+}
+
+fn precedence_safe_ts_constraint(constraint: &str) -> Cow<'_, str> {
+    let constraint = constraint.trim();
+    if ts_constraint_is_atomic(constraint) {
+        Cow::Borrowed(constraint)
+    } else {
+        Cow::Owned(format!("({constraint})"))
+    }
+}
+
+impl FunctionInfo {
+    pub fn resolved_type_annotation<'a>(&'a self, annotation: &'a str) -> Cow<'a, str> {
+        if self.type_parameter_constraints.is_empty() {
+            return Cow::Borrowed(annotation);
+        }
+
+        let mut resolved = String::with_capacity(annotation.len());
+        let mut copied_until = 0usize;
+        let mut token_start = None;
+        for (index, character) in annotation
+            .char_indices()
+            .chain(std::iter::once((annotation.len(), ' ')))
+        {
+            let identifier_character =
+                character.is_alphanumeric() || matches!(character, '_' | '$');
+            match (token_start, identifier_character) {
+                (None, true) => token_start = Some(index),
+                (Some(start), false) => {
+                    let token = &annotation[start..index];
+                    if let Some(constraint) = self.type_parameter_constraints.get(token) {
+                        resolved.push_str(&annotation[copied_until..start]);
+                        resolved.push_str(&precedence_safe_ts_constraint(constraint));
+                        copied_until = index;
+                    }
+                    token_start = None;
+                }
+                _ => {}
+            }
+        }
+        if copied_until == 0 {
+            Cow::Borrowed(annotation)
+        } else {
+            resolved.push_str(&annotation[copied_until..]);
+            Cow::Owned(resolved)
+        }
+    }
 }
 
 impl ParamInfo {

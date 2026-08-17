@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::types::{
     FailureDiagnostic, FailureDomain, FailureKind, HarnessEvent, HarnessEventRecord,
@@ -510,13 +510,237 @@ fn resolved_typescript_import(value: &str, source_dir: &std::path::Path) -> Opti
     None
 }
 
-fn rewrite_typescript_relative_imports(
+fn typescript_runtime_identifiers(code: &str) -> HashSet<String> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+        .expect("Failed to load TypeScript grammar");
+    let Some(tree) = parser.parse(code, None) else {
+        return HashSet::new();
+    };
+    let mut identifiers = HashSet::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if matches!(
+            node.kind(),
+            "identifier"
+                | "shorthand_property_identifier"
+                | "shorthand_property_identifier_pattern"
+        ) {
+            let mut ancestor = node.parent();
+            let mut imported = false;
+            while let Some(parent) = ancestor {
+                if parent.kind() == "import_statement" {
+                    imported = true;
+                    break;
+                }
+                ancestor = parent.parent();
+            }
+            if !imported {
+                if let Ok(identifier) = node.utf8_text(code.as_bytes()) {
+                    identifiers.insert(identifier.to_string());
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    identifiers
+}
+
+fn typescript_virtual_type_imports(code: &str) -> BTreeMap<String, Vec<String>> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+        .expect("Failed to load TypeScript grammar");
+    let Some(tree) = parser.parse(code, None) else {
+        return BTreeMap::new();
+    };
+    let runtime_identifiers = typescript_runtime_identifiers(code);
+    let mut imports = BTreeMap::<String, Vec<String>>::new();
+    let mut cursor = tree.root_node().walk();
+    for statement in tree.root_node().named_children(&mut cursor) {
+        if statement.kind() != "import_statement" {
+            continue;
+        }
+        let Some(source) = statement.child_by_field_name("source") else {
+            continue;
+        };
+        let Ok(source_text) = source.utf8_text(code.as_bytes()) else {
+            continue;
+        };
+        let Some(specifier) = parse_quoted_path(source_text) else {
+            continue;
+        };
+        let Ok(statement_text) = statement.utf8_text(code.as_bytes()) else {
+            continue;
+        };
+        if statement_text.trim_start().starts_with("import type ") {
+            continue;
+        }
+
+        let mut specifier_nodes = Vec::new();
+        let mut stack = vec![statement];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "import_specifier" {
+                specifier_nodes.push(node);
+                continue;
+            }
+            let mut children = node.walk();
+            stack.extend(node.named_children(&mut children));
+        }
+        if specifier_nodes.is_empty() {
+            continue;
+        }
+
+        for import_specifier in specifier_nodes {
+            let Ok(import_text) = import_specifier.utf8_text(code.as_bytes()) else {
+                continue;
+            };
+            if import_text.trim_start().starts_with("type ") {
+                continue;
+            }
+            let mut identifiers = Vec::new();
+            let mut children = import_specifier.walk();
+            for child in import_specifier.named_children(&mut children) {
+                if matches!(child.kind(), "identifier" | "type_identifier") {
+                    if let Ok(identifier) = child.utf8_text(code.as_bytes()) {
+                        identifiers.push(identifier.to_string());
+                    }
+                }
+            }
+            let Some(source_name) = identifiers.first().cloned() else {
+                continue;
+            };
+            let local_name = identifiers.last().unwrap_or(&source_name);
+            if !runtime_identifiers.contains(local_name)
+                && source_name.chars().enumerate().all(|(index, character)| {
+                    character == '_'
+                        || character == '$'
+                        || (index == 0 && character.is_ascii_alphabetic())
+                        || (index > 0 && character.is_ascii_alphanumeric())
+                })
+            {
+                imports
+                    .entry(specifier.clone())
+                    .or_default()
+                    .push(source_name);
+            }
+        }
+    }
+    imports.retain(|_, names| !names.is_empty());
+    for names in imports.values_mut() {
+        names.sort();
+        names.dedup();
+    }
+    imports
+}
+
+fn isolated_virtual_type_import_candidates(
+    context: &ExecutionContext,
+) -> BTreeMap<String, Vec<String>> {
+    if !matches!(
+        context.target_source.mode,
+        crate::types::SourceMode::TypeScript | crate::types::SourceMode::Tsx
+    ) {
+        return BTreeMap::new();
+    }
+    let Some(source_file) = context.target_source.source_file.as_deref() else {
+        return BTreeMap::new();
+    };
+    let Ok(code) = std::fs::read_to_string(source_file) else {
+        return BTreeMap::new();
+    };
+    typescript_virtual_type_imports(&code)
+}
+
+fn isolated_failure_source_file(
+    context: &ExecutionContext,
+    process: &ExecutionResult,
+) -> Option<std::path::PathBuf> {
+    let output = format!("{}\n{}", process.stderr, process.stdout);
+    output.lines().find_map(|line| {
+        ["/workspace/", "/court-jester/dependencies/"]
+            .iter()
+            .find_map(|prefix| {
+                let start = line.find(prefix)? + prefix.len();
+                let relative = line[start..].split(':').next()?;
+                let relative = std::path::Path::new(relative);
+                if relative.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::ParentDir | std::path::Component::RootDir
+                    )
+                }) {
+                    return None;
+                }
+                let source_file = context.workspace_root.join(relative);
+                source_file.is_file().then_some(source_file)
+            })
+    })
+}
+
+fn isolated_failure_package_name(
+    context: &ExecutionContext,
+    process: &ExecutionResult,
+) -> Option<String> {
+    let source_file = isolated_failure_source_file(context, process)?;
+    source_file
+        .ancestors()
+        .take_while(|directory| directory.starts_with(&context.workspace_root))
+        .find_map(|directory| {
+            let manifest = std::fs::read_to_string(directory.join("package.json")).ok()?;
+            serde_json::from_str::<serde_json::Value>(&manifest)
+                .ok()?
+                .get("name")?
+                .as_str()
+                .map(str::to_owned)
+        })
+}
+
+fn isolated_virtual_type_import_candidate_from_failure(
+    context: &ExecutionContext,
+    process: &ExecutionResult,
+    existing: &BTreeMap<String, BTreeMap<String, Vec<String>>>,
+) -> Option<(String, String, Vec<String>)> {
+    let output = format!("{}\n{}", process.stderr, process.stdout);
+    let source_file = isolated_failure_source_file(context, process)?;
+    if !matches!(
+        source_file
+            .extension()
+            .and_then(|extension| extension.to_str()),
+        Some("ts" | "tsx")
+    ) {
+        return None;
+    }
+    let relative = source_file
+        .strip_prefix(&context.workspace_root)
+        .ok()?
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    let code = std::fs::read_to_string(source_file).ok()?;
+    let candidates = typescript_virtual_type_imports(&code);
+    candidates.into_iter().find_map(|(specifier, names)| {
+        let already_present = existing
+            .get(&relative)
+            .is_some_and(|imports| imports.contains_key(&specifier));
+        (!already_present
+            && (output.contains(&format!("'{specifier}'"))
+                || output.contains(&format!("\"{specifier}\""))))
+        .then(|| (relative.clone(), specifier, names))
+    })
+}
+fn resolve_generated_typescript_relative_imports(
     code: &str,
     source_file: Option<&std::path::Path>,
 ) -> String {
-    let Some(source_dir) = source_file.and_then(std::path::Path::parent) else {
+    let Some(source_file) = source_file else {
         return code.to_string();
     };
+    let Some(source_dir) = source_file.parent() else {
+        return code.to_string();
+    };
+    let code = code.to_string();
     let mut rewritten = String::with_capacity(code.len());
     let mut cursor = 0;
     while cursor < code.len() {
@@ -631,7 +855,7 @@ fn resolve_typescript_import_file(
     let source_dir = std::path::Path::new(source_file).parent()?;
     let base = source_dir.join(import_path);
 
-    if base.exists() {
+    if base.is_file() {
         return Some(base);
     }
     for ext in [".ts", ".tsx", "/index.ts", "/index.tsx"] {
@@ -760,6 +984,238 @@ fn extract_typescript_named_relative_reexports(
     }
 
     reexports
+}
+
+fn source_defines_runtime_export(code: &str, name: &str) -> bool {
+    [
+        "export const ",
+        "export let ",
+        "export var ",
+        "export function ",
+        "export class ",
+        "export enum ",
+    ]
+    .iter()
+    .any(|prefix| {
+        code.lines().any(|line| {
+            let Some(remainder) = line.trim_start().strip_prefix(prefix) else {
+                return false;
+            };
+            remainder.strip_prefix(name).is_some_and(|suffix| {
+                suffix
+                    .chars()
+                    .next()
+                    .is_none_or(|character| character != '_' && !character.is_ascii_alphanumeric())
+            })
+        })
+    })
+}
+
+fn resolve_typescript_runtime_reexport(
+    source_file: &std::path::Path,
+    name: &str,
+    visited: &mut HashSet<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    let source_file = std::fs::canonicalize(source_file).ok()?;
+    if !visited.insert(source_file.clone()) {
+        return None;
+    }
+    let code = std::fs::read_to_string(&source_file).ok()?;
+    if source_defines_runtime_export(&code, name) {
+        return Some(source_file);
+    }
+    let source_text = source_file.to_str()?;
+
+    let mut named_matches = Vec::new();
+    for (import_path, specifiers) in extract_typescript_named_relative_reexports(&code) {
+        for specifier in specifiers {
+            if specifier.exported_name != name || specifier.type_only {
+                continue;
+            }
+            let target = resolve_typescript_import_file(source_text, &import_path)?;
+            let mut branch_visited = visited.clone();
+            let resolved = resolve_typescript_runtime_reexport(
+                &target,
+                &specifier.source_name,
+                &mut branch_visited,
+            )?;
+            if !named_matches.contains(&resolved) {
+                named_matches.push(resolved);
+            }
+        }
+    }
+    if named_matches.len() == 1 {
+        return named_matches.pop();
+    }
+    if !named_matches.is_empty() {
+        return None;
+    }
+
+    let mut wildcard_matches = Vec::new();
+    for line in code.lines() {
+        let trimmed = line.trim().trim_end_matches(';');
+        let Some(from_clause) = trimmed.strip_prefix("export * from ") else {
+            continue;
+        };
+        let Some(import_path) = parse_quoted_path(from_clause) else {
+            continue;
+        };
+        let Some(target) = resolve_typescript_import_file(source_text, &import_path) else {
+            continue;
+        };
+        let mut branch_visited = visited.clone();
+        if let Some(resolved) =
+            resolve_typescript_runtime_reexport(&target, name, &mut branch_visited)
+        {
+            if !wildcard_matches.contains(&resolved) {
+                wildcard_matches.push(resolved);
+            }
+        }
+    }
+    (wildcard_matches.len() == 1).then(|| wildcard_matches.remove(0))
+}
+
+fn relative_typescript_specifier(
+    source_dir: &std::path::Path,
+    target: &std::path::Path,
+) -> Option<String> {
+    let source_dir = std::fs::canonicalize(source_dir).ok()?;
+    let target = std::fs::canonicalize(target).ok()?;
+    let source_components = source_dir.components().collect::<Vec<_>>();
+    let target_components = target.components().collect::<Vec<_>>();
+    let shared = source_components
+        .iter()
+        .zip(&target_components)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut relative = std::path::PathBuf::new();
+    for _ in shared..source_components.len() {
+        relative.push("..");
+    }
+    for component in &target_components[shared..] {
+        relative.push(component.as_os_str());
+    }
+    let relative = relative
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    Some(if relative.starts_with('.') {
+        relative
+    } else {
+        format!("./{relative}")
+    })
+}
+
+fn isolated_typescript_barrel_redirects(context: &ExecutionContext) -> BTreeMap<String, String> {
+    let Some(source_file) = context.target_source.source_file.as_deref() else {
+        return BTreeMap::new();
+    };
+    let Ok(code) = std::fs::read_to_string(source_file) else {
+        return BTreeMap::new();
+    };
+    let Some(source_dir) = source_file.parent() else {
+        return BTreeMap::new();
+    };
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+        .is_err()
+    {
+        return BTreeMap::new();
+    }
+    let Some(tree) = parser.parse(&code, None) else {
+        return BTreeMap::new();
+    };
+    let mut redirects = BTreeMap::new();
+    let mut cursor = tree.root_node().walk();
+    for statement in tree.root_node().named_children(&mut cursor) {
+        if statement.kind() != "import_statement" {
+            continue;
+        }
+        let Ok(statement_text) = statement.utf8_text(code.as_bytes()) else {
+            continue;
+        };
+        let Some(import_body) = statement_text.trim().strip_prefix("import ") else {
+            continue;
+        };
+        if import_body.starts_with("type ") {
+            continue;
+        }
+        let Some((clause, _)) = import_body.split_once(" from ") else {
+            continue;
+        };
+        let clause = clause.trim();
+        if !clause.starts_with('{') || !clause.ends_with('}') {
+            continue;
+        }
+        let Some(source) = statement.child_by_field_name("source") else {
+            continue;
+        };
+        let Ok(source_text) = source.utf8_text(code.as_bytes()) else {
+            continue;
+        };
+        let Some(specifier) = parse_quoted_path(source_text) else {
+            continue;
+        };
+        if !(specifier.starts_with("./") || specifier.starts_with("../"))
+            || code.match_indices(&specifier).count() != 1
+        {
+            continue;
+        }
+        let Some(barrel) =
+            resolve_typescript_import_file(source_file.to_str().unwrap_or_default(), &specifier)
+        else {
+            continue;
+        };
+        let mut names = Vec::new();
+        let mut stack = vec![statement];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "import_specifier" {
+                let Ok(import_text) = node.utf8_text(code.as_bytes()) else {
+                    continue;
+                };
+                if import_text.trim_start().starts_with("type ") {
+                    continue;
+                }
+                let mut identifiers = Vec::new();
+                let mut children = node.walk();
+                for child in node.named_children(&mut children) {
+                    if matches!(child.kind(), "identifier" | "type_identifier") {
+                        if let Ok(identifier) = child.utf8_text(code.as_bytes()) {
+                            identifiers.push(identifier.to_string());
+                        }
+                    }
+                }
+                if let Some(source_name) = identifiers.first() {
+                    names.push(source_name.clone());
+                }
+                continue;
+            }
+            let mut children = node.walk();
+            stack.extend(node.named_children(&mut children));
+        }
+        if names.is_empty() {
+            continue;
+        }
+        let leaves = names
+            .iter()
+            .filter_map(|name| {
+                resolve_typescript_runtime_reexport(&barrel, name, &mut HashSet::new())
+            })
+            .collect::<Vec<_>>();
+        if leaves.len() != names.len() || leaves.iter().any(|leaf| leaf != &leaves[0]) {
+            continue;
+        }
+        let Ok(barrel) = std::fs::canonicalize(&barrel) else {
+            continue;
+        };
+        if leaves[0] == barrel {
+            continue;
+        }
+        if let Some(redirect) = relative_typescript_specifier(source_dir, &leaves[0]) {
+            redirects.insert(specifier, redirect);
+        }
+    }
+    redirects
 }
 
 fn source_key(source_file: &str) -> String {
@@ -1140,12 +1596,17 @@ struct NodePackageResolver {
 fn create_node_package_resolver(
     runtime_profile: crate::types::RuntimeProfile,
 ) -> Result<NodePackageResolver, String> {
+    create_node_package_resolver_with_virtual_type_imports(runtime_profile, None)
+}
+
+fn create_node_package_resolver_with_virtual_type_imports(
+    runtime_profile: crate::types::RuntimeProfile,
+    virtual_type_imports: Option<&str>,
+) -> Result<NodePackageResolver, String> {
     let directory = runtime_tempdir(runtime_profile)
         .map_err(|error| format!("failed to create Node package resolver: {error}"))?;
     let loader = directory.path().join("package-resolver.mjs");
-    std::fs::write(
-        &loader,
-        r##"
+    let loader_source = r##"
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -1160,6 +1621,9 @@ const overlayTargetRoot = realPathOrSelf(
 const generatedArtifact = realPathOrSelf(
   process.env.COURT_JESTER_NODE_GENERATED_ARTIFACT || "",
 );
+const loaderConfiguration = __COURT_JESTER_VIRTUAL_TYPE_IMPORTS__;
+const virtualTypeImports = loaderConfiguration.removals || {};
+const importRedirects = loaderConfiguration.redirects || {};
 const targetSelfReferenceName = readSelfReferenceName(overlayTargetRoot);
 
 function realPathOrSelf(value) {
@@ -1521,6 +1985,17 @@ function sourceParentURL(parentPath) {
   return pathToFileURL(path.join(sourceRoot, relative)).href;
 }
 
+function projectRelativePath(parentPath) {
+  if (!parentPath) return undefined;
+  const root = containsPath(overlayRoot, parentPath)
+    ? overlayRoot
+    : containsPath(sourceRoot, parentPath)
+      ? sourceRoot
+      : undefined;
+  return root ? path.relative(root, parentPath).split(path.sep).join("/") : undefined;
+}
+
+
 function packageWasNotFound(error, packageName) {
   if (error?.code !== "ERR_MODULE_NOT_FOUND") return false;
   return error.message?.includes(`Cannot find package '${packageName}'`) === true
@@ -1530,6 +2005,12 @@ function packageWasNotFound(error, packageName) {
 export async function resolve(specifier, context, nextResolve) {
   const parentPath = overlayParentPath(context);
   const projectParentPath = parentPath || sourceProjectParentPath(context);
+  const importer = projectRelativePath(projectParentPath);
+  const redirect = importer && importRedirects[importer]?.[specifier];
+  if (redirect) {
+    const redirected = relativeResolution(redirect, projectParentPath);
+    if (redirected) return redirected;
+  }
   if (projectParentPath && specifier.startsWith(".")) {
     const relative = relativeResolution(specifier, projectParentPath);
     if (relative) return relative;
@@ -1649,11 +2130,52 @@ function isProjectDependencyURL(url) {
   }
 }
 
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function rewriteTypeOnlyImports(url, loaded) {
+  if (!url.startsWith("file:") || loaded?.source == null) return loaded;
+  let importer;
+  try {
+    importer = projectRelativePath(realPathOrSelf(fileURLToPath(url)));
+  } catch {
+    return loaded;
+  }
+  const removals = importer && virtualTypeImports[importer];
+  if (!removals) return loaded;
+  let source = typeof loaded.source === "string"
+    ? loaded.source
+    : Buffer.from(loaded.source).toString("utf8");
+  for (const [specifier, names] of Object.entries(removals)) {
+    const pattern = new RegExp(
+      `import\\s*\\{([^}]*)\\}\\s*from\\s*(["'])${escapeRegExp(specifier)}\\2\\s*;?`,
+      "g",
+    );
+    source = source.replace(pattern, (statement, bindings) => {
+      const removed = new Set(names);
+      const kept = bindings.split(",").filter((binding) => {
+        const sourceName = binding
+          .trim()
+          .replace(/^type\\s+/, "")
+          .split(/\\s+as\\s+/)[0];
+        return sourceName && !removed.has(sourceName);
+      });
+      if (kept.length === 0) {
+        return statement.replace(/[^\n]/g, " ");
+      }
+      return statement.replace(bindings, ` ${kept.map((entry) => entry.trim()).join(", ")} `);
+    });
+  }
+  return { ...loaded, source };
+}
+
 export async function load(url, context, nextLoad) {
   for (let attempt = 0; ; attempt += 1) {
     try {
       const jsonModule = projectJsonModule(url, context);
-      return jsonModule || await nextLoad(url, context);
+      const loaded = jsonModule || await nextLoad(url, context);
+      return rewriteTypeOnlyImports(url, loaded);
     } catch (error) {
       if (error?.code !== "EACCES"
           || !isProjectDependencyURL(url)
@@ -1666,9 +2188,13 @@ export async function load(url, context, nextLoad) {
     }
   }
 }
-"##,
-    )
-    .map_err(|error| format!("failed to write Node package resolver: {error}"))?;
+"##
+    .replace(
+        "__COURT_JESTER_VIRTUAL_TYPE_IMPORTS__",
+        virtual_type_imports.unwrap_or(r#"{"removals":{},"redirects":{}}"#),
+    );
+    std::fs::write(&loader, loader_source)
+        .map_err(|error| format!("failed to write Node package resolver: {error}"))?;
     Ok(NodePackageResolver {
         _directory: directory,
         loader,
@@ -2643,9 +3169,9 @@ function compilerOptionsFor(filename) {
     sourceMap: false,
     inlineSourceMap: true,
     inlineSources: true,
-    verbatimModuleSyntax: false,
-    importsNotUsedAsValues: ts.ImportsNotUsedAsValues.Remove,
-    preserveValueImports: false,
+    verbatimModuleSyntax: true,
+    importsNotUsedAsValues: ts.ImportsNotUsedAsValues.Preserve,
+    preserveValueImports: true,
   });
   compilerOptionsByDirectory.set(directory, compilerOptions);
   return compilerOptions;
@@ -3368,9 +3894,13 @@ async fn run_launch_command(
 enum StructuredTestFailure {
     Assertion,
     Initialization(String),
+    ProcessSpawnDenied,
 }
 
-fn structured_test_failure(output: &str) -> Option<StructuredTestFailure> {
+fn structured_test_failure(
+    output: &str,
+    recognize_missing_vitest_globals: bool,
+) -> Option<StructuredTestFailure> {
     const MAX_SCAN_BYTES: usize = 16 * 1024 * 1024;
     const MAX_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
     const MAX_JSON_DEPTH: usize = 256;
@@ -3392,7 +3922,21 @@ fn structured_test_failure(output: &str) -> Option<StructuredTestFailure> {
         }
     }
 
-    fn runner_initialization_message(message: &str) -> bool {
+    fn contains_process_spawn_denial(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::String(message) => {
+                message.contains("court-jester process spawn denied")
+            }
+            serde_json::Value::Array(values) => values.iter().any(contains_process_spawn_denial),
+            serde_json::Value::Object(fields) => fields.values().any(contains_process_spawn_denial),
+            _ => false,
+        }
+    }
+
+    fn runner_initialization_message(
+        message: &str,
+        recognize_missing_vitest_globals: bool,
+    ) -> bool {
         [
             "Vitest failed to access its internal state",
             "Vitest was initialized with native Node instead of Vite Node",
@@ -3404,9 +3948,18 @@ fn structured_test_failure(output: &str) -> Option<StructuredTestFailure> {
         ]
         .iter()
         .any(|fragment| message.contains(fragment))
+            || (recognize_missing_vitest_globals
+                && message.lines().any(|line| {
+                    let line = line.trim();
+                    line == "describe is not defined"
+                        || line.starts_with("ReferenceError: describe is not defined")
+                }))
     }
 
-    fn reporter_failure(value: &serde_json::Value) -> Option<StructuredTestFailure> {
+    fn reporter_failure(
+        value: &serde_json::Value,
+        recognize_missing_vitest_globals: bool,
+    ) -> Option<StructuredTestFailure> {
         let fields = value.as_object()?;
         let has_test_results = fields
             .get("testResults")
@@ -3426,6 +3979,18 @@ fn structured_test_failure(output: &str) -> Option<StructuredTestFailure> {
             .any(|key| fields.get(*key).is_some_and(serde_json::Value::is_number));
         if !has_test_results && !has_summary {
             return None;
+        }
+        let reported_failure = fields.get("success").and_then(serde_json::Value::as_bool)
+            == Some(false)
+            || ["numFailedTests", "numFailedTestSuites"].iter().any(|key| {
+                fields
+                    .get(*key)
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|count| count > 0)
+            })
+            || contains_failure(value);
+        if reported_failure && contains_process_spawn_denial(value) {
+            return Some(StructuredTestFailure::ProcessSpawnDenied);
         }
 
         if fields
@@ -3452,22 +4017,14 @@ fn structured_test_failure(output: &str) -> Option<StructuredTestFailure> {
                         .map(str::trim)
                         .filter(|message| !message.is_empty())
                 });
-            if let Some(message) =
-                initialization_message.filter(|message| runner_initialization_message(message))
-            {
+            if let Some(message) = initialization_message.filter(|message| {
+                runner_initialization_message(message, recognize_missing_vitest_globals)
+            }) {
                 return Some(StructuredTestFailure::Initialization(message.to_string()));
             }
         }
 
-        (fields.get("success").and_then(serde_json::Value::as_bool) == Some(false)
-            || ["numFailedTests", "numFailedTestSuites"].iter().any(|key| {
-                fields
-                    .get(*key)
-                    .and_then(serde_json::Value::as_u64)
-                    .is_some_and(|count| count > 0)
-            })
-            || contains_failure(value))
-        .then_some(StructuredTestFailure::Assertion)
+        reported_failure.then_some(StructuredTestFailure::Assertion)
     }
 
     let mut scan_start = output.len().saturating_sub(MAX_SCAN_BYTES);
@@ -3537,7 +4094,9 @@ fn structured_test_failure(output: &str) -> Option<StructuredTestFailure> {
                 let candidate = &output[start..=index];
                 reporter_candidates += 1;
                 if let Ok(value) = serde_json::from_str(candidate) {
-                    if let Some(failure) = reporter_failure(&value) {
+                    if let Some(failure) =
+                        reporter_failure(&value, recognize_missing_vitest_globals)
+                    {
                         return Some(failure);
                     }
                 }
@@ -3783,11 +4342,11 @@ fn harness_diagnostics(
                 limits: Some(limits.clone()),
             });
         }
-        TestAdapter::VitestJson | TestAdapter::JestJson => {
+        adapter @ (TestAdapter::VitestJson | TestAdapter::JestJson) => {
             if has_non_target_blocker {
                 return diagnostics;
             }
-            match structured_test_failure(&process.stdout) {
+            match structured_test_failure(&process.stdout, adapter == TestAdapter::VitestJson) {
                 Some(StructuredTestFailure::Initialization(message)) => {
                     diagnostics.push(FailureDiagnostic {
                         domain: FailureDomain::Environment,
@@ -3799,13 +4358,36 @@ fn harness_diagnostics(
                         limits: Some(limits.clone()),
                     });
                 }
-                Some(StructuredTestFailure::Assertion) => {
+                failure @ (Some(StructuredTestFailure::Assertion)
+                | Some(StructuredTestFailure::ProcessSpawnDenied)) => {
+                    let spawn_denied = failure == Some(StructuredTestFailure::ProcessSpawnDenied)
+                        && limits.network_policy == NetworkPolicy::Deny;
                     diagnostics.push(FailureDiagnostic {
-                        domain: FailureDomain::TargetCode,
-                        kind: FailureKind::AssertionFailure,
-                        component: DiagnosticComponent::AuthoritativeTestRunner,
-                        impact: DiagnosticImpact::Gating,
-                        message: "authoritative test assertion failed".into(),
+                        domain: if spawn_denied {
+                            FailureDomain::Environment
+                        } else {
+                            FailureDomain::TargetCode
+                        },
+                        kind: if spawn_denied {
+                            FailureKind::ProcessSpawnDenied
+                        } else {
+                            FailureKind::AssertionFailure
+                        },
+                        component: if spawn_denied {
+                            DiagnosticComponent::Sandbox
+                        } else {
+                            DiagnosticComponent::AuthoritativeTestRunner
+                        },
+                        impact: if spawn_denied {
+                            DiagnosticImpact::Blocking
+                        } else {
+                            DiagnosticImpact::Gating
+                        },
+                        message: if spawn_denied {
+                            "process spawning was denied by the harness sandbox".into()
+                        } else {
+                            "authoritative test assertion failed".into()
+                        },
                         process: process.termination.clone(),
                         limits: Some(limits.clone()),
                     });
@@ -4007,6 +4589,19 @@ fn configure_docker_typescript_loader(loader: &str, command: &mut Vec<String>) {
     );
 }
 
+fn native_dependency_load_failed(process: &ExecutionResult) -> bool {
+    let output = format!("{}\n{}", process.stderr, process.stdout).to_ascii_lowercase();
+    [
+        "invalid elf header",
+        "exec format error",
+        "another platform",
+        "could not locate the query engine for runtime",
+        "does not provide an export named",
+    ]
+    .iter()
+    .any(|fragment| output.contains(fragment))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_harness_in_docker(
     root: Option<&std::path::Path>,
@@ -4016,6 +4611,7 @@ async fn run_harness_in_docker(
     harness: &crate::types::HarnessSpec,
     network_guard: Option<&NetworkGuard>,
     limits: crate::types::SandboxOptions<'_>,
+    isolated_type_import: Option<&str>,
 ) -> ExecutionResult {
     let image = docker_image_for_harness(limits.docker_image.unwrap_or_default(), &harness.runtime);
     let started = Instant::now();
@@ -4339,6 +4935,7 @@ async fn run_harness_in_docker(
         );
     }
 
+    let virtual_type_imports = isolated_type_import.map(str::to_owned);
     let node_package_resolver = if (matches!(
         harness.runtime,
         crate::types::HarnessRuntime::NodeScript
@@ -4348,7 +4945,10 @@ async fn run_harness_in_docker(
         && harness.kind != crate::types::HarnessKind::PortabilityProbe
         && !container_node_resolver_roots.is_empty()
     {
-        match create_node_package_resolver(crate::types::RuntimeProfile::Isolated) {
+        match create_node_package_resolver_with_virtual_type_imports(
+            crate::types::RuntimeProfile::Isolated,
+            virtual_type_imports.as_deref(),
+        ) {
             Ok(resolver) => Some(resolver),
             Err(error) => return launch_failure(error),
         }
@@ -4402,6 +5002,19 @@ async fn run_harness_in_docker(
         ];
         for value in resolver_environment {
             insert_docker_environment(&mut create, value);
+        }
+        if virtual_type_imports.is_some()
+            && root.is_some()
+            && harness.kind == crate::types::HarnessKind::GeneratedVerifier
+        {
+            let Some(source_file) = context.target_source.source_file.as_deref() else {
+                return launch_failure("generated target has no source path");
+            };
+            if source_file.strip_prefix(&context.workspace_root).is_err() {
+                return launch_failure(
+                    "target source is outside the workspace dependency boundary",
+                );
+            }
         }
     }
 
@@ -4752,7 +5365,7 @@ pub async fn execute_harness(
             }
             let code = match harness.source_mode {
                 crate::types::SourceMode::TypeScript | crate::types::SourceMode::Tsx => {
-                    rewrite_typescript_relative_imports(
+                    resolve_generated_typescript_relative_imports(
                         &code,
                         context.target_source.source_file.as_deref(),
                     )
@@ -5190,7 +5803,7 @@ pub async fn execute_harness(
     };
     let is_typescript = !matches!(harness.source_mode, SourceMode::Python);
     let mut process = if limits.runtime_profile == RuntimeProfile::Isolated {
-        run_harness_in_docker(
+        let mut isolated = run_harness_in_docker(
             temporary.as_ref().map(|directory| directory.path()),
             &plan.host_artifact,
             &plan.cwd,
@@ -5198,8 +5811,94 @@ pub async fn execute_harness(
             &harness,
             runtime_guard.as_ref(),
             limits,
+            None,
         )
-        .await
+        .await;
+        if harness.kind == HarnessKind::GeneratedVerifier
+            && is_typescript
+            && native_dependency_load_failed(&isolated)
+        {
+            let Some(target_file) = context.target_source.source_file.as_deref() else {
+                return HarnessExecution {
+                    process: isolated,
+                    diagnostics: Vec::new(),
+                };
+            };
+            let Some(target_relative) =
+                target_file
+                    .strip_prefix(&context.workspace_root)
+                    .ok()
+                    .map(|path| {
+                        path.to_string_lossy()
+                            .replace(std::path::MAIN_SEPARATOR, "/")
+                    })
+            else {
+                return HarnessExecution {
+                    process: isolated,
+                    diagnostics: Vec::new(),
+                };
+            };
+            let mut candidates = isolated_virtual_type_import_candidates(context);
+            if let Some(package_name) = isolated_failure_package_name(context, &isolated) {
+                if candidates.contains_key(&package_name) {
+                    candidates.retain(|specifier, _| specifier == &package_name);
+                }
+            }
+            let target_redirects = isolated_typescript_barrel_redirects(context);
+            let has_redirects = !target_redirects.is_empty();
+            let import_redirects = BTreeMap::from([(target_relative.clone(), target_redirects)]);
+            let mut retry_candidates = candidates.into_iter().map(Some).collect::<Vec<_>>();
+            if has_redirects {
+                retry_candidates.insert(0, None);
+            }
+            'candidate: for candidate in retry_candidates {
+                let mut virtual_imports = BTreeMap::new();
+                if let Some((specifier, names)) = candidate {
+                    virtual_imports.insert(
+                        target_relative.clone(),
+                        BTreeMap::from([(specifier, names)]),
+                    );
+                }
+                for _ in 0..32 {
+                    let configuration = serde_json::json!({
+                        "removals": &virtual_imports,
+                        "redirects": &import_redirects,
+                    });
+                    let Some(serialized) = serde_json::to_string(&configuration).ok() else {
+                        break;
+                    };
+                    let retry = run_harness_in_docker(
+                        temporary.as_ref().map(|directory| directory.path()),
+                        &plan.host_artifact,
+                        &plan.cwd,
+                        context,
+                        &harness,
+                        runtime_guard.as_ref(),
+                        limits,
+                        Some(&serialized),
+                    )
+                    .await;
+                    if !native_dependency_load_failed(&retry) {
+                        isolated = retry;
+                        break 'candidate;
+                    }
+                    let Some((importer, specifier, names)) =
+                        isolated_virtual_type_import_candidate_from_failure(
+                            context,
+                            &retry,
+                            &virtual_imports,
+                        )
+                    else {
+                        break;
+                    };
+                    virtual_imports
+                        .entry(importer)
+                        .or_default()
+                        .insert(specifier, names);
+                }
+            }
+        }
+        isolated
     } else {
         run_launch_command(
             &plan,
@@ -5262,11 +5961,14 @@ mod tests {
         copy_materialization_tree, create_network_guard, create_node_package_resolver,
         docker_dependency_mapping, docker_image_for_harness, docker_path_mapping,
         docker_project_module_path, harness_diagnostics, has_typescript_type_only_relative_imports,
-        insert_docker_environment, virtual_env_bin, vitest_project_entrypoint, which_binary,
+        insert_docker_environment, isolated_typescript_barrel_redirects,
+        resolve_typescript_runtime_reexport, typescript_virtual_type_imports, virtual_env_bin,
+        vitest_project_entrypoint, which_binary,
     };
     use crate::types::{
-        DiagnosticComponent, DiagnosticImpact, ExecutionLimits, ExecutionResult, FailureDomain,
-        FailureKind, NetworkPolicy, RuntimeProfile, TestAdapter,
+        DiagnosticComponent, DiagnosticImpact, ExecutionContext, ExecutionLimits, ExecutionResult,
+        FailureDomain, FailureKind, NetworkPolicy, RuntimeProfile, SourceContext, SourceMode,
+        TestAdapter,
     };
 
     #[test]
@@ -5539,6 +6241,66 @@ mod tests {
             assert_eq!(diagnostics[0].impact, DiagnosticImpact::Blocking);
         }
     }
+    #[test]
+    fn vitest_spawn_policy_denial_is_environmental_but_ordinary_assertions_are_target_code() {
+        let reporter_output = |message: &str| {
+            serde_json::json!({
+                "numTotalTestSuites": 1,
+                "numFailedTestSuites": 1,
+                "numTotalTests": 1,
+                "numFailedTests": 1,
+                "success": false,
+                "testResults": [{
+                    "assertionResults": [{
+                        "status": "failed",
+                        "failureMessages": [message],
+                    }],
+                    "status": "failed",
+                    "message": message,
+                }],
+            })
+            .to_string()
+        };
+        let process = |message: &str| ExecutionResult {
+            stdout: reporter_output(message),
+            stderr: String::new(),
+            exit_code: Some(1),
+            duration_ms: 1,
+            timed_out: false,
+            memory_error: false,
+            termination: None,
+            diagnostics: Vec::new(),
+        };
+        let limits = ExecutionLimits {
+            timeout_seconds: 1.0,
+            memory_mb: 128,
+            runtime_profile: RuntimeProfile::LocalTrusted,
+            network_policy: NetworkPolicy::Deny,
+        };
+
+        let denied = harness_diagnostics(
+            Some(TestAdapter::VitestJson),
+            &process(
+                "pdf-inspector process could not be started: court-jester process spawn denied",
+            ),
+            &limits,
+        );
+        assert_eq!(denied.len(), 1, "{denied:#?}");
+        assert_eq!(denied[0].domain, FailureDomain::Environment);
+        assert_eq!(denied[0].kind, FailureKind::ProcessSpawnDenied);
+        assert_eq!(denied[0].component, DiagnosticComponent::Sandbox);
+        assert_eq!(denied[0].impact, DiagnosticImpact::Blocking);
+
+        let assertion = harness_diagnostics(
+            Some(TestAdapter::VitestJson),
+            &process("AssertionError: expected 1 to be 2"),
+            &limits,
+        );
+        assert_eq!(assertion.len(), 1, "{assertion:#?}");
+        assert_eq!(assertion[0].domain, FailureDomain::TargetCode);
+        assert_eq!(assertion[0].kind, FailureKind::AssertionFailure);
+        assert_eq!(assertion[0].impact, DiagnosticImpact::Gating);
+    }
 
     #[test]
     fn vitest_initialization_exception_without_collected_tests_is_environmental() {
@@ -5582,6 +6344,59 @@ mod tests {
         assert_eq!(diagnostics[0].component, DiagnosticComponent::ModuleLoader);
         assert_eq!(diagnostics[0].impact, DiagnosticImpact::Blocking);
         assert!(diagnostics[0].message.contains("customEqualityTesters"));
+    }
+
+    #[test]
+    fn vitest_missing_global_after_config_fallback_is_environmental_only() {
+        let process = ExecutionResult {
+            stdout: r#"{
+  "numTotalTestSuites": 1,
+  "numFailedTestSuites": 1,
+  "numTotalTests": 0,
+  "numFailedTests": 0,
+  "success": false,
+  "testResults": [{
+    "assertionResults": [],
+    "status": "failed",
+    "message": "ReferenceError: describe is not defined\n    at /workspace/packages/utils/src/featureFlags.test.ts:3:1",
+    "name": "/workspace/packages/utils/src/featureFlags.test.ts"
+  }]
+}"#
+            .into(),
+            stderr: "court-jester project config requires a host-incompatible native dependency; retrying without project config\n".into(),
+            exit_code: Some(1),
+            duration_ms: 1,
+            timed_out: false,
+            memory_error: false,
+            termination: None,
+            diagnostics: Vec::new(),
+        };
+        let limits = ExecutionLimits {
+            timeout_seconds: 1.0,
+            memory_mb: 128,
+            runtime_profile: RuntimeProfile::Isolated,
+            network_policy: NetworkPolicy::Deny,
+        };
+
+        let diagnostics = harness_diagnostics(Some(TestAdapter::VitestJson), &process, &limits);
+
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(diagnostics[0].domain, FailureDomain::Environment);
+        assert_eq!(diagnostics[0].kind, FailureKind::ModuleLoad);
+        assert_eq!(diagnostics[0].component, DiagnosticComponent::ModuleLoader);
+        assert_eq!(diagnostics[0].impact, DiagnosticImpact::Blocking);
+        assert!(diagnostics[0].message.contains("describe is not defined"));
+        assert!(diagnostics.iter().all(|diagnostic| {
+            diagnostic.domain != FailureDomain::TargetCode
+                && diagnostic.kind != FailureKind::AssertionFailure
+                && diagnostic.impact != DiagnosticImpact::Gating
+        }));
+
+        let non_vitest = harness_diagnostics(Some(TestAdapter::JestJson), &process, &limits);
+        assert_eq!(non_vitest.len(), 1, "{non_vitest:#?}");
+        assert_eq!(non_vitest[0].domain, FailureDomain::TargetCode);
+        assert_eq!(non_vitest[0].kind, FailureKind::AssertionFailure);
+        assert_eq!(non_vitest[0].impact, DiagnosticImpact::Gating);
     }
 
     #[test]
@@ -6861,6 +7676,127 @@ export default {
             &code,
             Some(source_path.to_str().unwrap())
         ));
+    }
+
+    #[test]
+    fn identifies_type_only_bindings_without_dropping_runtime_siblings() {
+        let imports = typescript_virtual_type_imports(
+            "import { AISettings } from '@resin8/db-entities';\n\
+             import { Registration } from './registration';\n\
+             import { runtimeValue, RuntimeType } from '@example/runtime';\n\
+             export function upload(settings: AISettings, registration: Registration, value: RuntimeType) {\n\
+               return runtimeValue(settings, registration, value);\n\
+             }\n",
+        );
+
+        assert_eq!(
+            imports.get("@resin8/db-entities"),
+            Some(&vec!["AISettings".to_string()])
+        );
+        assert_eq!(
+            imports.get("./registration"),
+            Some(&vec!["Registration".to_string()])
+        );
+        assert_eq!(
+            imports.get("@example/runtime"),
+            Some(&vec!["RuntimeType".to_string()])
+        );
+    }
+
+    #[test]
+    fn resolves_selected_runtime_export_through_wildcard_barrel() {
+        let dir = tempfile::tempdir().unwrap();
+        let barrel = dir.path().join("index.ts");
+        let selected = dir.path().join("Selected.ts");
+        let unrelated = dir.path().join("Unrelated.ts");
+        std::fs::write(
+            &barrel,
+            "export * from './Unrelated';\nexport * from './Selected';\n",
+        )
+        .unwrap();
+        std::fs::write(&selected, "export const selected = 'ok';\n").unwrap();
+        std::fs::write(&unrelated, "export const unrelated = 'skip';\n").unwrap();
+
+        assert_eq!(
+            resolve_typescript_runtime_reexport(
+                &barrel,
+                "selected",
+                &mut std::collections::HashSet::new(),
+            )
+            .unwrap(),
+            std::fs::canonicalize(selected).unwrap()
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_wildcard_runtime_reexports() {
+        let dir = tempfile::tempdir().unwrap();
+        let barrel = dir.path().join("index.ts");
+        let first = dir.path().join("First.ts");
+        let second = dir.path().join("Second.ts");
+        std::fs::write(
+            &barrel,
+            "export * from './First';\nexport * from './Second';\n",
+        )
+        .unwrap();
+        std::fs::write(&first, "export const selected = 'first';\n").unwrap();
+        std::fs::write(&second, "export const selected = 'second';\n").unwrap();
+
+        assert_eq!(
+            resolve_typescript_runtime_reexport(
+                &barrel,
+                "selected",
+                &mut std::collections::HashSet::new(),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_barrel_redirects_with_unchecked_specifier_uses() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("main.ts");
+        let barrel = dir.path().join("index.ts");
+        let selected = dir.path().join("Selected.ts");
+        std::fs::write(&barrel, "export * from './Selected';\n").unwrap();
+        std::fs::write(&selected, "export const selected = 'ok';\n").unwrap();
+
+        let context = |source_file: &std::path::Path| ExecutionContext {
+            invocation_dir: dir.path().to_path_buf(),
+            workspace_root: dir.path().to_path_buf(),
+            materialization_source_root: None,
+            target_package_root: dir.path().to_path_buf(),
+            test_package_root: None,
+            dependency_roots: Vec::new(),
+            target_source: SourceContext {
+                language: crate::types::Language::TypeScript,
+                mode: SourceMode::TypeScript,
+                source_file: Some(source_file.to_path_buf()),
+                virtual_file_path: None,
+            },
+            test_source: None,
+        };
+
+        std::fs::write(
+            &source,
+            "import fallback, { selected } from './index';\nconsole.log(fallback, selected);\n",
+        )
+        .unwrap();
+        assert!(isolated_typescript_barrel_redirects(&context(&source)).is_empty());
+
+        std::fs::write(
+            &source,
+            "import { selected } from './index';\nvoid import('./index');\nconsole.log(selected);\n",
+        )
+        .unwrap();
+        assert!(isolated_typescript_barrel_redirects(&context(&source)).is_empty());
+
+        std::fs::write(
+            &source,
+            "import { selected } from './index';\nimport './index';\nconsole.log(selected);\n",
+        )
+        .unwrap();
+        assert!(isolated_typescript_barrel_redirects(&context(&source)).is_empty());
     }
 
     #[test]

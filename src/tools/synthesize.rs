@@ -12,7 +12,7 @@ pub fn bind_argument_slots(
 }
 /// Number of random inputs to generate per function.
 const FUZZ_ITERATIONS: usize = 30;
-const TS_TYPE_RECURSION_LIMIT: usize = 8;
+const TS_TYPE_RECURSION_LIMIT: usize = 16;
 
 /// Generate a property-based fuzz harness that tests each function with
 /// many random inputs and checks:
@@ -59,7 +59,13 @@ pub fn synthesize_calls_for(
     synthesize_plan_for(functions, classes, aliases, language).code
 }
 
-type PlannedSeedInputs = HashMap<String, Vec<PlannedArguments>>;
+#[derive(Clone)]
+struct PlannedSeedInput {
+    arguments: PlannedArguments,
+    predicate_valid: bool,
+}
+
+type PlannedSeedInputs = HashMap<String, Vec<PlannedSeedInput>>;
 
 pub fn synthesize_plan_for(
     functions: &[FunctionInfo],
@@ -93,6 +99,11 @@ pub fn synthesize_plan_for_verification(
         {
             safe_dependency_surfaces.insert(input.surface_id.clone());
         }
+        let predicate_valid = input.classification == InputClassification::Valid
+            && input
+                .sources
+                .iter()
+                .any(|source| source.kind == DomainSourceKind::ValidationGuard);
         seed_inputs
             .entry(
                 input
@@ -103,7 +114,10 @@ pub fn synthesize_plan_for_verification(
                     .to_string(),
             )
             .or_default()
-            .push(input.arguments.clone());
+            .push(PlannedSeedInput {
+                arguments: input.arguments.clone(),
+                predicate_valid,
+            });
     }
     let safe_dependency_surfaces = safe_dependency_surfaces.into_iter().collect::<Vec<_>>();
     synthesize_plan_legacy(
@@ -443,6 +457,7 @@ fn python_seed_rows_expr(func: &FunctionInfo, seed_inputs: &PlannedSeedInputs) -
         "[{}]",
         rows.iter()
             .map(|row| {
+                let row = &row.arguments;
                 let mut values = Vec::new();
                 let mut positional_index = 0usize;
                 for param in &fixed_params {
@@ -497,12 +512,14 @@ fn ts_seed_rows(func: &FunctionInfo, seed_inputs: &PlannedSeedInputs) -> String 
     rows.iter()
         .map(|row| {
             format!(
-                "[{}]",
-                row.positional
+                "{{ args: [{}], predicateValid: {} }}",
+                row.arguments
+                    .positional
                     .iter()
                     .map(|item| item.expression.as_str())
                     .collect::<Vec<_>>()
-                    .join(", ")
+                    .join(", "),
+                row.predicate_valid,
             )
         })
         .collect::<Vec<_>>()
@@ -2613,6 +2630,7 @@ fn synthesize_typescript(
             && positional_variadic.is_none()
             && !has_nested
             && has_noncheckable_ts_zero_arg_return_contract(func)
+            && !has_seed_rows
         {
             coverage.push(coverage_entry(
                 func,
@@ -2653,7 +2671,7 @@ fn synthesize_typescript(
             continue;
         }
 
-        if !ts_params_are_fuzzable(func, &callable_params, type_defs) {
+        if !has_seed_rows && !ts_params_are_fuzzable(func, &callable_params, type_defs) {
             coverage.push(coverage_entry(
                 func,
                 FuzzFunctionStatus::SkippedUnsupportedType,
@@ -2690,6 +2708,7 @@ fn synthesize_typescript(
             .enumerate()
             .map(|(idx, p)| {
                 ts_generator_for_param(contract, p.type_annotation.as_deref(), type_defs, idx, func)
+                    .or_else(|| has_seed_rows.then(|| "_fuzzAny()".to_string()))
             })
             .collect::<Option<Vec<_>>>()
         else {
@@ -2901,7 +2920,10 @@ fn synthesize_typescript(
                     "[2, 1]".into()
                 };
             }
-            let property_row = format!("[{}]", property_row.join(", "));
+            let property_row = format!(
+                "{{ args: [{}], predicateValid: false }}",
+                property_row.join(", ")
+            );
             seed_rows = if seed_rows.is_empty() {
                 property_row
             } else {
@@ -3102,8 +3124,90 @@ fn synthesize_typescript_factory_exercise(
     code
 }
 
+fn strip_balanced_ts_outer_parentheses(mut text: &str) -> &str {
+    loop {
+        let bytes = text.as_bytes();
+        if bytes.len() < 2 || bytes[0] != b'(' || bytes[bytes.len() - 1] != b')' {
+            return text;
+        }
+        let mut depth = 0i32;
+        let mut quote = None;
+        let mut escaped = false;
+        let mut encloses = true;
+        for (index, character) in text.char_indices() {
+            if let Some(active_quote) = quote {
+                if escaped {
+                    escaped = false;
+                } else if character == '\\' {
+                    escaped = true;
+                } else if character == active_quote {
+                    quote = None;
+                }
+                continue;
+            }
+            if matches!(character, '\'' | '"' | '`') {
+                quote = Some(character);
+                continue;
+            }
+            match character {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 && index + character.len_utf8() < text.len() {
+                        encloses = false;
+                        break;
+                    }
+                    if depth < 0 {
+                        encloses = false;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !encloses || depth != 0 || quote.is_some() {
+            return text;
+        }
+        text = text[1..text.len() - 1].trim();
+    }
+}
+
 fn ts_type_seen(stack: &[String], type_name: &str) -> bool {
     stack.iter().any(|item| item == type_name)
+}
+
+fn ts_top_level_arrow_return(type_ann: &str) -> Option<&str> {
+    let mut depth = 0i32;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, ch) in type_ann.char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(ch, '\'' | '"' | '`') {
+            quote = Some(ch);
+            continue;
+        }
+        if ch == '=' && depth == 0 && type_ann.as_bytes().get(index + 1).copied() == Some(b'>') {
+            return Some(type_ann[index + 2..].trim());
+        }
+        match ch {
+            '{' | '[' | '<' | '(' => depth += 1,
+            '}' | ']' | ')' => depth -= 1,
+            '>' if type_ann.as_bytes().get(index.wrapping_sub(1)).copied() != Some(b'=') => {
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn ts_generator(type_ann: Option<&str>, type_defs: &TsNamedTypes<'_>) -> Option<String> {
@@ -3125,7 +3229,7 @@ fn ts_generator_with_stack(
     depth: usize,
 ) -> String {
     let t = match type_ann {
-        Some(t) => t.trim(),
+        Some(t) => strip_balanced_ts_outer_parentheses(t.trim()),
         // No type annotation: generate a mix of types instead of just undefined
         None => return "_fuzzAny()".to_string(),
     };
@@ -3146,11 +3250,22 @@ fn ts_generator_with_stack(
         stack.pop();
         return generated;
     }
+    if let Some(return_type) = ts_top_level_arrow_return(t) {
+        let generated = ts_generator_with_stack(Some(return_type), type_defs, stack, depth + 1);
+        return format!(
+            "(() => {{ const _callbackValue = {generated}; return () => _callbackValue; }})()"
+        );
+    }
     match t {
         "number" => "_fuzzNum()".into(),
         "string" => "_fuzzStr()".into(),
         "boolean" => "_fuzzBool()".into(),
         "any" | "unknown" => "_fuzzAny()".into(),
+        "typeof fetch" => {
+            "(async () => ({ ok: false, status: 503, text: async () => \"\", json: async () => ({}) }))"
+                .into()
+        }
+        _ if t.starts_with("keyof ") => "_fuzzAny()".into(),
         "object" => "_fuzzObject()".into(),
         _ if t.ends_with("[]") => {
             let inner = t[..t.len() - 2].trim();
@@ -3321,10 +3436,13 @@ fn ts_params_are_fuzzable(
     params: &[&ParamInfo],
     type_defs: &TsNamedTypes<'_>,
 ) -> bool {
-    if params
-        .iter()
-        .all(|param| ts_type_is_fuzzable(param.type_annotation.as_deref(), type_defs))
-    {
+    if params.iter().all(|param| {
+        let resolved = param
+            .type_annotation
+            .as_deref()
+            .map(|annotation| func.resolved_type_annotation(annotation));
+        ts_type_is_fuzzable(resolved.as_deref(), type_defs)
+    }) {
         return true;
     }
 
@@ -3390,7 +3508,7 @@ fn ts_type_is_fuzzable_with_stack(
     depth: usize,
 ) -> bool {
     let t = match type_ann {
-        Some(t) => t.trim(),
+        Some(t) => strip_balanced_ts_outer_parentheses(t.trim()),
         None => return true,
     };
     if depth >= TS_TYPE_RECURSION_LIMIT {
@@ -3410,12 +3528,17 @@ fn ts_type_is_fuzzable_with_stack(
         stack.pop();
         return fuzzable;
     }
+    if let Some(return_type) = ts_top_level_arrow_return(t) {
+        return return_type == "void"
+            || ts_type_is_fuzzable_with_stack(Some(return_type), type_defs, stack, depth + 1);
+    }
 
     match t {
         "number" | "string" | "boolean" | "object" | "any" | "unknown" | "null" | "undefined"
         | "Date" | "RegExp" | "Map" | "Set" | "Error" | "Buffer" | "Uint8Array" | "ArrayBuffer"
         | "URL" | "URLSearchParams" | "Request" | "Response" | "Headers" | "FormData"
         | "AbortController" | "Promise" => true,
+        _ if t == "typeof fetch" || t.starts_with("keyof ") => true,
         "never[]" => true,
         _ if t.ends_with("[]") => {
             let inner = &t[..t.len() - 2];
@@ -3535,7 +3658,8 @@ fn ts_generator_for_param(
     {
         return Some("_fuzzObject()".to_string());
     }
-    ts_generator(type_ann, type_defs)
+    let resolved = type_ann.map(|annotation| func.resolved_type_annotation(annotation));
+    ts_generator(resolved.as_deref(), type_defs)
 }
 
 fn ts_edge_type_name_for_param(
@@ -4423,25 +4547,8 @@ const _EDGE_SEMVER_OBJECTS = [
   { major: 0, minor: 1, patch: 0, prerelease: ["beta", "2"] },
 ];
 
-function _replaceUnknownLeaves(value: unknown, replacement: unknown): unknown {
-  if (Array.isArray(value)) {
-    if (value.length === 0) return [_cloneSeed(replacement)];
-    return value.map((item) => _replaceUnknownLeaves(item, replacement));
-  }
-  if (value !== null && typeof value === "object") {
-    const clone: Record<string, unknown> = {};
-    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-      clone[key] = _replaceUnknownLeaves(item, replacement);
-    }
-    return clone;
-  }
-  return _cloneSeed(replacement);
-}
 
-function _edgeCasesFor(typeName: string, template?: unknown): unknown[] {
-  if (typeName === "object_unknown") {
-    return _EDGE_UNKNOWNS.map((replacement) => _replaceUnknownLeaves(template, replacement));
-  }
+function _edgeCasesFor(typeName: string, _template?: unknown): unknown[] {
   const m: Record<string, unknown[]> = {
     "number": _EDGE_NUMS,
     "string": _EDGE_STRS,
@@ -4538,6 +4645,7 @@ function _reproJsonValue(value: unknown, ancestors = new Set<object>()): unknown
     return value;
   }
   if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+  if (value instanceof URL) throw new TypeError("URL values are not JSON-serializable");
   if (Array.isArray(value)) {
     if (ancestors.has(value)) throw new TypeError("circular repro value");
     ancestors.add(value);
@@ -4566,6 +4674,7 @@ function _reproExpression(value: unknown, ancestors = new Set<object>()): string
   }
   if (value === null) return "null";
   if (typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
+  if (value instanceof URL) return `new URL(${JSON.stringify(value.href)})`;
   if (typeof value === "bigint") return `${value}n`;
   if (Array.isArray(value)) {
     if (ancestors.has(value)) throw new TypeError("circular repro value");
@@ -4593,6 +4702,7 @@ function _shortJson(value: unknown, limit = _FUZZ_TEXT_LIMIT): string {
 
 function _cloneSeedFallback<T>(value: T, seen: Map<object, unknown>): T {
   if (value === null || typeof value !== "object") return value;
+  if (value instanceof URL) return new URL(value.href) as T;
   if (seen.has(value)) return seen.get(value) as T;
   if (Array.isArray(value)) {
     const clone: unknown[] = [];
@@ -4609,6 +4719,16 @@ function _cloneSeedFallback<T>(value: T, seen: Map<object, unknown>): T {
 }
 
 function _cloneSeed<T>(value: T): T {
+  // structuredClone turns platform URL instances into plain empty objects in
+  // Node runtimes. Clone the argument vector recursively so URLs retain their
+  // internal slots before using the native clone for other values.
+  if (value instanceof URL) return new URL(value.href) as T;
+  if (
+    Array.isArray(value)
+    && value.some((item) => item instanceof URL || (Array.isArray(item) && item.some((nested) => nested instanceof URL)))
+  ) {
+    return value.map((item) => _cloneSeed(item)) as T;
+  }
   if (typeof structuredClone === "function") {
     try {
       return structuredClone(value);
@@ -4630,6 +4750,7 @@ function _fuzzLikeSeed(value: unknown): unknown {
   if (typeof value === "number") return [value, value - 1, value + 1, 0, -0][_fuzzIntRange(0, 4)];
   if (typeof value === "string") return [value, value.trim(), value.toUpperCase(), value.toLowerCase()][_fuzzIntRange(0, 3)];
   if (value === null || value === undefined) return value;
+  if (value instanceof URL) return new URL(value.href);
   if (Array.isArray(value)) {
     if (value.length === 0) return [];
     if (_isSortedNumericArray(value)) {
@@ -4644,10 +4765,10 @@ function _fuzzLikeSeed(value: unknown): unknown {
   return _cloneSeed(value);
 }
 
-function _fuzzSeedRow(seedRows: unknown[][]): unknown[] {
-  const row = _cloneSeed(seedRows[_fuzzIntRange(0, seedRows.length - 1)]);
-  if (_fuzzRand() < 0.65) return row;
-  return row.map(_fuzzLikeSeed);
+type _FuzzInput = { args: unknown[]; predicateValid: boolean };
+function _fuzzSeedRow(seedRows: _FuzzInput[]): _FuzzInput {
+  const row = _cloneSeed(seedRows[_fuzzIntRange(0, seedRows.length - 1)].args);
+  return { args: _fuzzRand() < 0.65 ? row : row.map(_fuzzLikeSeed), predicateValid: false };
 }
 
 const _cjCorpora = new Map<string, unknown[][]>();
@@ -4677,18 +4798,9 @@ function _mutateCorpusRow(row: unknown[]): unknown[] {
   if (candidate.length === 0) return candidate;
   const index = _fuzzIntRange(0, candidate.length - 1);
   const value = candidate[index];
-  if (Array.isArray(value) && value.length > 0 && _fuzzRand() < 0.5) {
-    const next = value.slice();
-    next.splice(_fuzzIntRange(0, next.length - 1), 1);
-    candidate[index] = next;
-  } else if (!Array.isArray(value) && value && typeof value === "object" && _fuzzRand() < 0.5) {
-    const next = { ...(value as Record<string, unknown>) };
-    const keys = Object.keys(next);
-    if (keys.length > 0) delete next[keys[_fuzzIntRange(0, keys.length - 1)]];
-    candidate[index] = next;
-  } else {
-    candidate[index] = _fuzzLikeSeed(value);
-  }
+  // Campaign rows are classified as valid inputs. Mutate values recursively while
+  // preserving required object keys and tuple/array shape.
+  candidate[index] = _fuzzLikeSeed(value);
   return candidate;
 }
 function _retainCorpusInput(
@@ -4767,7 +4879,8 @@ function _reproCase(args: unknown[], inputText: string | null = null): Record<st
 function _shrinkCandidates(value: unknown): unknown[] {
   const out: unknown[] = []; const seen = new Set<string>();
   const add = (candidate: unknown): void => { let key: string; try { key = JSON.stringify(_reproJsonValue(candidate)); } catch { key = String(candidate); } if (!seen.has(key)) { seen.add(key); out.push(candidate); } };
-  if (typeof value === "string") { add(""); add(value.slice(0, 1)); add(value.trim()); for (let step = Math.floor(value.length / 2); step > 0; step = Math.floor(step / 2)) for (let start = 0; start < value.length; start += step) add(value.slice(0, start) + value.slice(start + step)); }
+  if (value instanceof URL) { add(new URL("https://example.test/")); }
+  else if (typeof value === "string") { add(""); add(value.slice(0, 1)); add(value.trim()); for (let step = Math.floor(value.length / 2); step > 0; step = Math.floor(step / 2)) for (let start = 0; start < value.length; start += step) add(value.slice(0, start) + value.slice(start + step)); }
   else if (typeof value === "number") { if (Number.isNaN(value) || !Number.isFinite(value)) add(value); else { add(0); add(1); add(-1); for (let current = value; current && Math.abs(current) > Number.EPSILON; current /= 2) add(current); } }
   else if (Array.isArray(value)) { add([]); for (const item of value) add([item]); for (let step = Math.floor(value.length / 2); step > 0; step = Math.floor(step / 2)) for (let start = 0; start < value.length; start += step) add(value.slice(0, start).concat(value.slice(start + step))); value.forEach((item, index) => _shrinkCandidates(item).forEach((shrunk) => { const copy = value.slice(); copy[index] = shrunk; add(copy); })); }
   else if (value && typeof value === "object") { add({}); const objectValue = value as Record<string, unknown>; for (const key of Object.keys(objectValue)) { const copy = { ...objectValue }; delete copy[key]; add(copy); _shrinkCandidates(objectValue[key]).forEach((shrunk) => { const nested = { ...objectValue, [key]: shrunk }; add(nested); }); } }
@@ -4839,21 +4952,21 @@ function _fuzzOne(
   expectedType: string | null,
   paramTypes: string[] = [],
   properties: string[] = [],
-  seedRows: unknown[][] = [],
+  seedRows: _FuzzInput[] = [],
   defaultOmissionRows: unknown[][] = [],
   declaredProperties: string[] = [],
   sourceLine = 0,
 ): boolean {
   let pass = 0, reject = 0, crash = 0;
   let firstCrash = "";
-  const allInputs: unknown[][] = [];
+  const allInputs: _FuzzInput[] = [];
   const corpus: unknown[][] = [];
   const behaviorSignatures = new Set<string>();
   for (const seed of seedRows) {
     allInputs.push(seed);
   }
   for (const omission of defaultOmissionRows) {
-    allInputs.push(omission);
+    allInputs.push({ args: omission, predicateValid: false });
   }
   const edgePools: unknown[][] = [];
   for (let pi = 0; pi < paramTypes.length; pi++) {
@@ -4861,7 +4974,9 @@ function _fuzzOne(
     const edges = _edgeCasesFor(paramTypes[pi], template);
     edgePools.push(edges);
     for (const ev of edges) {
-      const row = genArgs(); row[pi] = _cloneSeed(ev); allInputs.push(row);
+      const row = genArgs();
+      row[pi] = _cloneSeed(ev);
+      allInputs.push({ args: row, predicateValid: false });
     }
   }
   if (seedRows.length === 0) {
@@ -4873,7 +4988,7 @@ function _fuzzOne(
             const row = genArgs();
             row[left] = _cloneSeed(leftEdge);
             row[right] = _cloneSeed(rightEdge);
-            allInputs.push(row);
+            allInputs.push({ args: row, predicateValid: false });
             pairwiseEdgeRows++;
             if (pairwiseEdgeRows >= 128) break pairwiseEdges;
           }
@@ -4882,14 +4997,21 @@ function _fuzzOne(
     }
   }
   for (let i = 0; i < iters; i++) {
-    allInputs.push(seedRows.length > 0 ? _fuzzSeedRow(seedRows) : genArgs());
+    allInputs.push(seedRows.length > 0 ? _fuzzSeedRow(seedRows) : { args: genArgs(), predicateValid: false });
   }
   const maxCampaignInputs = allInputs.length + iters;
   for (let i = 0; i < allInputs.length; i++) {
-    const args = allInputs[i];
+    const { args, predicateValid } = allInputs[i];
+    let predicateTargetException = false;
     try {
       _targetEntered(`${name}:${sourceLine}`, i);
-      const result = fn(_cloneSeed(args));
+      let result: unknown;
+      try {
+        result = fn(_cloneSeed(args));
+      } catch (error) {
+        predicateTargetException = predicateValid;
+        throw error;
+      }
       // Type check
       if (expectedType !== null && typeof result !== expectedType) {
         throw new Error(`Return type mismatch: expected ${expectedType}, got ${typeof result}`);
@@ -4996,19 +5118,20 @@ function _fuzzOne(
       }
       if (_retainCorpusInput(corpus, behaviorSignatures, _behaviorSignature("passed", result), args)
           && allInputs.length < maxCampaignInputs) {
-        allInputs.push(_mutateCorpusRow(args));
+        allInputs.push({ args: _mutateCorpusRow(args), predicateValid: false });
       }
       _cjUnitCompleted(`${name}:${sourceLine}`, i, "passed");
       pass++;
     } catch (e: unknown) {
-      if (_retainCorpusInput(corpus, behaviorSignatures, _behaviorSignature(_isCrash(e) ? "crash" : "rejected", e), args)
+      const targetException = _isCrash(e) || predicateTargetException;
+      if (_retainCorpusInput(corpus, behaviorSignatures, _behaviorSignature(targetException ? "crash" : "rejected", e), args)
           && allInputs.length < maxCampaignInputs) {
-        allInputs.push(_mutateCorpusRow(args));
+        allInputs.push({ args: _mutateCorpusRow(args), predicateValid: false });
       }
-      if (_isCrash(e)) {
+      if (targetException) {
         crash++;
         _cjUnitCompleted(`${name}:${sourceLine}`, i, "target_exception");
-        const propertyFailure = e instanceof Error && !(e instanceof TypeError || e instanceof RangeError || e instanceof ReferenceError || e instanceof URIError);
+        const propertyFailure = !predicateTargetException && e instanceof Error && !(e instanceof TypeError || e instanceof RangeError || e instanceof ReferenceError || e instanceof URIError);
         const failedProperty = _declaredPropertyForFailure(e);
         const declared = propertyFailure && failedProperty !== null && declaredProperties.includes(failedProperty);
         const oracleKind = declared ? "declared_property" : (propertyFailure ? "generic_property" : "runtime_contract");
@@ -5392,7 +5515,10 @@ fn ts_edge_type_name(type_ann: Option<&str>, type_defs: &TsNamedTypes<'_>) -> &'
     if (looks_like_ts_object_type(t) || ts_class_def(t, type_defs).is_some())
         && ts_type_contains_unknown_leaf(t, type_defs)
     {
-        return "object_unknown";
+        // The typed generator already varies unknown-valued fields while preserving every
+        // required sibling. A shape-blind object edge would also replace required literals
+        // and can turn an invalid object into a purportedly valid invocation.
+        return "";
     }
     if ts_type_contains_literal_domain(t, type_defs) {
         return "";

@@ -95,6 +95,7 @@ pub fn analyze_with_context(code: &str, context: &SourceContext) -> AnalysisResu
             );
             mark_typescript_explicit_exports(&root, bytes, &mut functions);
             apply_typescript_const_tuple_alias_domains(&root, bytes, &mut aliases);
+            apply_typescript_keyof_alias_domains(&root, bytes, &mut aliases);
         }
     }
 
@@ -1163,6 +1164,66 @@ fn predicate_boundary_values(value: serde_json::Value) -> Vec<serde_json::Value>
         .collect()
 }
 
+fn is_typeof_parameter_expression(
+    node: tree_sitter::Node<'_>,
+    parameter: &str,
+    source: &[u8],
+) -> bool {
+    let raw = text(&node, source).trim();
+    let Some(operand) = raw.strip_prefix("typeof") else {
+        return false;
+    };
+    if !operand
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_whitespace() || character == '(')
+    {
+        return false;
+    }
+    let mut operand = operand.trim();
+    while let Some(inner) = operand
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        operand = inner.trim();
+    }
+    predicate_property_path(operand, parameter).is_some()
+}
+
+fn collect_parameter_predicate_literals(
+    node: tree_sitter::Node<'_>,
+    parameter: &str,
+    source: &[u8],
+    values: &mut Vec<serde_json::Value>,
+) {
+    if matches!(node.kind(), "binary_expression" | "comparison_operator") {
+        let left = node
+            .child_by_field_name("left")
+            .or_else(|| node.named_child(0));
+        let right = node
+            .child_by_field_name("right")
+            .or_else(|| node.named_child(node.named_child_count().saturating_sub(1)));
+        if left.is_some_and(|child| is_typeof_parameter_expression(child, parameter, source))
+            || right.is_some_and(|child| is_typeof_parameter_expression(child, parameter, source))
+        {
+            return;
+        }
+    }
+    if let Some(value) = predicate_literal(node, source) {
+        values.extend(predicate_boundary_values(value));
+        return;
+    }
+    let raw = text(&node, source).trim();
+    if raw == "[]" {
+        values.push(serde_json::json!([]));
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_parameter_predicate_literals(child, parameter, source, values);
+    }
+}
+
 fn collect_predicate_literals(
     node: tree_sitter::Node<'_>,
     source: &[u8],
@@ -1215,6 +1276,97 @@ fn predicate_expression<'tree>(
     }
 }
 
+fn predicate_property_path(raw: &str, parameter: &str) -> Option<Vec<String>> {
+    let mut rest = raw.trim().strip_prefix(parameter)?;
+    if rest.is_empty() {
+        return Some(Vec::new());
+    }
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        return None;
+    }
+
+    let mut path = Vec::new();
+    while !rest.is_empty() {
+        rest = rest.trim_start();
+        if let Some(after_dot) = rest.strip_prefix("?.").or_else(|| rest.strip_prefix('.')) {
+            let length = after_dot
+                .chars()
+                .take_while(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '$')
+                })
+                .map(char::len_utf8)
+                .sum::<usize>();
+            if length == 0 {
+                return None;
+            }
+            path.push(after_dot[..length].to_string());
+            rest = &after_dot[length..];
+            continue;
+        }
+        if let Some(after_bracket) = rest.strip_prefix('[') {
+            let closing = after_bracket.find(']')?;
+            let key = after_bracket[..closing].trim();
+            let key = serde_json::from_str::<String>(key).ok().or_else(|| {
+                key.strip_prefix('\'')
+                    .and_then(|value| value.strip_suffix('\''))
+                    .map(str::to_string)
+            })?;
+            path.push(key);
+            rest = &after_bracket[closing + 1..];
+            continue;
+        }
+        return None;
+    }
+    Some(path)
+}
+
+fn collect_property_predicate_seeds(
+    node: tree_sitter::Node<'_>,
+    parameter: &str,
+    source: &[u8],
+    predicate_line: usize,
+    seeds: &mut Vec<PredicateSeed>,
+) {
+    if matches!(node.kind(), "binary_expression" | "comparison_operator") {
+        let left = node
+            .child_by_field_name("left")
+            .or_else(|| node.named_child(0));
+        let right = node
+            .child_by_field_name("right")
+            .or_else(|| node.named_child(node.named_child_count().saturating_sub(1)));
+        for (access, values_node) in [(left, right), (right, left)] {
+            let (Some(access), Some(values_node)) = (access, values_node) else {
+                continue;
+            };
+            let Some(property_path) = predicate_property_path(text(&access, source), parameter)
+            else {
+                continue;
+            };
+            if property_path.is_empty() {
+                continue;
+            }
+            let mut values = Vec::new();
+            collect_predicate_literals(values_node, source, &mut values);
+            for value in values {
+                seeds.push(PredicateSeed {
+                    parameter: parameter.to_string(),
+                    property_path: property_path.clone(),
+                    value,
+                    line: predicate_line,
+                });
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_property_predicate_seeds(child, parameter, source, predicate_line, seeds);
+    }
+}
+
 fn extract_predicate_seeds(
     function: tree_sitter::Node<'_>,
     params: &[ParamInfo],
@@ -1226,11 +1378,18 @@ fn extract_predicate_seeds(
         .map(|param| param.name.as_str())
         .collect::<Vec<_>>();
     let mut seeds = Vec::new();
+    let mut grouped_predicate_ranges = Vec::<(usize, usize)>::new();
     let mut stack = function
         .child_by_field_name("body")
         .into_iter()
         .collect::<Vec<_>>();
     while let Some(node) = stack.pop() {
+        if grouped_predicate_ranges
+            .iter()
+            .any(|(start, end)| node.start_byte() >= *start && node.end_byte() <= *end)
+        {
+            continue;
+        }
         if matches!(
             node.kind(),
             "function_definition"
@@ -1243,20 +1402,40 @@ fn extract_predicate_seeds(
         }
         if let Some(expression) = predicate_expression(node, source) {
             let expression_text = text(&expression, source);
-            let mut values = Vec::new();
-            collect_predicate_literals(expression, source, &mut values);
+            let predicate_line = expression.start_position().row + 1;
+            if expression.id() != node.id() {
+                grouped_predicate_ranges.push((expression.start_byte(), expression.end_byte()));
+            } else if matches!(node.kind(), "binary_expression" | "comparison_operator") {
+                grouped_predicate_ranges.push((node.start_byte(), node.end_byte()));
+            }
             for name in &names {
                 if !contains_identifier(expression_text, name) {
                     continue;
                 }
-                for value in &values {
-                    let seed = PredicateSeed {
+                let mut candidates = Vec::new();
+                collect_property_predicate_seeds(
+                    expression,
+                    name,
+                    source,
+                    predicate_line,
+                    &mut candidates,
+                );
+                if candidates.is_empty() {
+                    let mut values = Vec::new();
+                    collect_parameter_predicate_literals(expression, name, source, &mut values);
+                    candidates.extend(values.into_iter().map(|value| PredicateSeed {
                         parameter: (*name).to_string(),
-                        value: value.clone(),
-                        line: expression.start_position().row + 1,
-                    };
+                        property_path: Vec::new(),
+                        value,
+                        line: predicate_line,
+                    }));
+                }
+                for seed in candidates {
                     if !seeds.iter().any(|existing: &PredicateSeed| {
-                        existing.parameter == seed.parameter && existing.value == seed.value
+                        existing.parameter == seed.parameter
+                            && existing.property_path == seed.property_path
+                            && existing.value == seed.value
+                            && existing.line == seed.line
                     }) {
                         seeds.push(seed);
                     }
@@ -1393,6 +1572,7 @@ fn visit_python(
                 params,
                 return_type,
                 type_parameters: vec![],
+                type_parameter_constraints: BTreeMap::new(),
                 line: node.start_position().row + 1,
                 end_line: node.end_position().row + 1,
                 complexity: metrics.cyclomatic,
@@ -1656,11 +1836,14 @@ fn visit_typescript(
             let metrics = callable_complexity(node, &Language::TypeScript, source);
             let returned_callables = extract_ts_returned_object_callables(node, source);
             let predicate_seeds = extract_predicate_seeds(*node, &params, source);
+            let (type_parameters, type_parameter_constraints) =
+                extract_ts_type_parameters(node, source);
             functions.push(FunctionInfo {
                 name,
                 params,
                 return_type,
-                type_parameters: extract_ts_type_parameters(node, source),
+                type_parameters,
+                type_parameter_constraints,
                 line: node.start_position().row + 1,
                 end_line: node.end_position().row + 1,
                 complexity: metrics.cyclomatic,
@@ -1718,11 +1901,14 @@ fn visit_typescript(
             let metrics = callable_complexity(node, &Language::TypeScript, source);
             let returned_callables = extract_ts_returned_object_callables(node, source);
             let predicate_seeds = extract_predicate_seeds(*node, &params, source);
+            let (type_parameters, type_parameter_constraints) =
+                extract_ts_type_parameters(node, source);
             functions.push(FunctionInfo {
                 name,
                 params,
                 return_type,
-                type_parameters: extract_ts_type_parameters(node, source),
+                type_parameters,
+                type_parameter_constraints,
                 line: node.start_position().row + 1,
                 end_line: node.end_position().row + 1,
                 complexity: metrics.cyclomatic,
@@ -1755,11 +1941,14 @@ fn visit_typescript(
                     let metrics = callable_complexity(&value, &Language::TypeScript, source);
                     let returned_callables = extract_ts_returned_object_callables(&value, source);
                     let predicate_seeds = extract_predicate_seeds(value, &params, source);
+                    let (type_parameters, type_parameter_constraints) =
+                        extract_ts_type_parameters(&value, source);
                     functions.push(FunctionInfo {
                         name,
                         params,
                         return_type,
-                        type_parameters: extract_ts_type_parameters(&value, source),
+                        type_parameters,
+                        type_parameter_constraints,
                         line: node.start_position().row + 1,
                         end_line: node.end_position().row + 1,
                         complexity: metrics.cyclomatic,
@@ -1862,6 +2051,15 @@ fn visit_typescript(
                 line: node.start_position().row + 1,
             });
         }
+        "export_statement" => {
+            let statement = text(node, source);
+            if statement.contains(" from ") {
+                imports.push(ImportInfo {
+                    statement: statement.to_string(),
+                    line: node.start_position().row + 1,
+                });
+            }
+        }
         _ => {}
     }
 
@@ -1950,6 +2148,115 @@ fn apply_typescript_const_tuple_alias_domains(
             alias.type_annotation = domain.clone();
         }
     }
+}
+
+fn apply_typescript_keyof_alias_domains(
+    root: &tree_sitter::Node,
+    source: &[u8],
+    aliases: &mut [TypeAliasInfo],
+) {
+    let domains = collect_typescript_keyof_domains(root, source);
+    if domains.is_empty() {
+        return;
+    }
+
+    for alias in aliases {
+        let Some(value_name) = typescript_keyof_typeof_name(&alias.type_annotation) else {
+            continue;
+        };
+        if let Some(domain) = domains.get(value_name.as_str()) {
+            alias.type_annotation = domain.clone();
+        }
+    }
+}
+
+fn collect_typescript_keyof_domains(
+    root: &tree_sitter::Node,
+    source: &[u8],
+) -> HashMap<String, String> {
+    fn visit(node: &tree_sitter::Node, source: &[u8], domains: &mut HashMap<String, String>) {
+        if node.kind() == "variable_declarator" {
+            if let (Some(name), Some(value)) = (
+                node.child_by_field_name("name"),
+                node.child_by_field_name("value"),
+            ) {
+                let name = text(&name, source).trim();
+                let value = text(&value, source).trim();
+                if let Some(domain) = parse_typescript_keyof_source_domain(value, domains) {
+                    domains.insert(name.to_string(), domain);
+                }
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            visit(&child, source, domains);
+        }
+    }
+
+    let mut domains = HashMap::new();
+    visit(root, source, &mut domains);
+    domains
+}
+
+fn parse_typescript_keyof_source_domain(
+    value: &str,
+    domains: &HashMap<String, String>,
+) -> Option<String> {
+    if value.contains(".enum(") || value.starts_with("z.enum(") {
+        let start = value.find('[')?;
+        let end = matching_bracket_index(value, start, '[', ']')?;
+        let literals = split_typescript_top_level_commas(&value[start + 1..end])
+            .into_iter()
+            .filter_map(|item| typescript_literal_expr(item.trim()))
+            .collect::<Vec<_>>();
+        return (!literals.is_empty()).then(|| literals.join(" | "));
+    }
+
+    let compact: String = value.chars().filter(|ch| !ch.is_whitespace()).collect();
+    if let Some(source_name) = compact.strip_suffix(".enum") {
+        if let Some(domain) = domains.get(source_name) {
+            return Some(domain.clone());
+        }
+    }
+
+    let start = value.find('{')?;
+    let end = matching_bracket_index(value, start, '{', '}')?;
+    let keys = split_typescript_top_level_commas(&value[start + 1..end])
+        .into_iter()
+        .filter_map(|entry| {
+            let entry = entry.trim();
+            if entry.is_empty() || entry.starts_with("...") {
+                return None;
+            }
+            let raw_key = entry
+                .split_once(':')
+                .map(|(key, _)| key)
+                .unwrap_or(entry)
+                .trim();
+            let key = raw_key.trim_matches(&['"', '\'', '`'][..]);
+            (!key.is_empty())
+                .then(|| serde_json::to_string(key).expect("object property key serializes"))
+        })
+        .collect::<Vec<_>>();
+    (!keys.is_empty()).then(|| keys.join(" | "))
+}
+
+fn typescript_keyof_typeof_name(type_annotation: &str) -> Option<String> {
+    let compact: String = type_annotation
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    let raw = compact.strip_prefix("keyoftypeof")?;
+    let name = raw.split('.').next()?;
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$')
+    {
+        return None;
+    }
+    Some(name.to_string())
 }
 
 fn collect_typescript_const_tuple_domains(
@@ -2314,11 +2621,14 @@ fn push_ts_surfaced_callable(
         .map(|n| type_text(&n, source));
     let metrics = callable_complexity(callable_node, &Language::TypeScript, source);
     let predicate_seeds = extract_predicate_seeds(*callable_node, &params, source);
+    let (type_parameters, type_parameter_constraints) =
+        extract_ts_type_parameters(callable_node, source);
     functions.push(FunctionInfo {
         name: format!("{base_name}.{method_name}"),
         params,
         return_type,
-        type_parameters: extract_ts_type_parameters(callable_node, source),
+        type_parameters,
+        type_parameter_constraints,
         line: property_node.start_position().row + 1,
         end_line: property_node.end_position().row + 1,
         complexity: metrics.cyclomatic,
@@ -2947,11 +3257,15 @@ fn inferred_ts_default_type(
     explicit_type.or_else(|| default_value.and_then(|value| infer_ts_default_type(value, source)))
 }
 
-fn extract_ts_type_parameters(func: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+fn extract_ts_type_parameters(
+    func: &tree_sitter::Node,
+    source: &[u8],
+) -> (Vec<String>, BTreeMap<String, String>) {
     let Some(parameters) = func.child_by_field_name("type_parameters") else {
-        return vec![];
+        return (vec![], BTreeMap::new());
     };
     let mut names = vec![];
+    let mut constraints = BTreeMap::new();
     let mut cursor = parameters.walk();
     for parameter in parameters.named_children(&mut cursor) {
         let name = if matches!(parameter.kind(), "identifier" | "type_identifier") {
@@ -2961,14 +3275,26 @@ fn extract_ts_type_parameters(func: &tree_sitter::Node, source: &[u8]) -> Vec<St
                 .child_by_field_name("name")
                 .or_else(|| parameter.named_child(0))
         };
-        if let Some(name) = name {
-            let name = text(&name, source).trim();
-            if !name.is_empty() {
-                names.push(name.to_string());
+        let Some(name) = name else {
+            continue;
+        };
+        let name = text(&name, source).trim();
+        if name.is_empty() {
+            continue;
+        }
+        names.push(name.to_string());
+        if let Some(constraint) = parameter.child_by_field_name("constraint") {
+            let constraint = text(&constraint, source)
+                .trim()
+                .strip_prefix("extends ")
+                .unwrap_or_else(|| text(&constraint, source).trim())
+                .trim();
+            if !constraint.is_empty() {
+                constraints.insert(name.to_string(), constraint.to_string());
             }
         }
     }
-    names
+    (names, constraints)
 }
 
 fn extract_ts_params(func: &tree_sitter::Node, source: &[u8]) -> Vec<ParamInfo> {
@@ -3047,6 +3373,7 @@ enum ParsedImportBinding {
         local_name: String,
     },
     Wildcard,
+    ReExportWildcard,
 }
 
 #[derive(Debug, Clone)]
@@ -3073,6 +3400,9 @@ pub fn referenced_type_names_for_functions(functions: &[FunctionInfo]) -> HashSe
             collect_annotation_names(param.type_annotation.as_deref(), &mut names);
         }
         collect_annotation_names(func.return_type.as_deref(), &mut names);
+        for constraint in func.type_parameter_constraints.values() {
+            collect_annotation_names(Some(constraint), &mut names);
+        }
     }
     names
 }
@@ -3234,9 +3564,6 @@ fn resolve_imported_types_for_request(
             Some(parsed) => parsed,
             None => continue,
         };
-        if !parsed.path.starts_with('.') {
-            continue;
-        }
         let request = match request_for_import(&parsed, &unresolved_names) {
             Some(request) => request,
             None => continue,
@@ -3457,6 +3784,9 @@ fn request_for_import(
             ParsedImportBinding::Wildcard => {
                 needs_full_module = true;
             }
+            ParsedImportBinding::ReExportWildcard => {
+                requested_exports.extend(unresolved_names.iter().cloned());
+            }
         }
     }
 
@@ -3522,11 +3852,15 @@ fn parse_import(statement: &str, language: &Language) -> Option<ParsedImport> {
 
 fn parse_typescript_import(statement: &str) -> Option<ParsedImport> {
     let trimmed = statement.trim().trim_end_matches(';');
-    if !trimmed.starts_with("import ") {
+    let (clause_start, wildcard_reexport) = if trimmed.starts_with("import ") {
+        ("import ".len(), false)
+    } else if trimmed.starts_with("export ") {
+        ("export ".len(), true)
+    } else {
         return None;
-    }
+    };
     let from_idx = trimmed.find("from ")?;
-    let clause = trimmed["import ".len()..from_idx].trim();
+    let clause = trimmed[clause_start..from_idx].trim();
     let rest = &trimmed[from_idx + 5..];
     let quote = rest.chars().find(|c| *c == '"' || *c == '\'')?;
     let start = rest.find(quote)? + 1;
@@ -3534,7 +3868,12 @@ fn parse_typescript_import(statement: &str) -> Option<ParsedImport> {
     let path = rest[start..end].to_string();
     let mut bindings = Vec::new();
 
-    parse_typescript_import_clause(clause, &mut bindings);
+    let reexport_clause = clause.strip_prefix("type ").unwrap_or(clause).trim();
+    if wildcard_reexport && reexport_clause == "*" {
+        bindings.push(ParsedImportBinding::ReExportWildcard);
+    } else {
+        parse_typescript_import_clause(clause, &mut bindings);
+    }
     if bindings.is_empty() {
         return None;
     }
@@ -3644,7 +3983,151 @@ fn parse_python_import(statement: &str) -> Option<ParsedImport> {
     Some(ParsedImport { path, bindings })
 }
 
-/// Resolve a relative import path to an actual file.
+/// Resolve an import path to a source file available from the importing module.
+fn resolve_typescript_path_candidate(base: &std::path::Path) -> Option<std::path::PathBuf> {
+    if base.is_file() {
+        return Some(base.to_path_buf());
+    }
+    for ext in &[
+        ".ts",
+        ".tsx",
+        ".jsx",
+        ".js",
+        ".d.ts",
+        "/index.ts",
+        "/index.tsx",
+        "/index.jsx",
+        "/index.js",
+    ] {
+        let candidate = std::path::PathBuf::from(format!("{}{}", base.display(), ext));
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn typescript_package_parts(import_path: &str) -> Option<(String, String)> {
+    let mut parts = import_path.split('/');
+    let first = parts.next()?;
+    let package = if first.starts_with('@') {
+        format!("{first}/{}", parts.next()?)
+    } else {
+        first.to_string()
+    };
+    Some((package, parts.collect::<Vec<_>>().join("/")))
+}
+
+fn resolve_typescript_export_target(
+    value: &serde_json::Value,
+    wildcard_replacement: Option<&str>,
+) -> Option<String> {
+    match value {
+        serde_json::Value::String(target) => {
+            let target = match wildcard_replacement {
+                Some(replacement) => target.replace('*', replacement),
+                None => target.clone(),
+            };
+            target.starts_with("./").then_some(target)
+        }
+        serde_json::Value::Array(targets) => targets
+            .iter()
+            .find_map(|target| resolve_typescript_export_target(target, wildcard_replacement)),
+        serde_json::Value::Object(conditions) => ["types", "import", "default"]
+            .into_iter()
+            .filter_map(|condition| conditions.get(condition))
+            .find_map(|target| resolve_typescript_export_target(target, wildcard_replacement)),
+        _ => None,
+    }
+}
+
+fn typescript_package_export_target(manifest: &serde_json::Value, subpath: &str) -> Option<String> {
+    let exports = manifest.get("exports")?;
+    let requested = if subpath.is_empty() {
+        ".".to_string()
+    } else {
+        format!("./{subpath}")
+    };
+
+    let serde_json::Value::Object(entries) = exports else {
+        return subpath
+            .is_empty()
+            .then(|| resolve_typescript_export_target(exports, None))
+            .flatten();
+    };
+
+    if let Some(target) = entries.get(&requested) {
+        return resolve_typescript_export_target(target, None);
+    }
+
+    let wildcard = entries
+        .iter()
+        .filter_map(|(key, target)| {
+            let (prefix, suffix) = key.split_once('*')?;
+            let replacement = requested
+                .strip_prefix(prefix)?
+                .strip_suffix(suffix)?
+                .to_string();
+            Some((prefix.len() + suffix.len(), replacement, target))
+        })
+        .max_by_key(|(specificity, _, _)| *specificity);
+    if let Some((_, replacement, target)) = wildcard {
+        return resolve_typescript_export_target(target, Some(&replacement));
+    }
+
+    if subpath.is_empty() && !entries.keys().any(|key| key.starts_with('.')) {
+        return resolve_typescript_export_target(exports, None);
+    }
+
+    None
+}
+
+fn resolve_typescript_package_entry(
+    source_dir: &std::path::Path,
+    import_path: &str,
+) -> Option<std::path::PathBuf> {
+    let (package, subpath) = typescript_package_parts(import_path)?;
+    for ancestor in source_dir.ancestors() {
+        let package_dir = ancestor.join("node_modules").join(&package);
+        if !package_dir.is_dir() {
+            continue;
+        }
+
+        let manifest = std::fs::read_to_string(package_dir.join("package.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+        if let Some(manifest) = manifest.as_ref() {
+            if let Some(entry) = typescript_package_export_target(manifest, &subpath) {
+                if let Some(path) = resolve_typescript_path_candidate(&package_dir.join(entry)) {
+                    return Some(path);
+                }
+            }
+        }
+
+        if !subpath.is_empty() {
+            if let Some(path) = resolve_typescript_path_candidate(&package_dir.join(&subpath)) {
+                return Some(path);
+            }
+            continue;
+        }
+
+        if let Some(manifest) = manifest {
+            for field in ["types", "typings", "module", "main"] {
+                let Some(entry) = manifest.get(field).and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                if let Some(path) = resolve_typescript_path_candidate(&package_dir.join(entry)) {
+                    return Some(path);
+                }
+            }
+        }
+        if let Some(path) = resolve_typescript_path_candidate(&package_dir.join("index")) {
+            return Some(path);
+        }
+    }
+    None
+}
+
 fn resolve_import_file(
     source_dir: &std::path::Path,
     import_path: &str,
@@ -3652,27 +4135,11 @@ fn resolve_import_file(
 ) -> Option<std::path::PathBuf> {
     match language {
         Language::TypeScript => {
-            let base = source_dir.join(import_path);
-            if base.exists() {
-                return Some(base);
+            if import_path.starts_with('.') {
+                resolve_typescript_path_candidate(&source_dir.join(import_path))
+            } else {
+                resolve_typescript_package_entry(source_dir, import_path)
             }
-            for ext in &[
-                ".ts",
-                ".tsx",
-                ".jsx",
-                ".js",
-                ".d.ts",
-                "/index.ts",
-                "/index.tsx",
-                "/index.jsx",
-                "/index.js",
-            ] {
-                let candidate = std::path::PathBuf::from(format!("{}{}", base.display(), ext));
-                if candidate.exists() {
-                    return Some(candidate);
-                }
-            }
-            None
         }
         Language::Python => {
             let leading_dots = import_path.chars().take_while(|c| *c == '.').count();

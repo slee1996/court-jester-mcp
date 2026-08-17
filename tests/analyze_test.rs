@@ -873,6 +873,219 @@ export function profileKey(value: Profile): string | number { return value.key; 
     );
 }
 
+#[test]
+fn resolve_imported_types_through_workspace_package_reexport() {
+    let dir = tempfile::tempdir().unwrap();
+    let app_dir = dir.path().join("apps/api");
+    let package_dir = app_dir.join("node_modules/@acme/types");
+    std::fs::create_dir_all(package_dir.join("src")).unwrap();
+    std::fs::write(
+        package_dir.join("package.json"),
+        r#"{"name":"@acme/types","types":"src/index.ts"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        package_dir.join("src/index.ts"),
+        "export * from './field-value';",
+    )
+    .unwrap();
+    std::fs::write(
+        package_dir.join("src/field-value.ts"),
+        r#"
+export const FieldValueTypeSchema = z.enum(["NUMBER", "STRING", "BOOLEAN"]);
+export type FieldValueType = keyof typeof FieldValueTypeSchema.enum;
+"#,
+    )
+    .unwrap();
+
+    let main_path = app_dir.join("main.ts");
+    std::fs::write(
+        &main_path,
+        r#"
+import type { FieldValueType } from "@acme/types";
+export function normalize(type: FieldValueType): string { return type; }
+"#,
+    )
+    .unwrap();
+    let code = std::fs::read_to_string(&main_path).unwrap();
+    let analysis = analyze(&code, &Language::TypeScript);
+    let referenced = analyze::referenced_type_names_for_functions(&analysis.functions);
+    let imported = analyze::resolve_imported_types_for_names(
+        &analysis,
+        main_path.to_str().unwrap(),
+        &Language::TypeScript,
+        &referenced,
+    );
+
+    let alias = imported
+        .aliases
+        .iter()
+        .find(|alias| alias.name == "FieldValueType")
+        .expect("workspace package alias");
+    assert_eq!(
+        alias.type_annotation,
+        "\"NUMBER\" | \"STRING\" | \"BOOLEAN\""
+    );
+}
+
+#[test]
+fn resolve_imported_type_used_only_by_generic_constraint() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("types.ts"),
+        "export type Entity = { id: string };",
+    )
+    .unwrap();
+    let main_path = dir.path().join("main.ts");
+    let code = r#"
+import type { Entity } from "./types";
+export function identity<T extends Entity>(value: T): T { return value; }
+"#;
+    std::fs::write(&main_path, code).unwrap();
+
+    let analysis = analyze(code, &Language::TypeScript);
+    let referenced = analyze::referenced_type_names_for_functions(&analysis.functions);
+    assert!(
+        referenced.contains("Entity"),
+        "generic constraint should participate in the referenced-type closure"
+    );
+    let imported = analyze::resolve_imported_types_for_names(
+        &analysis,
+        main_path.to_str().unwrap(),
+        &Language::TypeScript,
+        &referenced,
+    );
+    assert!(
+        imported.classes.iter().any(|class| class.name == "Entity"),
+        "type used only by T extends Entity should resolve"
+    );
+}
+
+#[test]
+fn resolve_typescript_package_root_from_exports_types_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let package_dir = dir.path().join("node_modules/exports-root");
+    std::fs::create_dir_all(package_dir.join("dist")).unwrap();
+    std::fs::write(
+        package_dir.join("package.json"),
+        r#"{"name":"exports-root","exports":{".":{"types":"./dist/root.d.ts","default":"./dist/root.js"}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        package_dir.join("dist/root.d.ts"),
+        "export type RootContract = { root: string };",
+    )
+    .unwrap();
+    std::fs::write(
+        package_dir.join("dist/root.js"),
+        "export type WrongRootContract = { wrong: boolean };",
+    )
+    .unwrap();
+    let main_path = dir.path().join("main.ts");
+    let code = r#"
+import type { RootContract } from "exports-root";
+export function readRoot(value: RootContract): string { return value.root; }
+"#;
+    std::fs::write(&main_path, code).unwrap();
+
+    let analysis = analyze(code, &Language::TypeScript);
+    let referenced = analyze::referenced_type_names_for_functions(&analysis.functions);
+    let imported = analyze::resolve_imported_types_for_names(
+        &analysis,
+        main_path.to_str().unwrap(),
+        &Language::TypeScript,
+        &referenced,
+    );
+    assert!(
+        imported
+            .classes
+            .iter()
+            .any(|class| class.name == "RootContract"),
+        "root exports.types target should resolve before exports.default"
+    );
+}
+
+#[test]
+fn resolve_typescript_package_subpath_from_exports_types_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let package_dir = dir.path().join("node_modules/@acme/contracts");
+    std::fs::create_dir_all(package_dir.join("dist")).unwrap();
+    std::fs::write(
+        package_dir.join("package.json"),
+        r#"{"name":"@acme/contracts","exports":{"./models":{"types":"./dist/models.d.ts","import":"./dist/models.js"}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        package_dir.join("dist/models.d.ts"),
+        "export type ModelContract = { model: string };",
+    )
+    .unwrap();
+    std::fs::write(
+        package_dir.join("dist/models.js"),
+        "export type WrongModelContract = { wrong: boolean };",
+    )
+    .unwrap();
+    let main_path = dir.path().join("main.ts");
+    let code = r#"
+import type { ModelContract } from "@acme/contracts/models";
+export function readModel(value: ModelContract): string { return value.model; }
+"#;
+    std::fs::write(&main_path, code).unwrap();
+
+    let analysis = analyze(code, &Language::TypeScript);
+    let referenced = analyze::referenced_type_names_for_functions(&analysis.functions);
+    let imported = analyze::resolve_imported_types_for_names(
+        &analysis,
+        main_path.to_str().unwrap(),
+        &Language::TypeScript,
+        &referenced,
+    );
+    assert!(
+        imported
+            .classes
+            .iter()
+            .any(|class| class.name == "ModelContract"),
+        "subpath exports.types target should resolve before exports.import"
+    );
+}
+
+#[test]
+fn resolve_imported_types_through_export_type_wildcard_barrel() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("models.ts"),
+        "export type BarrelContract = { value: string };",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("barrel.ts"),
+        "export type * from './models';",
+    )
+    .unwrap();
+    let main_path = dir.path().join("main.ts");
+    let code = r#"
+import type { BarrelContract } from "./barrel";
+export function readBarrel(value: BarrelContract): string { return value.value; }
+"#;
+    std::fs::write(&main_path, code).unwrap();
+
+    let analysis = analyze(code, &Language::TypeScript);
+    let referenced = analyze::referenced_type_names_for_functions(&analysis.functions);
+    let imported = analyze::resolve_imported_types_for_names(
+        &analysis,
+        main_path.to_str().unwrap(),
+        &Language::TypeScript,
+        &referenced,
+    );
+    assert!(
+        imported
+            .classes
+            .iter()
+            .any(|class| class.name == "BarrelContract"),
+        "export type * should behave as a wildcard re-export"
+    );
+}
+
 // ── Per-function complexity (Change 2) ──────────────────────────────────────
 
 #[test]
@@ -1383,6 +1596,26 @@ fn branch_predicates_produce_literal_and_neighbor_seeds() {
 }
 
 #[test]
+fn typeof_predicates_do_not_seed_type_labels_as_runtime_values() {
+    let analysis = analyze(
+        r#"export function normalize(input: unknown): unknown {
+  if (typeof input === "string" && input === "ready") return input;
+  if (typeof input === "function") return input;
+  return null;
+}"#,
+        &Language::TypeScript,
+    );
+    let values = analysis.functions[0]
+        .predicate_seeds
+        .iter()
+        .map(|seed| seed.value.clone())
+        .collect::<Vec<_>>();
+    assert!(values.contains(&serde_json::json!("ready")));
+    assert!(!values.contains(&serde_json::json!("string")));
+    assert!(!values.contains(&serde_json::json!("function")));
+}
+
+#[test]
 fn python_length_and_membership_guards_seed_boundaries() {
     let analysis = analyze(
         "def classify(value: str) -> str:\n    if len(value) <= 5:\n        return 'short'\n    if value in {'admin', 'owner'}:\n        return 'role'\n    return 'other'\n",
@@ -1398,4 +1631,75 @@ fn python_length_and_membership_guards_seed_boundaries() {
     assert!(values.contains(&serde_json::json!(6)));
     assert!(values.contains(&serde_json::json!("admin")));
     assert!(values.contains(&serde_json::json!("owner")));
+}
+
+#[test]
+fn object_predicates_seed_complete_argument_rows() {
+    let analysis = analyze(
+        r#"export function routeJob(input: { kind: string; attempts: number }): string {
+  if (
+    input.kind === "priority"
+    && input.attempts === 7
+  ) {
+    throw new RangeError("priority retry overflow");
+  }
+  return input.kind;
+}"#,
+        &Language::TypeScript,
+    );
+    let function = &analysis.functions[0];
+    assert!(function.predicate_seeds.iter().any(|seed| {
+        seed.parameter == "input"
+            && seed.property_path == ["kind"]
+            && seed.value == serde_json::json!("priority")
+    }));
+    assert!(function.predicate_seeds.iter().any(|seed| {
+        seed.parameter == "input"
+            && seed.property_path == ["attempts"]
+            && seed.value == serde_json::json!(7)
+    }));
+    let predicate_lines = function
+        .predicate_seeds
+        .iter()
+        .filter(|seed| {
+            seed.parameter == "input"
+                && (seed.property_path == ["kind"] || seed.property_path == ["attempts"])
+        })
+        .map(|seed| seed.line)
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        predicate_lines.len(),
+        1,
+        "all comparisons in one multiline guard must share predicate provenance"
+    );
+
+    let plan = build_verification_plan(
+        &analysis.functions,
+        &analysis.classes,
+        &analysis.aliases,
+        &Language::TypeScript,
+        &[],
+        &[],
+        &[],
+    );
+    let complete_rows = plan
+        .inputs
+        .iter()
+        .filter(|input| {
+            input.classification == court_jester::types::InputClassification::Valid
+                && input
+                    .arguments
+                    .positional
+                    .first()
+                    .and_then(|value| value.json_value.as_ref())
+                    == Some(&serde_json::json!({
+                        "kind": "priority",
+                        "attempts": 7,
+                    }))
+        })
+        .count();
+    assert_eq!(
+        complete_rows, 1,
+        "the multiline predicate must produce one complete guarded row"
+    );
 }

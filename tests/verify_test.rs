@@ -3617,6 +3617,89 @@ class Reader {
 }
 
 #[tokio::test]
+async fn typescript_url_helper_never_receives_a_plain_object_as_valid_input() {
+    let code = r#"
+function normalizedHostname(url: URL): string {
+  return url.hostname.startsWith("[") && url.hostname.endsWith("]")
+    ? url.hostname.slice(1, -1)
+    : url.hostname;
+}
+
+export async function validateDocumentFetchUrl(value: string | URL): Promise<string> {
+  const url = new URL(value);
+  return normalizedHostname(url);
+}
+"#;
+
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+    let coverage_detail = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "coverage")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("coverage stage detail");
+    let coverage = coverage_detail
+        .get("functions")
+        .and_then(|value| value.as_array())
+        .expect("coverage stage should contain per-function entries");
+    let helper_input = coverage_detail["verification_plan"]["inputs"]
+        .as_array()
+        .and_then(|inputs| {
+            inputs.iter().find(|input| {
+                input["surface_id"]
+                    .as_str()
+                    .is_some_and(|surface| surface.starts_with("normalizedHostname:"))
+            })
+        })
+        .expect("the URL helper should have a planned URL input");
+    assert_eq!(
+        helper_input["classification"], "valid",
+        "the constructible URL expression must be classified as valid"
+    );
+    let helper_expression = helper_input["arguments"]["positional"][0]["expression"]
+        .as_str()
+        .expect("planned URL expression");
+    assert!(
+        helper_expression.starts_with("new URL(") && helper_expression != "{}",
+        "URL planning must use a constructible platform value, got {helper_expression}"
+    );
+    let helper_status = coverage
+        .iter()
+        .find(|entry| {
+            entry.get("function").and_then(|value| value.as_str()) == Some("normalizedHostname")
+        })
+        .and_then(|entry| entry.get("status"))
+        .and_then(|value| value.as_str())
+        .expect("normalizedHostname coverage status");
+    assert!(
+        matches!(
+            helper_status,
+            "checked_direct" | "skipped_unsupported_type" | "skipped_internal_helper"
+        ),
+        "URL helper must execute with a URL or be skipped as unsupported: {helper_status}"
+    );
+    assert!(
+        report.diagnostics.iter().all(|diagnostic| {
+            diagnostic.domain != FailureDomain::TargetCode
+                || diagnostic.impact != DiagnosticImpact::Gating
+        }),
+        "a generated plain object must not become a gating URL crash: {report:#?}"
+    );
+    if helper_status == "checked_direct" {
+        let execute = report
+            .stages
+            .iter()
+            .find(|stage| stage.name == "execute")
+            .expect("execute stage");
+        assert_eq!(
+            execute.status,
+            StageStatus::Passed,
+            "the checked URL helper must receive constructible URL instances: {report:#?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn zero_arg_object_getter_is_classified_as_no_fuzzable_surface() {
     let code = r#"
 export function ensureScraper(): { enabled: boolean } {
@@ -3999,7 +4082,7 @@ hostLabel("https://example.com");
         .find(|stage| stage.name == "execute")
         .and_then(|stage| stage.detail.as_ref())
         .expect("execute stage should be present");
-    assert_eq!(unseeded_execute["no_inputs_reached"].as_u64(), Some(1));
+    assert_eq!(unseeded_execute["no_inputs_reached"].as_u64(), Some(0));
     assert_eq!(unseeded_execute["seed_input_count"].as_u64(), Some(0));
 }
 
@@ -5277,6 +5360,100 @@ test("denied operations", () => {
             .all(|diagnostic| diagnostic.domain != FailureDomain::TargetCode
                 && diagnostic.kind != FailureKind::AssertionFailure),
         "sandbox-caused Bun output must not become a target assertion: {:#?}",
+        report.diagnostics
+    );
+}
+
+#[tokio::test]
+async fn vitest_spawn_policy_denial_makes_authoritative_stage_inconclusive() {
+    let dir = tempfile::tempdir().unwrap();
+    let tool_dir = dir.path().join("node_modules").join(".bin");
+    install_fake_tool_at(
+        &tool_dir,
+        "vitest",
+        r#"#!/bin/sh
+cat <<'EOF'
+{"numTotalTestSuites":1,"numFailedTestSuites":1,"numTotalTests":1,"numFailedTests":1,"success":false,"testResults":[{"assertionResults":[{"status":"failed","failureMessages":["pdf-inspector process could not be started: court-jester process spawn denied"]}],"status":"failed","message":"pdf-inspector process could not be started: court-jester process spawn denied"}]}
+EOF
+exit 1
+"#,
+    );
+    let vitest_dir = dir.path().join("node_modules").join("vitest");
+    std::fs::create_dir_all(&vitest_dir).unwrap();
+    std::fs::write(
+        vitest_dir.join("package.json"),
+        r#"{"name":"vitest","version":"3.2.4","type":"module","bin":{"vitest":"./vitest.mjs"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        vitest_dir.join("vitest.mjs"),
+        r#"console.log(JSON.stringify({"numTotalTestSuites":1,"numFailedTestSuites":1,"numTotalTests":1,"numFailedTests":1,"success":false,"testResults":[{"assertionResults":[{"status":"failed","failureMessages":["pdf-inspector process could not be started: court-jester process spawn denied"]}],"status":"failed","message":"pdf-inspector process could not be started: court-jester process spawn denied"}]}));
+process.exitCode = 1;
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"devDependencies":{"vitest":"3.2.4"}}"#,
+    )
+    .unwrap();
+
+    let source_path = dir.path().join("inspect.ts");
+    let test_path = dir.path().join("inspect.test.ts");
+    let code = "export function inspect(): string { return \"ready\"; }\n";
+    let tests = r#"
+import { expect, test } from "vitest";
+import { inspect } from "./inspect";
+
+test("inspects a document", () => {
+  expect(inspect()).toBe("ready");
+});
+"#;
+    std::fs::write(&source_path, code).unwrap();
+    std::fs::write(&test_path, tests).unwrap();
+    let source_file = source_path.to_string_lossy().into_owned();
+    let test_file = test_path.to_string_lossy().into_owned();
+    let project_dir = dir.path().to_string_lossy().into_owned();
+    let mut opts = default_opts(Some(tests));
+    opts.test_source_file = Some(&test_file);
+    opts.test_runner = TestRunner::Auto;
+    opts.tests_only = true;
+    opts.project_dir = Some(&project_dir);
+    opts.source_file = Some(&source_file);
+
+    let report = verify(code, &Language::TypeScript, opts).await;
+    let test_stage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "test")
+        .expect("test stage should be present");
+
+    assert_eq!(
+        test_stage.status,
+        StageStatus::Inconclusive,
+        "a harness spawn-policy denial cannot fail target code: {:#?}",
+        report.stages
+    );
+    let detail = test_stage.detail.as_ref().unwrap();
+    assert_eq!(detail["non_target_blocking"].as_bool(), Some(true));
+    assert_eq!(detail["assertion_failure"].as_bool(), Some(false));
+    assert_eq!(report.verdict, VerificationVerdict::Inconclusive);
+    assert!(
+        report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.domain == FailureDomain::Environment
+                && diagnostic.kind == FailureKind::ProcessSpawnDenied
+                && diagnostic.component == DiagnosticComponent::Sandbox
+                && diagnostic.impact == DiagnosticImpact::Blocking
+        }),
+        "expected a typed spawn-policy blocker: {:#?}",
+        report.diagnostics
+    );
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.kind != FailureKind::AssertionFailure),
+        "the spawn-policy denial must not also become a target assertion: {:#?}",
         report.diagnostics
     );
 }
@@ -7448,5 +7625,315 @@ fn cli_llm_plateau_escape_executes_novel_seed_after_corpus_stalls() {
             .as_object()
             .map(serde_json::Map::len),
         Some(1)
+    );
+}
+
+#[tokio::test]
+async fn typescript_keyof_any_switch_guards_produce_executable_seed_rows() {
+    let code = r#"
+const FieldValueType = {
+  NUMBER: "NUMBER",
+  STRING: "STRING",
+  BOOLEAN: "BOOLEAN",
+  JSON: "JSON",
+  DATE: "DATE",
+} as const;
+type FieldValueType = keyof typeof FieldValueType;
+
+export function isValidFieldValueType(type: FieldValueType, value: any): boolean {
+  switch (type) {
+    case "NUMBER": return typeof value === "number";
+    case "STRING": return typeof value === "string";
+    case "BOOLEAN": return typeof value === "boolean";
+    case "JSON": return typeof value === "object";
+    case "DATE": return typeof value === "string" && !Number.isNaN(Date.parse(value));
+    default: return false;
+  }
+}
+"#;
+
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+    let execute = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("execute stage");
+    assert_eq!(
+        execute.status,
+        StageStatus::Passed,
+        "keyof/any guard seeds must reach generated execution: {report:#?}"
+    );
+    let detail = execute.detail.as_ref().expect("execute detail");
+    assert!(
+        detail["valid_invocations"].as_u64().unwrap_or(0) > 0,
+        "switch literals must become valid invocations: {detail:#?}"
+    );
+    let rendered = serde_json::to_string(&report_json_value(&report, ReportLevel::Full)).unwrap();
+    assert!(
+        !rendered.contains("unresolved:keyof typeof"),
+        "keyof typeof must resolve to a usable domain: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn typescript_constrained_generic_uses_constraint_domain() {
+    let code = r#"
+type ProductRerankCandidate = {
+  preRankScore?: number;
+  postRankScore?: number;
+  modelNumber?: string | null;
+};
+
+export function productSearchReranker<T extends ProductRerankCandidate>(
+  candidates: T[],
+  fetchImpl: typeof fetch = fetch
+): number {
+  void fetchImpl;
+  return candidates[0]?.postRankScore ?? candidates[0]?.preRankScore ?? 0;
+}
+"#;
+
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+    let execute = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("execute stage");
+    assert_eq!(
+        execute.status,
+        StageStatus::Passed,
+        "the generic constraint must supply runnable candidates: {report:#?}"
+    );
+    assert!(
+        execute
+            .detail
+            .as_ref()
+            .and_then(|detail| detail["valid_invocations"].as_u64())
+            .unwrap_or(0)
+            > 0,
+        "the constraint domain must produce valid invocations: {report:#?}"
+    );
+}
+
+#[tokio::test]
+async fn multiline_union_object_field_stays_one_domain_field() {
+    let code = r#"
+type Unit = {
+  id: string
+  name: string
+}
+type Specification = {
+  id: string
+  secondaryUnits?:
+    | Unit[]
+    | { getItems: () => Unit[] }
+}
+type Input = {
+  specification: Specification
+  value: unknown
+  unit?: Unit | null
+}
+
+export function countUnits(input: Input): number {
+  const value = input.specification.secondaryUnits;
+  if (!value) return 0;
+  return Array.isArray(value) ? value.length : value.getItems().length;
+}
+"#;
+
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+    let rendered = serde_json::to_string(&report_json_value(&report, ReportLevel::Full)).unwrap();
+    assert!(
+        !rendered.contains("\"| { getItems\""),
+        "a union arm must not become a sibling property: {rendered}"
+    );
+    let execute = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("execute stage");
+    assert_eq!(
+        execute.status,
+        StageStatus::Passed,
+        "constructible omitted and array arms must execute: {report:#?}"
+    );
+}
+
+#[tokio::test]
+async fn planned_calls_survive_unsupported_sibling_surfaces() {
+    let project = tempfile::tempdir().unwrap();
+    let source_path = project.path().join("settings.ts");
+    let caller_path = project.path().join("caller.ts");
+    let code = r#"
+type RuntimeConfig = { name: string; retries: number };
+type StoredSettings = { token: symbol };
+
+export const createDefaultSettings = (): RuntimeConfig => ({
+  name: "default",
+  retries: 4,
+});
+
+export function resolveSettings(settings: StoredSettings | null): string {
+  return settings?.token.description ?? "default";
+}
+"#;
+    let caller = r#"
+import { createDefaultSettings, resolveSettings } from "./settings";
+export const defaults = createDefaultSettings();
+export const resolved = resolveSettings(null);
+"#;
+    fs::write(&source_path, code).unwrap();
+    fs::write(&caller_path, caller).unwrap();
+
+    let mut opts = default_opts(None);
+    opts.project_dir = project.path().to_str();
+    opts.source_file = source_path.to_str();
+    let report = verify(code, &Language::TypeScript, opts).await;
+
+    let execute = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("execute stage");
+    assert_eq!(
+        execute.status,
+        StageStatus::Passed,
+        "valid planned calls must execute despite unsupported generic generation: {report:#?}"
+    );
+    let coverage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "coverage")
+        .and_then(|stage| stage.detail.as_ref())
+        .and_then(|detail| detail["functions"].as_array())
+        .expect("function coverage");
+    for name in ["createDefaultSettings", "resolveSettings"] {
+        let function = coverage
+            .iter()
+            .find(|function| function["function"] == name)
+            .unwrap_or_else(|| panic!("missing {name} coverage: {coverage:#?}"));
+        assert_eq!(
+            function["status"].as_str(),
+            Some("checked_direct"),
+            "planned {name} call was discarded: {function:#?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn object_predicate_seed_reaches_overflow_crash() {
+    let code = r#"
+export function routeJob(input: { kind: string; attempts: number }): string {
+  if (input.kind === "priority" && input.attempts === 7) {
+    throw new RangeError("priority retry overflow");
+  }
+  return input.kind;
+}
+"#;
+
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+    let execute = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("execute stage");
+    assert_eq!(
+        execute.status,
+        StageStatus::Failed,
+        "the predicate-derived object must reproduce the crash: {report:#?}"
+    );
+    let findings = execute
+        .detail
+        .as_ref()
+        .and_then(|detail| detail["findings"].as_array())
+        .expect("execute findings");
+    assert!(findings.iter().any(|finding| {
+        finding["location"]["function"] == "routeJob"
+            && finding["error_type"] == "RangeError"
+            && finding["message"] == "priority retry overflow"
+            && finding["input_classification"] == "valid"
+            && finding["repro"]["arguments"][0]["json_value"]
+                == serde_json::json!({
+                    "kind": "priority",
+                    "attempts": 7,
+                })
+    }));
+}
+
+#[tokio::test]
+async fn multiline_object_predicate_seed_reaches_guarded_exception() {
+    let code = r#"
+export function dispatch(input: { kind: string; attempts: number }): string {
+  if (
+    input.kind === "priority"
+    && input.attempts === 7
+  ) {
+    throw new RangeError("multiline guarded failure");
+  }
+  return input.kind;
+}
+"#;
+
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+    let execute = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("execute stage");
+    assert_eq!(
+        execute.status,
+        StageStatus::Failed,
+        "the complete multiline predicate row must reach the guarded exception: {report:#?}"
+    );
+    assert!(
+        execute
+            .detail
+            .as_ref()
+            .and_then(|detail| detail["findings"].as_array())
+            .is_some_and(|findings| findings.iter().any(|finding| {
+                finding["location"]["function"] == "dispatch"
+                    && finding["message"] == "multiline guarded failure"
+                    && finding["repro"]["arguments"][0]["json_value"]
+                        == serde_json::json!({
+                            "kind": "priority",
+                            "attempts": 7,
+                        })
+            })),
+        "the multiline guard finding must retain the complete predicate input: {report:#?}"
+    );
+}
+
+#[tokio::test]
+async fn generated_application_overflow_range_error_is_rejected() {
+    let code = r#"
+export function reserve(quantity: number): number {
+  if (!Number.isFinite(quantity)) {
+    throw new RangeError("quantity overflow");
+  }
+  return quantity;
+}
+"#;
+
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+    let execute = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("execute stage");
+    assert_eq!(
+        execute.status,
+        StageStatus::Passed,
+        "an application validation RangeError on arbitrary generated rows must be rejected: {report:#?}"
+    );
+    assert!(
+        execute
+            .detail
+            .as_ref()
+            .and_then(|detail| detail["findings"].as_array())
+            .is_none_or(|findings| findings.iter().all(|finding| {
+                finding["location"]["function"] != "reserve"
+                    || finding["message"] != "quantity overflow"
+            })),
+        "the validation RangeError must not become a finding: {report:#?}"
     );
 }

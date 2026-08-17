@@ -20,7 +20,7 @@
       "language": "typescript",
       "expected_verdict": "fail",
       "expected_stage": {"name": "execute", "status": "failed"},
-      "expected_finding": {"function": "routeJob", "category": "property"}
+      "expected_finding": {"function": "routeJob", "category": "exception"}
     },
     {
       "id": "python-stateful-second-step-crash",

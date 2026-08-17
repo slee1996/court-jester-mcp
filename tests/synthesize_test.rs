@@ -39,6 +39,7 @@ fn func(name: &str, params: Vec<(&str, Option<&str>)>, ret: Option<&str>) -> Fun
             .collect(),
         return_type: ret.map(|s| s.to_string()),
         type_parameters: vec![],
+        type_parameter_constraints: std::collections::BTreeMap::new(),
         line: 1,
         end_line: 1,
         complexity: 1,
@@ -86,6 +87,7 @@ fn kwonly_func(
         params,
         return_type: ret.map(|s| s.to_string()),
         type_parameters: vec![],
+        type_parameter_constraints: std::collections::BTreeMap::new(),
         line: 1,
         end_line: 1,
         complexity: 1,
@@ -1871,21 +1873,11 @@ fn typescript_skips_aliases_with_unresolved_type_expressions() {
 fn typescript_skips_imported_aliases_that_exhaust_recursion_depth() {
     let dir = tempfile::tempdir().unwrap();
     let types_path = dir.path().join("types.ts");
-    std::fs::write(
-        &types_path,
-        r#"
-export type Alias0 = Alias1;
-export type Alias1 = Alias2;
-export type Alias2 = Alias3;
-export type Alias3 = Alias4;
-export type Alias4 = Alias5;
-export type Alias5 = Alias6;
-export type Alias6 = Alias7;
-export type Alias7 = Alias8;
-export type Alias8 = { required: string };
-"#,
-    )
-    .unwrap();
+    let mut aliases = (0..32)
+        .map(|index| format!("export type Alias{index} = Alias{};\n", index + 1))
+        .collect::<String>();
+    aliases.push_str("export type Alias32 = { required: string };\n");
+    std::fs::write(&types_path, aliases).unwrap();
     let source_path = dir.path().join("main.ts");
     let source = r#"
 import type { Alias0 } from "./types";
@@ -2052,22 +2044,13 @@ fn typescript_skips_recursive_alias_params_without_a_terminating_value() {
         aliases: vec![
             TypeAliasInfo {
                 name: "RequestLike".into(),
-                type_annotation:
-                    "{ headers?: Record<string, string | undefined>; app?: ApplicationLike }"
-                        .into(),
+                type_annotation: "{ app: ApplicationLike }".into(),
                 line: 1,
             },
             TypeAliasInfo {
                 name: "ApplicationLike".into(),
-                type_annotation: "RouterLike & { parent?: ApplicationLike }".into(),
+                type_annotation: "{ request: RequestLike }".into(),
                 line: 2,
-            },
-            TypeAliasInfo {
-                name: "RouterLike".into(),
-                type_annotation:
-                    "((req: RequestLike) => void) & { use: (...args: unknown[]) => RouterLike; parent?: ApplicationLike }"
-                        .into(),
-                line: 3,
             },
         ],
         imports: vec![],
@@ -2726,6 +2709,7 @@ fn python_skips_methods_in_fuzz() {
                 }],
                 return_type: Some("int".to_string()),
                 type_parameters: vec![],
+                type_parameter_constraints: BTreeMap::new(),
                 line: 2,
                 end_line: 3,
                 complexity: 1,
@@ -2890,8 +2874,45 @@ fn typescript_callback_generator() {
     );
     let code = synthesize_calls(&a, &Language::TypeScript);
     assert!(
-        code.contains("() => undefined"),
-        "callback should generate stub function, got: {code}"
+        code.contains("const _callbackValue = undefined")
+            && code.contains("return () => _callbackValue"),
+        "callback should generate a stable stub function, got: {code}"
+    );
+}
+
+#[test]
+fn typescript_callback_returning_named_array_preserves_return_shape() {
+    let analysis = analyze(
+        r#"
+type Unit = {
+    id: string
+    name: string
+}
+type Specification = {
+    id: string
+    secondaryUnits?:
+        | Unit[]
+        | { getItems: () => Unit[] }
+}
+export function countUnits(specification: Specification): number {
+    return specification.id.length
+}
+"#,
+        &Language::TypeScript,
+    );
+    assert!(
+        analysis
+            .aliases
+            .iter()
+            .any(|alias| alias.name == "Unit" && alias.type_annotation.contains("id")),
+        "Unit alias should be available to synthesis: {:#?}",
+        analysis.aliases
+    );
+    let code = synthesize_calls(&analysis, &Language::TypeScript);
+    assert!(
+        code.contains("const _callbackValue = Array.from")
+            && code.contains("return () => _callbackValue"),
+        "callback return arrays must retain a stable array shape, got: {code}"
     );
 }
 
@@ -3064,6 +3085,77 @@ fn typescript_generic_collection_generators() {
     assert!(
         code.contains("new Map(Array.from"),
         "Map<string, number> should generate a populated Map, got: {code}"
+    );
+}
+
+#[test]
+fn typescript_generic_constraint_substitution_preserves_expression_precedence() {
+    let mut function = func("consume", vec![("values", Some("T[]"))], None);
+    function.type_parameters = vec!["T".into(), "U".into(), "V".into()];
+    function
+        .type_parameter_constraints
+        .insert("T".into(), "string | number".into());
+    function
+        .type_parameter_constraints
+        .insert("U".into(), "Widget".into());
+    function
+        .type_parameter_constraints
+        .insert("V".into(), "Array<string | number>".into());
+
+    for (annotation, expected) in [
+        ("T[]", "(string | number)[]"),
+        ("Array<T>", "Array<(string | number)>"),
+        ("[T, T]", "[(string | number), (string | number)]"),
+        ("T | null", "(string | number) | null"),
+        ("T & Tagged", "(string | number) & Tagged"),
+        (
+            "Promise<Map<string, Array<T>>>",
+            "Promise<Map<string, Array<(string | number)>>>",
+        ),
+        ("U[]", "Widget[]"),
+        ("V[]", "Array<string | number>[]"),
+    ] {
+        assert_eq!(
+            function.resolved_type_annotation(annotation),
+            expected,
+            "unexpected substitution for {annotation}"
+        );
+    }
+}
+
+#[test]
+fn typescript_constrained_union_array_builds_array_of_union_domain() {
+    let mut function = func("consume", vec![("values", Some("T[]"))], None);
+    function.type_parameters = vec!["T".into()];
+    function
+        .type_parameter_constraints
+        .insert("T".into(), "string | number".into());
+
+    let plan = build_verification_plan(&[function], &[], &[], &Language::TypeScript, &[], &[], &[]);
+    assert_eq!(
+        plan.parameter_domains[0].domain,
+        DomainNode::Array(Box::new(DomainNode::Union(vec![
+            DomainNode::String,
+            DomainNode::Float,
+        ])))
+    );
+}
+
+#[test]
+fn typescript_constrained_union_array_generator_keeps_union_inside_array() {
+    let mut function = func("consume", vec![("values", Some("T[]"))], None);
+    function.type_parameters = vec!["T".into()];
+    function
+        .type_parameter_constraints
+        .insert("T".into(), "string | number".into());
+    let analysis = make_analysis(vec![function], vec![]);
+
+    let code = synthesize_calls(&analysis, &Language::TypeScript);
+    assert!(
+        code.contains(
+            "Array.from({length: _fuzzIntRange(0,5)}, () => [_fuzzStr(), _fuzzNum()][_fuzzIntRange(0, 1)])"
+        ),
+        "the union choice must be generated for each array element, got: {code}"
     );
 }
 

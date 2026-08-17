@@ -52,6 +52,40 @@ fn split_top_level(raw: &str, delimiter: char) -> Vec<String> {
     out
 }
 
+fn top_level_arrow_return(type_ann: &str) -> Option<&str> {
+    let mut depth = 0i32;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, ch) in type_ann.char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(ch, '\'' | '"' | '`') {
+            quote = Some(ch);
+            continue;
+        }
+        if ch == '=' && depth == 0 && type_ann.as_bytes().get(index + 1).copied() == Some(b'>') {
+            return Some(type_ann[index + 2..].trim());
+        }
+        match ch {
+            '[' | '(' | '{' | '<' => depth += 1,
+            ']' | ')' | '}' => depth -= 1,
+            '>' if type_ann.as_bytes().get(index.wrapping_sub(1)).copied() != Some(b'=') => {
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn literal(raw: &str, language: &Language) -> Option<DomainLiteral> {
     let text = raw.trim();
     if text.is_empty() {
@@ -151,12 +185,36 @@ fn domain_inner(
     stack: &mut Vec<String>,
     depth: usize,
 ) -> DomainNode {
-    let text = raw.trim();
+    let text = strip_outer_parentheses(raw.trim());
     if text.is_empty() {
         return DomainNode::Any;
     }
     if depth > ALIAS_DEPTH_LIMIT {
         return DomainNode::Opaque("recursive_or_depth_limit".into());
+    }
+    if let Some(class) = classes.iter().find(|class| class.name == text) {
+        if stack.iter().any(|name| name == text) {
+            return DomainNode::Opaque("recursive_or_depth_limit".into());
+        }
+        stack.push(text.to_string());
+        let fields = class
+            .fields
+            .iter()
+            .map(|field| DomainField {
+                name: field.name.clone(),
+                domain: domain_inner(
+                    field.type_annotation.as_deref().unwrap_or("Any"),
+                    aliases,
+                    classes,
+                    language,
+                    stack,
+                    depth + 1,
+                ),
+                optional: field.optional || field.has_default,
+            })
+            .collect();
+        stack.pop();
+        return DomainNode::Object(fields);
     }
     let alias = aliases.iter().find(|item| item.name == text);
     if let Some(alias) = alias {
@@ -174,6 +232,9 @@ fn domain_inner(
         );
         stack.pop();
         return result;
+    }
+    if matches!(language, Language::TypeScript) && text.starts_with("keyof ") {
+        return DomainNode::Any;
     }
     if text.starts_with("Literal[") {
         let inner = text
@@ -210,6 +271,9 @@ fn domain_inner(
             stack,
             depth,
         );
+    }
+    if top_level_arrow_return(text).is_some() {
+        return DomainNode::Opaque("unsupported:callable".into());
     }
     if let Some(inner) = text.strip_suffix("[]") {
         return DomainNode::Array(Box::new(domain_inner(
@@ -324,30 +388,6 @@ fn domain_inner(
         }
         return DomainNode::Object(fields);
     }
-    if let Some(class) = classes.iter().find(|class| class.name == text) {
-        if stack.iter().any(|name| name == text) {
-            return DomainNode::Opaque("recursive_or_depth_limit".into());
-        }
-        stack.push(text.to_string());
-        let fields = class
-            .fields
-            .iter()
-            .map(|field| DomainField {
-                name: field.name.clone(),
-                domain: domain_inner(
-                    field.type_annotation.as_deref().unwrap_or("Any"),
-                    aliases,
-                    classes,
-                    language,
-                    stack,
-                    depth + 1,
-                ),
-                optional: field.optional || field.has_default,
-            })
-            .collect();
-        stack.pop();
-        return DomainNode::Object(fields);
-    }
     if let Some(values) = split_top_level(text, ',')
         .into_iter()
         .filter_map(|item| literal(&item, language))
@@ -360,7 +400,7 @@ fn domain_inner(
         return DomainNode::Literal(vec![values]);
     }
     match text.trim_matches(&[' ', '"', '\'', '`'][..]) {
-        "Any" | "unknown" => DomainNode::Any,
+        "Any" | "any" | "unknown" => DomainNode::Any,
         "bool" | "boolean" => DomainNode::Boolean,
         "int" | "number" | "bigint" => {
             if text == "number" || text == "bigint" {
@@ -372,6 +412,12 @@ fn domain_inner(
         "float" => DomainNode::Float,
         "str" | "string" => DomainNode::String,
         "bytes" | "Buffer" | "Uint8Array" => DomainNode::Bytes,
+        "URL" if matches!(language, Language::TypeScript) => {
+            DomainNode::Literal(vec![DomainLiteral {
+                expression: "new URL(\"https://example.test/\")".into(),
+                json_value: None,
+            }])
+        }
         "None" | "null" | "undefined" => DomainNode::Opaque("null_only".into()),
         _ => DomainNode::Opaque(format!("unresolved:{text}")),
     }
@@ -542,14 +588,34 @@ fn strip_outer_parentheses(mut text: &str) -> &str {
         if bytes.len() < 2 || bytes[0] != b'(' || bytes[bytes.len() - 1] != b')' {
             return text;
         }
-        let mut depth = 0usize;
+        let mut depth = 0i32;
+        let mut quote = None;
+        let mut escaped = false;
         let mut encloses = true;
         for (index, character) in text.char_indices() {
+            if let Some(active_quote) = quote {
+                if escaped {
+                    escaped = false;
+                } else if character == '\\' {
+                    escaped = true;
+                } else if character == active_quote {
+                    quote = None;
+                }
+                continue;
+            }
+            if matches!(character, '\'' | '"' | '`') {
+                quote = Some(character);
+                continue;
+            }
             match character {
                 '(' => depth += 1,
                 ')' => {
-                    depth = depth.saturating_sub(1);
+                    depth -= 1;
                     if depth == 0 && index + character.len_utf8() < text.len() {
+                        encloses = false;
+                        break;
+                    }
+                    if depth < 0 {
                         encloses = false;
                         break;
                     }
@@ -557,7 +623,7 @@ fn strip_outer_parentheses(mut text: &str) -> &str {
                 _ => {}
             }
         }
-        if !encloses || depth != 0 {
+        if !encloses || depth != 0 || quote.is_some() {
             return text;
         }
         text = text[1..text.len() - 1].trim();
@@ -756,6 +822,12 @@ pub fn safe_dependency_substitute(
         .ok_or(UnsafeDefaultReason::Untyped)?;
     if !is_dependency_shaped(param, classes, aliases) {
         return Err(UnsafeDefaultReason::Unsynthesizable);
+    }
+    if matches!(language, Language::TypeScript) && annotation.trim() == "typeof fetch" {
+        return Ok(DomainLiteral {
+            expression: "(async () => ({ ok: false, status: 503, text: async () => \"\", json: async () => ({}) }))".into(),
+            json_value: None,
+        });
     }
     if let Some((return_type, is_async)) = callable_return_annotation(annotation, aliases) {
         return callback_substitute(&return_type, is_async, language, classes, aliases)
@@ -1002,28 +1074,55 @@ fn domain_literals(domain: &DomainNode, language: &Language) -> Vec<DomainLitera
     }
 }
 
+fn representative_domain_json(
+    domain: &DomainNode,
+    language: &Language,
+) -> Option<serde_json::Value> {
+    if let Some(value) = domain_literals(domain, language)
+        .into_iter()
+        .next()
+        .and_then(|literal| literal.json_value)
+    {
+        return Some(value);
+    }
+    match domain {
+        DomainNode::Any | DomainNode::Nullable(_) => Some(serde_json::Value::Null),
+        DomainNode::Boolean => Some(serde_json::Value::Bool(false)),
+        DomainNode::Integer => Some(serde_json::json!(0)),
+        DomainNode::Float => Some(serde_json::json!(0.0)),
+        DomainNode::String | DomainNode::Bytes => Some(serde_json::Value::String(String::new())),
+        DomainNode::Array(_) | DomainNode::Set(_) => Some(serde_json::json!([])),
+        DomainNode::Tuple(items) => items
+            .iter()
+            .map(|item| representative_domain_json(item, language))
+            .collect::<Option<Vec<_>>>()
+            .map(serde_json::Value::Array),
+        DomainNode::Map(_, _) => Some(serde_json::json!({})),
+        DomainNode::Object(fields) => {
+            let mut object = serde_json::Map::new();
+            for field in fields.iter().filter(|field| !field.optional) {
+                object.insert(
+                    field.name.clone(),
+                    representative_domain_json(&field.domain, language)?,
+                );
+            }
+            Some(serde_json::Value::Object(object))
+        }
+        DomainNode::Union(items) => items
+            .iter()
+            .find_map(|item| representative_domain_json(item, language)),
+        DomainNode::Literal(values) => values
+            .first()
+            .and_then(|literal| literal.json_value.clone()),
+        DomainNode::Opaque(_) => None,
+    }
+}
+
 fn representative_domain_literal(
     domain: &DomainNode,
     language: &Language,
 ) -> Option<DomainLiteral> {
-    if let Some(value) = domain_literals(domain, language).into_iter().next() {
-        return Some(value);
-    }
-    let json = match domain {
-        DomainNode::Any | DomainNode::Nullable(_) => serde_json::Value::Null,
-        DomainNode::Boolean => serde_json::Value::Bool(false),
-        DomainNode::Integer => serde_json::json!(0),
-        DomainNode::Float => serde_json::json!(0.0),
-        DomainNode::String | DomainNode::Bytes => serde_json::Value::String(String::new()),
-        DomainNode::Array(_) | DomainNode::Tuple(_) | DomainNode::Set(_) => serde_json::json!([]),
-        DomainNode::Map(_, _) | DomainNode::Object(_) => serde_json::json!({}),
-        DomainNode::Union(items) => {
-            return items
-                .iter()
-                .find_map(|item| representative_domain_literal(item, language));
-        }
-        DomainNode::Literal(_) | DomainNode::Opaque(_) => return None,
-    };
+    let json = representative_domain_json(domain, language)?;
     Some(DomainLiteral {
         expression: render_json_literal(&json, language),
         json_value: Some(json),
@@ -1031,27 +1130,38 @@ fn representative_domain_literal(
 }
 
 fn value_matches_domain(value: &DomainLiteral, domain: &DomainNode) -> Option<bool> {
+    if let DomainNode::Literal(values) = domain {
+        return Some(values.iter().any(|candidate| same_value(candidate, value)));
+    }
     let Some(json) = &value.json_value else {
         return None;
     };
-    Some(match domain {
-        DomainNode::Any | DomainNode::Opaque(_) => return None,
-        DomainNode::Boolean => json.is_boolean(),
-        DomainNode::Integer => json.as_i64().is_some(),
-
-        DomainNode::Float => json.is_number(),
-        DomainNode::String => json.is_string(),
-        DomainNode::Bytes => false,
-        DomainNode::Literal(values) => values.iter().any(|candidate| same_value(candidate, value)),
+    match domain {
+        DomainNode::Any => Some(true),
+        DomainNode::Opaque(_) => None,
+        DomainNode::Boolean => Some(json.is_boolean()),
+        DomainNode::Integer => Some(json.as_i64().is_some()),
+        DomainNode::Float => Some(json.is_number()),
+        DomainNode::String => Some(json.is_string()),
+        DomainNode::Bytes => Some(false),
+        DomainNode::Literal(_) => unreachable!("literal domains are matched by expression above"),
         DomainNode::Nullable(inner) => {
-            json.is_null() || value_matches_domain(value, inner).unwrap_or(false)
+            Some(json.is_null() || value_matches_domain(value, inner).unwrap_or(false))
         }
-        DomainNode::Union(items) => items
-            .iter()
-            .any(|item| value_matches_domain(value, item).unwrap_or(false)),
-        DomainNode::Array(_) | DomainNode::Tuple(_) | DomainNode::Set(_) => json.is_array(),
-        DomainNode::Map(_, _) | DomainNode::Object(_) => json.is_object(),
-    })
+        DomainNode::Union(items) => {
+            let mut unknown = false;
+            for item in items {
+                match value_matches_domain(value, item) {
+                    Some(true) => return Some(true),
+                    Some(false) => {}
+                    None => unknown = true,
+                }
+            }
+            (!unknown).then_some(false)
+        }
+        DomainNode::Array(_) | DomainNode::Tuple(_) | DomainNode::Set(_) => Some(json.is_array()),
+        DomainNode::Map(_, _) | DomainNode::Object(_) => Some(json.is_object()),
+    }
 }
 
 fn normalized_expression(expression: &str) -> String {
@@ -1249,6 +1359,81 @@ fn add_planned_input(inputs: &mut Vec<PlannedInput>, mut candidate: PlannedInput
     inputs.push(candidate);
 }
 
+fn assign_predicate_property(
+    value: &mut serde_json::Value,
+    property_path: &[String],
+    replacement: serde_json::Value,
+) -> bool {
+    let Some((property, rest)) = property_path.split_first() else {
+        *value = replacement;
+        return true;
+    };
+    let Some(object) = value.as_object_mut() else {
+        return false;
+    };
+    if rest.is_empty() {
+        object.insert(property.clone(), replacement);
+        return true;
+    }
+    let child = object
+        .entry(property.clone())
+        .or_insert_with(|| serde_json::json!({}));
+    assign_predicate_property(child, rest, replacement)
+}
+
+fn predicate_seed_literals(
+    domain: &DomainNode,
+    seeds: &[&PredicateSeed],
+    language: &Language,
+) -> Vec<DomainLiteral> {
+    let whole_value_seeds = seeds
+        .iter()
+        .filter(|seed| seed.property_path.is_empty())
+        .collect::<Vec<_>>();
+    if !whole_value_seeds.is_empty() {
+        return whole_value_seeds
+            .into_iter()
+            .map(|seed| DomainLiteral {
+                expression: render_json_literal(&seed.value, language),
+                json_value: Some(seed.value.clone()),
+            })
+            .collect();
+    }
+
+    let Some(base) = representative_domain_json(domain, language) else {
+        return Vec::new();
+    };
+    let mut values_by_path: BTreeMap<&[String], Vec<&serde_json::Value>> = BTreeMap::new();
+    for seed in seeds {
+        let values = values_by_path
+            .entry(seed.property_path.as_slice())
+            .or_default();
+        if !values.contains(&&seed.value) {
+            values.push(&seed.value);
+        }
+    }
+    let mut rows = vec![base];
+    for (property_path, replacements) in values_by_path {
+        rows = rows
+            .into_iter()
+            .flat_map(|row| {
+                replacements.iter().filter_map(move |replacement| {
+                    let mut candidate = row.clone();
+                    assign_predicate_property(&mut candidate, property_path, (*replacement).clone())
+                        .then_some(candidate)
+                })
+            })
+            .take(128)
+            .collect();
+    }
+    rows.into_iter()
+        .map(|json| DomainLiteral {
+            expression: render_json_literal(&json, language),
+            json_value: Some(json),
+        })
+        .collect()
+}
+
 pub fn build_verification_plan(
     functions: &[FunctionInfo],
     classes: &[ClassInfo],
@@ -1293,19 +1478,37 @@ pub fn build_verification_plan(
                     None,
                 ));
             }
-            for seed in func
+            let guard_seeds = func
                 .predicate_seeds
                 .iter()
                 .filter(|seed| seed.parameter == param.name)
-            {
+                .collect::<Vec<_>>();
+            for seed in &guard_seeds {
                 sources.push(source(
                     DomainSourceKind::ValidationGuard,
                     Some(&param.name),
                     Some(seed.line),
                 ));
             }
+            let resolved_annotation = param
+                .type_annotation
+                .as_deref()
+                .map(|annotation| func.resolved_type_annotation(annotation));
             let mut domain =
-                domain_for_annotation(param.type_annotation.as_deref(), aliases, classes, language);
+                domain_for_annotation(resolved_annotation.as_deref(), aliases, classes, language);
+            if matches!(domain, DomainNode::Opaque(_)) && !guard_seeds.is_empty() {
+                let mut values = Vec::new();
+                for seed in guard_seeds {
+                    let value = DomainLiteral {
+                        expression: render_json_literal(&seed.value, language),
+                        json_value: Some(seed.value.clone()),
+                    };
+                    if !values.contains(&value) {
+                        values.push(value);
+                    }
+                }
+                domain = DomainNode::Union(vec![DomainNode::Literal(values), domain]);
+            }
             if matches!(param.variadic, Some(VariadicKind::Positional))
                 && matches!(language, Language::TypeScript)
             {
@@ -1481,67 +1684,108 @@ pub fn build_verification_plan(
             .get(surface_id.as_str())
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        for seed in &function.predicate_seeds {
-            let mut slots = Vec::with_capacity(domains.len());
-            let mut complete = true;
+        // Analysis assigns the enclosing logical predicate's start line to
+        // every comparison seed, so all parts of a multiline guard are
+        // combined into the same complete argument row here.
+        let mut predicate_groups = function
+            .predicate_seeds
+            .iter()
+            .map(|seed| seed.line)
+            .collect::<Vec<_>>();
+        predicate_groups.sort_unstable();
+        predicate_groups.dedup();
+        for predicate_line in predicate_groups {
+            let mut choices = Vec::with_capacity(domains.len());
             for parameter in domains {
-                let value = if parameter.parameter == seed.parameter {
-                    DomainLiteral {
-                        expression: render_json_literal(&seed.value, language),
-                        json_value: Some(seed.value.clone()),
-                    }
+                let parameter_seeds = function
+                    .predicate_seeds
+                    .iter()
+                    .filter(|seed| {
+                        seed.line == predicate_line && seed.parameter == parameter.parameter
+                    })
+                    .collect::<Vec<_>>();
+                let values = if parameter_seeds.is_empty() {
+                    representative_domain_literal(&parameter.domain, language)
+                        .into_iter()
+                        .collect()
                 } else {
-                    let Some(value) = representative_domain_literal(&parameter.domain, language)
-                    else {
-                        complete = false;
-                        break;
-                    };
-                    value
+                    predicate_seed_literals(&parameter.domain, &parameter_seeds, language)
                 };
-                slots.push(match parameter.variadic {
-                    Some(VariadicKind::Positional) => {
-                        PlannedArgumentSlot::PositionalVariadic(vec![value])
-                    }
-                    Some(VariadicKind::Keyword) => {
-                        let mut values = BTreeMap::new();
-                        values.insert("kw0".to_string(), value);
-                        PlannedArgumentSlot::KeywordVariadic(values)
-                    }
-                    None => PlannedArgumentSlot::Single(value),
-                });
+                let slots = values
+                    .into_iter()
+                    .map(|value| match parameter.variadic {
+                        Some(VariadicKind::Positional) => {
+                            PlannedArgumentSlot::PositionalVariadic(vec![value])
+                        }
+                        Some(VariadicKind::Keyword) => {
+                            let mut values = BTreeMap::new();
+                            values.insert("kw0".to_string(), value);
+                            PlannedArgumentSlot::KeywordVariadic(values)
+                        }
+                        None => PlannedArgumentSlot::Single(value),
+                    })
+                    .collect::<Vec<_>>();
+                choices.push(slots);
             }
-            if !complete {
+            if choices.is_empty()
+                || choices.iter().any(Vec::is_empty)
+                || choices
+                    .iter()
+                    .fold(1usize, |total, values| total.saturating_mul(values.len()))
+                    > 128
+            {
                 continue;
             }
-            let Ok(mut arguments) = bind_argument_slots(domains, PlannedArgumentSlots { slots })
+            let mut rows = vec![PlannedArgumentSlots { slots: Vec::new() }];
+            for parameter_choices in choices {
+                rows = rows
+                    .into_iter()
+                    .flat_map(|row| {
+                        parameter_choices.iter().map(move |value| {
+                            let mut next = row.clone();
+                            next.slots.push(value.clone());
+                            next
+                        })
+                    })
+                    .collect();
+            }
+            let Some(seed) = function
+                .predicate_seeds
+                .iter()
+                .find(|seed| seed.line == predicate_line)
             else {
                 continue;
             };
-            let dependency_sources = match normalize_dependency_arguments(
-                &function.params,
-                &mut arguments,
-                language,
-                classes,
-                aliases,
-            ) {
-                Ok(sources) => sources,
-                Err(_) => continue,
-            };
-            let mut sources = vec![source(
-                DomainSourceKind::ValidationGuard,
-                Some(&seed.parameter),
-                Some(seed.line),
-            )];
-            sources.extend(dependency_sources.into_iter().map(|(_, source)| source));
-            add_planned_input(
-                &mut inputs,
-                PlannedInput {
-                    surface_id: surface_id.clone(),
-                    classification: classify_input(&arguments, domains),
-                    arguments,
-                    sources,
-                },
-            );
+            for slots in rows {
+                let Ok(mut arguments) = bind_argument_slots(domains, slots) else {
+                    continue;
+                };
+                let dependency_sources = match normalize_dependency_arguments(
+                    &function.params,
+                    &mut arguments,
+                    language,
+                    classes,
+                    aliases,
+                ) {
+                    Ok(sources) => sources,
+                    Err(_) => continue,
+                };
+                let mut sources = vec![source(
+                    DomainSourceKind::ValidationGuard,
+                    Some(&seed.parameter),
+                    Some(predicate_line),
+                )];
+                sources.extend(dependency_sources.into_iter().map(|(_, source)| source));
+                add_planned_input(
+                    &mut inputs,
+                    PlannedInput {
+                        surface_id: surface_id.clone(),
+                        classification: classify_input(&arguments, domains),
+                        arguments,
+                        sources,
+                    },
+                );
+            }
         }
     }
     for caller in caller_examples {
