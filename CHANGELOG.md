@@ -8,6 +8,8 @@ This changelog tracks user-visible verifier semantics, report-shape changes, and
 
 Deep fuzz-campaign release. Predicate-aware guard seeds, retained-corpus mutation, oracle-preserving fixed-point shrinking, broader metamorphic checks, and stateful factory action sequences expand the deterministic Python and TypeScript search. Installed Atheris or Jazzer.js engines and an external plateau seed proposer are available as explicit opt-ins; their findings retain the normal sandbox, diagnostic, minimization, replay, and report semantics. A seeded evaluation lane detected all seven mutations while both clean controls remained finding-free. See [docs/release-notes-0.2.14.md](docs/release-notes-0.2.14.md) for the full behavior and evidence.
 
+Compatibility repairs close issues #9, #12, #21, #28, #29, #32, #33, and #36–#40: stable isolated Docker binds, project-owned TypeScript dependency/config resolution, source-preserving instrumentation, concurrent materialization safety, completed-harness termination, and recursive TypeScript type-domain generation.
+
 ## 0.2.13 - 2026-08-15
 
 Publication retry for the immutable 0.2.12 candidate. Its Linux Clippy gate found a macOS-only test helper imported on every target; the import is now platform-gated without changing the runtime fixes below. See [docs/release-notes-0.2.13.md](docs/release-notes-0.2.13.md) for release evidence.

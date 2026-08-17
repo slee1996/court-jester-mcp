@@ -4,6 +4,12 @@ Release date: 2026-08-15
 
 Court Jester 0.2.14 expands synthesized verification from a fixed edge-case pass into a layered fuzz campaign. Deterministic domain seeds remain the default foundation; retained-corpus mutation, semantic campaigns, stateful factory sequences, optional native engines, and an opt-in external seed proposer now add depth without weakening sandboxing, finding normalization, minimization, replay, or evidence classification.
 
+## Compatibility repairs
+
+- Isolated doctor workspaces use a stable Docker Desktop-shared bind root, and isolated dependency materialization tolerates transient concurrent permission races while preserving permanent `EACCES` blockers (#9, #32).
+- TypeScript execute and verify resolve project/workspace dependencies, retain project `tsconfig` and Nuxt aliases, preserve decorated source and hoisted Vitest mocks, and classify native-module failures only after exact target reachability (#12, #21, #28, #29, #33).
+- Generated TypeScript campaigns honor requested run limits after the completion sentinel, retain planned zero-argument and nullable-union calls, resolve generic constraints, fuzz `any` as an unknown domain, and avoid interpreting union arms as object fields (#36–#40).
+
 ## Search depth
 
 - Python and TypeScript analyzers extract predicate-aware seeds from equality, membership, range, and switch/case guards so declared branches enter the initial corpus.
