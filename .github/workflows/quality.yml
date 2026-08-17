@@ -48,7 +48,7 @@ jobs:
         run: cargo test --locked --tests -- --test-threads=1
 
       - name: Run benchmark unit tests
-        run: python3 -m unittest bench.test_run_matrix bench.test_runner bench.test_summarize_runs bench.test_evidence
+        run: python3 -m unittest bench.test_run_matrix bench.test_runner bench.test_summarize_runs bench.test_evidence bench.test_fuzz_effectiveness
 
       - name: Run release contract tests
         run: python3 -m unittest discover -s tests -p 'release_test.py'
@@ -58,6 +58,9 @@ jobs:
 
       - name: Run release CLI smoke test
         run: python3 scripts/smoke_cli.py --binary target/release/court-jester
+
+      - name: Run fuzz effectiveness benchmark
+        run: python3 -m bench.fuzz_effectiveness --binary target/release/court-jester
 
       - name: Run locked benchmark dry-run
         run: python3 -m bench.run_matrix --task-set swebench-lite-pilot --models noop --policies baseline --dry-run --enforce-heldout-lock --output-dir /tmp/cj-heldout-dry

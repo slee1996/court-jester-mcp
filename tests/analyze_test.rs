@@ -211,6 +211,52 @@ def check_metric(a: int, b: int) -> int:
 }
 
 #[test]
+fn declared_metamorphic_properties_normalize_aliases() {
+    let code = "\
+// court-jester-properties involutive monotonic order-independent
+export function transform(value: number): number {
+  return value;
+}
+";
+    assert_eq!(
+        source_declared_properties(code, &Language::TypeScript, 2),
+        vec![
+            "involution".to_string(),
+            "monotonic".to_string(),
+            "order_invariant".to_string()
+        ]
+    );
+}
+
+#[test]
+fn python_factory_returns_only_track_nested_callables() {
+    let code = "\
+def create_counter():
+    def increment(value: int) -> int:
+        return value + 1
+    return {'increment': increment}
+
+def identity(value: int) -> int:
+    result = value
+    return result
+";
+    let analysis = analyze(code, &Language::Python);
+    let factory = analysis
+        .functions
+        .iter()
+        .find(|function| function.name == "create_counter")
+        .expect("factory");
+    let identity = analysis
+        .functions
+        .iter()
+        .find(|function| function.name == "identity")
+        .expect("identity");
+
+    assert_eq!(factory.returned_callables, vec!["increment"]);
+    assert!(identity.returned_callables.is_empty());
+}
+
+#[test]
 fn typescript_exported_object_literal_methods_are_callable_surfaces() {
     let code = "\
 export const reorderer = {
@@ -1279,4 +1325,77 @@ fn malformed_tsx_reports_structured_diagnostic() {
     assert!(diagnostic.start_line >= 1);
     assert!(diagnostic.start_column >= 1);
     assert!(diagnostic.message.contains("syntax node"));
+}
+
+#[test]
+fn branch_predicates_produce_literal_and_neighbor_seeds() {
+    let analysis = analyze(
+        r#"export function guarded(value: number, mode: string): string {
+  if (value === 777125) return "exact";
+  if (value < 10 && ["safe", "strict"].includes(mode)) return "bounded";
+  return "other";
+}"#,
+        &Language::TypeScript,
+    );
+    let function = &analysis.functions[0];
+    let values = function
+        .predicate_seeds
+        .iter()
+        .filter(|seed| seed.parameter == "value")
+        .map(|seed| seed.value.clone())
+        .collect::<Vec<_>>();
+    assert!(values.contains(&serde_json::json!(777124)));
+    assert!(values.contains(&serde_json::json!(777125)));
+    assert!(values.contains(&serde_json::json!(777126)));
+    assert!(values.contains(&serde_json::json!(9)));
+    assert!(values.contains(&serde_json::json!(10)));
+    assert!(values.contains(&serde_json::json!(11)));
+    let modes = function
+        .predicate_seeds
+        .iter()
+        .filter(|seed| seed.parameter == "mode")
+        .map(|seed| seed.value.clone())
+        .collect::<Vec<_>>();
+    assert!(modes.contains(&serde_json::json!("safe")));
+    assert!(modes.contains(&serde_json::json!("strict")));
+
+    let plan = build_verification_plan(
+        &analysis.functions,
+        &analysis.classes,
+        &analysis.aliases,
+        &Language::TypeScript,
+        &[],
+        &[],
+        &[],
+    );
+    assert!(plan.inputs.iter().any(|input| {
+        input
+            .arguments
+            .positional
+            .first()
+            .and_then(|value| value.json_value.as_ref())
+            == Some(&serde_json::json!(777125))
+            && input
+                .sources
+                .iter()
+                .any(|source| source.kind == court_jester::types::DomainSourceKind::ValidationGuard)
+    }));
+}
+
+#[test]
+fn python_length_and_membership_guards_seed_boundaries() {
+    let analysis = analyze(
+        "def classify(value: str) -> str:\n    if len(value) <= 5:\n        return 'short'\n    if value in {'admin', 'owner'}:\n        return 'role'\n    return 'other'\n",
+        &Language::Python,
+    );
+    let values = analysis.functions[0]
+        .predicate_seeds
+        .iter()
+        .map(|seed| seed.value.clone())
+        .collect::<Vec<_>>();
+    assert!(values.contains(&serde_json::json!(4)));
+    assert!(values.contains(&serde_json::json!(5)));
+    assert!(values.contains(&serde_json::json!(6)));
+    assert!(values.contains(&serde_json::json!("admin")));
+    assert!(values.contains(&serde_json::json!("owner")));
 }

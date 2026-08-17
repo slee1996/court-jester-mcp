@@ -1079,7 +1079,7 @@ fn copy_materialization_tree_inner(
     active_directories.remove(&canonical_source);
     result
 }
-fn runtime_tempdir(
+pub fn runtime_tempdir(
     _runtime_profile: crate::types::RuntimeProfile,
 ) -> std::io::Result<tempfile::TempDir> {
     #[cfg(target_os = "macos")]
@@ -1470,6 +1470,28 @@ function relativeResolution(specifier, parentPath) {
   return relative ? fileResolution(relative) : undefined;
 }
 
+function packageSubpathResolution(specifier, parentPath) {
+  const packageName = requestedPackageName(specifier);
+  if (specifier === packageName) return undefined;
+  const root = containsPath(sourceRoot, parentPath)
+    ? sourceRoot
+    : containsPath(overlayRoot, parentPath)
+      ? overlayRoot
+      : undefined;
+  if (!root) return undefined;
+  let directory = path.dirname(parentPath);
+  while (containsPath(root, directory)) {
+    const resolved = resolveAliasFile(
+      path.join(directory, "node_modules", specifier),
+      root,
+    );
+    if (resolved) return fileResolution(resolved);
+    if (directory === root) break;
+    directory = path.dirname(directory);
+  }
+  return undefined;
+}
+
 function isInsideNodeModules(candidate) {
   return candidate.split(path.sep).includes("node_modules");
 }
@@ -1520,7 +1542,16 @@ export async function resolve(specifier, context, nextResolve) {
     return nextResolve(specifier, context);
   }
   if (!parentPath) {
-    return nextResolve(specifier, context);
+    try {
+      return await nextResolve(specifier, context);
+    } catch (error) {
+      const packageSubpath = projectParentPath
+        && error?.code === "ERR_MODULE_NOT_FOUND"
+        ? packageSubpathResolution(specifier, projectParentPath)
+        : undefined;
+      if (packageSubpath) return packageSubpath;
+      throw error;
+    }
   }
 
   const packageName = requestedPackageName(specifier);
@@ -1581,6 +1612,30 @@ export async function resolve(specifier, context, nextResolve) {
   }
 }
 
+function projectJsonModule(url, context) {
+  if (!url.startsWith("file:")
+      || context.importAttributes?.type === "json"
+      || (!overlayRoot && !sourceRoot)) {
+    return undefined;
+  }
+  let filename;
+  try {
+    filename = realPathOrSelf(fileURLToPath(url));
+  } catch {
+    return undefined;
+  }
+  if (path.extname(filename) !== ".json"
+      || !(containsPath(overlayRoot, filename) || containsPath(sourceRoot, filename))) {
+    return undefined;
+  }
+  const value = JSON.parse(readFileSync(filename, "utf8"));
+  return {
+    format: "module",
+    source: `export default ${JSON.stringify(value)};\n`,
+    shortCircuit: true,
+  };
+}
+
 const dependencyReadRetryDelays = [10, 25, 50, 100];
 
 function isProjectDependencyURL(url) {
@@ -1597,7 +1652,8 @@ function isProjectDependencyURL(url) {
 export async function load(url, context, nextLoad) {
   for (let attempt = 0; ; attempt += 1) {
     try {
-      return await nextLoad(url, context);
+      const jsonModule = projectJsonModule(url, context);
+      return jsonModule || await nextLoad(url, context);
     } catch (error) {
       if (error?.code !== "EACCES"
           || !isProjectDependencyURL(url)
@@ -1937,6 +1993,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 const [vitestModule, typescriptModule, testFile, guard, instrumentation, ...extraFilters] = process.argv.slice(2);
+const workspaceRoot = process.env.COURT_JESTER_WORKSPACE_ROOT || "/workspace";
 if (!vitestModule || !typescriptModule || !testFile || !guard || !instrumentation) {
   throw new Error("court-jester portable Vitest coordinator requires runner, compiler, test, guard, and instrumentation paths");
 }
@@ -2019,7 +2076,20 @@ function workspacePackageMap(workspace) {
   }
   return packages;
 }
-const workspacePackages = workspacePackageMap("/workspace");
+const workspacePackages = workspacePackageMap(workspaceRoot);
+function mockedModulesInTest(filename) {
+  let source = "";
+  try {
+    source = fs.readFileSync(filename, "utf8");
+  } catch {
+    return new Set();
+  }
+  const modules = new Set();
+  const mockCall = /\b(?:vi\s*\.\s*)?mock\s*\(\s*(['"])([^'"]+)\1/g;
+  for (const match of source.matchAll(mockCall)) modules.add(match[2]);
+  return modules;
+}
+const mockedModules = mockedModulesInTest(testFile);
 function exportedDeclarationName(statement, exportedName) {
   if (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)
       || ts.isEnumDeclaration(statement)) {
@@ -2106,6 +2176,7 @@ function narrowWorkspaceImports(source, filename) {
       continue;
     }
     const packageRoot = workspacePackages.get(statement.moduleSpecifier.text);
+    if (mockedModules.has(statement.moduleSpecifier.text)) continue;
     if (!packageRoot) continue;
     const manifest = JSON.parse(
       fs.readFileSync(path.join(packageRoot, "package.json"), "utf8"),
@@ -2182,7 +2253,7 @@ const transform = {
     const filename = withoutQuery.startsWith("file:")
       ? fileURLToPath(withoutQuery)
       : withoutQuery;
-    if (!filename.startsWith("/workspace/")
+    if (!(filename === workspaceRoot || filename.startsWith(`${workspaceRoot}${path.sep}`))
         || filename.endsWith(".d.ts")
         || !/\.[cm]?[jt]sx?$/.test(filename)) {
       return null;
@@ -2203,7 +2274,7 @@ process.env.NODE_OPTIONS = process.env.NODE_OPTIONS
   ? `${preload} ${process.env.NODE_OPTIONS}`
   : preload;
 const normalizedTestFile = path.isAbsolute(testFile)
-  ? path.relative("/workspace", testFile)
+  ? path.relative(workspaceRoot, testFile)
   : testFile;
 const filters = [normalizedTestFile, ...extraFilters];
 const options = {
@@ -3908,14 +3979,19 @@ fn configure_docker_node_loader(
     command: &mut Vec<String>,
 ) -> Option<String> {
     match runtime {
-        crate::types::HarnessRuntime::NodeScript
-        | crate::types::HarnessRuntime::NodeTest
-        | crate::types::HarnessRuntime::Vitest => {
+        crate::types::HarnessRuntime::NodeScript | crate::types::HarnessRuntime::NodeTest => {
             command.splice(
                 1..1,
                 ["--experimental-loader".to_string(), loader.to_string()],
             );
             None
+        }
+        crate::types::HarnessRuntime::Vitest => {
+            command.splice(
+                1..1,
+                ["--experimental-loader".to_string(), loader.to_string()],
+            );
+            Some(format!("NODE_OPTIONS=--experimental-loader={loader}"))
         }
         crate::types::HarnessRuntime::TsxScript => {
             Some(format!("NODE_OPTIONS=--experimental-loader={loader}"))
@@ -4382,6 +4458,7 @@ async fn run_harness_in_docker(
             "--".to_string(),
             artifact,
         ],
+        crate::types::HarnessRuntime::Jazzer => vec!["jazzer".to_string(), artifact],
     };
     if limits.instrumented_source.is_some() {
         let preload_index = match harness.runtime {
@@ -4788,6 +4865,7 @@ pub async fn execute_harness(
         HarnessRuntime::Vitest => "vitest",
         HarnessRuntime::Jest => "jest",
         HarnessRuntime::RepoTest => "npm",
+        HarnessRuntime::Jazzer => "jazzer",
     };
     let mut executable = if limits.runtime_profile == RuntimeProfile::Isolated
         && harness.runtime != HarnessRuntime::Vitest
@@ -4831,6 +4909,7 @@ pub async fn execute_harness(
         HarnessRuntime::Vitest => args.extend(["run", "--reporter=json"].map(Into::into)),
         HarnessRuntime::Jest => args.extend(["--json"].map(Into::into)),
         HarnessRuntime::RepoTest => args.extend(["test", "--"].map(Into::into)),
+        HarnessRuntime::Jazzer => {}
     }
     let python_module = matches!(harness.runtime, HarnessRuntime::Python)
         .then(|| module_run_for_python_source(&host_artifact))
@@ -5289,6 +5368,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn combined_project_loaders_preserve_nested_json_without_import_attributes() {
+        let project = tempfile::tempdir().unwrap();
+        let overlay = project.path().join("overlay");
+        let entrypoint = overlay.join("packages/app/entry.mjs");
+        let nested_module = overlay.join("packages/config/index.mjs");
+        let data = overlay.join("packages/config/tenant.json");
+        let typescript = project.path().join("typescript.mjs");
+        for path in [&entrypoint, &nested_module, &data, &typescript] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        std::fs::write(
+            &entrypoint,
+            "import { marker } from '../config/index.mjs';\nconsole.log(marker);\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &nested_module,
+            "import tenant from './tenant.json';\nexport const marker = tenant.marker;\n",
+        )
+        .unwrap();
+        std::fs::write(&data, r#"{"marker":"nested-loader-json-ok"}"#).unwrap();
+        std::fs::write(
+            &typescript,
+            "export default { findConfigFile() {}, sys: {}, ModuleKind: {}, ScriptTarget: {}, ModuleResolutionKind: {}, ImportsNotUsedAsValues: {}, transpileModule(source) { return { outputText: source }; } };\n",
+        )
+        .unwrap();
+        let resolver = create_node_package_resolver(RuntimeProfile::LocalTrusted).unwrap();
+        let guard = create_network_guard(RuntimeProfile::LocalTrusted, None).unwrap();
+
+        let output = std::process::Command::new("node")
+            .arg("--no-warnings")
+            .arg("--experimental-loader")
+            .arg(&guard.typescript_loader)
+            .arg("--experimental-loader")
+            .arg(&resolver.loader)
+            .arg(&entrypoint)
+            .env("COURT_JESTER_TYPESCRIPT_MODULE", &typescript)
+            .env("COURT_JESTER_NODE_RESOLUTION_MODE", "generated")
+            .env("COURT_JESTER_NODE_OVERLAY_ROOT", &overlay)
+            .env("COURT_JESTER_NODE_SOURCE_ROOT", &overlay)
+            .env(
+                "COURT_JESTER_NODE_TARGET_ROOT",
+                overlay.join("packages/app"),
+            )
+            .env(
+                "COURT_JESTER_NODE_OVERLAY_TARGET_ROOT",
+                overlay.join("packages/app"),
+            )
+            .env("COURT_JESTER_NODE_GENERATED_ARTIFACT", &entrypoint)
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "nested-loader-json-ok"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn vitest_project_entrypoint_uses_manifest_ownership_for_npm_alias() {
@@ -5584,6 +5727,123 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    #[cfg(unix)]
+    #[test]
+    fn resolver_supports_extensionless_workspace_package_subpaths_from_dependencies() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let overlay = directory.path().join("overlay");
+        let ai_package = workspace.join("packages/ai-workflows");
+        let db_package = workspace.join("packages/db-entities");
+        let entrypoint = ai_package.join("src/entry.mjs");
+        let dependency = db_package.join("src/marketplace/AnonymousSearchSession.mjs");
+        let package_link = ai_package.join("node_modules/@fixture/db-entities");
+        std::fs::create_dir_all(entrypoint.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(dependency.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(package_link.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&overlay).unwrap();
+        std::fs::write(
+            &entrypoint,
+            "import { marker } from '@fixture/db-entities/src/marketplace/AnonymousSearchSession';\nconsole.log(marker);\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &dependency,
+            "export const marker = 'workspace-subpath-ok';\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&db_package, &package_link).unwrap();
+        let resolver = create_node_package_resolver(RuntimeProfile::LocalTrusted).unwrap();
+
+        let output = std::process::Command::new("node")
+            .arg("--no-warnings")
+            .arg("--experimental-loader")
+            .arg(&resolver.loader)
+            .arg(&entrypoint)
+            .env("COURT_JESTER_NODE_RESOLUTION_MODE", "generated")
+            .env("COURT_JESTER_NODE_OVERLAY_ROOT", &overlay)
+            .env("COURT_JESTER_NODE_SOURCE_ROOT", &workspace)
+            .env("COURT_JESTER_NODE_TARGET_ROOT", &ai_package)
+            .env("COURT_JESTER_NODE_OVERLAY_TARGET_ROOT", &overlay)
+            .env(
+                "COURT_JESTER_NODE_GENERATED_ARTIFACT",
+                overlay.join("generated.mjs"),
+            )
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "workspace-subpath-ok"
+        );
+    }
+
+    #[test]
+    fn resolver_preserves_package_exports_for_workspace_dependencies() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let overlay = directory.path().join("overlay");
+        let package = workspace.join("packages/provider");
+        let dependency = package.join("node_modules/eventsource-parser");
+        let entrypoint = package.join("src/entry.mjs");
+        std::fs::create_dir_all(entrypoint.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(dependency.join("dist")).unwrap();
+        std::fs::create_dir_all(&overlay).unwrap();
+        std::fs::write(
+            &entrypoint,
+            "import { marker } from 'eventsource-parser/stream';\nconsole.log(marker);\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dependency.join("package.json"),
+            r#"{"type":"module","exports":{"./stream":{"import":"./dist/stream.js"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dependency.join("stream.js"),
+            "export const marker = 'incorrect-compatibility-shim';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dependency.join("dist/stream.js"),
+            "export const marker = 'package-exports-ok';\n",
+        )
+        .unwrap();
+        let resolver = create_node_package_resolver(RuntimeProfile::LocalTrusted).unwrap();
+
+        let output = std::process::Command::new("node")
+            .arg("--no-warnings")
+            .arg("--experimental-loader")
+            .arg(&resolver.loader)
+            .arg(&entrypoint)
+            .env("COURT_JESTER_NODE_RESOLUTION_MODE", "generated")
+            .env("COURT_JESTER_NODE_OVERLAY_ROOT", &overlay)
+            .env("COURT_JESTER_NODE_SOURCE_ROOT", &workspace)
+            .env("COURT_JESTER_NODE_TARGET_ROOT", &package)
+            .env("COURT_JESTER_NODE_OVERLAY_TARGET_ROOT", &overlay)
+            .env(
+                "COURT_JESTER_NODE_GENERATED_ARTIFACT",
+                overlay.join("generated.mjs"),
+            )
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "package-exports-ok"
+        );
+    }
+
     #[test]
     fn node_dependency_loader_retries_transient_access_denial() {
         let directory = tempfile::tempdir().unwrap();
@@ -5911,6 +6171,150 @@ export async function startTests(files) {
         assert!(filtered_summary["testResults"][0]["message"]
             .as_str()
             .is_some_and(|message| message.contains("cannot preserve Vitest filters")));
+    }
+
+    #[test]
+    fn portable_vitest_preserves_mocked_workspace_package_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let package = workspace.join("packages/ai-workflows");
+        let vitest_root = directory.path().join("node_modules/vitest");
+        let vitest_module = vitest_root.join("dist/node.js");
+        let typescript_module = directory.path().join("typescript.mjs");
+        let test_file = workspace.join("target.test.ts");
+        let target_file = workspace.join("packages/app/target.ts");
+        std::fs::create_dir_all(package.join("src")).unwrap();
+        std::fs::create_dir_all(vitest_root.join("dist")).unwrap();
+        std::fs::create_dir_all(target_file.parent().unwrap()).unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            r#"{"name":"@fixture/ai-workflows","source":"src/index.ts"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("src/index.ts"),
+            "export function generateTypedObject() { return 'real'; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &test_file,
+            "vi.mock('@fixture/ai-workflows', async () => ({ generateTypedObject: vi.fn() }));\n",
+        )
+        .unwrap();
+        std::fs::write(vitest_root.join("package.json"), r#"{"type":"module"}"#).unwrap();
+        std::fs::write(
+            &vitest_module,
+            r#"
+export const version = "3.1.3";
+export async function startVitest(_kind, _filters, _options, overrides) {
+  const transform = overrides.plugins.find(
+    (plugin) => plugin.name === "court-jester-typescript-transform",
+  );
+  const source = "import { generateTypedObject } from '@fixture/ai-workflows';\n";
+  const result = transform.transform(source, process.env.COURT_JESTER_TEST_TARGET);
+  if (!result.code.includes("@fixture/ai-workflows")) {
+    throw new Error(`mocked package identity was rewritten: ${result.code}`);
+  }
+  process.stdout.write(JSON.stringify({
+    numTotalTestSuites: 1,
+    numPassedTestSuites: 1,
+    numFailedTestSuites: 0,
+    numTotalTests: 1,
+    numPassedTests: 1,
+    numFailedTests: 0,
+    success: true,
+    testResults: [],
+  }) + "\n");
+  return true;
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &typescript_module,
+            r#"
+const ExportKeyword = 1;
+function importStatement(source) {
+  const moduleName = source.match(/from\s+['"]([^'"]+)['"]/)[1];
+  const importedName = source.match(/import\s*\{\s*([A-Za-z0-9_]+)/)[1];
+  return {
+    kind: "import",
+    moduleSpecifier: { kind: "string", text: moduleName },
+    importClause: {
+      isTypeOnly: false,
+      namedBindings: {
+        kind: "named-imports",
+        elements: [{
+          isTypeOnly: false,
+          name: { text: importedName },
+          propertyName: null,
+        }],
+      },
+    },
+    getStart() { return 0; },
+    end: source.length,
+  };
+}
+export default {
+  findConfigFile() { return undefined; },
+  sys: { fileExists() { return false; }, readFile() { return ""; } },
+  ModuleKind: { ESNext: 99 },
+  ScriptTarget: { Latest: 99, ES2022: 99 },
+  ScriptKind: { TS: 1, TSX: 2 },
+  ModuleResolutionKind: { Bundler: 99 },
+  ImportsNotUsedAsValues: { Remove: 0 },
+  SyntaxKind: { ExportKeyword },
+  createSourceFile(_filename, source) {
+    if (source.startsWith("import")) return { statements: [importStatement(source)] };
+    if (source.includes("export function generateTypedObject")) {
+      return {
+        statements: [{
+          kind: "function",
+          name: { text: "generateTypedObject" },
+          modifiers: [{ kind: ExportKeyword }],
+        }],
+      };
+    }
+    return { statements: [] };
+  },
+  isImportDeclaration(node) { return node.kind === "import"; },
+  isStringLiteral(node) { return node.kind === "string"; },
+  isNamedImports(node) { return node.kind === "named-imports"; },
+  isFunctionDeclaration(node) { return node.kind === "function"; },
+  isClassDeclaration() { return false; },
+  isEnumDeclaration() { return false; },
+  isVariableStatement() { return false; },
+  isExportDeclaration() { return false; },
+  transpileModule(source) { return { outputText: source }; },
+};
+"#,
+        )
+        .unwrap();
+        let guard = create_network_guard(RuntimeProfile::LocalTrusted, None).unwrap();
+
+        let output = std::process::Command::new("node")
+            .arg(&guard.portable_vitest_coordinator)
+            .arg(&vitest_module)
+            .arg(&typescript_module)
+            .arg(&test_file)
+            .arg(&guard.node_preload)
+            .arg(&guard.instrumentation_preload)
+            .env("COURT_JESTER_WORKSPACE_ROOT", &workspace)
+            .env("COURT_JESTER_TEST_TARGET", &target_file)
+            .current_dir(&workspace)
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let summary: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("portable runner JSON summary");
+        assert_eq!(summary["success"], true);
+        assert_eq!(summary["numPassedTests"], 1);
     }
 
     #[test]
@@ -6243,7 +6647,10 @@ export default {
             &mut command,
         );
 
-        assert_eq!(environment, None);
+        assert_eq!(
+            environment.as_deref(),
+            Some("NODE_OPTIONS=--experimental-loader=/court-jester/package-resolver.mjs")
+        );
         assert_eq!(
             command,
             vec![

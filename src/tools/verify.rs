@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
 use tree_sitter::Parser;
 
 use crate::tools::{analyze, diff, domain, lint, sandbox, synthesize};
@@ -110,6 +111,28 @@ fn test_timeout() -> f64 {
         "COURT_JESTER_VERIFY_TEST_TIMEOUT_SECONDS",
         DEFAULT_TEST_TIMEOUT,
     )
+}
+
+const DEFAULT_NATIVE_FUZZ_RUNS: usize = 1_000;
+
+#[derive(Debug, Clone, Copy)]
+struct NativeFuzzConfig {
+    engine: NativeFuzzEngine,
+    runs: usize,
+}
+
+fn native_fuzz_config() -> NativeFuzzConfig {
+    let engine = std::env::var("COURT_JESTER_NATIVE_FUZZ_ENGINE")
+        .ok()
+        .as_deref()
+        .and_then(NativeFuzzEngine::parse)
+        .unwrap_or_default();
+    let runs = std::env::var("COURT_JESTER_NATIVE_FUZZ_RUNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|runs| (1..=1_000_000).contains(runs))
+        .unwrap_or(DEFAULT_NATIVE_FUZZ_RUNS);
+    NativeFuzzConfig { engine, runs }
 }
 
 fn test_code_has_imports(code: &str, language: &Language) -> bool {
@@ -1566,6 +1589,27 @@ fn generated_typescript_target_import(
         );
     }
     Some(prelude)
+}
+
+fn generated_verifier_source(
+    context: &ExecutionContext,
+    code: &str,
+    language: &Language,
+    functions: &[FunctionInfo],
+    classes: &[ClassInfo],
+    coverage: &[FuzzFunctionCoverage],
+    verifier: &str,
+) -> String {
+    let mut full_code = match language {
+        Language::TypeScript => {
+            generated_typescript_target_import(context, functions, classes, coverage)
+                .unwrap_or_else(|| generated_target_source(code, language))
+        }
+        Language::Python => generated_target_source(code, language),
+    };
+    full_code.push('\n');
+    full_code.push_str(verifier);
+    full_code
 }
 
 fn differential_probe(
@@ -4082,6 +4126,250 @@ async fn execute_generated_harness<'a>(
     )
     .await
 }
+#[derive(Debug, Deserialize)]
+struct LlmPlateauResponse {
+    seeds: Vec<LlmSeedProposal>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmSeedProposal {
+    function: String,
+    arguments: Vec<serde_json::Value>,
+}
+
+struct LlmPlateauOutcome {
+    corpus: PersistentCorpus,
+    proposed_count: usize,
+    invalid_count: usize,
+    stderr: String,
+    duration_ms: u64,
+}
+
+fn llm_plateau_command() -> Option<String> {
+    std::env::var("COURT_JESTER_LLM_PLATEAU_COMMAND")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+async fn propose_llm_plateau_seeds(
+    command: &str,
+    language: &Language,
+    functions: &[FunctionInfo],
+    corpus: &PersistentCorpus,
+    project_dir: Option<&str>,
+) -> Result<LlmPlateauOutcome, String> {
+    let started = Instant::now();
+    let prompt = serde_json::json!({
+        "protocol_version": 1,
+        "task": "Propose high-value argument lists that may reach behavior not represented in the retained corpus. Return JSON only.",
+        "language": match language {
+            Language::Python => "python",
+            Language::TypeScript => "typescript",
+        },
+        "constraints": {
+            "maximum_seeds": 32,
+            "response_schema": {
+                "seeds": [{
+                    "function": "exact exported function name",
+                    "arguments": ["JSON value for each positional argument"]
+                }]
+            }
+        },
+        "targets": functions.iter().map(|function| serde_json::json!({
+            "function": function.name,
+            "line": function.line,
+            "parameters": function.params.iter().map(|parameter| serde_json::json!({
+                "name": parameter.name,
+                "type": parameter.type_annotation,
+                "optional": parameter.optional,
+                "keyword_only": parameter.keyword_only,
+                "variadic": parameter.variadic.is_some(),
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "retained_corpus": corpus,
+    });
+    let prompt = serde_json::to_vec(&prompt)
+        .map_err(|error| format!("failed to serialize LLM plateau prompt: {error}"))?;
+    let mut process = tokio::process::Command::new(command);
+    process
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .env("COURT_JESTER_LLM_PROTOCOL", "plateau-seeds-v1");
+    if let Some(project_dir) = project_dir {
+        process.current_dir(project_dir);
+    }
+    let mut child = process
+        .spawn()
+        .map_err(|error| format!("failed to launch LLM plateau command `{command}`: {error}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "LLM plateau command stdin was unavailable".to_string())?;
+    stdin
+        .write_all(&prompt)
+        .await
+        .map_err(|error| format!("failed to write LLM plateau prompt: {error}"))?;
+    drop(stdin);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(20), child.wait_with_output())
+        .await
+        .map_err(|_| "LLM plateau command timed out after 20 seconds".to_string())?
+        .map_err(|error| format!("LLM plateau command failed: {error}"))?;
+    if output.stdout.len() > 1_048_576 || output.stderr.len() > 1_048_576 {
+        return Err("LLM plateau command output exceeded 1 MiB".into());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !output.status.success() {
+        return Err(format!(
+            "LLM plateau command exited with {}{}",
+            output
+                .status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "a signal".into()),
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            }
+        ));
+    }
+    let response: LlmPlateauResponse = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("LLM plateau command returned invalid JSON: {error}"))?;
+    let proposed_count = response.seeds.len();
+    let mut invalid_count = proposed_count.saturating_sub(32);
+    let mut proposed_corpus = PersistentCorpus::new();
+    for proposal in response.seeds.into_iter().take(32) {
+        let Some(function) = functions
+            .iter()
+            .find(|function| function.name == proposal.function)
+        else {
+            invalid_count += 1;
+            continue;
+        };
+        let required = function
+            .params
+            .iter()
+            .filter(|parameter| {
+                !parameter.optional
+                    && parameter.default_value.is_none()
+                    && parameter.variadic.is_none()
+            })
+            .count();
+        let has_variadic = function
+            .params
+            .iter()
+            .any(|parameter| parameter.variadic.is_some());
+        let positional_limit = function
+            .params
+            .iter()
+            .filter(|parameter| !parameter.keyword_only && parameter.variadic.is_none())
+            .count();
+        let has_required_keyword_only = function.params.iter().any(|parameter| {
+            parameter.keyword_only && !parameter.optional && parameter.default_value.is_none()
+        });
+        if has_required_keyword_only
+            || proposal.arguments.len() < required
+            || (!has_variadic && proposal.arguments.len() > positional_limit)
+            || serde_json::to_vec(&proposal.arguments)
+                .map(|bytes| bytes.len() > 65_536)
+                .unwrap_or(true)
+        {
+            invalid_count += 1;
+            continue;
+        }
+        let surface_id = format!("{}:{}", function.name, function.line);
+        let rows = proposed_corpus.entry(surface_id).or_default();
+        if !rows.contains(&proposal.arguments) {
+            rows.push(proposal.arguments);
+        }
+    }
+    Ok(LlmPlateauOutcome {
+        corpus: proposed_corpus,
+        proposed_count,
+        invalid_count,
+        stderr,
+        duration_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_native_fuzz_harness<'a>(
+    context: &ExecutionContext,
+    code: String,
+    plan: &synthesize::NativeFuzzPlan,
+    runs: usize,
+    opts: &VerifyOptions<'a>,
+    language: &Language,
+    timeout_seconds: f64,
+    project_dir: Option<&'a str>,
+    source_file: Option<&'a str>,
+) -> HarnessExecution {
+    let source_mode = context.target_source.mode;
+    let (runtime, extension, args) = match plan.engine {
+        NativeFuzzEngine::Atheris => (
+            HarnessRuntime::Python,
+            "py",
+            vec![HarnessArg::Literal {
+                literal: format!("-atheris_runs={runs}"),
+            }],
+        ),
+        NativeFuzzEngine::Jazzer => (
+            HarnessRuntime::Jazzer,
+            match source_mode {
+                SourceMode::Tsx => "tsx",
+                _ => "ts",
+            },
+            vec![
+                HarnessArg::Literal {
+                    literal: "--".into(),
+                },
+                HarnessArg::Literal {
+                    literal: format!("-runs={runs}"),
+                },
+            ],
+        ),
+        NativeFuzzEngine::Off | NativeFuzzEngine::Auto => {
+            unreachable!("native fuzz synthesis resolves auto to a concrete engine")
+        }
+    };
+    let relative_path = context
+        .target_source
+        .source_file
+        .as_deref()
+        .and_then(|source| source.strip_prefix(&context.workspace_root).ok())
+        .and_then(Path::parent)
+        .map(|parent| parent.join(format!(".court-jester-native-fuzz.{extension}")))
+        .unwrap_or_else(|| {
+            PathBuf::from(format!(".court-jester/generated/native-fuzz.{extension}"))
+        });
+    sandbox::execute_harness(
+        context,
+        HarnessSpec {
+            kind: HarnessKind::Standalone,
+            runtime,
+            test_adapter: None,
+            source_mode,
+            artifact: HarnessArtifact::Generated {
+                code,
+                relative_path,
+            },
+            args,
+            network: opts.network,
+        },
+        sandbox_options(
+            opts,
+            language,
+            timeout_seconds,
+            opts.memory_mb,
+            project_dir,
+            source_file,
+        ),
+    )
+    .await
+}
 
 fn authoritative_harness_runtime(
     language: Language,
@@ -4683,7 +4971,7 @@ pub async fn verify(
                 });
             }
         }
-        let verification_plan = domain::build_verification_plan(
+        let mut verification_plan = domain::build_verification_plan(
             &functions_to_fuzz,
             &all_classes,
             &all_aliases,
@@ -4692,6 +4980,23 @@ pub async fn verify(
             &fixture_examples,
             &inferred_properties,
         );
+        let corpus_path = persistent_corpus_path(
+            opts.output_dir,
+            candidate_source_file_owned.as_deref(),
+            language,
+        );
+        let persistent_corpus = corpus_path
+            .as_deref()
+            .map(read_persistent_corpus)
+            .unwrap_or_default();
+        let corpus_loaded_count = persistent_corpus.values().map(Vec::len).sum::<usize>();
+        verification_plan.inputs.extend(corpus_inputs(
+            &persistent_corpus,
+            &functions_to_fuzz,
+            language,
+            candidate_source_file_owned.as_deref(),
+        ));
+        let mut corpus_retained_count = corpus_loaded_count;
         let seed_input_count = verification_plan
             .inputs
             .iter()
@@ -4781,6 +5086,8 @@ pub async fn verify(
                     "inferred_context_properties": inferred_context_properties,
                     "auto_seed": opts.auto_seed,
                     "verification_plan": &verification_plan,
+                    "corpus_loaded": corpus_loaded_count,
+                    "corpus_retained": corpus_retained_count,
                 })),
                 message: Some(
                     "generated execution deferred to the Nuxt project test runner".into(),
@@ -4791,18 +5098,15 @@ pub async fn verify(
                 "Generated execution skipped because the Nuxt project runner owns this surface",
             ));
         } else if !fuzz_plan.code.is_empty() {
-            let mut full_code = match language {
-                Language::TypeScript => generated_typescript_target_import(
-                    &verification_context.candidate,
-                    &functions_to_fuzz,
-                    &analysis.classes,
-                    &fuzz_plan.coverage,
-                )
-                .unwrap_or_else(|| generated_target_source(code, language)),
-                Language::Python => generated_target_source(code, language),
-            };
-            full_code.push('\n');
-            full_code.push_str(&fuzz_plan.code);
+            let full_code = generated_verifier_source(
+                &verification_context.candidate,
+                code,
+                language,
+                &functions_to_fuzz,
+                &analysis.classes,
+                &fuzz_plan.coverage,
+                &fuzz_plan.code,
+            );
             let execute_timeout = execute_timeout_for(language);
 
             let start = Instant::now();
@@ -4823,6 +5127,8 @@ pub async fn verify(
             let mut harness_diagnostics = harness_execution.diagnostics;
             let mut exec_result = harness_execution.process;
             let mut generated_failures = parse_findings(&exec_result.stdout).unwrap_or_default();
+            let mut corpus_update = parse_corpus(&exec_result.stdout);
+            corpus_retained_count = persist_corpus(corpus_path.as_deref(), &corpus_update);
             let nuxt_runtime_blocker = take_nuxt_runtime_failures(
                 &verification_context.candidate,
                 &mut generated_failures,
@@ -4919,6 +5225,9 @@ pub async fn verify(
                     "inferred_context_properties": inferred_context_properties,
                     "auto_seed": opts.auto_seed,
                     "verification_plan": &verification_plan,
+                    "corpus_loaded": corpus_loaded_count,
+                    "corpus_retained": corpus_retained_count,
+                    "corpus_novel": corpus_retained_count.saturating_sub(corpus_loaded_count),
                 })),
                 message: None,
             });
@@ -5121,8 +5430,303 @@ pub async fn verify(
                 });
             }
 
+            if let Some(command) = llm_plateau_command() {
+                let plateaued = corpus_loaded_count > 0
+                    && corpus_retained_count <= corpus_loaded_count
+                    && generated_failures.is_empty();
+                if !plateaued {
+                    stages.push(VerificationStage {
+                        name: "llm_plateau_escape".into(),
+                        status: StageStatus::Skipped,
+                        duration_ms: 0,
+                        detail: Some(serde_json::json!({
+                            "reason": if corpus_loaded_count == 0 {
+                                "insufficient_corpus_history"
+                            } else if !generated_failures.is_empty() {
+                                "behavioral_failure_already_found"
+                            } else {
+                                "corpus_progressing"
+                            },
+                            "corpus_loaded": corpus_loaded_count,
+                            "corpus_retained": corpus_retained_count,
+                        })),
+                        message: None,
+                    });
+                } else {
+                    match propose_llm_plateau_seeds(
+                        &command,
+                        language,
+                        &functions_to_fuzz,
+                        &persistent_corpus,
+                        Some(candidate_project_dir_owned.as_str()),
+                    )
+                    .await
+                    {
+                        Err(error) => stages.push(VerificationStage {
+                            name: "llm_plateau_escape".into(),
+                            status: StageStatus::Advisory,
+                            duration_ms: 0,
+                            detail: Some(serde_json::json!({
+                                "reason": "proposal_command_failed",
+                                "error": error,
+                            })),
+                            message: Some(
+                                "LLM plateau escape was requested but did not produce usable seeds"
+                                    .into(),
+                            ),
+                        }),
+                        Ok(mut proposal) => {
+                            for (surface_id, retained_rows) in &persistent_corpus {
+                                if let Some(rows) = proposal.corpus.get_mut(surface_id) {
+                                    rows.retain(|row| !retained_rows.contains(row));
+                                }
+                            }
+                            proposal.corpus.retain(|_, rows| !rows.is_empty());
+                            if proposal.corpus.is_empty() {
+                                stages.push(VerificationStage {
+                                    name: "llm_plateau_escape".into(),
+                                    status: StageStatus::Advisory,
+                                    duration_ms: proposal.duration_ms,
+                                    detail: Some(serde_json::json!({
+                                        "reason": "no_novel_valid_seeds",
+                                        "proposed": proposal.proposed_count,
+                                        "invalid": proposal.invalid_count,
+                                        "stderr": proposal.stderr,
+                                    })),
+                                    message: Some(
+                                        "LLM plateau escape produced no novel valid seed".into(),
+                                    ),
+                                });
+                            } else {
+                                let accepted_count =
+                                    proposal.corpus.values().map(Vec::len).sum::<usize>();
+                                let mut plateau_plan = verification_plan.clone();
+                                let mut plateau_inputs = corpus_inputs(
+                                    &proposal.corpus,
+                                    &functions_to_fuzz,
+                                    language,
+                                    candidate_source_file_owned.as_deref(),
+                                );
+                                plateau_inputs.append(&mut plateau_plan.inputs);
+                                plateau_plan.inputs = plateau_inputs;
+                                let plateau_fuzz_plan =
+                                    synthesize::synthesize_plan_for_verification(
+                                        &functions_to_fuzz,
+                                        &all_classes,
+                                        &all_aliases,
+                                        language,
+                                        &plateau_plan,
+                                    );
+                                let plateau_code = generated_verifier_source(
+                                    &verification_context.candidate,
+                                    code,
+                                    language,
+                                    &functions_to_fuzz,
+                                    &all_classes,
+                                    &plateau_fuzz_plan.coverage,
+                                    &plateau_fuzz_plan.code,
+                                );
+                                let plateau_execution = execute_generated_harness(
+                                    &verification_context.candidate,
+                                    plateau_code,
+                                    HarnessKind::GeneratedVerifier,
+                                    &opts,
+                                    language,
+                                    execute_timeout,
+                                    Some(candidate_project_dir_owned.as_str()),
+                                    candidate_source_file_owned.as_deref(),
+                                )
+                                .await;
+                                let plateau_process = plateau_execution.process;
+                                let plateau_findings =
+                                    parse_findings(&plateau_process.stdout).unwrap_or_default();
+                                let plateau_corpus = parse_corpus(&plateau_process.stdout);
+                                for (surface_id, rows) in proposal
+                                    .corpus
+                                    .into_iter()
+                                    .chain(plateau_corpus.into_iter())
+                                {
+                                    let retained = corpus_update.entry(surface_id).or_default();
+                                    for row in rows {
+                                        if !retained.contains(&row) {
+                                            retained.push(row);
+                                        }
+                                    }
+                                }
+                                corpus_retained_count =
+                                    persist_corpus(corpus_path.as_deref(), &corpus_update);
+                                let execution_ok = plateau_process.exit_code == Some(0)
+                                    && !plateau_process.timed_out
+                                    && !plateau_process.memory_error;
+                                let status = if !plateau_findings.is_empty() {
+                                    StageStatus::Failed
+                                } else if execution_ok {
+                                    StageStatus::Passed
+                                } else {
+                                    StageStatus::Advisory
+                                };
+                                let finding_count = plateau_findings.len();
+                                generated_failures.extend(plateau_findings);
+                                stages.push(VerificationStage {
+                                    name: "llm_plateau_escape".into(),
+                                    status,
+                                    duration_ms: proposal.duration_ms + plateau_process.duration_ms,
+                                    detail: Some(serde_json::json!({
+                                        "proposed": proposal.proposed_count,
+                                        "accepted": accepted_count,
+                                        "invalid": proposal.invalid_count,
+                                        "finding_count": finding_count,
+                                        "corpus_retained": corpus_retained_count,
+                                        "stderr": proposal.stderr,
+                                        "execution": plateau_process,
+                                    })),
+                                    message: (!execution_ok && finding_count == 0).then(|| {
+                                        "LLM-proposed seeds could not be executed authoritatively"
+                                            .into()
+                                    }),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            let native_config = native_fuzz_config();
+            let mut native_findings = Vec::new();
+            if native_config.engine != NativeFuzzEngine::Off {
+                let selected_refs = functions_to_fuzz.iter().collect::<Vec<_>>();
+                if let Some(native_plan) = synthesize::synthesize_native_fuzz(
+                    language,
+                    &selected_refs,
+                    native_config.engine,
+                ) {
+                    if opts.runtime_profile == RuntimeProfile::Isolated {
+                        stages.push(VerificationStage {
+                            name: "native_fuzz".into(),
+                            status: StageStatus::Inconclusive,
+                            duration_ms: 0,
+                            detail: Some(serde_json::json!({
+                                "engine": native_plan.engine,
+                                "runs": native_config.runs,
+                                "target_count": native_plan.target_count,
+                                "reason": "native_engine_requires_local_trusted_profile",
+                            })),
+                            message: Some(
+                                "Optional native fuzz engines require the local-trusted runtime profile"
+                                    .into(),
+                            ),
+                        });
+                    } else {
+                        let mut native_code = match language {
+                            Language::TypeScript => generated_typescript_target_import(
+                                &verification_context.candidate,
+                                &functions_to_fuzz,
+                                &analysis.classes,
+                                &fuzz_plan.coverage,
+                            )
+                            .unwrap_or_else(|| generated_target_source(code, language)),
+                            Language::Python => generated_target_source(code, language),
+                        };
+                        native_code.push('\n');
+                        native_code.push_str(&native_plan.code);
+                        let native_start = Instant::now();
+                        let native_execution = execute_native_fuzz_harness(
+                            &verification_context.candidate,
+                            native_code,
+                            &native_plan,
+                            native_config.runs,
+                            &opts,
+                            language,
+                            execute_timeout.max(30.0),
+                            Some(candidate_project_dir_owned.as_str()),
+                            candidate_source_file_owned.as_deref(),
+                        )
+                        .await;
+                        let native_ms = native_start.elapsed().as_millis() as u64;
+                        let native_output = format!(
+                            "{}\n{}",
+                            native_execution.process.stdout, native_execution.process.stderr
+                        );
+                        native_findings = parse_native_findings(&native_output);
+                        let unavailable = native_engine_unavailable(&native_output);
+                        let succeeded = native_execution.process.exit_code == Some(0)
+                            && !native_execution.process.timed_out
+                            && !native_execution.process.memory_error;
+                        let (status, message) = if unavailable
+                            && native_config.engine == NativeFuzzEngine::Auto
+                        {
+                            (
+                                StageStatus::Skipped,
+                                Some("No compatible native fuzz engine is installed".into()),
+                            )
+                        } else if unavailable {
+                            (
+                                StageStatus::Inconclusive,
+                                Some(format!(
+                                    "Requested native fuzz engine {:?} is unavailable",
+                                    native_plan.engine
+                                )),
+                            )
+                        } else if !native_findings.is_empty() {
+                            (
+                                StageStatus::Failed,
+                                Some(format!(
+                                    "{} found {} crashing input(s)",
+                                    match native_plan.engine {
+                                        NativeFuzzEngine::Atheris => "Atheris",
+                                        NativeFuzzEngine::Jazzer => "Jazzer.js",
+                                        NativeFuzzEngine::Off | NativeFuzzEngine::Auto => {
+                                            "Native engine"
+                                        }
+                                    },
+                                    native_findings.len()
+                                )),
+                            )
+                        } else if succeeded {
+                            (StageStatus::Passed, None)
+                        } else {
+                            (
+                                StageStatus::Inconclusive,
+                                Some(
+                                    "Native fuzz engine exited without a replayable finding".into(),
+                                ),
+                            )
+                        };
+                        stages.push(VerificationStage {
+                            name: "native_fuzz".into(),
+                            status,
+                            duration_ms: native_ms,
+                            detail: Some(serde_json::json!({
+                                "engine": native_plan.engine,
+                                "runs": native_config.runs,
+                                "target_count": native_plan.target_count,
+                                "execution": native_execution.process,
+                                "native_findings": &native_findings,
+                                "diagnostics": native_execution.diagnostics,
+                            })),
+                            message,
+                        });
+                    }
+                } else {
+                    stages.push(VerificationStage {
+                        name: "native_fuzz".into(),
+                        status: StageStatus::Skipped,
+                        duration_ms: 0,
+                        detail: Some(serde_json::json!({
+                            "engine": native_config.engine,
+                            "runs": native_config.runs,
+                            "reason": "no_supported_native_targets",
+                        })),
+                        message: Some(
+                            "No selected function has a native-engine-compatible signature".into(),
+                        ),
+                    });
+                }
+            }
+
             let mut failures = generated_failures;
             failures.extend(differential_findings);
+            failures.extend(native_findings);
             for finding in &mut failures {
                 finding.launch_context = Some(launch_context.clone());
             }
@@ -5915,6 +6519,24 @@ fn detail_has_non_target_blocker(detail: Option<&serde_json::Value>) -> bool {
     has_blocker(detail) || detail.get("execution").is_some_and(has_blocker)
 }
 
+fn detail_has_target_finding(detail: Option<&serde_json::Value>) -> bool {
+    let Some(detail) = detail else {
+        return false;
+    };
+    detail
+        .get("findings")
+        .and_then(|value| value.as_array())
+        .is_some_and(|findings| !findings.is_empty())
+        || detail
+            .get("suppressed_findings")
+            .and_then(|value| value.as_array())
+            .is_some_and(|findings| !findings.is_empty())
+        || detail
+            .get("finding_count")
+            .and_then(|value| value.as_u64())
+            .is_some_and(|count| count > 0)
+}
+
 fn diagnostic_from_stage(
     stage: &VerificationStage,
     coverage_gate: CoverageGate,
@@ -6040,6 +6662,21 @@ fn diagnostic_from_stage(
             DiagnosticComponent::DifferentialRunner,
             DiagnosticImpact::Advisory,
         )),
+        "llm_plateau_escape" => Some(if detail_has_target_finding(detail) {
+            simple(
+                FailureDomain::TargetCode,
+                FailureKind::TargetException,
+                DiagnosticComponent::Target,
+                DiagnosticImpact::Gating,
+            )
+        } else {
+            simple(
+                FailureDomain::Environment,
+                FailureKind::ToolFailure,
+                DiagnosticComponent::Sandbox,
+                DiagnosticImpact::Blocking,
+            )
+        }),
         "execute" | "test" => {
             let is_test = stage.name == "test";
             let non_target_blocked = detail_has_non_target_blocker(detail);
@@ -6051,14 +6688,7 @@ fn diagnostic_from_stage(
                         .and_then(|value| value.get("assertion_failure"))
                         .and_then(|value| value.as_bool())
                         == Some(true));
-            let has_target_finding = detail
-                .and_then(|value| value.get("findings"))
-                .and_then(|value| value.as_array())
-                .is_some_and(|findings| !findings.is_empty())
-                || detail
-                    .and_then(|value| value.get("suppressed_findings"))
-                    .and_then(|value| value.as_array())
-                    .is_some_and(|findings| !findings.is_empty());
+            let has_target_finding = detail_has_target_finding(detail);
             let execution = detail.and_then(|value| value.get("execution")).or(detail);
             let module_load_blocked = detail
                 .and_then(|value| value.get("module_load_blocked"))
@@ -6183,14 +6813,7 @@ fn diagnostics_from_stage_detail(detail: Option<&serde_json::Value>) -> Vec<Fail
     let Some(detail) = detail else {
         return diagnostics;
     };
-    let target_cause = detail
-        .get("findings")
-        .and_then(|value| value.as_array())
-        .is_some_and(|findings| !findings.is_empty())
-        || detail
-            .get("suppressed_findings")
-            .and_then(|value| value.as_array())
-            .is_some_and(|findings| !findings.is_empty())
+    let target_cause = detail_has_target_finding(Some(detail))
         || detail
             .get("assertion_failure")
             .and_then(|value| value.as_bool())
@@ -6224,14 +6847,7 @@ fn diagnostics_from_stage_detail(detail: Option<&serde_json::Value>) -> Vec<Fail
         {
             for value in values {
                 if let Ok(diagnostic) = serde_json::from_value::<FailureDiagnostic>(value.clone()) {
-                    let target_cause = detail
-                        .get("findings")
-                        .and_then(|value| value.as_array())
-                        .is_some_and(|findings| !findings.is_empty())
-                        || detail
-                            .get("suppressed_findings")
-                            .and_then(|value| value.as_array())
-                            .is_some_and(|findings| !findings.is_empty())
+                    let target_cause = detail_has_target_finding(Some(detail))
                         || detail
                             .get("assertion_failure")
                             .and_then(|value| value.as_bool())
@@ -6288,18 +6904,7 @@ fn annotate_stage_diagnostics(stages: &mut [VerificationStage], coverage_gate: C
                             .and_then(|value| value.get("assertion_failure"))
                             .and_then(|value| value.as_bool())
                             == Some(true));
-                    let has_target_finding = stage
-                        .detail
-                        .as_ref()
-                        .and_then(|value| value.get("findings"))
-                        .and_then(|value| value.as_array())
-                        .is_some_and(|findings| !findings.is_empty())
-                        || stage
-                            .detail
-                            .as_ref()
-                            .and_then(|value| value.get("suppressed_findings"))
-                            .and_then(|value| value.as_array())
-                            .is_some_and(|findings| !findings.is_empty());
+                    let has_target_finding = detail_has_target_finding(stage.detail.as_ref());
                     let module_load_blocked = stage
                         .detail
                         .as_ref()
@@ -7181,6 +7786,221 @@ fn write_report(
 ///
 /// Prefer the bounded event stream: the trailing aggregate can be truncated
 /// when a target produces many detailed failures, while each event remains an
+type PersistentCorpus = BTreeMap<String, Vec<Vec<serde_json::Value>>>;
+
+const CORPUS_MARKER: &str = "__COURT_JESTER_CORPUS_JSON__";
+
+fn stable_corpus_key(source_file: Option<&str>, language: &Language) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in format!("{language:?}:{}", source_file.unwrap_or("<inline>")).bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn persistent_corpus_path(
+    output_dir: Option<&str>,
+    source_file: Option<&str>,
+    language: &Language,
+) -> Option<PathBuf> {
+    output_dir.map(|directory| {
+        Path::new(directory).join(format!(
+            ".court-jester-corpus-{}.json",
+            stable_corpus_key(source_file, language)
+        ))
+    })
+}
+
+fn read_persistent_corpus(path: &Path) -> PersistentCorpus {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+        .unwrap_or_default()
+}
+
+fn parse_corpus(stdout: &str) -> PersistentCorpus {
+    stdout
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix(CORPUS_MARKER))
+        .and_then(|payload| serde_json::from_str(payload).ok())
+        .unwrap_or_default()
+}
+
+fn corpus_inputs(
+    corpus: &PersistentCorpus,
+    functions: &[FunctionInfo],
+    language: &Language,
+    source_file: Option<&str>,
+) -> Vec<PlannedInput> {
+    let mut inputs = Vec::new();
+    for function in functions.iter().filter(|function| !function.is_nested) {
+        let surface_id = format!("{}:{}", function.name, function.line);
+        let Some(rows) = corpus.get(&surface_id) else {
+            continue;
+        };
+        let params = function
+            .params
+            .iter()
+            .filter(|param| !param.is_variadic())
+            .collect::<Vec<_>>();
+        for row in rows.iter().take(64) {
+            if row.len() != params.len() {
+                continue;
+            }
+            let mut positional = Vec::new();
+            let mut named = BTreeMap::new();
+            for (param, value) in params.iter().zip(row) {
+                let literal = domain::literal_from_json_value(value.clone(), language);
+                if matches!(language, Language::Python) && param.keyword_only {
+                    named.insert(param.name.clone(), literal);
+                } else {
+                    positional.push(literal);
+                }
+            }
+            inputs.push(PlannedInput {
+                surface_id: surface_id.clone(),
+                arguments: PlannedArguments { positional, named },
+                classification: InputClassification::Unknown,
+                sources: vec![DomainSource {
+                    kind: DomainSourceKind::CoverageCorpus,
+                    symbol: Some(function.name.clone()),
+                    source_file: source_file.map(str::to_string),
+                    line: None,
+                }],
+            });
+        }
+    }
+    inputs
+}
+
+fn persist_corpus(path: Option<&Path>, update: &PersistentCorpus) -> usize {
+    let Some(path) = path else {
+        return update.values().map(Vec::len).sum();
+    };
+    let mut corpus = read_persistent_corpus(path);
+    for (surface, rows) in update {
+        let retained = corpus.entry(surface.clone()).or_default();
+        for row in rows {
+            let duplicate = retained.iter().any(|existing| existing == row);
+            if !duplicate && retained.len() < 64 {
+                retained.push(row.clone());
+            }
+        }
+    }
+    let retained_count = corpus.values().map(Vec::len).sum();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(content) = serde_json::to_vec_pretty(&corpus) {
+        let temporary = path.with_extension("json.tmp");
+        if std::fs::write(&temporary, content).is_ok() {
+            let _ = std::fs::rename(temporary, path);
+        }
+    }
+    retained_count
+}
+
+const NATIVE_FINDING_MARKER: &str = "__COURT_JESTER_NATIVE_FINDING__";
+
+#[derive(Debug, Deserialize)]
+struct NativeFindingRecord {
+    function: String,
+    line: usize,
+    #[serde(default)]
+    arguments: Vec<serde_json::Value>,
+    input: String,
+    #[serde(default)]
+    error_type: Option<String>,
+    message: String,
+}
+
+fn parse_native_findings(output: &str) -> Vec<VerificationFinding> {
+    output
+        .lines()
+        .filter_map(|line| line.find(NATIVE_FINDING_MARKER).map(|index| &line[index..]))
+        .filter_map(|line| {
+            serde_json::from_str::<NativeFindingRecord>(&line[NATIVE_FINDING_MARKER.len()..]).ok()
+        })
+        .map(|record| {
+            let arguments = record
+                .arguments
+                .iter()
+                .map(|value| ReproValue {
+                    expression: serde_json::to_string(value).unwrap_or_else(|_| "null".into()),
+                    json_value: Some(value.clone()),
+                })
+                .collect::<Vec<_>>();
+            let original = ReproCase {
+                arguments: arguments.clone(),
+                input_text: Some(record.input.clone()),
+            };
+            let expectation = ReplayExpectation {
+                severity: FindingSeverity::Crash,
+                oracle_kind: OracleKind::RuntimeContract,
+                category: FindingCategory::Exception,
+            };
+            VerificationFinding {
+                id: format!("native:{}", record.function),
+                severity: FindingSeverity::Crash,
+                confidence: FindingConfidence::High,
+                category: FindingCategory::Exception,
+                location: FindingLocation {
+                    source_file: String::new(),
+                    function: record.function.clone(),
+                    line: record.line,
+                    invocation_path: InvocationPath::Direct,
+                },
+                oracle: OracleInfo {
+                    id: format!("native_runtime:{}", record.function),
+                    kind: OracleKind::RuntimeContract,
+                    provenance: OracleProvenance::LanguageRuntime,
+                    confidence: FindingConfidence::High,
+                    expected: None,
+                    actual: Some(record.message.clone()),
+                },
+                input_classification: InputClassification::Valid,
+                repro: StructuredRepro {
+                    kind: ReproKind::FunctionCall,
+                    function: Some(record.function.clone()),
+                    arguments,
+                    input_text: Some(record.input),
+                    case_label: Some("native_coverage_guided".into()),
+                    snippet: format!("{}(/* minimized native input */)", record.function),
+                    command: None,
+                    expectation,
+                    differential: None,
+                },
+                minimization: MinimizationInfo {
+                    status: MinimizationStatus::Preserved,
+                    attempts: 0,
+                    original: original.clone(),
+                    minimized: Some(original),
+                },
+                launch_context: None,
+                error_type: record.error_type,
+                message: record.message,
+                classification: Some("native_coverage_guided".into()),
+                suggestion: None,
+                suppressed: false,
+            }
+        })
+        .collect()
+}
+
+fn native_engine_unavailable(output: &str) -> bool {
+    [
+        "No module named 'atheris'",
+        "No module named atheris",
+        "required runtime 'jazzer' is unavailable",
+        "Cannot find package '@jazzer.js",
+        "Cannot find module '@jazzer.js",
+    ]
+    .iter()
+    .any(|message| output.contains(message))
+}
+
 /// independently framed result.
 pub fn parse_findings(stdout: &str) -> Option<Vec<VerificationFinding>> {
     if stdout.contains(sandbox::HARNESS_EVENT_SENTINEL) {

@@ -268,6 +268,7 @@ pub enum HarnessRuntime {
     Vitest,
     Jest,
     RepoTest,
+    Jazzer,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -500,6 +501,28 @@ impl TestRunner {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
+pub enum NativeFuzzEngine {
+    #[default]
+    Off,
+    Auto,
+    Atheris,
+    Jazzer,
+}
+
+impl NativeFuzzEngine {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "off" => Some(Self::Off),
+            "auto" => Some(Self::Auto),
+            "atheris" => Some(Self::Atheris),
+            "jazzer" | "jazzer-js" | "jazzer_js" => Some(Self::Jazzer),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum InferredOracleGate {
     #[default]
     Advisory,
@@ -557,6 +580,13 @@ pub struct ParamInfo {
     pub variadic: Option<VariadicKind>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PredicateSeed {
+    pub parameter: String,
+    pub value: serde_json::Value,
+    pub line: usize,
+}
+
 /// Statically observed behavior that makes repeat-call output equality an
 /// invalid implicit oracle. Explicit source-declared properties remain active.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -595,6 +625,9 @@ pub struct FunctionInfo {
     pub is_exported: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub declared_properties: Vec<String>,
+    /// Boundary and literal values observed in branch predicates for this callable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub predicate_seeds: Vec<PredicateSeed>,
     /// Effects found in this function's own body (nested callable bodies excluded).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effects: Vec<FunctionEffect>,
@@ -1474,6 +1507,7 @@ pub enum DomainSourceKind {
     DefaultValue,
     ValidationGuard,
     SafeDependencySubstitute,
+    CoverageCorpus,
 }
 
 /// Stable textual reason used in coverage diagnostics for a dependency whose

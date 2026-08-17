@@ -27,6 +27,7 @@ fn debug_print_synthesized_code() {
             is_nested: false,
             is_exported: true,
             declared_properties: vec![],
+            predicate_seeds: vec![],
             effects: vec![],
             invocation_target: None,
             returned_callables: vec![],

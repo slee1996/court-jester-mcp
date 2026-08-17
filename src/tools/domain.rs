@@ -900,6 +900,16 @@ fn render_json_literal(value: &serde_json::Value, language: &Language) -> String
     }
 }
 
+pub(crate) fn literal_from_json_value(
+    value: serde_json::Value,
+    language: &Language,
+) -> DomainLiteral {
+    DomainLiteral {
+        expression: render_json_literal(&value, language),
+        json_value: Some(value),
+    }
+}
+
 fn domain_literals(domain: &DomainNode, language: &Language) -> Vec<DomainLiteral> {
     match domain {
         DomainNode::Boolean => [false, true]
@@ -990,6 +1000,34 @@ fn domain_literals(domain: &DomainNode, language: &Language) -> Vec<DomainLitera
         }
         _ => Vec::new(),
     }
+}
+
+fn representative_domain_literal(
+    domain: &DomainNode,
+    language: &Language,
+) -> Option<DomainLiteral> {
+    if let Some(value) = domain_literals(domain, language).into_iter().next() {
+        return Some(value);
+    }
+    let json = match domain {
+        DomainNode::Any | DomainNode::Nullable(_) => serde_json::Value::Null,
+        DomainNode::Boolean => serde_json::Value::Bool(false),
+        DomainNode::Integer => serde_json::json!(0),
+        DomainNode::Float => serde_json::json!(0.0),
+        DomainNode::String | DomainNode::Bytes => serde_json::Value::String(String::new()),
+        DomainNode::Array(_) | DomainNode::Tuple(_) | DomainNode::Set(_) => serde_json::json!([]),
+        DomainNode::Map(_, _) | DomainNode::Object(_) => serde_json::json!({}),
+        DomainNode::Union(items) => {
+            return items
+                .iter()
+                .find_map(|item| representative_domain_literal(item, language));
+        }
+        DomainNode::Literal(_) | DomainNode::Opaque(_) => return None,
+    };
+    Some(DomainLiteral {
+        expression: render_json_literal(&json, language),
+        json_value: Some(json),
+    })
 }
 
 fn value_matches_domain(value: &DomainLiteral, domain: &DomainNode) -> Option<bool> {
@@ -1255,6 +1293,17 @@ pub fn build_verification_plan(
                     None,
                 ));
             }
+            for seed in func
+                .predicate_seeds
+                .iter()
+                .filter(|seed| seed.parameter == param.name)
+            {
+                sources.push(source(
+                    DomainSourceKind::ValidationGuard,
+                    Some(&param.name),
+                    Some(seed.line),
+                ));
+            }
             let mut domain =
                 domain_for_annotation(param.type_annotation.as_deref(), aliases, classes, language);
             if matches!(param.variadic, Some(VariadicKind::Positional))
@@ -1421,6 +1470,78 @@ pub fn build_verification_plan(
                     },
                 );
             }
+        }
+    }
+    for function in functions.iter().filter(|function| !function.is_nested) {
+        if function.predicate_seeds.is_empty() {
+            continue;
+        }
+        let surface_id = format!("{}:{}", function.name, function.line);
+        let domains = by_surface
+            .get(surface_id.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for seed in &function.predicate_seeds {
+            let mut slots = Vec::with_capacity(domains.len());
+            let mut complete = true;
+            for parameter in domains {
+                let value = if parameter.parameter == seed.parameter {
+                    DomainLiteral {
+                        expression: render_json_literal(&seed.value, language),
+                        json_value: Some(seed.value.clone()),
+                    }
+                } else {
+                    let Some(value) = representative_domain_literal(&parameter.domain, language)
+                    else {
+                        complete = false;
+                        break;
+                    };
+                    value
+                };
+                slots.push(match parameter.variadic {
+                    Some(VariadicKind::Positional) => {
+                        PlannedArgumentSlot::PositionalVariadic(vec![value])
+                    }
+                    Some(VariadicKind::Keyword) => {
+                        let mut values = BTreeMap::new();
+                        values.insert("kw0".to_string(), value);
+                        PlannedArgumentSlot::KeywordVariadic(values)
+                    }
+                    None => PlannedArgumentSlot::Single(value),
+                });
+            }
+            if !complete {
+                continue;
+            }
+            let Ok(mut arguments) = bind_argument_slots(domains, PlannedArgumentSlots { slots })
+            else {
+                continue;
+            };
+            let dependency_sources = match normalize_dependency_arguments(
+                &function.params,
+                &mut arguments,
+                language,
+                classes,
+                aliases,
+            ) {
+                Ok(sources) => sources,
+                Err(_) => continue,
+            };
+            let mut sources = vec![source(
+                DomainSourceKind::ValidationGuard,
+                Some(&seed.parameter),
+                Some(seed.line),
+            )];
+            sources.extend(dependency_sources.into_iter().map(|(_, source)| source));
+            add_planned_input(
+                &mut inputs,
+                PlannedInput {
+                    surface_id: surface_id.clone(),
+                    classification: classify_input(&arguments, domains),
+                    arguments,
+                    sources,
+                },
+            );
         }
     }
     for caller in caller_examples {

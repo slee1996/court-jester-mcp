@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 
 use crate::tools::domain;
 use crate::types::*;
@@ -289,7 +290,9 @@ fn likely_intentionally_nondeterministic(func: &FunctionInfo) -> bool {
 }
 
 fn supports_implicit_consistency(func: &FunctionInfo) -> bool {
-    func.effects.is_empty() && !likely_intentionally_nondeterministic(func)
+    func.effects.is_empty()
+        && func.returned_callables.is_empty()
+        && !likely_intentionally_nondeterministic(func)
 }
 
 const SIMPLE_HELPER_NAME_CUES: &[&str] = &[
@@ -885,6 +888,8 @@ fn synthesize_python(
             r#"
 _all_inputs = []
 _seed_rows = {seed_rows}
+_corpus = []
+_behavior_signatures = set()
 {edge_case_setup}
 _all_inputs.extend(_seed_rows)
 for _ in range({FUZZ_ITERATIONS}):
@@ -892,6 +897,7 @@ for _ in range({FUZZ_ITERATIONS}):
         _all_inputs.append(_fuzz_seed_row(_seed_rows))
     else:
         _all_inputs.append([{gen_list}])
+_max_campaign_inputs = len(_all_inputs) + {FUZZ_ITERATIONS}
 _pass = 0
 _reject = 0
 _crash = 0
@@ -913,8 +919,13 @@ for _iteration, _args in enumerate(_all_inputs):
 {nullish_string_leak_check}
 {comparator_check}
 {symmetry_check}
+{metamorphic_checks}
+        if _retain_corpus_input(_corpus, _behavior_signatures, _behavior_signature("passed", _result), _args) and len(_all_inputs) < _max_campaign_inputs:
+            _all_inputs.append(_mutate_corpus_row(_args))
         _cj_unit_completed("{name}:{line}", _iteration, "passed")
     except Exception as _e:
+        if _retain_corpus_input(_corpus, _behavior_signatures, _behavior_signature("crash" if _is_crash(_e) else "rejected", _e), _args) and len(_all_inputs) < _max_campaign_inputs:
+            _all_inputs.append(_mutate_corpus_row(_args))
         if _is_crash(_e):
             _crash += 1
             _cj_unit_completed("{name}:{line}", _iteration, "target_exception")
@@ -924,6 +935,7 @@ for _iteration, _args in enumerate(_all_inputs):
         else:
             _reject += 1
             _cj_unit_completed("{name}:{line}", _iteration, "rejected")
+_CJ_CORPORA["{name}:{line}"] = _corpus[:64]
 {query_string_semantic_check}
 {pep440_version_ordering_check}
 {pep440_specifier_membership_check}
@@ -968,6 +980,7 @@ else:
             cookie_header_quote_check = python_cookie_header_quote_check(func, &callable_params),
             comparator_check = python_comparator_check(func, &callable_params),
             symmetry_check = python_symmetry_check(func, &callable_params),
+            metamorphic_checks = python_metamorphic_checks(func, &callable_params),
         ));
 
         any_synthesized = true;
@@ -980,87 +993,128 @@ else:
         };
     }
 
-    // Factory exercise: for functions containing nested functions,
-    // call the factory and exercise the returned object's callables
+    // Stateful factory campaign: create one instance, then execute a generated
+    // sequence that covers every known action and repeats random actions.
     for func in selected_functions {
         if func.returned_callables.is_empty() {
             continue;
         }
         let callable_params: Vec<&ParamInfo> =
             func.params.iter().filter(|p| !p.is_variadic()).collect();
-        let generators: Vec<String> = callable_params
+        let factory_args = callable_params
             .iter()
-            .map(|p| python_generator(p.type_annotation.as_deref(), type_defs))
-            .collect();
-        let known_nested_names: Vec<&str> = analysis
-            .functions
+            .map(|param| {
+                let generated = python_generator(param.type_annotation.as_deref(), type_defs);
+                if param.keyword_only {
+                    format!("{}={generated}", param.name)
+                } else {
+                    generated
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let known_specs = func
+            .returned_callables
             .iter()
-            .filter(|candidate| {
-                candidate.is_nested
-                    && candidate.line >= func.line
-                    && candidate.end_line <= func.end_line
+            .filter_map(|callable| {
+                let declaration = factory_callable_declaration(analysis, func, callable)?;
+                if declaration.params.iter().any(|param| {
+                    param.is_variadic()
+                        || (param.type_annotation.is_none() && param.default_value.is_none())
+                }) {
+                    return None;
+                }
+                let mut positional = Vec::new();
+                let mut keyword = Vec::new();
+                for param in declaration.params.iter().filter(|param| !param.is_variadic()) {
+                    let generated =
+                        python_generator(param.type_annotation.as_deref(), type_defs);
+                    if generated == "_fuzz_none()"
+                        && param.type_annotation.as_deref() != Some("None")
+                        && param.default_value.is_none()
+                    {
+                        return None;
+                    }
+                    if param.keyword_only {
+                        let key = serde_json::to_string(&param.name).ok()?;
+                        keyword.push(format!("{key}: {generated}"));
+                    } else {
+                        positional.push(generated);
+                    }
+                }
+                let key = serde_json::to_string(callable).ok()?;
+                let surface =
+                    serde_json::to_string(&format!("{}().{}", func.name, callable)).ok()?;
+                Some(format!(
+                    "{key}: {{\"surface\": {surface}, \"line\": {line}, \"args\": lambda: [{args}], \"kwargs\": lambda: {{{kwargs}}}}}",
+                    line = declaration.line,
+                    args = positional.join(", "),
+                    kwargs = keyword.join(", "),
+                ))
             })
-            .filter(|candidate| {
-                !candidate
-                    .params
-                    .iter()
-                    .any(|param| !param.is_variadic() && param.type_annotation.is_none())
-            })
-            .map(|candidate| candidate.name.as_str())
-            .filter(|name| {
-                func.returned_callables
-                    .iter()
-                    .any(|callable| callable == *name)
-            })
-            .collect();
-        let known_nested_expr = format!(
-            "{{{}}}",
-            known_nested_names
-                .iter()
-                .map(|name| format!("\"{}\"", name))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        let gen_list = generators.join(", ");
-        let nested_names: Vec<&str> = func.returned_callables.iter().map(String::as_str).collect();
+            .collect::<Vec<_>>();
+        if known_specs.is_empty() {
+            continue;
+        }
+        let known_specs_expr = format!("{{{}}}", known_specs.join(", "));
+        let nested_names = func.returned_callables.join(", ");
         code.push_str(&format!(
             r#"
-# Factory exercise: {name} -> test returned callables
+# Stateful factory action-sequence campaign: {name}
 _factory_pass = 0
 _factory_crash = 0
-_known_factory_callables = {known_nested_expr}
+_known_factory_callables = {known_specs_expr}
+_action_keys = list(_known_factory_callables)
 for _fi in range({iters}):
-        _factory_result = {name}({gen_list})
-        _target_entered("{name}:{func_line}")
-        if callable(_factory_result):
-            if len(_known_factory_callables) == 1:
-                _factory_callable_name = next(iter(_known_factory_callables))
-                _target_entered("{name}()." + _factory_callable_name)
-                _factory_result(_fuzz_any())
-        elif hasattr(_factory_result, '__dict__'):
-            for _attr in dir(_factory_result):
-                if _attr in _known_factory_callables and callable(getattr(_factory_result, _attr, None)):
-                    _target_entered("{name}()." + _attr)
-                    getattr(_factory_result, _attr)(_fuzz_any())
+    _active_factory_callable = "unknown"
+    _active_factory_surface = "{name} (factory)"
+    _active_factory_line = {func_line}
+    _active_factory_args = []
+    _active_factory_kwargs = {{}}
+    _action_trace = []
+    try:
+        _factory_result = {name}({factory_args})
+        _action_plan = list(_action_keys)
+        for _ in range(_fuzz_int_range(2, 5)):
+            _action_plan.append(_rng.choice(_action_keys))
+        for _action in _action_plan:
+            _spec = _known_factory_callables[_action]
+            if callable(_factory_result) and len(_action_keys) == 1:
+                _candidate = _factory_result
+            elif isinstance(_factory_result, dict):
+                _candidate = _factory_result.get(_action)
+            else:
+                _candidate = getattr(_factory_result, _action, None)
+            if not callable(_candidate):
+                continue
+            _active_factory_callable = _action
+            _active_factory_surface = _spec["surface"]
+            _active_factory_line = _spec["line"]
+            _active_factory_args = _spec["args"]()
+            _active_factory_kwargs = _spec["kwargs"]()
+            _action_trace.append({{"action": _action, "args": _copy.deepcopy(_active_factory_args), "kwargs": _copy.deepcopy(_active_factory_kwargs)}})
+            _target_entered(_active_factory_surface)
+            _candidate(*_active_factory_args, **_active_factory_kwargs)
         _factory_pass += 1
     except Exception as _e:
         if _is_crash(_e):
             _factory_crash += 1
-            _emit_finding("{name} (factory)", [], _e, "crash", "runtime_contract", "language_runtime", "high", "exception", invocation_path={{"factory": {{"factory": "{name}", "callable": "unknown"}}}})
+            _emit_finding(_active_factory_surface, _active_factory_args, _e, "crash", "runtime_contract", "observed_call", "high", "exception", case_label=_clip_text(_action_trace), invocation_path={{"factory": {{"factory": "{name}", "callable": _active_factory_callable}}}})
             if _factory_crash == 1:
-                print(f"  CRASH {name}(factory): {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
+                print(f"  CRASH {{_active_factory_surface}} after actions {{_clip_text(_action_trace)}}: {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
 _factory_total = _factory_pass + _factory_crash
 if _factory_crash > 0:
-    print(f"FUZZ {name} (factory->nested): {{_factory_pass}} passed, {{_factory_crash}} CRASHED (of {{_factory_total}}) [exercises: {nested}]")
+    print(f"FUZZ {name} (factory state machine): {{_factory_pass}} passed, {{_factory_crash}} CRASHED (of {{_factory_total}}) [actions: {nested_names}]")
     _fuzz_failures += 1
 else:
-    print(f"FUZZ {name} (factory->nested): {{_factory_pass}} passed (of {{_factory_total}}) [exercises: {nested}]")
+    print(f"FUZZ {name} (factory state machine): {{_factory_pass}} passed (of {{_factory_total}}) [actions: {nested_names}]")
 "#,
             func_line = func.line,
             name = func.name,
-            known_nested_expr = known_nested_expr,
+            known_specs_expr = known_specs_expr,
+            factory_args = factory_args,
             iters = FUZZ_ITERATIONS,
-            nested = nested_names.join(", "),
+            nested_names = nested_names,
         ));
     }
 
@@ -2019,6 +2073,56 @@ fn python_symmetry_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
     }
 }
 
+fn python_metamorphic_checks(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
+    if params.len() != 1 {
+        return String::new();
+    }
+    let param = params[0];
+    let param_type = param.type_annotation.as_deref().unwrap_or("").trim();
+    let return_type = func.return_type.as_deref().unwrap_or("").trim();
+    let invoke = |argument: &str| {
+        if param.keyword_only {
+            format!("{}({}={argument})", func.name, param.name)
+        } else {
+            format!("{}({argument})", func.name)
+        }
+    };
+    let mut checks = Vec::new();
+
+    if has_declared_property(func, "involution")
+        && !param_type.is_empty()
+        && param_type == return_type
+    {
+        checks.push(format!(
+            "        _involution_result = _materialize_if_iterator({})\n        assert _nan_eq(_args[0], _involution_result), f\"Involution violated: {{repr(_args[0])}} -> {{repr(_result)}} -> {{repr(_involution_result)}}\"",
+            invoke("_copy.deepcopy(_result)")
+        ));
+    }
+
+    if has_declared_property(func, "monotonic")
+        && matches!(param_type, "int" | "float")
+        && matches!(return_type, "int" | "float")
+    {
+        checks.push(format!(
+            "        _monotonic_input = _copy.deepcopy(_args[0]) + 1\n        _monotonic_result = _materialize_if_iterator({})\n        assert _monotonic_result >= _result, f\"Monotonicity violated: f({{repr(_args[0])}})={{repr(_result)}} > f({{repr(_monotonic_input)}})={{repr(_monotonic_result)}}\"",
+            invoke("_monotonic_input")
+        ));
+    }
+
+    let orderable_input = param_type.starts_with("list[")
+        || param_type.starts_with("List[")
+        || param_type.starts_with("tuple[")
+        || param_type.starts_with("Tuple[");
+    if has_declared_property(func, "order_invariant") && orderable_input {
+        checks.push(format!(
+            "        _order_input = type(_args[0])(reversed(_copy.deepcopy(_args[0])))\n        _order_result = _materialize_if_iterator({})\n        assert _nan_eq(_result, _order_result), f\"Order invariance violated: {{repr(_result)}} != {{repr(_order_result)}}\"",
+            invoke("_order_input")
+        ));
+    }
+
+    checks.join("\n")
+}
+
 const PYTHON_FUZZ_PRELUDE: &str = r#"
 import random as _rng
 import json as _json
@@ -2131,18 +2235,34 @@ def _shrink_candidates(value):
                 candidate = dict(value); candidate[key] = shrunk; yield from add(candidate)
     elif value is not None:
         yield from add(None)
+def _shrink_rank(value):
+    try:
+        rendered = _json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False, default=repr)
+    except Exception:
+        rendered = repr(value)
+    return (len(rendered), rendered)
 def _minimize_failure(original, reproduce, severity, oracle_id):
     import time as _time
     current = _copy.deepcopy(original); attempts = 0; deadline = _time.monotonic() + 0.250
-    for index, candidate in enumerate(_shrink_candidates(current)):
-        if index >= 100 or _time.monotonic() >= deadline: break
-        attempts += 1
-        try:
-            if reproduce(candidate): current = _copy.deepcopy(candidate)
-        except Exception: pass
+    while attempts < 100 and _time.monotonic() < deadline:
+        current_rank = _shrink_rank(current)
+        improved = False
+        for candidate in _shrink_candidates(current):
+            if attempts >= 100 or _time.monotonic() >= deadline: break
+            if _shrink_rank(candidate) >= current_rank: continue
+            attempts += 1
+            try:
+                if reproduce(candidate):
+                    current = _copy.deepcopy(candidate)
+                    improved = True
+                    break
+            except Exception:
+                pass
+        if not improved:
+            break
     if isinstance(current, list):
         nb_space_candidate = ["\u00a0" if isinstance(value, str) and "\u00a0" in value else value for value in current]
-        if nb_space_candidate != current:
+        if _shrink_rank(nb_space_candidate) <= _shrink_rank(current) and nb_space_candidate != current:
             try:
                 if reproduce(nb_space_candidate):
                     current = nb_space_candidate
@@ -2182,7 +2302,7 @@ def _emit_error(function, args, error, properties=(), reproduce=None, case_label
         return
 
     is_property = isinstance(error, AssertionError)
-    declared = any(name in properties for name in ("idempotent", "bounded", "nonneg", "sorted", "permutation", "clamped", "symmetric", "no_nullish_string", "antisymmetric"))
+    declared = any(name in properties for name in ("idempotent", "bounded", "nonneg", "sorted", "permutation", "clamped", "symmetric", "no_nullish_string", "antisymmetric", "involution", "monotonic", "order_invariant"))
     kind = "declared_property" if is_property and declared else ("generic_property" if is_property else "runtime_contract")
     provenance = "source_directive" if kind == "declared_property" else "language_runtime"
     confidence = "authoritative" if kind == "declared_property" else ("medium" if is_property else "high")
@@ -2264,20 +2384,81 @@ def _fuzz_dict():
     return {}
 
 def _fuzz_like_seed(value):
-    if isinstance(value, bool): return value
-    if isinstance(value, (int, float, str)) or value is None: return value
-    if isinstance(value, list): return [_fuzz_like_seed(item) for item in value]
-    if isinstance(value, tuple): return tuple(_fuzz_like_seed(item) for item in value)
-    if isinstance(value, dict): return {key: _fuzz_like_seed(item) for key, item in value.items()}
+    if isinstance(value, bool):
+        return _rng.choice([value, not value])
+    if isinstance(value, int) and not isinstance(value, bool):
+        return _rng.choice([value, value - 1, value + 1, 0, -1])
+    if isinstance(value, float):
+        return _rng.choice([value, value - 1.0, value + 1.0, 0.0, -1.0])
+    if isinstance(value, str):
+        return _rng.choice([value, value.strip(), value.upper(), value.lower(), value[:max(0, len(value) // 2)]])
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return [_fuzz_like_seed(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_fuzz_like_seed(item) for item in value)
+    if isinstance(value, dict):
+        return {key: _fuzz_like_seed(item) for key, item in value.items()}
     return _copy.deepcopy(value)
 
 def _fuzz_seed_row(seed_rows):
     row = _copy.deepcopy(_rng.choice(seed_rows))
     return row if _rng.random() < 0.65 else [_fuzz_like_seed(item) for item in row]
+
+_CJ_CORPORA = {}
+def _behavior_signature(outcome, value):
+    if isinstance(value, BaseException):
+        return f"{outcome}:error:{type(value).__name__}:{str(value).split(':', 1)[0]}"
+    if value is None:
+        return f"{outcome}:none"
+    if isinstance(value, (list, tuple)):
+        return f"{outcome}:sequence:{min(len(value), 8)}:{','.join(type(item).__name__ for item in value[:4])}"
+    if isinstance(value, dict):
+        return f"{outcome}:mapping:{','.join(sorted(map(str, value.keys()))[:12])}"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if isinstance(value, float) and value != value:
+            bucket = "nan"
+        elif value == 0:
+            bucket = "zero"
+        elif value < 0:
+            bucket = "negative"
+        else:
+            bucket = "positive"
+        return f"{outcome}:number:{bucket}"
+    if isinstance(value, str):
+        bucket = "empty" if not value else ("blank" if not value.strip() else str(min(len(value), 32)))
+        return f"{outcome}:string:{bucket}"
+    return f"{outcome}:{type(value).__name__}:{value!s}"
+
+def _mutate_corpus_row(row):
+    candidate = _copy.deepcopy(row)
+    if not candidate:
+        return candidate
+    index = _rng.randrange(len(candidate))
+    value = candidate[index]
+    if isinstance(value, list) and value and _rng.random() < 0.5:
+        value = list(value)
+        value.pop(_rng.randrange(len(value)))
+        candidate[index] = value
+    elif isinstance(value, dict) and value and _rng.random() < 0.5:
+        value = dict(value)
+        value.pop(_rng.choice(list(value)))
+        candidate[index] = value
+    else:
+        candidate[index] = _fuzz_like_seed(value)
+    return candidate
+
+def _retain_corpus_input(corpus, signatures, signature, args):
+    if signature in signatures or len(corpus) >= 64:
+        return False
+    signatures.add(signature)
+    corpus.append(_copy.deepcopy(args))
+    return True
 _EDGE_INTS = [0, 1, -1, 2**53, -(2**53), 2**53 + 1]
 _EDGE_FLOATS = [0.0, -0.0, float('inf'), float('-inf'), float('nan'), 1e-300, 1e300]
-_EDGE_STRS = ["", "\0", "\uFFFF", "a" * 10000, "true", "null", "0", "-1",
-              "\r\n", "\u200F", "\u200D", "${...}", "<script>"]
+_EDGE_STRS = ["", "\0", "\uFFFF", "\u00A0", "\u00A0\u00A0\u00A0", "a" * 10000,
+              "true", "null", "0", "-1", "\r\n", "\u200F", "\u200D", "${...}", "<script>"]
 _EDGE_BYTES = [b"", b"\x00", b"\xff" * 100, bytes(range(256))]
 _EDGE_DICTS = [{}]
 
@@ -2376,6 +2557,18 @@ def _is_palindrome_sequence(value):
 "#;
 
 const PYTHON_FUZZ_EPILOGUE: &str = r#"
+_cj_corpus_payload = {}
+for _surface_id, _rows in _CJ_CORPORA.items():
+    _serializable = []
+    for _row in _rows:
+        try:
+            _json.dumps(_row, ensure_ascii=False, allow_nan=False)
+            _serializable.append(_row)
+        except Exception:
+            pass
+    if _serializable:
+        _cj_corpus_payload[_surface_id] = _serializable[:64]
+print("__COURT_JESTER_CORPUS_JSON__" + _json.dumps(_cj_corpus_payload, ensure_ascii=False, allow_nan=False))
 _cj_event("harness_completed", {"completed_units": _CJ_COMPLETED_UNITS})
 if _FUZZ_RESULTS:
     print("__COURT_JESTER_FINDINGS_JSON__")
@@ -2612,6 +2805,28 @@ fn synthesize_typescript(
         if has_declared_property(func, "clamped") {
             push_property("clamped");
         }
+        if callable_params.len() == 1
+            && !param_types[0].is_empty()
+            && param_types[0] == ret_type
+            && has_declared_property(func, "involution")
+        {
+            push_property("involution");
+        }
+        if callable_params.len() == 1
+            && param_types[0] == "number"
+            && ret_type == "number"
+            && has_declared_property(func, "monotonic")
+        {
+            push_property("monotonic");
+        }
+        if callable_params.len() == 1
+            && (param_types[0].ends_with("[]")
+                || param_types[0].starts_with("Array<")
+                || param_types[0].starts_with("ReadonlyArray<"))
+            && has_declared_property(func, "order_invariant")
+        {
+            push_property("order_invariant");
+        }
 
         let properties_list: String = properties
             .iter()
@@ -2756,11 +2971,8 @@ fn synthesize_typescript(
 
     // Involution roundtrip checks
     code.push_str(&synthesize_typescript_involution_checks(
-        analysis,
-        &selected_functions,
-        type_defs,
+        analysis, type_defs,
     ));
-
     code.push_str(TYPESCRIPT_FUZZ_EPILOGUE);
     FuzzPlan { code, coverage }
 }
@@ -2795,7 +3007,8 @@ fn synthesize_typescript_factory_exercise(
         else {
             continue;
         };
-        let factory_args = factory_args.join(", ");
+        let factory_arg_refs = factory_args.iter().map(String::as_str).collect::<Vec<_>>();
+        let factory_call = ts_call_with_args(func, &factory_arg_refs);
 
         let known_specs = func
             .returned_callables
@@ -2817,57 +3030,69 @@ fn synthesize_typescript_factory_exercise(
                     line = declaration.line,
                 ))
             })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let known_specs_expr = format!("{{{known_specs}}}");
+            .collect::<Vec<_>>();
+        if known_specs.is_empty() {
+            continue;
+        }
+        let known_specs_expr = format!("{{{}}}", known_specs.join(", "));
         let returned_names = func.returned_callables.join(", ");
 
         code.push_str(&format!(
             r#"
-// Factory exercise: {name} -> test returned methods
+// Stateful factory action-sequence campaign: {name}
 {{
   let _factoryPass = 0, _factoryCrash = 0;
   const _knownFactoryCallables: Record<string, {{surface: string; line: number; args: () => unknown[]}}> = {known_specs_expr};
+  const _actionKeys = Object.keys(_knownFactoryCallables);
   for (let _fi = 0; _fi < {iters}; _fi++) {{
     let _activeFactoryCallable = "unknown";
     let _activeFactorySurface = "{name} (factory)";
     let _activeFactoryLine = {factory_line};
     let _activeFactoryArgs: unknown[] = [];
+    const _actionTrace: Array<{{action: string; args: unknown[]}}> = [];
     try {{
-      const _factory = ({name} as Function)({factory_args});
-      if (_factory && typeof _factory === "object") {{
-        for (const [_key, _spec] of Object.entries(_knownFactoryCallables)) {{
-          const _candidate = (_factory as Record<string, unknown>)[_key];
-          if (typeof _candidate !== "function") continue;
-          _activeFactoryCallable = _key;
-          _activeFactorySurface = _spec.surface;
-          _activeFactoryLine = _spec.line;
-          _activeFactoryArgs = _spec.args();
-          _targetEntered(_activeFactorySurface);
-          (_candidate as Function)(..._activeFactoryArgs);
-        }}
+      const _factory = {factory_call};
+      const _actionPlan = [..._actionKeys];
+      for (let _step = 0; _step < _fuzzIntRange(2, 5); _step++) {{
+        _actionPlan.push(_actionKeys[_fuzzIntRange(0, _actionKeys.length - 1)]);
+      }}
+      for (const _action of _actionPlan) {{
+        const _spec = _knownFactoryCallables[_action];
+        const _candidate = typeof _factory === "function" && _actionKeys.length === 1
+          ? _factory
+          : _factory && (typeof _factory === "object" || typeof _factory === "function")
+            ? (_factory as Record<string, unknown>)[_action]
+            : undefined;
+        if (typeof _candidate !== "function") continue;
+        _activeFactoryCallable = _action;
+        _activeFactorySurface = _spec.surface;
+        _activeFactoryLine = _spec.line;
+        _activeFactoryArgs = _spec.args();
+        _actionTrace.push({{ action: _action, args: _cloneSeed(_activeFactoryArgs) }});
+        _targetEntered(_activeFactorySurface);
+        (_candidate as Function).apply(_factory, _activeFactoryArgs);
       }}
       _factoryPass++;
     }} catch (_e: unknown) {{
       if (_isCrash(_e)) {{
         _factoryCrash++;
-        _emitFinding(_activeFactorySurface, _activeFactoryArgs, _e, "crash", "runtime_contract", "observed_call", "high", "exception", null, {{factory: {{factory: "{name}", callable: _activeFactoryCallable}}}}, null, _activeFactoryLine);
-        if (_factoryCrash === 1) console.log(`  CRASH ${{_activeFactorySurface}}: ${{_clipText(_e)}}`);
+        _emitFinding(_activeFactorySurface, _activeFactoryArgs, _e, "crash", "runtime_contract", "observed_call", "high", "exception", null, {{factory: {{factory: "{name}", callable: _activeFactoryCallable}}}}, _clipText(_shortJson(_actionTrace)), _activeFactoryLine);
+        if (_factoryCrash === 1) console.log(`  CRASH ${{_activeFactorySurface}} after actions ${{_clipText(_shortJson(_actionTrace))}}: ${{_clipText(_e)}}`);
       }}
     }}
   }}
   const _ftotal = _factoryPass + _factoryCrash;
   if (_factoryCrash > 0) {{
-    console.log(`FUZZ {name} (factory->nested): ${{_factoryPass}} passed, ${{_factoryCrash}} CRASHED (of ${{_ftotal}}) [returns: {returned_names}]`);
+    console.log(`FUZZ {name} (factory state machine): ${{_factoryPass}} passed, ${{_factoryCrash}} CRASHED (of ${{_ftotal}}) [actions: {returned_names}]`);
     _fuzzTotalFailures++;
   }} else {{
-    console.log(`FUZZ {name} (factory->nested): ${{_factoryPass}} passed (of ${{_ftotal}}) [returns: {returned_names}]`);
+    console.log(`FUZZ {name} (factory state machine): ${{_factoryPass}} passed (of ${{_ftotal}}) [actions: {returned_names}]`);
   }}
 }}
 "#,
             name = func.name,
             factory_line = func.line,
-            factory_args = factory_args,
+            factory_call = factory_call,
             known_specs_expr = known_specs_expr,
             iters = FUZZ_ITERATIONS,
             returned_names = returned_names,
@@ -4176,7 +4401,7 @@ function _fuzzResponse(): Response {
 }
 
 const _EDGE_NUMS = [0, -0, Infinity, -Infinity, NaN, Number.MAX_SAFE_INTEGER, -Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER + 1, 1e-300, 1e300];
-const _EDGE_STRS = ["", "   ", "\0", "\uFFFF", "a".repeat(10000), "true", "null", "0", "-1", "\r\n", "\u200F", "\u200D", "${...}", "<script>"];
+const _EDGE_STRS = ["", "   ", "\0", "\u00A0", "\u00A0\u00A0\u00A0", "\uFFFF", "a".repeat(10000), "true", "null", "0", "-1", "\r\n", "\u200F", "\u200D", "${...}", "<script>"];
 const _EDGE_STR_ARRAYS = [
   [],
   [""],
@@ -4189,6 +4414,8 @@ const _EDGE_STR_ARRAYS = [
   ["secondary", "primary", "tertiary"],
 ];
 const _EDGE_OBJECTS = [{}];
+const _EDGE_UNKNOWNS = [undefined, null, NaN, Infinity, -Infinity, "", 0, false, {}, []];
+const _EDGE_UNKNOWN_ARRAYS = [[], [undefined], [null], [NaN], [Infinity], [-Infinity], [""], [0]];
 const _EDGE_SEMVER_OBJECTS = [
   { major: 0, minor: 0, patch: 0, prerelease: null },
   { major: 1, minor: 2, patch: 3, prerelease: [] },
@@ -4196,14 +4423,34 @@ const _EDGE_SEMVER_OBJECTS = [
   { major: 0, minor: 1, patch: 0, prerelease: ["beta", "2"] },
 ];
 
-function _edgeCasesFor(typeName: string): unknown[] {
+function _replaceUnknownLeaves(value: unknown, replacement: unknown): unknown {
+  if (Array.isArray(value)) {
+    if (value.length === 0) return [_cloneSeed(replacement)];
+    return value.map((item) => _replaceUnknownLeaves(item, replacement));
+  }
+  if (value !== null && typeof value === "object") {
+    const clone: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      clone[key] = _replaceUnknownLeaves(item, replacement);
+    }
+    return clone;
+  }
+  return _cloneSeed(replacement);
+}
+
+function _edgeCasesFor(typeName: string, template?: unknown): unknown[] {
+  if (typeName === "object_unknown") {
+    return _EDGE_UNKNOWNS.map((replacement) => _replaceUnknownLeaves(template, replacement));
+  }
   const m: Record<string, unknown[]> = {
     "number": _EDGE_NUMS,
     "string": _EDGE_STRS,
     "string_array": _EDGE_STR_ARRAYS,
-  "object": _EDGE_OBJECTS,
-  "semver_version": _EDGE_SEMVER_OBJECTS,
-};
+    "unknown": _EDGE_UNKNOWNS,
+    "unknown_array": _EDGE_UNKNOWN_ARRAYS,
+    "object": _EDGE_OBJECTS,
+    "semver_version": _EDGE_SEMVER_OBJECTS,
+  };
   return m[typeName] || [];
 }
 
@@ -4344,11 +4591,32 @@ function _shortJson(value: unknown, limit = _FUZZ_TEXT_LIMIT): string {
   }
 }
 
+function _cloneSeedFallback<T>(value: T, seen: Map<object, unknown>): T {
+  if (value === null || typeof value !== "object") return value;
+  if (seen.has(value)) return seen.get(value) as T;
+  if (Array.isArray(value)) {
+    const clone: unknown[] = [];
+    seen.set(value, clone);
+    for (const item of value) clone.push(_cloneSeedFallback(item, seen));
+    return clone as T;
+  }
+  const clone = Object.create(Object.getPrototypeOf(value)) as Record<string, unknown>;
+  seen.set(value, clone);
+  for (const key of Object.keys(value)) {
+    clone[key] = _cloneSeedFallback((value as Record<string, unknown>)[key], seen);
+  }
+  return clone as T;
+}
+
 function _cloneSeed<T>(value: T): T {
   if (typeof structuredClone === "function") {
-    return structuredClone(value);
+    try {
+      return structuredClone(value);
+    } catch {
+      // Runtime collaborators may contain functions, which structuredClone rejects.
+    }
   }
-  return JSON.parse(JSON.stringify(value)) as T;
+  return _cloneSeedFallback(value, new Map());
 }
 
 function _isSortedNumericArray(value: unknown): value is number[] {
@@ -4380,6 +4648,59 @@ function _fuzzSeedRow(seedRows: unknown[][]): unknown[] {
   const row = _cloneSeed(seedRows[_fuzzIntRange(0, seedRows.length - 1)]);
   if (_fuzzRand() < 0.65) return row;
   return row.map(_fuzzLikeSeed);
+}
+
+const _cjCorpora = new Map<string, unknown[][]>();
+function _behaviorSignature(outcome: string, value: unknown): string {
+  if (value instanceof Error) {
+    return `${outcome}:error:${value.constructor.name}:${value.message.split(":", 1)[0]}`;
+  }
+  if (value === null) return `${outcome}:null`;
+  if (value === undefined) return `${outcome}:undefined`;
+  if (Array.isArray(value)) {
+    return `${outcome}:array:${Math.min(value.length, 8)}:${value.slice(0, 4).map((item) => typeof item).join(",")}`;
+  }
+  if (typeof value === "object") {
+    return `${outcome}:object:${Object.keys(value as Record<string, unknown>).sort().slice(0, 12).join(",")}`;
+  }
+  if (typeof value === "number") {
+    const bucket = Number.isNaN(value) ? "nan" : !Number.isFinite(value) ? String(value) : value === 0 ? "zero" : value < 0 ? "negative" : "positive";
+    return `${outcome}:number:${bucket}`;
+  }
+  if (typeof value === "string") {
+    return `${outcome}:string:${value.length === 0 ? "empty" : value.trim().length === 0 ? "blank" : Math.min(value.length, 32)}`;
+  }
+  return `${outcome}:${typeof value}:${String(value)}`;
+}
+function _mutateCorpusRow(row: unknown[]): unknown[] {
+  const candidate = _cloneSeed(row);
+  if (candidate.length === 0) return candidate;
+  const index = _fuzzIntRange(0, candidate.length - 1);
+  const value = candidate[index];
+  if (Array.isArray(value) && value.length > 0 && _fuzzRand() < 0.5) {
+    const next = value.slice();
+    next.splice(_fuzzIntRange(0, next.length - 1), 1);
+    candidate[index] = next;
+  } else if (!Array.isArray(value) && value && typeof value === "object" && _fuzzRand() < 0.5) {
+    const next = { ...(value as Record<string, unknown>) };
+    const keys = Object.keys(next);
+    if (keys.length > 0) delete next[keys[_fuzzIntRange(0, keys.length - 1)]];
+    candidate[index] = next;
+  } else {
+    candidate[index] = _fuzzLikeSeed(value);
+  }
+  return candidate;
+}
+function _retainCorpusInput(
+  corpus: unknown[][],
+  signatures: Set<string>,
+  signature: string,
+  args: unknown[],
+): boolean {
+  if (signatures.has(signature) || corpus.length >= 64) return false;
+  signatures.add(signature);
+  corpus.push(_cloneSeed(args));
+  return true;
 }
 
 // Crash detection: real bugs vs intentional validation errors
@@ -4416,7 +4737,10 @@ function _isCrash(e: unknown): boolean {
     e.message.startsWith("Clamp bounds violated") ||
     e.message.startsWith("Clamp passthrough violated") ||
     e.message.startsWith("Comparator") ||
-    e.message.startsWith("Roundtrip")
+    e.message.startsWith("Roundtrip") ||
+    e.message.startsWith("Involution violated") ||
+    e.message.startsWith("Monotonicity violated") ||
+    e.message.startsWith("Order invariance violated")
   )) return true;
   // Stack overflow
   if (e instanceof Error && e.message.includes("Maximum call stack")) return true;
@@ -4450,9 +4774,38 @@ function _shrinkCandidates(value: unknown): unknown[] {
   else if (value !== null && value !== undefined) add(null);
   return out;
 }
+function _shrinkRank(value: unknown): [number, string] {
+  let rendered: string;
+  try { rendered = JSON.stringify(_reproJsonValue(value)); } catch { rendered = String(value); }
+  return [rendered.length, rendered];
+}
+function _rankLess(candidate: unknown, current: unknown): boolean {
+  const candidateRank = _shrinkRank(candidate); const currentRank = _shrinkRank(current);
+  return candidateRank[0] < currentRank[0] || (candidateRank[0] === currentRank[0] && candidateRank[1] < currentRank[1]);
+}
+function _failureIdentity(error: unknown): string {
+  const property = _declaredPropertyForFailure(error);
+  if (property !== null) return `property:${property}`;
+  if (error instanceof Error) return `exception:${error.constructor.name}:${error.message.split(":", 1)[0]}`;
+  return `exception:${typeof error}:${String(error).split(":", 1)[0]}`;
+}
 function _minimizeFailure(original: unknown[], reproduce: (candidate: unknown[]) => boolean): [string, number, unknown[]] {
   let current = _cloneSeed(original); let attempts = 0; const deadline = Date.now() + 250;
-  for (const candidateValue of _shrinkCandidates(current)) { if (attempts >= 100 || Date.now() >= deadline) break; attempts++; const candidate = Array.isArray(candidateValue) ? candidateValue : [candidateValue]; if (reproduce(candidate)) current = _cloneSeed(candidate); }
+  while (attempts < 100 && Date.now() < deadline) {
+    let improved = false;
+    for (const candidateValue of _shrinkCandidates(current)) {
+      if (attempts >= 100 || Date.now() >= deadline) break;
+      const candidate = Array.isArray(candidateValue) ? candidateValue : [candidateValue];
+      if (!_rankLess(candidate, current)) continue;
+      attempts++;
+      if (reproduce(candidate)) {
+        current = _cloneSeed(candidate);
+        improved = true;
+        break;
+      }
+    }
+    if (!improved) break;
+  }
   return [reproduce(current) ? "preserved" : "failed", attempts, current];
 }
 function _emitFinding(name: string, args: unknown[], error: unknown, severity = "crash", oracleKind = "runtime_contract", provenance = "language_runtime", confidence = "high", category = "exception", minimize: [string, number, unknown[]] | null = null, invocationPath: unknown = "direct", caseLabel: string | null = null, sourceLine = 0): void {
@@ -4473,6 +4826,8 @@ function _declaredPropertyForFailure(error: unknown): string | null {
     ["Not sorted", "sorted"], ["Permutation violated", "permutation"],
     ["Clamp bounds violated", "clamped"], ["Clamp passthrough violated", "clamped"],
     ["Comparator", "antisymmetric"],
+    ["Involution violated", "involution"], ["Monotonicity violated", "monotonic"],
+    ["Order invariance violated", "order_invariant"],
   ];
   return mappings.find(([prefix]) => error.message.startsWith(prefix))?.[1] ?? null;
 }
@@ -4492,32 +4847,56 @@ function _fuzzOne(
   let pass = 0, reject = 0, crash = 0;
   let firstCrash = "";
   const allInputs: unknown[][] = [];
+  const corpus: unknown[][] = [];
+  const behaviorSignatures = new Set<string>();
   for (const seed of seedRows) {
     allInputs.push(seed);
   }
   for (const omission of defaultOmissionRows) {
     allInputs.push(omission);
   }
+  const edgePools: unknown[][] = [];
   for (let pi = 0; pi < paramTypes.length; pi++) {
-    for (const ev of _edgeCasesFor(paramTypes[pi])) {
-      const row = genArgs(); row[pi] = ev; allInputs.push(row);
+    const template = genArgs()[pi];
+    const edges = _edgeCasesFor(paramTypes[pi], template);
+    edgePools.push(edges);
+    for (const ev of edges) {
+      const row = genArgs(); row[pi] = _cloneSeed(ev); allInputs.push(row);
+    }
+  }
+  if (seedRows.length === 0) {
+    let pairwiseEdgeRows = 0;
+    pairwiseEdges: for (let left = 0; left < edgePools.length; left++) {
+      for (let right = left + 1; right < edgePools.length; right++) {
+        for (const leftEdge of edgePools[left].slice(0, 8)) {
+          for (const rightEdge of edgePools[right].slice(0, 8)) {
+            const row = genArgs();
+            row[left] = _cloneSeed(leftEdge);
+            row[right] = _cloneSeed(rightEdge);
+            allInputs.push(row);
+            pairwiseEdgeRows++;
+            if (pairwiseEdgeRows >= 128) break pairwiseEdges;
+          }
+        }
+      }
     }
   }
   for (let i = 0; i < iters; i++) {
     allInputs.push(seedRows.length > 0 ? _fuzzSeedRow(seedRows) : genArgs());
   }
+  const maxCampaignInputs = allInputs.length + iters;
   for (let i = 0; i < allInputs.length; i++) {
     const args = allInputs[i];
     try {
       _targetEntered(`${name}:${sourceLine}`, i);
-      const result = fn(args);
+      const result = fn(_cloneSeed(args));
       // Type check
       if (expectedType !== null && typeof result !== expectedType) {
         throw new Error(`Return type mismatch: expected ${expectedType}, got ${typeof result}`);
       }
       // Consistency: same input → same output
       if (properties.includes("consistent")) {
-        const result2 = fn(args);
+        const result2 = fn(_cloneSeed(args));
         if (!_nanSafeEq(result, result2)) {
           throw new Error(`Inconsistent: ${JSON.stringify(result)} !== ${JSON.stringify(result2)}`);
         }
@@ -4527,6 +4906,28 @@ function _fuzzOne(
         const result3 = fn([result]);
         if (!_nanSafeEq(result, result3)) {
           throw new Error(`Not idempotent: ${JSON.stringify(result)} -> ${JSON.stringify(result3)}`);
+        }
+      }
+      if (properties.includes("involution")) {
+        const involutionResult = fn([_cloneSeed(result)]);
+        if (!_nanSafeEq(args[0], involutionResult)) {
+          throw new Error(`Involution violated: ${JSON.stringify(args[0])} -> ${JSON.stringify(result)} -> ${JSON.stringify(involutionResult)}`);
+        }
+      }
+      if (properties.includes("monotonic") && typeof args[0] === "number" && Number.isFinite(args[0]) && typeof result === "number") {
+        const monotonicArgs = _cloneSeed(args);
+        monotonicArgs[0] = args[0] + 1;
+        const monotonicResult = fn(monotonicArgs);
+        if (typeof monotonicResult !== "number" || !(monotonicResult >= result)) {
+          throw new Error(`Monotonicity violated: f(${JSON.stringify(args[0])})=${JSON.stringify(result)} > f(${JSON.stringify(monotonicArgs[0])})=${JSON.stringify(monotonicResult)}`);
+        }
+      }
+      if (properties.includes("order_invariant") && Array.isArray(args[0])) {
+        const reorderedArgs = _cloneSeed(args);
+        reorderedArgs[0] = [...args[0]].reverse();
+        const reorderedResult = fn(reorderedArgs);
+        if (!_nanSafeEq(result, reorderedResult)) {
+          throw new Error(`Order invariance violated: ${JSON.stringify(result)} != ${JSON.stringify(reorderedResult)}`);
         }
       }
       // Boundedness: len(f(x)) <= len(x)
@@ -4593,9 +4994,17 @@ function _fuzzOne(
           throw new Error(`Comparator antisymmetry violated: ${JSON.stringify(result)} vs ${JSON.stringify(resultRev)}`);
         }
       }
+      if (_retainCorpusInput(corpus, behaviorSignatures, _behaviorSignature("passed", result), args)
+          && allInputs.length < maxCampaignInputs) {
+        allInputs.push(_mutateCorpusRow(args));
+      }
       _cjUnitCompleted(`${name}:${sourceLine}`, i, "passed");
       pass++;
     } catch (e: unknown) {
+      if (_retainCorpusInput(corpus, behaviorSignatures, _behaviorSignature(_isCrash(e) ? "crash" : "rejected", e), args)
+          && allInputs.length < maxCampaignInputs) {
+        allInputs.push(_mutateCorpusRow(args));
+      }
       if (_isCrash(e)) {
         crash++;
         _cjUnitCompleted(`${name}:${sourceLine}`, i, "target_exception");
@@ -4606,7 +5015,15 @@ function _fuzzOne(
         const provenance = declared ? "source_directive" : (propertyFailure ? "language_runtime" : "observed_call");
         const confidence = declared ? "authoritative" : (propertyFailure ? "medium" : "high");
         const severity = propertyFailure ? "property_violation" : "crash";
-        const minimized = _minimizeFailure(args, (candidate) => { try { fn(candidate); return false; } catch (candidateError) { return _isCrash(candidateError) && (candidateError instanceof Error ? candidateError.constructor.name : "unknown") === (e instanceof Error ? e.constructor.name : "unknown"); } });
+        const failureIdentity = _failureIdentity(e);
+        const minimized = _minimizeFailure(args, (candidate) => {
+          try {
+            fn(candidate);
+            return false;
+          } catch (candidateError) {
+            return _isCrash(candidateError) && _failureIdentity(candidateError) === failureIdentity;
+          }
+        });
         _emitFinding(name, args, e, severity, oracleKind, provenance, confidence, propertyFailure ? "property" : "exception", minimized, "direct", null, sourceLine);
         if (crash === 1) firstCrash = `  CRASH ${name}(${_shortJson(args)}): ${_clipText(e)}`;
       } else {
@@ -4615,6 +5032,7 @@ function _fuzzOne(
       }
     }
   }
+  _cjCorpora.set(`${name}:${sourceLine}`, corpus.slice(0, 64));
   const total = pass + reject + crash;
   if (crash > 0) {
     console.log(`FUZZ ${name}: ${pass} passed, ${reject} rejected, ${crash} CRASHED (of ${total})`);
@@ -4632,6 +5050,21 @@ function _fuzzOne(
 }
 "#;
 const TYPESCRIPT_FUZZ_EPILOGUE: &str = r#"
+const _cjCorpusPayload: Record<string, unknown[][]> = {};
+for (const [surfaceId, rows] of _cjCorpora.entries()) {
+  const serializable: unknown[][] = [];
+  for (const row of rows) {
+    try {
+      const encoded = row.map((value) => _reproJsonValue(value));
+      JSON.stringify(encoded);
+      serializable.push(encoded);
+    } catch {
+      // Runtime-only values are useful during this campaign but cannot persist.
+    }
+  }
+  if (serializable.length > 0) _cjCorpusPayload[surfaceId] = serializable.slice(0, 64);
+}
+console.log("__COURT_JESTER_CORPUS_JSON__" + JSON.stringify(_cjCorpusPayload));
 _cjEvent("harness_completed", { completed_units: _cjCompletedUnits });
 if (_fuzzResults.length > 0) {
   console.log("__COURT_JESTER_FINDINGS_JSON__");
@@ -4874,6 +5307,72 @@ fn ts_object_type_allows_empty(type_ann: &str, type_defs: &TsNamedTypes<'_>) -> 
             .all(|field| field.optional)
 }
 
+fn ts_type_contains_unknown_leaf(type_ann: &str, type_defs: &TsNamedTypes<'_>) -> bool {
+    fn inner(
+        type_ann: &str,
+        type_defs: &TsNamedTypes<'_>,
+        stack: &mut Vec<String>,
+        depth: usize,
+    ) -> bool {
+        if depth >= TS_TYPE_RECURSION_LIMIT {
+            return false;
+        }
+        let trimmed = type_ann.trim();
+        if matches!(trimmed, "unknown" | "any") {
+            return true;
+        }
+        if let Some(resolved) = ts_resolve_alias_text(trimmed, type_defs) {
+            if resolved != trimmed {
+                return inner(&resolved, type_defs, stack, depth + 1);
+            }
+        }
+        let union_branches = split_ts_top_level(trimmed, '|');
+        if union_branches.len() > 1 {
+            return union_branches
+                .iter()
+                .any(|branch| inner(branch, type_defs, stack, depth + 1));
+        }
+        if trimmed.ends_with("[]") {
+            return inner(
+                trimmed.trim_end_matches("[]").trim(),
+                type_defs,
+                stack,
+                depth + 1,
+            );
+        }
+        if trimmed.starts_with("Array<") || trimmed.starts_with("ReadonlyArray<") {
+            return inner(&extract_generic_arg(trimmed), type_defs, stack, depth + 1);
+        }
+        if looks_like_ts_object_type(trimmed) {
+            return extract_ts_object_type_fields_from_text(trimmed)
+                .iter()
+                .any(|field| {
+                    field
+                        .type_annotation
+                        .as_deref()
+                        .is_some_and(|field_type| inner(field_type, type_defs, stack, depth + 1))
+                });
+        }
+        if let Some(class) = ts_class_def(trimmed, type_defs) {
+            if ts_type_seen(stack, trimmed) {
+                return false;
+            }
+            stack.push(trimmed.to_string());
+            let contains = class.fields.iter().any(|field| {
+                field
+                    .type_annotation
+                    .as_deref()
+                    .is_some_and(|field_type| inner(field_type, type_defs, stack, depth + 1))
+            });
+            stack.pop();
+            return contains;
+        }
+        false
+    }
+
+    inner(type_ann, type_defs, &mut Vec::new(), 0)
+}
+
 fn ts_edge_type_name(type_ann: Option<&str>, type_defs: &TsNamedTypes<'_>) -> &'static str {
     let t = match type_ann {
         Some(t) => t.trim(),
@@ -4881,6 +5380,19 @@ fn ts_edge_type_name(type_ann: Option<&str>, type_defs: &TsNamedTypes<'_>) -> &'
     };
     if let Some(resolved) = ts_resolve_alias_text(t, type_defs) {
         return ts_edge_type_name(Some(&resolved), type_defs);
+    }
+    if matches!(t, "unknown" | "any") {
+        return "unknown";
+    }
+    if (t.ends_with("[]") || t.starts_with("Array<") || t.starts_with("ReadonlyArray<"))
+        && ts_type_contains_unknown_leaf(t, type_defs)
+    {
+        return "unknown_array";
+    }
+    if (looks_like_ts_object_type(t) || ts_class_def(t, type_defs).is_some())
+        && ts_type_contains_unknown_leaf(t, type_defs)
+    {
+        return "object_unknown";
     }
     if ts_type_contains_literal_domain(t, type_defs) {
         return "";
@@ -5075,22 +5587,29 @@ fn synthesize_python_involution_checks(
     for (enc, dec) in &pairs {
         let param = enc.params.iter().find(|p| !p.is_variadic()).unwrap();
         let gen = python_generator(param.type_annotation.as_deref(), type_defs);
+        let pair_label = serde_json::to_string(&format!("{}<->{}", enc.name, dec.name))
+            .unwrap_or_else(|_| "\"roundtrip\"".into());
+        let corpus_key = serde_json::to_string(&format!("{}:{}", enc.name, enc.line))
+            .unwrap_or_else(|_| "\"\"".into());
 
         code.push_str(&format!(
             r#"
 # Involution roundtrip: {enc_name} <-> {dec_name}
-for _i in range(30):
-    _inv_input = {gen}
+_inv_inputs = [{gen} for _ in range(30)]
+_inv_inputs.extend(_copy.deepcopy(_row[0]) for _row in _CJ_CORPORA.get({corpus_key}, []) if _row)
+for _inv_input in _inv_inputs:
     try:
-        _inv_encoded = {enc_name}(_inv_input)
-        _inv_decoded = {dec_name}(_inv_encoded)
-        assert _nan_eq(_inv_input, _inv_decoded), f"Roundtrip failed: {{repr(_inv_input)}} -> {{repr(_inv_encoded)}} -> {{repr(_inv_decoded)}}"
-    except AssertionError:
-        print(f"  ROUNDTRIP FAIL {enc_name} <-> {dec_name}: {{_short_repr(_inv_input)}} -> {{_short_repr(_inv_encoded)}} -> {{_short_repr(_inv_decoded)}}")
-        _fuzz_failures += 1
-        break
+        _inv_encoded = {enc_name}(_copy.deepcopy(_inv_input))
+        _inv_decoded = {dec_name}(_copy.deepcopy(_inv_encoded))
+        if not _nan_eq(_inv_input, _inv_decoded):
+            _roundtrip_error = AssertionError(f"Roundtrip failed: {{repr(_inv_input)}} -> {{repr(_inv_encoded)}} -> {{repr(_inv_decoded)}}")
+            _emit_finding({pair_label}, [_inv_input], _roundtrip_error, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", case_label="roundtrip")
+            print(f"  ROUNDTRIP FAIL {enc_name} <-> {dec_name}: {{_short_repr(_inv_input)}} -> {{_short_repr(_inv_encoded)}} -> {{_short_repr(_inv_decoded)}}")
+            _fuzz_failures += 1
+            break
     except Exception as _e:
         if _is_crash(_e):
+            _emit_finding({pair_label}, [_inv_input], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", case_label="roundtrip")
             print(f"  ROUNDTRIP CRASH {enc_name} <-> {dec_name}: {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
             _fuzz_failures += 1
             break
@@ -5105,7 +5624,6 @@ for _i in range(30):
 
 fn synthesize_typescript_involution_checks(
     analysis: &AnalysisResult,
-    _selected_functions: &[&FunctionInfo],
     type_defs: &TsNamedTypes<'_>,
 ) -> String {
     let pairs = find_involution_pairs(analysis);
@@ -5116,46 +5634,322 @@ fn synthesize_typescript_involution_checks(
         let Some(gen) = ts_generator(param.type_annotation.as_deref(), type_defs) else {
             continue;
         };
+        let pair_label = serde_json::to_string(&format!("{}<->{}", enc.name, dec.name))
+            .unwrap_or_else(|_| "\"roundtrip\"".into());
+        let corpus_key = serde_json::to_string(&format!("{}:{}", enc.name, enc.line))
+            .unwrap_or_else(|_| "\"\"".into());
+        let encode_call = ts_call_with_args(enc, &["input"]);
+        let decode_call = ts_call_with_args(dec, &["encoded"]);
 
-        code.push_str("\n// Involution roundtrip: ");
-        code.push_str(&enc.name);
-        code.push_str(" <-> ");
-        code.push_str(&dec.name);
-        code.push_str("\n{\n  let _invFail = false;\n  for (let i = 0; i < 30; i++) {\n");
-        code.push_str("    const input = ");
-        code.push_str(&gen);
-        code.push_str(";\n    try {\n");
-        code.push_str("      const encoded = ");
-        code.push_str(&ts_call_with_args(enc, &["input"]));
-        code.push_str(";\n");
-        code.push_str("      const decoded = ");
-        code.push_str(&ts_call_with_args(dec, &["encoded"]));
-        code.push_str(";\n");
-        code.push_str("      if (!_nanSafeEq(input, decoded)) {\n");
-        code.push_str("        console.log(`  ROUNDTRIP FAIL ");
-        code.push_str(&enc.name);
-        code.push_str(" <-> ");
-        code.push_str(&dec.name);
-        code.push_str(
-            ": ${_shortJson(input)} -> ${_shortJson(encoded)} -> ${_shortJson(decoded)}`);\n",
-        );
-        code.push_str(
-            "        _fuzzTotalFailures++;\n        _invFail = true;\n        break;\n      }\n",
-        );
-        code.push_str("    } catch (e: unknown) {\n");
-        code.push_str("      if (_isCrash(e)) {\n");
-        code.push_str("        console.log(`  ROUNDTRIP CRASH ");
-        code.push_str(&enc.name);
-        code.push_str(" <-> ");
-        code.push_str(&dec.name);
-        code.push_str(": ${_clipText(e)}`);\n");
-        code.push_str("        _fuzzTotalFailures++;\n        _invFail = true;\n        break;\n      }\n    }\n  }\n");
-        code.push_str("  if (!_invFail) console.log(\"FUZZ ");
-        code.push_str(&enc.name);
-        code.push_str(" <-> ");
-        code.push_str(&dec.name);
-        code.push_str(" roundtrip: passed\");\n}\n");
+        code.push_str(&format!(
+            r#"
+// Involution roundtrip: {enc_name} <-> {dec_name}
+{{
+  let _invFail = false;
+  const _invInputs: unknown[] = Array.from({{ length: 30 }}, () => {gen});
+  for (const row of _cjCorpora.get({corpus_key}) ?? []) {{
+    if (row.length > 0) _invInputs.push(_cloneSeed(row[0]));
+  }}
+  for (const input of _invInputs) {{
+    try {{
+      const encoded = {encode_call};
+      const decoded = {decode_call};
+      if (!_nanSafeEq(input, decoded)) {{
+        const failure = new Error(`Roundtrip failed: ${{_shortJson(input)}} -> ${{_shortJson(encoded)}} -> ${{_shortJson(decoded)}}`);
+        _emitFinding({pair_label}, [input], failure, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", null, "direct", "roundtrip", {source_line});
+        console.log(`  ROUNDTRIP FAIL {enc_name} <-> {dec_name}: ${{_shortJson(input)}} -> ${{_shortJson(encoded)}} -> ${{_shortJson(decoded)}}`);
+        _fuzzTotalFailures++;
+        _invFail = true;
+        break;
+      }}
+    }} catch (e: unknown) {{
+      if (_isCrash(e)) {{
+        _emitFinding({pair_label}, [input], e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", null, "direct", "roundtrip", {source_line});
+        console.log(`  ROUNDTRIP CRASH {enc_name} <-> {dec_name}: ${{_clipText(e)}}`);
+        _fuzzTotalFailures++;
+        _invFail = true;
+        break;
+      }}
+    }}
+  }}
+  if (!_invFail) console.log("FUZZ {enc_name} <-> {dec_name} roundtrip: passed");
+}}
+"#,
+            enc_name = enc.name,
+            dec_name = dec.name,
+            source_line = enc.line,
+        ));
     }
 
     code
+}
+
+#[derive(Debug, Clone)]
+pub struct NativeFuzzPlan {
+    pub code: String,
+    pub engine: NativeFuzzEngine,
+    pub target_count: usize,
+}
+
+fn python_native_argument(type_annotation: Option<&str>) -> Option<&'static str> {
+    let normalized = type_annotation
+        .unwrap_or("str")
+        .to_ascii_lowercase()
+        .replace(' ', "");
+    match normalized.as_str() {
+        "bool" => Some("_cj_data.ConsumeBool()"),
+        "int" => Some("_cj_data.ConsumeInt(8)"),
+        "float" => Some("_cj_data.ConsumeFloat()"),
+        "str" | "string" | "any" => Some("_cj_data.ConsumeUnicodeNoSurrogates(64)"),
+        "bytes" => Some("_cj_data.ConsumeBytes(64)"),
+        "bytearray" => Some("bytearray(_cj_data.ConsumeBytes(64))"),
+        "list[int]" | "typing.list[int]" => Some("_cj_data.ConsumeIntList(8, 8)"),
+        "list[str]" | "typing.list[str]" => Some(
+            "[_cj_data.ConsumeUnicodeNoSurrogates(16) for _ in range(_cj_data.ConsumeIntInRange(0, 4))]",
+        ),
+        "list[bool]" | "typing.list[bool]" => Some(
+            "[_cj_data.ConsumeBool() for _ in range(_cj_data.ConsumeIntInRange(0, 8))]",
+        ),
+        _ => None,
+    }
+}
+
+fn typescript_native_argument(type_annotation: Option<&str>) -> Option<&'static str> {
+    let normalized = type_annotation
+        .unwrap_or("unknown")
+        .to_ascii_lowercase()
+        .replace(' ', "");
+    match normalized.as_str() {
+        "number" => Some("_cj_data.number()"),
+        "string" | "unknown" | "any" => Some("_cj_data.string()"),
+        "boolean" | "bool" => Some("_cj_data.boolean()"),
+        "bigint" => Some("BigInt(_cj_data.integer())"),
+        "uint8array" => Some("_cj_data.bytes()"),
+        "buffer" => Some("Buffer.from(_cj_data.bytes())"),
+        "number[]" | "array<number>" => Some("_cj_data.array(() => _cj_data.number())"),
+        "string[]" | "array<string>" => Some("_cj_data.array(() => _cj_data.string())"),
+        "boolean[]" | "array<boolean>" => Some("_cj_data.array(() => _cj_data.boolean())"),
+        "date" => Some("new Date(Math.abs(_cj_data.integer()) % 4102444800000)"),
+        _ => None,
+    }
+}
+
+fn synthesize_python_native_fuzz(selected_functions: &[&FunctionInfo]) -> Option<NativeFuzzPlan> {
+    let targets: Vec<(&FunctionInfo, Vec<&'static str>)> = selected_functions
+        .iter()
+        .copied()
+        .filter(|func| !func.is_nested && !func.is_method)
+        .filter_map(|func| {
+            let arguments = func
+                .params
+                .iter()
+                .filter(|param| !param.is_variadic())
+                .map(|param| python_native_argument(param.type_annotation.as_deref()))
+                .collect::<Option<Vec<_>>>()?;
+            Some((func, arguments))
+        })
+        .collect();
+    if targets.is_empty() {
+        return None;
+    }
+
+    let mut code = format!(
+        r#"
+
+# -- Court Jester optional Atheris adapter ------------------------------------
+import atheris as _cj_atheris
+import json as _cj_native_json
+import sys as _cj_native_sys
+
+def _cj_native_value(value):
+    try:
+        return _cj_native_json.loads(
+            _cj_native_json.dumps(value, ensure_ascii=False, allow_nan=False)
+        )
+    except Exception:
+        return repr(value)
+
+def _cj_native_emit(function, line, arguments, error, data):
+    payload = {{
+        "function": function,
+        "line": line,
+        "arguments": [_cj_native_value(value) for value in arguments],
+        "input": bytes(data).hex(),
+        "error_type": type(error).__name__,
+        "message": str(error),
+    }}
+    print("__COURT_JESTER_NATIVE_FINDING__" + _cj_native_json.dumps(payload, ensure_ascii=False))
+
+def TestOneInput(data):
+    _cj_data = _cj_atheris.FuzzedDataProvider(data)
+    _cj_target = _cj_data.ConsumeIntInRange(0, {last_target})
+"#,
+        last_target = targets.len() - 1
+    );
+
+    for (index, (func, arguments)) in targets.iter().enumerate() {
+        let branch = if index == 0 { "if" } else { "elif" };
+        let call_args = func
+            .params
+            .iter()
+            .filter(|param| !param.is_variadic())
+            .enumerate()
+            .map(|(argument_index, param)| {
+                if param.keyword_only {
+                    format!("{}=_cj_args[{argument_index}]", param.name)
+                } else {
+                    format!("_cj_args[{argument_index}]")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let function_label =
+            serde_json::to_string(&func.name).unwrap_or_else(|_| "\"unknown\"".into());
+        let _ = writeln!(
+            code,
+            "    {branch} _cj_target == {index}:\n        _cj_args = [{}]\n        try:\n            {}({call_args})\n        except Exception as _cj_error:\n            _cj_native_emit({function_label}, {}, _cj_args, _cj_error, data)\n            raise",
+            arguments.join(", "),
+            func.name,
+            func.line,
+        );
+    }
+    code.push_str(
+        "\n_cj_atheris.instrument_all()\n_cj_atheris.Setup(_cj_native_sys.argv, TestOneInput)\n_cj_atheris.Fuzz()\n",
+    );
+
+    Some(NativeFuzzPlan {
+        code,
+        engine: NativeFuzzEngine::Atheris,
+        target_count: targets.len(),
+    })
+}
+
+fn synthesize_typescript_native_fuzz(
+    selected_functions: &[&FunctionInfo],
+) -> Option<NativeFuzzPlan> {
+    let targets: Vec<(&FunctionInfo, Vec<&'static str>)> = selected_functions
+        .iter()
+        .copied()
+        .filter(|func| is_api_surface(func))
+        .filter_map(|func| {
+            let arguments = func
+                .params
+                .iter()
+                .filter(|param| !param.is_variadic())
+                .map(|param| typescript_native_argument(param.type_annotation.as_deref()))
+                .collect::<Option<Vec<_>>>()?;
+            Some((func, arguments))
+        })
+        .collect();
+    if targets.is_empty() {
+        return None;
+    }
+
+    let mut code = format!(
+        r#"
+
+// -- Court Jester optional Jazzer.js adapter ---------------------------------
+class _CourtJesterNativeInput {{
+  private offset = 1;
+  constructor(private readonly data: Uint8Array) {{}}
+  private take(length: number): Uint8Array {{
+    const available = Math.max(0, Math.min(length, this.data.length - this.offset));
+    const value = this.data.slice(this.offset, this.offset + available);
+    this.offset += available;
+    return value;
+  }}
+  integer(): number {{
+    const bytes = this.take(6);
+    let value = 0;
+    for (const byte of bytes) value = value * 256 + byte;
+    return value - 2 ** 47;
+  }}
+  number(): number {{
+    const value = this.integer();
+    return this.boolean() ? value / 1000 : value;
+  }}
+  boolean(): boolean {{
+    return (this.take(1)[0] ?? 0) % 2 === 1;
+  }}
+  bytes(): Uint8Array {{
+    const length = (this.take(1)[0] ?? 0) % 65;
+    return this.take(length);
+  }}
+  string(): string {{
+    return new TextDecoder("utf-8", {{ fatal: false }}).decode(this.bytes());
+  }}
+  array<T>(generate: () => T): T[] {{
+    const length = (this.take(1)[0] ?? 0) % 9;
+    return Array.from({{ length }}, generate);
+  }}
+}}
+
+function _cjNativeValue(value: unknown): unknown {{
+  if (typeof value === "bigint") return value.toString();
+  if (value instanceof Uint8Array) return Array.from(value);
+  try {{
+    return JSON.parse(JSON.stringify(value));
+  }} catch {{
+    return String(value);
+  }}
+}}
+
+function _cjNativeEmit(functionName: string, line: number, args: unknown[], error: unknown, input: Uint8Array): void {{
+  const payload = {{
+    function: functionName,
+    line,
+    arguments: args.map(_cjNativeValue),
+    input: Array.from(input, (byte) => byte.toString(16).padStart(2, "0")).join(""),
+    error_type: error instanceof Error ? error.constructor.name : typeof error,
+    message: error instanceof Error ? error.message : String(error),
+  }};
+  console.log("__COURT_JESTER_NATIVE_FINDING__" + JSON.stringify(payload));
+}}
+
+export async function fuzz(data: Uint8Array): Promise<void> {{
+  const _cj_data = new _CourtJesterNativeInput(data);
+  const _cj_target = (data[0] ?? 0) % {target_count};
+"#,
+        target_count = targets.len()
+    );
+
+    for (index, (func, arguments)) in targets.iter().enumerate() {
+        let branch = if index == 0 { "if" } else { "else if" };
+        let arg_names = (0..arguments.len())
+            .map(|argument_index| format!("_cj_args[{argument_index}]"))
+            .collect::<Vec<_>>();
+        let arg_refs = arg_names.iter().map(String::as_str).collect::<Vec<_>>();
+        let call = ts_call_with_args(func, &arg_refs);
+        let function_label =
+            serde_json::to_string(&func.name).unwrap_or_else(|_| "\"unknown\"".into());
+        let _ = writeln!(
+            code,
+            "  {branch} (_cj_target === {index}) {{\n    const _cj_args: unknown[] = [{}];\n    try {{\n      await {call};\n    }} catch (_cj_error: unknown) {{\n      _cjNativeEmit({function_label}, {}, _cj_args, _cj_error, data);\n      throw _cj_error;\n    }}\n  }}",
+            arguments.join(", "),
+            func.line,
+        );
+    }
+    code.push_str("}\n");
+
+    Some(NativeFuzzPlan {
+        code,
+        engine: NativeFuzzEngine::Jazzer,
+        target_count: targets.len(),
+    })
+}
+
+pub fn synthesize_native_fuzz(
+    language: &Language,
+    selected_functions: &[&FunctionInfo],
+    engine: NativeFuzzEngine,
+) -> Option<NativeFuzzPlan> {
+    match (language, engine) {
+        (Language::Python, NativeFuzzEngine::Auto | NativeFuzzEngine::Atheris) => {
+            synthesize_python_native_fuzz(selected_functions)
+        }
+        (Language::TypeScript, NativeFuzzEngine::Auto | NativeFuzzEngine::Jazzer) => {
+            synthesize_typescript_native_fuzz(selected_functions)
+        }
+        _ => None,
+    }
 }

@@ -253,6 +253,8 @@ Useful `verify` flags:
 - `--report-level full|minimal`: choose full debug output or CI-sized reports
 - `--suppressions-file <PATH>`: JSON suppression rules for known findings
 - `--no-auto-seed`: disable automatic seed extraction from nearby tests and simple literal call sites
+- `--native-fuzz-engine off|auto|atheris|jazzer` with `--native-fuzz-runs <N>`: opt into an installed coverage-guided engine after the deterministic campaign. `auto` selects Atheris for Python or Jazzer.js for TypeScript and reports unavailable engines explicitly instead of silently falling back.
+- `--llm-plateau-command <PATH>`: opt into an external JSON seed proposer only after the retained deterministic corpus stops growing; accepted seeds still run through the normal sandbox, finding, minimization, and replay pipeline.
 - `--diff-file <PATH>`: only inspect changed functions from a unified diff
 - `--complexity-metric cyclomatic|cognitive`: choose which complexity metric drives threshold failures
 - `--complexity-threshold <N>`: fail when a function exceeds the threshold
@@ -267,6 +269,7 @@ Runtime and evidence controls:
 - `--runtime-profile local-trusted|isolated` (default `local-trusted`) selects host execution or Docker isolation. Isolated mode accepts `--python-docker-image` (`python:3.12-slim`) and `--typescript-docker-image` (`node:24-bookworm-slim`).
 - `court-jester doctor --language python|typescript|all` checks the selected runtime; use its schema-v3 report as a prerequisite for benchmark evidence.
 - `court-jester replay --report <PATH> --finding <ID>` reruns a persisted structured repro and returns a typed replay outcome.
+- `just bench-fuzz-effectiveness` runs the seeded mutation/control lane and reports mutation recall plus clean-control specificity. The command exits nonzero on any expected-finding, stage, verdict, or specificity mismatch.
 
 Sandbox flags for `execute`:
 

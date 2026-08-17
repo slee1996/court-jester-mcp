@@ -1,7 +1,7 @@
 use court_jester::tools::analyze::analyze;
 use court_jester::tools::domain::{build_verification_plan, safe_dependency_substitute};
 use court_jester::tools::synthesize::{
-    synthesize_calls, synthesize_plan, synthesize_plan_for_verification,
+    synthesize_calls, synthesize_native_fuzz, synthesize_plan, synthesize_plan_for_verification,
     synthesize_plan_for_with_seeds,
 };
 use court_jester::types::*;
@@ -49,6 +49,7 @@ fn func(name: &str, params: Vec<(&str, Option<&str>)>, ret: Option<&str>) -> Fun
         is_nested: false,
         is_exported: true,
         declared_properties: vec![],
+        predicate_seeds: vec![],
         effects: vec![],
         invocation_target: None,
         returned_callables: vec![],
@@ -95,6 +96,7 @@ fn kwonly_func(
         is_nested: false,
         is_exported: true,
         declared_properties: vec![],
+        predicate_seeds: vec![],
         effects: vec![],
         invocation_target: None,
         returned_callables: vec![],
@@ -2370,6 +2372,79 @@ fn python_involution_pair() {
 }
 
 #[test]
+fn python_declared_metamorphic_properties_use_campaign_inputs() {
+    let mut involution = func("invert", vec![("value", Some("int"))], Some("int"));
+    involution.declared_properties = vec!["involution".into(), "monotonic".into()];
+    let mut aggregate = func(
+        "aggregate",
+        vec![("values", Some("list[int]"))],
+        Some("int"),
+    );
+    aggregate.declared_properties = vec!["order_invariant".into()];
+    let a = make_analysis(vec![involution, aggregate], vec![]);
+    let code = synthesize_calls(&a, &Language::Python);
+
+    assert!(
+        code.contains("Involution violated") && code.contains("Monotonicity violated"),
+        "declared scalar metamorphic checks should be synthesized, got: {code}"
+    );
+    assert!(
+        code.contains("Order invariance violated") && code.contains("reversed"),
+        "declared order invariance should compare a corpus input with its reversal, got: {code}"
+    );
+}
+
+#[test]
+fn typescript_declared_metamorphic_properties_use_campaign_inputs() {
+    let mut involution = func("invert", vec![("value", Some("number"))], Some("number"));
+    involution.declared_properties = vec!["involution".into(), "monotonic".into()];
+    let mut aggregate = func(
+        "aggregate",
+        vec![("values", Some("number[]"))],
+        Some("number"),
+    );
+    aggregate.declared_properties = vec!["order_invariant".into()];
+    let a = make_analysis(vec![involution, aggregate], vec![]);
+    let code = synthesize_calls(&a, &Language::TypeScript);
+
+    assert!(
+        code.contains("\"involution\"")
+            && code.contains("\"monotonic\"")
+            && code.contains("\"order_invariant\""),
+        "declared metamorphic properties should be passed to the corpus campaign, got: {code}"
+    );
+}
+
+#[test]
+fn inferred_roundtrip_pairs_reuse_retained_corpus_rows() {
+    let a = make_analysis(
+        vec![
+            func("encode", vec![("s", Some("str"))], Some("str")),
+            func("decode", vec![("s", Some("str"))], Some("str")),
+        ],
+        vec![],
+    );
+    let python = synthesize_calls(&a, &Language::Python);
+    assert!(
+        python.contains("_CJ_CORPORA.get(\"encode:1\""),
+        "Python roundtrip checks should reuse retained encoder corpus rows, got: {python}"
+    );
+
+    let typescript_analysis = make_analysis(
+        vec![
+            func("encode", vec![("s", Some("string"))], Some("string")),
+            func("decode", vec![("s", Some("string"))], Some("string")),
+        ],
+        vec![],
+    );
+    let typescript = synthesize_calls(&typescript_analysis, &Language::TypeScript);
+    assert!(
+        typescript.contains("_cjCorpora.get(\"encode:1\""),
+        "TypeScript roundtrip checks should reuse retained encoder corpus rows, got: {typescript}"
+    );
+}
+
+#[test]
 fn python_no_boundedness_for_non_matching_name() {
     let a = make_analysis(
         vec![func("transform", vec![("s", Some("str"))], Some("str"))],
@@ -2591,6 +2666,48 @@ fn typescript_involution_pair() {
     );
 }
 
+#[test]
+fn factory_campaigns_generate_repeated_stateful_action_sequences() {
+    let typescript_source = r#"
+export function createCounter() {
+    let count = 0;
+    function add(value: number): number { count += value; return count; }
+    function reset(): number { count = 0; return count; }
+    return { add, reset };
+}
+"#;
+    let typescript_analysis = analyze(typescript_source, &Language::TypeScript);
+    let typescript = synthesize_calls(&typescript_analysis, &Language::TypeScript);
+    assert!(
+        typescript.contains("_actionTrace")
+            && typescript.contains("_actionKeys")
+            && typescript.contains("_fuzzIntRange(2, 5)"),
+        "TypeScript factory campaign should run repeated actions on one instance, got: {typescript}"
+    );
+
+    let python_source = "\
+def create_counter():
+    count = 0
+    def add(value: int) -> int:
+        nonlocal count
+        count += value
+        return count
+    def reset() -> int:
+        nonlocal count
+        count = 0
+        return count
+    return {'add': add, 'reset': reset}
+";
+    let python_analysis = analyze(python_source, &Language::Python);
+    let python = synthesize_calls(&python_analysis, &Language::Python);
+    assert!(
+        python.contains("_action_trace")
+            && python.contains("_action_keys")
+            && python.contains("_fuzz_int_range(2, 5)"),
+        "Python factory campaign should run repeated actions on one instance, got: {python}"
+    );
+}
+
 // ── Method skipping (Change 3) ──────────────────────────────────────────────
 
 #[test]
@@ -2619,6 +2736,7 @@ fn python_skips_methods_in_fuzz() {
                 is_nested: false,
                 is_exported: false,
                 declared_properties: vec![],
+                predicate_seeds: vec![],
                 effects: vec![],
                 invocation_target: None,
                 returned_callables: vec![],
@@ -3050,4 +3168,100 @@ fn generated_domains_do_not_use_removed_business_field_pools() {
             );
         }
     }
+}
+
+#[test]
+fn atheris_adapter_consumes_typed_bytes_and_emits_native_findings() {
+    let analysis = make_analysis(
+        vec![func(
+            "parse_record",
+            vec![("name", Some("str")), ("count", Some("int"))],
+            Some("str"),
+        )],
+        vec![],
+    );
+    let selected = analysis.functions.iter().collect::<Vec<_>>();
+    let plan = synthesize_native_fuzz(&Language::Python, &selected, NativeFuzzEngine::Atheris)
+        .expect("Atheris plan");
+
+    assert_eq!(plan.engine, NativeFuzzEngine::Atheris);
+    assert_eq!(plan.target_count, 1);
+    assert!(plan.code.contains("FuzzedDataProvider(data)"));
+    assert!(plan.code.contains("ConsumeUnicodeNoSurrogates(64)"));
+    assert!(plan.code.contains("ConsumeInt(8)"));
+    assert!(plan.code.contains("parse_record(_cj_args[0], _cj_args[1])"));
+    assert!(plan.code.contains("__COURT_JESTER_NATIVE_FINDING__"));
+}
+
+#[test]
+fn jazzer_adapter_exports_async_fuzz_target_for_supported_api_surfaces() {
+    let analysis = make_analysis(
+        vec![func(
+            "decodeValue",
+            vec![("value", Some("string")), ("strict", Some("boolean"))],
+            Some("string"),
+        )],
+        vec![],
+    );
+    let selected = analysis.functions.iter().collect::<Vec<_>>();
+    let plan = synthesize_native_fuzz(&Language::TypeScript, &selected, NativeFuzzEngine::Jazzer)
+        .expect("Jazzer plan");
+
+    assert_eq!(plan.engine, NativeFuzzEngine::Jazzer);
+    assert_eq!(plan.target_count, 1);
+    assert!(plan.code.contains("export async function fuzz"));
+    assert!(plan.code.contains("_cj_data.string()"));
+    assert!(plan.code.contains("_cj_data.boolean()"));
+    assert!(plan.code.contains("await (decodeValue as Function)"));
+    assert!(plan.code.contains("__COURT_JESTER_NATIVE_FINDING__"));
+}
+
+#[test]
+fn verification_plan_renders_coverage_corpus_seed() {
+    let analysis = analyze(
+        "def explode(value: str) -> str:\n    normalized = str(value)\n    score = sum((index + 1) * ord(char) for index, char in enumerate(normalized))\n    if len(normalized) == 10 and score == 5686:\n        raise IndexError('plateau crash')\n    return 'ok'\n",
+        &Language::Python,
+    );
+    let mut plan = build_verification_plan(
+        &analysis.functions,
+        &analysis.classes,
+        &analysis.aliases,
+        &Language::Python,
+        &[],
+        &[],
+        &[],
+    );
+    plan.inputs.insert(
+        0,
+        PlannedInput {
+            surface_id: "explode:1".into(),
+            arguments: PlannedArguments {
+                positional: vec![DomainLiteral {
+                    expression: "\"llm-secret\"".into(),
+                    json_value: Some(serde_json::json!("llm-secret")),
+                }],
+                named: BTreeMap::new(),
+            },
+            classification: InputClassification::Unknown,
+            sources: vec![DomainSource {
+                kind: DomainSourceKind::CoverageCorpus,
+                symbol: Some("explode".into()),
+                source_file: Some("target.py".into()),
+                line: None,
+            }],
+        },
+    );
+    let code = synthesize_plan_for_verification(
+        &analysis.functions,
+        &analysis.classes,
+        &analysis.aliases,
+        &Language::Python,
+        &plan,
+    )
+    .code;
+
+    assert!(
+        code.contains("\"llm-secret\""),
+        "coverage corpus seed must be rendered: {code}"
+    );
 }

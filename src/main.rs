@@ -9,8 +9,8 @@ use tempfile::TempDir;
 
 use court_jester::types::{
     ComplexityMetric, CoverageGate, DiagnosticImpact, ExecuteGate, FailureDomain, HarnessArg,
-    InferredOracleGate, Language, NetworkPolicy, ReportLevel, RuntimeProfile, StageStatus,
-    SummaryFormat, TestRunner, VerificationReport, VerificationVerdict,
+    InferredOracleGate, Language, NativeFuzzEngine, NetworkPolicy, ReportLevel, RuntimeProfile,
+    StageStatus, SummaryFormat, TestRunner, VerificationReport, VerificationVerdict,
     DEFAULT_PYTHON_DOCKER_IMAGE, DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
 };
 use court_jester::{parse_language, tools};
@@ -57,6 +57,9 @@ VERIFY OPTIONS:
   --memory-mb <N>            Memory cap MB (default 512)
   --network <POLICY>         deny | allow (isolated requires deny)
   --harness-args-json <JSON> Ordered literal/project_path argument array
+  --native-fuzz-engine <E>   off | auto | atheris | jazzer (default off)
+  --native-fuzz-runs <N>     Coverage-guided engine iteration cap (default 1000)
+  --llm-plateau-command <P> Executable implementing the JSON seed-proposal protocol
 
 CI OPTIONS:
   --base <REV>               Base revision for changed-file diffing (required for `ci`)
@@ -87,6 +90,9 @@ ENVIRONMENT:
   COURT_JESTER_VERIFY_PYTHON_TIMEOUT_SECONDS      Python fuzz-exec timeout (default 10)
   COURT_JESTER_VERIFY_TYPESCRIPT_TIMEOUT_SECONDS  TS fuzz-exec timeout (default 25)
   COURT_JESTER_VERIFY_TEST_TIMEOUT_SECONDS        Test stage timeout (default 30)
+  COURT_JESTER_NATIVE_FUZZ_ENGINE                 off | auto | atheris | jazzer
+  COURT_JESTER_LLM_PLATEAU_COMMAND                Opt-in seed-proposal executable
+  COURT_JESTER_NATIVE_FUZZ_RUNS                   Coverage-guided iteration cap
 
 EXAMPLES:
   court-jester verify --file src/profile.py --language python
@@ -170,6 +176,9 @@ struct CliArgs {
     summary_format: SummaryFormat,
     suppressions_file: Option<String>,
     no_auto_seed: bool,
+    native_fuzz_engine: NativeFuzzEngine,
+    native_fuzz_runs: Option<usize>,
+    llm_plateau_command: Option<String>,
     diff_file: Option<String>,
     profile: Option<String>,
     complexity_metric: ComplexityMetric,
@@ -222,6 +231,76 @@ impl Drop for VerifyTimeoutEnv {
             } else {
                 env::remove_var(key);
             }
+        }
+    }
+}
+
+struct VerifyNativeFuzzEnv {
+    previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl VerifyNativeFuzzEnv {
+    fn install(engine: NativeFuzzEngine, runs: Option<usize>) -> Self {
+        let mut previous = Vec::new();
+        if engine != NativeFuzzEngine::Off {
+            previous.push((
+                "COURT_JESTER_NATIVE_FUZZ_ENGINE",
+                env::var_os("COURT_JESTER_NATIVE_FUZZ_ENGINE"),
+            ));
+            env::set_var(
+                "COURT_JESTER_NATIVE_FUZZ_ENGINE",
+                match engine {
+                    NativeFuzzEngine::Off => "off",
+                    NativeFuzzEngine::Auto => "auto",
+                    NativeFuzzEngine::Atheris => "atheris",
+                    NativeFuzzEngine::Jazzer => "jazzer",
+                },
+            );
+        }
+        if let Some(runs) = runs {
+            previous.push((
+                "COURT_JESTER_NATIVE_FUZZ_RUNS",
+                env::var_os("COURT_JESTER_NATIVE_FUZZ_RUNS"),
+            ));
+            env::set_var("COURT_JESTER_NATIVE_FUZZ_RUNS", runs.to_string());
+        }
+        Self { previous }
+    }
+}
+
+impl Drop for VerifyNativeFuzzEnv {
+    fn drop(&mut self) {
+        for (key, value) in self.previous.drain(..) {
+            if let Some(value) = value {
+                env::set_var(key, value);
+            } else {
+                env::remove_var(key);
+            }
+        }
+    }
+}
+
+struct VerifyLlmPlateauEnv {
+    previous: Option<Option<std::ffi::OsString>>,
+}
+
+impl VerifyLlmPlateauEnv {
+    fn install(command: Option<&str>) -> Self {
+        let previous = command.map(|command| {
+            let previous = env::var_os("COURT_JESTER_LLM_PLATEAU_COMMAND");
+            env::set_var("COURT_JESTER_LLM_PLATEAU_COMMAND", command);
+            previous
+        });
+        Self { previous }
+    }
+}
+
+impl Drop for VerifyLlmPlateauEnv {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(Some(previous)) => env::set_var("COURT_JESTER_LLM_PLATEAU_COMMAND", previous),
+            Some(None) => env::remove_var("COURT_JESTER_LLM_PLATEAU_COMMAND"),
+            None => {}
         }
     }
 }
@@ -321,6 +400,38 @@ fn parse_flags(rest: &[String]) -> Result<CliArgs, String> {
             }
             "--suppressions-file" => out.suppressions_file = Some(take_value(&mut i)?),
             "--no-auto-seed" => out.no_auto_seed = true,
+            "--native-fuzz-engine" => {
+                let raw = take_value(&mut i)?;
+                out.native_fuzz_engine = NativeFuzzEngine::parse(&raw).ok_or_else(|| {
+                    format!(
+                        "--native-fuzz-engine must be one of: off, auto, atheris, jazzer (got '{}')",
+                        raw
+                    )
+                })?;
+            }
+            "--native-fuzz-runs" => {
+                let raw = take_value(&mut i)?;
+                let runs = raw.parse::<usize>().map_err(|_| {
+                    format!(
+                        "--native-fuzz-runs must be a positive integer, got '{}'",
+                        raw
+                    )
+                })?;
+                if runs == 0 || runs > 1_000_000 {
+                    return Err(format!(
+                        "--native-fuzz-runs must be between 1 and 1000000, got '{}'",
+                        raw
+                    ));
+                }
+                out.native_fuzz_runs = Some(runs);
+            }
+            "--llm-plateau-command" => {
+                let command = take_value(&mut i)?;
+                if command.trim().is_empty() {
+                    return Err("--llm-plateau-command must not be empty".into());
+                }
+                out.llm_plateau_command = Some(command);
+            }
             "--diff-file" => out.diff_file = Some(take_value(&mut i)?),
             "--profile" => out.profile = Some(take_value(&mut i)?),
             "--complexity-metric" => {
@@ -1550,7 +1661,7 @@ async fn run_doctor(args: &CliArgs) -> Result<court_jester::types::DoctorReport,
                 Language::Python => "print('court-jester doctor')",
                 Language::TypeScript => "console.log(process.versions.node)",
             };
-            let project = TempDir::new()
+            let project = tools::sandbox::runtime_tempdir(RuntimeProfile::Isolated)
                 .map_err(|error| format!("failed to create doctor workspace: {error}"))?;
             let project_path = project.path().to_path_buf();
             let source_mode = match language {
@@ -1774,6 +1885,10 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
             let repo_dir = env::current_dir()
                 .map_err(|e| format!("failed to resolve current directory for ci: {}", e))?;
             let _verify_timeout_env = VerifyTimeoutEnv::install(args.timeout_seconds);
+            let _verify_native_fuzz_env =
+                VerifyNativeFuzzEnv::install(args.native_fuzz_engine, args.native_fuzz_runs);
+            let _verify_llm_plateau_env =
+                VerifyLlmPlateauEnv::install(args.llm_plateau_command.as_deref());
             let result = run_ci_for_repo(&repo_dir, &args).await?;
             match args.ci_report_format {
                 CiReportFormat::Human => {
@@ -1855,6 +1970,10 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
                 tests_only: args.tests_only,
             };
             let _verify_timeout_env = VerifyTimeoutEnv::install(args.timeout_seconds);
+            let _verify_native_fuzz_env =
+                VerifyNativeFuzzEnv::install(args.native_fuzz_engine, args.native_fuzz_runs);
+            let _verify_llm_plateau_env =
+                VerifyLlmPlateauEnv::install(args.llm_plateau_command.as_deref());
             let report = tools::verify::verify(&code, &language, opts).await;
             match args.summary_format {
                 SummaryFormat::Json => {
@@ -2043,7 +2162,8 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
 mod tests {
     use super::{parse_ci_gates, parse_flags, resolve_complexity_threshold, run_ci_for_repo};
     use court_jester::types::{
-        ComplexityMetric, ExecuteGate, ReportLevel, StageStatus, SummaryFormat, TestRunner,
+        ComplexityMetric, ExecuteGate, NativeFuzzEngine, ReportLevel, StageStatus, SummaryFormat,
+        TestRunner,
     };
     use std::fs;
     use std::path::Path;
@@ -2120,6 +2240,22 @@ mod tests {
     fn no_auto_seed_flag_parses() {
         let args = parse_flags(&["--no-auto-seed".into()]).unwrap();
         assert!(args.no_auto_seed);
+    }
+
+    #[test]
+    fn native_fuzz_flags_parse_and_validate_bounds() {
+        let args = parse_flags(&[
+            "--native-fuzz-engine".into(),
+            "atheris".into(),
+            "--native-fuzz-runs".into(),
+            "2500".into(),
+        ])
+        .unwrap();
+        assert_eq!(args.native_fuzz_engine, NativeFuzzEngine::Atheris);
+        assert_eq!(args.native_fuzz_runs, Some(2500));
+
+        let error = parse_flags(&["--native-fuzz-runs".into(), "0".into()]).unwrap_err();
+        assert!(error.contains("between 1 and 1000000"));
     }
 
     #[test]

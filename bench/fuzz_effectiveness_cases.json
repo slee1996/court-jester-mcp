@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "suite": "fuzz-effectiveness-v1",
+  "cases": [
+    {
+      "id": "python-predicate-seed-crash",
+      "kind": "mutation",
+      "technique": "predicate_aware_seed",
+      "source": "repos/fuzz_effectiveness/python_predicate_crash.py",
+      "language": "python",
+      "expected_verdict": "fail",
+      "expected_stage": {"name": "execute", "status": "failed"},
+      "expected_finding": {"function": "decode_mode", "category": "exception"}
+    },
+    {
+      "id": "typescript-predicate-seed-crash",
+      "kind": "mutation",
+      "technique": "predicate_aware_seed",
+      "source": "repos/fuzz_effectiveness/typescript_predicate_crash.ts",
+      "language": "typescript",
+      "expected_verdict": "fail",
+      "expected_stage": {"name": "execute", "status": "failed"},
+      "expected_finding": {"function": "routeJob", "category": "property"}
+    },
+    {
+      "id": "python-stateful-second-step-crash",
+      "kind": "mutation",
+      "technique": "stateful_action_sequence",
+      "source": "repos/fuzz_effectiveness/python_stateful_crash.py",
+      "language": "python",
+      "expected_verdict": "fail",
+      "expected_stage": {"name": "execute", "status": "failed"},
+      "expected_finding": {"function": "create_counter().push", "category": "exception"}
+    },
+    {
+      "id": "typescript-stateful-second-step-crash",
+      "kind": "mutation",
+      "technique": "stateful_action_sequence",
+      "source": "repos/fuzz_effectiveness/typescript_stateful_crash.ts",
+      "language": "typescript",
+      "expected_verdict": "fail",
+      "expected_stage": {"name": "execute", "status": "failed"},
+      "expected_finding": {"function": "createCounter().push", "category": "exception"}
+    },
+    {
+      "id": "python-declared-involution-violation",
+      "kind": "mutation",
+      "technique": "metamorphic_property",
+      "source": "repos/fuzz_effectiveness/python_involution_bug.py",
+      "language": "python",
+      "expected_verdict": "fail",
+      "expected_stage": {"name": "execute", "status": "failed"},
+      "expected_finding": {"function": "reverse_text", "category": "property"}
+    },
+    {
+      "id": "python-differential-regression",
+      "kind": "mutation",
+      "technique": "differential_oracle",
+      "source": "repos/fuzz_effectiveness/differential_candidate/normalize.py",
+      "base_source": "repos/fuzz_effectiveness/differential_base/normalize.py",
+      "language": "python",
+      "expected_verdict": "pass",
+      "expected_stage": {"name": "execute", "status": "passed"},
+      "expected_finding": {"function": "normalize_limit", "category": "differential"}
+    },
+    {
+      "id": "python-llm-plateau-escape",
+      "kind": "mutation",
+      "technique": "llm_plateau_escape",
+      "source": "repos/fuzz_effectiveness/python_llm_plateau_crash.py",
+      "language": "python",
+      "llm_seeds": [
+        {"function": "explode", "arguments": ["llm-secret"]}
+      ],
+      "expected_verdict": "fail",
+      "expected_stage": {"name": "llm_plateau_escape", "status": "failed"},
+      "expected_finding": {"function": "explode", "category": "exception"}
+    },
+    {
+      "id": "python-clean-specificity-control",
+      "kind": "control",
+      "technique": "specificity_control",
+      "source": "repos/fuzz_effectiveness/python_clean_control.py",
+      "language": "python",
+      "expected_verdict": "pass",
+      "expected_stage": {"name": "execute", "status": "passed"}
+    },
+    {
+      "id": "typescript-clean-specificity-control",
+      "kind": "control",
+      "technique": "specificity_control",
+      "source": "repos/fuzz_effectiveness/typescript_clean_control.ts",
+      "language": "typescript",
+      "expected_verdict": "pass",
+      "expected_stage": {"name": "execute", "status": "passed"}
+    }
+  ]
+}

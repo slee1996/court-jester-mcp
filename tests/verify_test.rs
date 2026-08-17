@@ -3177,6 +3177,102 @@ export function reorder(values: string[]): string[] {
 }
 
 #[tokio::test]
+async fn declared_monotonicity_failure_is_authoritative() {
+    let code = r#"
+// court-jester-properties monotonic
+export function negate(value: number): number {
+    return -value;
+}
+"#;
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+    let finding = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .and_then(|stage| stage.detail.as_ref())
+        .and_then(|detail| detail["findings"].as_array())
+        .and_then(|findings| {
+            findings.iter().find(|finding| {
+                finding["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("Monotonicity violated"))
+            })
+        })
+        .unwrap_or_else(|| panic!("monotonicity finding missing: {report:#?}"));
+
+    assert_eq!(
+        finding["oracle"]["kind"].as_str(),
+        Some("declared_property")
+    );
+    assert_eq!(finding["confidence"].as_str(), Some("authoritative"));
+    assert_eq!(finding["category"].as_str(), Some("property"));
+}
+
+#[tokio::test]
+async fn declared_python_involution_failure_is_authoritative() {
+    let code = "\
+# court-jester-properties involutive
+def increment(value: int) -> int:
+    return value + 1
+";
+    let report = verify(code, &Language::Python, default_opts(None)).await;
+    let finding = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .and_then(|stage| stage.detail.as_ref())
+        .and_then(|detail| detail["findings"].as_array())
+        .and_then(|findings| {
+            findings.iter().find(|finding| {
+                finding["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("Involution violated"))
+            })
+        })
+        .unwrap_or_else(|| panic!("involution finding missing: {report:#?}"));
+
+    assert_eq!(
+        finding["oracle"]["kind"].as_str(),
+        Some("declared_property")
+    );
+    assert_eq!(finding["confidence"].as_str(), Some("authoritative"));
+}
+
+#[tokio::test]
+async fn inferred_roundtrip_failure_emits_structured_advisory() {
+    let code = r#"
+export function encode(value: string): string {
+    return value + "x";
+}
+export function decode(value: string): string {
+    return value;
+}
+"#;
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+    let finding = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .and_then(|stage| stage.detail.as_ref())
+        .and_then(|detail| detail["findings"].as_array())
+        .and_then(|findings| {
+            findings.iter().find(|finding| {
+                finding["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("Roundtrip failed"))
+            })
+        })
+        .unwrap_or_else(|| panic!("roundtrip finding missing: {report:#?}"));
+
+    assert_eq!(
+        finding["oracle"]["kind"].as_str(),
+        Some("inferred_semantic")
+    );
+    assert_eq!(finding["confidence"].as_str(), Some("low"));
+    assert_eq!(finding["category"].as_str(), Some("property"));
+}
+
+#[tokio::test]
 async fn exported_object_literal_methods_can_fail_verify() {
     let code = r#"
 export const reorderer = {
@@ -3276,6 +3372,80 @@ export function createReorderer() {
         }),
         "factory-returned callables should be explicit in coverage output"
     );
+}
+
+#[tokio::test]
+async fn typescript_factory_action_sequence_finds_second_step_crash() {
+    let code = r#"
+export function createCounter() {
+    let calls = 0;
+    function push(value: number): number {
+        calls += 1;
+        if (calls === 2) {
+            throw new ReferenceError("stateful second-step crash");
+        }
+        return value;
+    }
+    return { push };
+}
+"#;
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+    let finding = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .and_then(|stage| stage.detail.as_ref())
+        .and_then(|detail| detail["findings"].as_array())
+        .and_then(|findings| {
+            findings.iter().find(|finding| {
+                finding["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("stateful second-step crash"))
+            })
+        })
+        .unwrap_or_else(|| panic!("stateful TypeScript finding missing: {report:#?}"));
+
+    assert_eq!(
+        finding["location"]["function"].as_str(),
+        Some("createCounter().push")
+    );
+    assert!(finding["repro"]["case_label"]
+        .as_str()
+        .is_some_and(|label| label.contains("push")));
+}
+
+#[tokio::test]
+async fn python_factory_action_sequence_finds_second_step_crash() {
+    let code = "\
+def create_counter():
+    calls = 0
+    def push(value: int) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise ValueError('stateful second-step crash')
+        return value
+    return {'push': push}
+";
+    let report = verify(code, &Language::Python, default_opts(None)).await;
+    let finding = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .and_then(|stage| stage.detail.as_ref())
+        .and_then(|detail| detail["findings"].as_array())
+        .and_then(|findings| {
+            findings.iter().find(|finding| {
+                finding["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("stateful second-step crash"))
+            })
+        })
+        .unwrap_or_else(|| panic!("stateful Python finding missing: {report:#?}"));
+
+    assert!(finding["repro"]["case_label"]
+        .as_str()
+        .is_some_and(|label| label.contains("push")));
 }
 
 #[tokio::test]
@@ -5792,7 +5962,7 @@ async fn nonbreaking_space_failure_has_structured_minimized_replay() {
     let finding = findings
         .iter()
         .find(|finding| finding["location"]["function"] == "normalize_display_name")
-        .expect("NBSP finding");
+        .unwrap_or_else(|| panic!("NBSP finding: {report:#?}"));
     assert_eq!(
         finding["minimization"]["status"].as_str(),
         Some("preserved")
@@ -6952,5 +7122,331 @@ export function useCounter() {
             })
         }),
         "the unresolved ref must remain a target crash: {detail:#?}"
+    );
+}
+
+#[tokio::test]
+async fn feedback_corpus_persists_and_is_reused_across_verification_runs() {
+    let project = tempfile::tempdir().unwrap();
+    let output = project.path().join("reports");
+    let source = project.path().join("bucket.ts");
+    let code = r#"export function bucket(value: number): string {
+  if (value === 777125) return "rare";
+  if (value < 0) return "negative";
+  return "other";
+}"#;
+    fs::write(&source, code).unwrap();
+    let source_text = source.to_string_lossy().into_owned();
+    let project_text = project.path().to_string_lossy().into_owned();
+    let output_text = output.to_string_lossy().into_owned();
+
+    let mut first_opts = default_opts(None);
+    first_opts.project_dir = Some(&project_text);
+    first_opts.source_file = Some(&source_text);
+    first_opts.output_dir = Some(&output_text);
+    let first = verify(code, &Language::TypeScript, first_opts).await;
+    assert_eq!(first.verdict, VerificationVerdict::Pass, "{first:#?}");
+    let first_coverage = first
+        .stages
+        .iter()
+        .find(|stage| stage.name == "coverage")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("first coverage detail");
+    assert_eq!(first_coverage["corpus_loaded"], 0);
+    assert!(
+        first_coverage["corpus_retained"].as_u64().unwrap_or(0) > 0,
+        "{first_coverage:#?}"
+    );
+
+    let mut second_opts = default_opts(None);
+    second_opts.project_dir = Some(&project_text);
+    second_opts.source_file = Some(&source_text);
+    second_opts.output_dir = Some(&output_text);
+    let second = verify(code, &Language::TypeScript, second_opts).await;
+    assert_eq!(second.verdict, VerificationVerdict::Pass, "{second:#?}");
+    let second_coverage = second
+        .stages
+        .iter()
+        .find(|stage| stage.name == "coverage")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("second coverage detail");
+    assert!(
+        second_coverage["corpus_loaded"].as_u64().unwrap_or(0) > 0,
+        "{second_coverage:#?}"
+    );
+    assert!(fs::read_dir(&output).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".court-jester-corpus-")
+    }));
+}
+
+#[tokio::test]
+async fn typescript_shrinking_reaches_an_oracle_preserving_fixed_point() {
+    let code = r#"export function explode(input: {
+  token: string;
+  noiseA?: string;
+  noiseB?: string;
+}): string {
+  if (input.token === "boom") {
+    throw new ReferenceError("stable crash");
+  }
+  return "ok";
+}
+
+function caller(): string {
+  return explode({ token: "boom", noiseA: "discard-a", noiseB: "discard-b" });
+}"#;
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+    let finding = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .and_then(|stage| stage.detail.as_ref())
+        .and_then(|detail| detail["findings"].as_array())
+        .and_then(|findings| {
+            findings
+                .iter()
+                .find(|finding| finding["location"]["function"] == "explode")
+        })
+        .unwrap_or_else(|| panic!("explode finding: {report:#?}"));
+    assert_eq!(
+        finding["minimization"]["status"].as_str(),
+        Some("preserved")
+    );
+    assert_eq!(
+        finding["minimization"]["minimized"]["arguments"][0]["json_value"],
+        serde_json::json!({
+            "token": "boom"
+        }),
+        "fixed-point shrinking must discard both independent noise fields: {finding:#?}"
+    );
+}
+
+#[test]
+fn cli_atheris_adapter_runs_installed_engine_and_reports_crashing_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("target.py");
+    fs::write(
+        &source,
+        "def explode(value: int) -> int:\n    if value == 7:\n        raise RuntimeError('native crash')\n    return value\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("atheris.py"),
+        r#"class FuzzedDataProvider:
+    def __init__(self, data):
+        self.data = data
+    def ConsumeIntInRange(self, lower, upper):
+        return lower
+    def ConsumeInt(self, size):
+        return 7
+
+_callback = None
+
+def instrument_all():
+    pass
+
+def Setup(argv, callback):
+    global _callback
+    _callback = callback
+
+def Fuzz():
+    _callback(b"\x00" * 16)
+"#,
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_court-jester"))
+        .args([
+            "verify",
+            "--file",
+            source.to_str().unwrap(),
+            "--language",
+            "python",
+            "--project-dir",
+            dir.path().to_str().unwrap(),
+            "--native-fuzz-engine",
+            "atheris",
+            "--native-fuzz-runs",
+            "1",
+            "--timeout-seconds",
+            "10",
+        ])
+        .output()
+        .unwrap();
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "native fuzz report must be JSON ({error}); stdout={}; stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+    let native = report["stages"]
+        .as_array()
+        .and_then(|stages| {
+            stages
+                .iter()
+                .find(|stage| stage["name"].as_str() == Some("native_fuzz"))
+        })
+        .unwrap_or_else(|| panic!("native_fuzz stage missing: {report:#?}"));
+
+    assert_eq!(native["status"].as_str(), Some("failed"));
+    assert_eq!(native["detail"]["engine"].as_str(), Some("atheris"));
+    assert_eq!(native["detail"]["runs"].as_u64(), Some(1));
+    assert_eq!(
+        native["detail"]["native_findings"][0]["location"]["function"].as_str(),
+        Some("explode")
+    );
+    assert_eq!(
+        native["detail"]["native_findings"][0]["classification"].as_str(),
+        Some("native_coverage_guided")
+    );
+}
+
+#[test]
+fn cli_llm_plateau_escape_executes_novel_seed_after_corpus_stalls() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("target.py");
+    let output_dir = dir.path().join("reports");
+    fs::write(
+        &source,
+        "def explode(value: str) -> str:\n    normalized = str(value)\n    score = sum((index + 1) * ord(char) for index, char in enumerate(normalized))\n    if len(normalized) == 10 and score == 5686:\n        raise IndexError('plateau crash')\n    return 'ok'\n",
+    )
+    .unwrap();
+    let initial = std::process::Command::new(env!("CARGO_BIN_EXE_court-jester"))
+        .args([
+            "verify",
+            "--file",
+            source.to_str().unwrap(),
+            "--language",
+            "python",
+            "--project-dir",
+            dir.path().to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--timeout-seconds",
+            "10",
+        ])
+        .env_remove("COURT_JESTER_LLM_PLATEAU_COMMAND")
+        .output()
+        .unwrap();
+    let initial_report: serde_json::Value =
+        serde_json::from_slice(&initial.stdout).unwrap_or_else(|error| {
+            panic!(
+                "initial report must be JSON ({error}); stdout={}; stderr={}",
+                String::from_utf8_lossy(&initial.stdout),
+                String::from_utf8_lossy(&initial.stderr)
+            )
+        });
+    let retained = initial_report["stages"]
+        .as_array()
+        .and_then(|stages| {
+            stages
+                .iter()
+                .find(|stage| stage["name"].as_str() == Some("coverage"))
+        })
+        .and_then(|stage| stage["detail"]["corpus_retained"].as_u64())
+        .unwrap_or(0);
+    assert!(
+        retained > 0,
+        "initial run must retain corpus history: {initial_report:#?}"
+    );
+
+    let prompt_path = dir.path().join("llm-prompt.json");
+    let command = dir.path().join("propose-seeds");
+    fs::write(
+        &command,
+        format!(
+            "#!/bin/sh\ncat > '{}'\nprintf '%s\\n' '{{\"seeds\":[{{\"function\":\"explode\",\"arguments\":[\"llm-secret\"]}}]}}'\n",
+            prompt_path.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&command);
+    let escaped = std::process::Command::new(env!("CARGO_BIN_EXE_court-jester"))
+        .args([
+            "verify",
+            "--file",
+            source.to_str().unwrap(),
+            "--language",
+            "python",
+            "--project-dir",
+            dir.path().to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--llm-plateau-command",
+            command.to_str().unwrap(),
+            "--timeout-seconds",
+            "10",
+        ])
+        .output()
+        .unwrap();
+    let report: serde_json::Value =
+        serde_json::from_slice(&escaped.stdout).unwrap_or_else(|error| {
+            panic!(
+                "plateau report must be JSON ({error}); stdout={}; stderr={}",
+                String::from_utf8_lossy(&escaped.stdout),
+                String::from_utf8_lossy(&escaped.stderr)
+            )
+        });
+    assert_eq!(
+        escaped.status.code(),
+        Some(1),
+        "a discovered plateau crash is a target failure, not an infrastructure error"
+    );
+    assert_eq!(
+        report["verdict"].as_str(),
+        Some("fail"),
+        "authoritative plateau findings must fail verification: {report:#?}"
+    );
+    let plateau = report["stages"]
+        .as_array()
+        .and_then(|stages| {
+            stages
+                .iter()
+                .find(|stage| stage["name"].as_str() == Some("llm_plateau_escape"))
+        })
+        .unwrap_or_else(|| panic!("llm_plateau_escape stage missing: {report:#?}"));
+
+    assert_eq!(
+        plateau["status"].as_str(),
+        Some("failed"),
+        "plateau stage: {plateau:#?}"
+    );
+    assert_eq!(plateau["detail"]["accepted"].as_u64(), Some(1));
+    assert!(
+        plateau["detail"]["finding_count"].as_u64().unwrap_or(0) > 0,
+        "plateau seed must produce an authoritative finding: {plateau:#?}"
+    );
+    let escaped_seed_found = report["stages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|stage| stage["name"].as_str() == Some("execute"))
+        .and_then(|stage| stage["detail"]["findings"].as_array())
+        .is_some_and(|findings| {
+            findings.iter().any(|finding| {
+                ["original", "minimized"].iter().any(|case| {
+                    finding["minimization"][case]["arguments"][0]["json_value"].as_str()
+                        == Some("llm-secret")
+                })
+            })
+        });
+    assert!(
+        escaped_seed_found,
+        "LLM-proposed seed must reach the reported crash: {report:#?}"
+    );
+    let prompt: serde_json::Value =
+        serde_json::from_slice(&fs::read(prompt_path).unwrap()).unwrap();
+    assert_eq!(prompt["protocol_version"].as_u64(), Some(1));
+    assert_eq!(
+        prompt["retained_corpus"]
+            .as_object()
+            .map(serde_json::Map::len),
+        Some(1)
     );
 }

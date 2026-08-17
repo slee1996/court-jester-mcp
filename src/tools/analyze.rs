@@ -203,6 +203,9 @@ fn normalize_declared_property(token: &str) -> Option<&'static str> {
         "symmetric" => Some("symmetric"),
         "antisymmetric" | "comparator" => Some("antisymmetric"),
         "bounded" => Some("bounded"),
+        "involution" | "involutive" => Some("involution"),
+        "monotonic" | "monotone" | "nondecreasing" => Some("monotonic"),
+        "order_invariant" | "order-independent" | "order_independent" => Some("order_invariant"),
         "no_nullish_string" => Some("no_nullish_string"),
         "palindrome" | "palindrome_sequence" => Some("palindrome"),
         "query_nested_brackets" | "nested_query_brackets" | "query_bracket_notation" => {
@@ -1075,7 +1078,291 @@ fn function_effects(
     effects
 }
 
+fn contains_identifier(source: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    source.match_indices(name).any(|(start, _)| {
+        let before = source[..start].chars().next_back();
+        let after = source[start + name.len()..].chars().next();
+        !before.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            && !after.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    })
+}
+
+fn predicate_literal(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<serde_json::Value> {
+    let raw = text(&node, source).trim();
+    match node.kind() {
+        "true" => return Some(serde_json::Value::Bool(true)),
+        "false" => return Some(serde_json::Value::Bool(false)),
+        "none" | "null" => return Some(serde_json::Value::Null),
+        "undefined" => return None,
+        "integer" | "float" | "number" => {
+            let normalized = raw.replace('_', "");
+            if let Ok(value) = normalized.parse::<i64>() {
+                return Some(serde_json::json!(value));
+            }
+            if let Ok(value) = normalized.parse::<f64>() {
+                return serde_json::Number::from_f64(value).map(serde_json::Value::Number);
+            }
+            return None;
+        }
+        "string" | "string_fragment" | "template_string" => {}
+        _ => return None,
+    }
+    if raw.starts_with('"') {
+        return serde_json::from_str(raw).ok();
+    }
+    let unquoted = raw
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+        .or_else(|| {
+            raw.strip_prefix('`')
+                .and_then(|value| value.strip_suffix('`'))
+        })?;
+    Some(serde_json::Value::String(
+        unquoted
+            .replace("\\'", "'")
+            .replace("\\\"", "\"")
+            .replace("\\n", "\n")
+            .replace("\\t", "\t"),
+    ))
+}
+
+fn predicate_boundary_values(value: serde_json::Value) -> Vec<serde_json::Value> {
+    let Some(number) = value.as_number() else {
+        return vec![value];
+    };
+    if let Some(integer) = number.as_i64() {
+        return [
+            integer.checked_sub(1),
+            Some(integer),
+            integer.checked_add(1),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|candidate| serde_json::json!(candidate))
+        .collect();
+    }
+    if let Some(unsigned) = number.as_u64() {
+        return [
+            unsigned.checked_sub(1),
+            Some(unsigned),
+            unsigned.checked_add(1),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|candidate| serde_json::json!(candidate))
+        .collect();
+    }
+    let value = number.as_f64().unwrap_or(0.0);
+    [value - 1.0, value, value + 1.0]
+        .into_iter()
+        .filter_map(serde_json::Number::from_f64)
+        .map(serde_json::Value::Number)
+        .collect()
+}
+
+fn collect_predicate_literals(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    values: &mut Vec<serde_json::Value>,
+) {
+    if let Some(value) = predicate_literal(node, source) {
+        values.extend(predicate_boundary_values(value));
+        return;
+    }
+    let raw = text(&node, source).trim();
+    if raw == "[]" {
+        values.push(serde_json::json!([]));
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_predicate_literals(child, source, values);
+    }
+}
+
+fn predicate_expression<'tree>(
+    node: tree_sitter::Node<'tree>,
+    source: &[u8],
+) -> Option<tree_sitter::Node<'tree>> {
+    match node.kind() {
+        "if_statement" | "while_statement" | "conditional_expression" => node
+            .child_by_field_name("condition")
+            .or_else(|| node.child_by_field_name("condition_clause")),
+        "comparison_operator" => Some(node),
+        "binary_expression" => {
+            let expression = text(&node, source);
+            [
+                "===",
+                "!==",
+                "==",
+                "!=",
+                "<=",
+                ">=",
+                "<",
+                ">",
+                " in ",
+                ".includes(",
+            ]
+            .iter()
+            .any(|operator| expression.contains(operator))
+            .then_some(node)
+        }
+        "switch_statement" | "match_statement" => Some(node),
+        _ => None,
+    }
+}
+
+fn extract_predicate_seeds(
+    function: tree_sitter::Node<'_>,
+    params: &[ParamInfo],
+    source: &[u8],
+) -> Vec<PredicateSeed> {
+    let names = params
+        .iter()
+        .filter(|param| !param.is_variadic())
+        .map(|param| param.name.as_str())
+        .collect::<Vec<_>>();
+    let mut seeds = Vec::new();
+    let mut stack = function
+        .child_by_field_name("body")
+        .into_iter()
+        .collect::<Vec<_>>();
+    while let Some(node) = stack.pop() {
+        if matches!(
+            node.kind(),
+            "function_definition"
+                | "function_declaration"
+                | "function_expression"
+                | "arrow_function"
+                | "method_definition"
+        ) {
+            continue;
+        }
+        if let Some(expression) = predicate_expression(node, source) {
+            let expression_text = text(&expression, source);
+            let mut values = Vec::new();
+            collect_predicate_literals(expression, source, &mut values);
+            for name in &names {
+                if !contains_identifier(expression_text, name) {
+                    continue;
+                }
+                for value in &values {
+                    let seed = PredicateSeed {
+                        parameter: (*name).to_string(),
+                        value: value.clone(),
+                        line: expression.start_position().row + 1,
+                    };
+                    if !seeds.iter().any(|existing: &PredicateSeed| {
+                        existing.parameter == seed.parameter && existing.value == seed.value
+                    }) {
+                        seeds.push(seed);
+                    }
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    seeds
+}
+
 // ── Python ──────────────────────────────────────────────────────────────────
+
+fn python_returned_callable_names(callable: tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
+    fn returned_expression_names(node: tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
+        if node.kind() == "identifier" {
+            return vec![text(&node, source).trim().to_string()];
+        }
+        if node.kind() != "dictionary" {
+            return Vec::new();
+        }
+
+        let mut names = Vec::new();
+        let mut cursor = node.walk();
+        for pair in node
+            .named_children(&mut cursor)
+            .filter(|child| child.kind() == "pair")
+        {
+            let Some(key) = pair.child_by_field_name("key") else {
+                continue;
+            };
+            let Some(value) = pair.child_by_field_name("value") else {
+                continue;
+            };
+            if value.kind() != "identifier" {
+                continue;
+            }
+            let value_name = text(&value, source).trim();
+            let key_text = text(&key, source).trim();
+            let key_name = key_text
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .or_else(|| {
+                    key_text
+                        .strip_prefix('\'')
+                        .and_then(|value| value.strip_suffix('\''))
+                });
+            if key_name == Some(value_name) {
+                names.push(value_name.to_string());
+            }
+        }
+        names
+    }
+
+    fn collect_returns(
+        node: tree_sitter::Node<'_>,
+        root_id: usize,
+        source: &[u8],
+        names: &mut Vec<String>,
+    ) {
+        if node.id() != root_id && matches!(node.kind(), "function_definition" | "lambda") {
+            return;
+        }
+        if node.kind() == "return_statement" {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                for name in returned_expression_names(child, source) {
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+            }
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            collect_returns(child, root_id, source, names);
+        }
+    }
+
+    fn collect_nested_functions(
+        node: tree_sitter::Node<'_>,
+        root_id: usize,
+        source: &[u8],
+        names: &mut Vec<String>,
+    ) {
+        if node.id() != root_id && node.kind() == "function_definition" {
+            if let Some(name) = node.child_by_field_name("name") {
+                names.push(text(&name, source).trim().to_string());
+            }
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            collect_nested_functions(child, root_id, source, names);
+        }
+    }
+
+    let mut nested = Vec::new();
+    collect_nested_functions(callable, callable.id(), source, &mut nested);
+    let mut names = Vec::new();
+    collect_returns(callable, callable.id(), source, &mut names);
+    names.retain(|name| nested.contains(name));
+    names
+}
 
 fn visit_python(
     node: &tree_sitter::Node,
@@ -1099,6 +1386,8 @@ fn visit_python(
                 .child_by_field_name("return_type")
                 .map(|n| text(&n, source).to_string());
             let metrics = callable_complexity(node, &Language::Python, source);
+            let predicate_seeds = extract_predicate_seeds(*node, &params, source);
+            let returned_callables = python_returned_callable_names(*node, source);
             functions.push(FunctionInfo {
                 name,
                 params,
@@ -1114,9 +1403,10 @@ fn visit_python(
                 is_nested: func_depth > 0,
                 is_exported,
                 declared_properties: vec![],
+                predicate_seeds,
                 effects: function_effects(node, source, &Language::Python),
                 invocation_target: None,
-                returned_callables: vec![],
+                returned_callables,
             });
             child_depth = func_depth + 1;
         }
@@ -1365,6 +1655,7 @@ fn visit_typescript(
                 .map(|n| type_text(&n, source));
             let metrics = callable_complexity(node, &Language::TypeScript, source);
             let returned_callables = extract_ts_returned_object_callables(node, source);
+            let predicate_seeds = extract_predicate_seeds(*node, &params, source);
             functions.push(FunctionInfo {
                 name,
                 params,
@@ -1380,6 +1671,7 @@ fn visit_typescript(
                 is_nested: func_depth > 0,
                 is_exported: ts_is_exported(node),
                 declared_properties: vec![],
+                predicate_seeds,
                 effects: function_effects(node, source, &Language::TypeScript),
                 invocation_target: None,
                 returned_callables,
@@ -1425,6 +1717,7 @@ fn visit_typescript(
                 .map(|n| type_text(&n, source));
             let metrics = callable_complexity(node, &Language::TypeScript, source);
             let returned_callables = extract_ts_returned_object_callables(node, source);
+            let predicate_seeds = extract_predicate_seeds(*node, &params, source);
             functions.push(FunctionInfo {
                 name,
                 params,
@@ -1440,6 +1733,7 @@ fn visit_typescript(
                 is_nested: func_depth > 0,
                 is_exported,
                 declared_properties: vec![],
+                predicate_seeds,
                 effects: function_effects(node, source, &Language::TypeScript),
                 invocation_target,
                 returned_callables,
@@ -1460,6 +1754,7 @@ fn visit_typescript(
                         .map(|n| type_text(&n, source));
                     let metrics = callable_complexity(&value, &Language::TypeScript, source);
                     let returned_callables = extract_ts_returned_object_callables(&value, source);
+                    let predicate_seeds = extract_predicate_seeds(value, &params, source);
                     functions.push(FunctionInfo {
                         name,
                         params,
@@ -1475,6 +1770,7 @@ fn visit_typescript(
                         is_nested: func_depth > 0,
                         is_exported: ts_is_exported(node),
                         declared_properties: vec![],
+                        predicate_seeds,
                         effects: function_effects(&value, source, &Language::TypeScript),
                         invocation_target: None,
                         returned_callables,
@@ -2017,6 +2313,7 @@ fn push_ts_surfaced_callable(
         .child_by_field_name("return_type")
         .map(|n| type_text(&n, source));
     let metrics = callable_complexity(callable_node, &Language::TypeScript, source);
+    let predicate_seeds = extract_predicate_seeds(*callable_node, &params, source);
     functions.push(FunctionInfo {
         name: format!("{base_name}.{method_name}"),
         params,
@@ -2032,6 +2329,7 @@ fn push_ts_surfaced_callable(
         is_nested,
         is_exported: true,
         declared_properties: vec![],
+        predicate_seeds,
         effects: function_effects(callable_node, source, &Language::TypeScript),
         invocation_target: Some(format!("{invocation_root}.{method_name}")),
         returned_callables: vec![],
