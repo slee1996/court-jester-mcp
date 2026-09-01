@@ -10,7 +10,7 @@ use tempfile::TempDir;
 use court_jester::types::{
     ComplexityMetric, CoverageGate, DiagnosticImpact, ExecuteGate, FailureDomain, HarnessArg,
     InferredOracleGate, Language, NativeFuzzEngine, NetworkPolicy, ReportLevel, RuntimeProfile,
-    StageStatus, SummaryFormat, TestRunner, VerificationReport, VerificationVerdict,
+    SourceMode, StageStatus, SummaryFormat, TestRunner, VerificationReport, VerificationVerdict,
     DEFAULT_PYTHON_DOCKER_IMAGE, DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
 };
 use court_jester::{parse_language, tools};
@@ -39,9 +39,10 @@ COMMON OPTIONS:
   --typescript-docker-image <IMAGE> TypeScript isolated image (default node:24-bookworm-slim)
 
 VERIFY OPTIONS:
-  --test-file <PATH>         Test file to include as an authoritative stage
+  --test-file <PATH>         Authoritative test file (exactly one with --test-quality)
   --test-runner <MODE>       auto | node | bun | repo-native (default auto)
   --tests-only               Skip fuzz-execute and run only the authoritative test stage
+  --test-quality [N]         Run up to N validated behavior mutants (default 8; range 1..32)
   --output-dir <PATH>        Directory to write persistent JSON reports
   --base-file <PATH>         Candidate's base source file for differential verification
   --base-project-dir <PATH>  Read-only project root for the base source tree
@@ -70,6 +71,9 @@ CI OPTIONS:
   --memory-mb <N>            Memory cap MB (default 512)
   --network <POLICY>         deny | allow (isolated requires deny)
   --harness-args-json <JSON> Ordered arguments (only one changed target)
+  --test-file <PATH>         Quality-test entrypoint (repeat once per target language)
+  --test-runner <MODE>       auto | node | bun | repo-native (default auto)
+  --test-quality [N]         Run up to N mutants globally across changed files (default 8)
 
 EXECUTE OPTIONS:
   --timeout-seconds <F>      Sandbox timeout (default 10)
@@ -168,9 +172,10 @@ struct CliArgs {
     project_dir: Option<String>,
     config_path: Option<String>,
     virtual_file_path: Option<String>,
-    test_file: Option<String>,
+    test_files: Vec<String>,
     test_runner: TestRunner,
     tests_only: bool,
+    test_quality_max_mutants: Option<usize>,
     output_dir: Option<String>,
     report_level: ReportLevel,
     summary_format: SummaryFormat,
@@ -368,7 +373,7 @@ fn parse_flags(rest: &[String]) -> Result<CliArgs, String> {
             "--project-dir" => out.project_dir = Some(take_value(&mut i)?),
             "--config-path" => out.config_path = Some(take_value(&mut i)?),
             "--virtual-file-path" => out.virtual_file_path = Some(take_value(&mut i)?),
-            "--test-file" => out.test_file = Some(take_value(&mut i)?),
+            "--test-file" => out.test_files.push(take_value(&mut i)?),
             "--test-runner" => {
                 let raw = take_value(&mut i)?;
                 out.test_runner = TestRunner::parse(&raw).ok_or_else(|| {
@@ -379,6 +384,30 @@ fn parse_flags(rest: &[String]) -> Result<CliArgs, String> {
                 })?;
             }
             "--tests-only" => out.tests_only = true,
+            "--test-quality" => {
+                let max_mutants = rest
+                    .get(i + 1)
+                    .filter(|value| !value.starts_with("--"))
+                    .map(|raw| {
+                        let value = raw.parse::<usize>().map_err(|_| {
+                            format!(
+                                "--test-quality must be an integer from 1 to 32, got '{}'",
+                                raw
+                            )
+                        })?;
+                        if !(1..=tools::test_quality::MAX_MUTANTS).contains(&value) {
+                            return Err(format!(
+                                "--test-quality must be between 1 and 32, got '{}'",
+                                raw
+                            ));
+                        }
+                        i += 1;
+                        Ok(value)
+                    })
+                    .transpose()?
+                    .unwrap_or(tools::test_quality::DEFAULT_MAX_MUTANTS);
+                out.test_quality_max_mutants = Some(max_mutants);
+            }
             "--output-dir" => out.output_dir = Some(take_value(&mut i)?),
             "--report-level" => {
                 let raw = take_value(&mut i)?;
@@ -714,7 +743,7 @@ fn resolve_cli_context(
         invocation_dir: &invocation_dir,
         explicit_project_dir: args.project_dir.as_deref().map(Path::new),
         target_file: Some(Path::new(target_file)),
-        test_file: args.test_file.as_deref().map(Path::new),
+        test_file: args.test_files.first().map(String::as_str).map(Path::new),
         language,
         virtual_file_path: args.virtual_file_path.as_deref().map(Path::new),
     })
@@ -763,6 +792,13 @@ fn validate_policy_flags(cmd: &str, args: &CliArgs) -> Result<(), String> {
     }
     if args.runtime_profile == RuntimeProfile::Isolated && args.network == NetworkPolicy::Allow {
         return Err("isolated execution requires --network deny".into());
+    }
+    Ok(())
+}
+
+fn validate_test_quality_flag(cmd: &str, args: &CliArgs) -> Result<(), String> {
+    if args.test_quality_max_mutants.is_some() && !matches!(cmd, "verify" | "ci") {
+        return Err(format!("--test-quality is not supported for `{cmd}`"));
     }
     Ok(())
 }
@@ -867,6 +903,15 @@ fn resolve_complexity_threshold(args: &CliArgs) -> Result<Option<usize>, String>
     }
 }
 
+#[derive(Debug)]
+struct CiPreparedFile {
+    relative_path: String,
+    language: Language,
+    absolute_string: String,
+    code: String,
+    candidate_count: usize,
+}
+
 #[derive(Debug, Clone)]
 struct CiFileResult {
     file: String,
@@ -874,6 +919,48 @@ struct CiFileResult {
     verdict: VerificationVerdict,
     failing_gates: Vec<String>,
     report: VerificationReport,
+}
+
+#[derive(Debug, Clone)]
+struct CiTestEntrypoint {
+    source_file: String,
+    code: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CiTestEntrypoints {
+    python: Option<CiTestEntrypoint>,
+    typescript: Option<CiTestEntrypoint>,
+}
+
+impl CiTestEntrypoints {
+    fn for_language(&self, language: Language) -> Option<&CiTestEntrypoint> {
+        match language {
+            Language::Python => self.python.as_ref(),
+            Language::TypeScript => self.typescript.as_ref(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct CiTestQualitySummary {
+    max_mutants: usize,
+    #[serde(flatten)]
+    counts: tools::verify::TestQualitySummary,
+}
+
+fn ci_test_quality_summary(
+    max_mutants: usize,
+    summaries: impl IntoIterator<Item = tools::verify::TestQualitySummary>,
+) -> CiTestQualitySummary {
+    let mut counts = tools::verify::TestQualitySummary::default();
+    for summary in summaries {
+        counts.add(summary);
+    }
+    CiTestQualitySummary {
+        max_mutants,
+        counts,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -885,6 +972,7 @@ struct CiRunResult {
     checked_files: usize,
     skipped_files: Vec<String>,
     files: Vec<CiFileResult>,
+    test_quality: Option<CiTestQualitySummary>,
     verdict: VerificationVerdict,
 }
 
@@ -1019,6 +1107,100 @@ fn ci_language_name(language: &Language) -> &'static str {
     }
 }
 
+fn ci_test_language(path: &str) -> Result<Language, String> {
+    match Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("py") => Ok(Language::Python),
+        Some("ts") | Some("tsx") => Ok(Language::TypeScript),
+        _ => Err(format!(
+            "CI --test-file must end in .py, .ts, or .tsx, got '{}'",
+            path
+        )),
+    }
+}
+
+fn ci_test_entrypoints(repo_dir: &Path, paths: &[String]) -> Result<CiTestEntrypoints, String> {
+    let mut python_path: Option<&str> = None;
+    let mut typescript_path: Option<&str> = None;
+    for path in paths {
+        let (language, slot) = match ci_test_language(path)? {
+            Language::Python => (Language::Python, &mut python_path),
+            Language::TypeScript => (Language::TypeScript, &mut typescript_path),
+        };
+        if let Some(existing) = *slot {
+            return Err(format!(
+                "`ci --test-quality` accepts at most one {} --test-file; got '{}' and '{}'",
+                ci_language_name(&language),
+                existing,
+                path
+            ));
+        }
+        *slot = Some(path);
+    }
+
+    let load = |path: &str| -> Result<CiTestEntrypoint, String> {
+        let source_path = {
+            let path = Path::new(path);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                repo_dir.join(path)
+            }
+        };
+        let source_file = source_path.to_string_lossy().into_owned();
+        Ok(CiTestEntrypoint {
+            code: read_file(&source_file)?,
+            source_file,
+        })
+    };
+    Ok(CiTestEntrypoints {
+        python: python_path.map(load).transpose()?,
+        typescript: typescript_path.map(load).transpose()?,
+    })
+}
+
+fn ci_source_mode(path: &str, language: Language) -> SourceMode {
+    if language == Language::Python {
+        return SourceMode::Python;
+    }
+    match Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("tsx") | Some("jsx") => SourceMode::Tsx,
+        _ => SourceMode::TypeScript,
+    }
+}
+
+fn ci_quality_allocations(max_mutants: usize, candidate_counts: &[usize]) -> Vec<usize> {
+    let mut allocations = vec![0; candidate_counts.len()];
+    let mut remaining = max_mutants;
+    while remaining > 0 {
+        let mut allocated = false;
+        for (index, capacity) in candidate_counts.iter().copied().enumerate() {
+            if allocations[index] >= capacity {
+                continue;
+            }
+            allocations[index] += 1;
+            remaining -= 1;
+            allocated = true;
+            if remaining == 0 {
+                break;
+            }
+        }
+        if !allocated {
+            break;
+        }
+    }
+    allocations
+}
+
 fn git_output(repo_dir: &Path, args: &[String]) -> Result<String, String> {
     let output = Command::new("git")
         .args(args)
@@ -1065,6 +1247,7 @@ fn ci_changed_source_files(
             files.push((path.to_string(), language));
         }
     }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(files)
 }
 
@@ -1092,14 +1275,22 @@ fn archive_baseline_tree(repo_dir: &Path, revision: &str) -> Result<TempDir, Str
         .map_err(|e| format!("failed to unpack baseline archive: {e}"))?;
     Ok(temp)
 }
-
 async fn run_ci_for_repo(repo_dir: &Path, args: &CliArgs) -> Result<CiRunResult, String> {
     if args.file.is_some() || args.language.is_some() {
         return Err("`court-jester ci` does not accept --file or --language".into());
     }
-    if args.test_file.is_some() || args.tests_only {
-        return Err("`court-jester ci` does not support --test-file or --tests-only yet".into());
+    if args.tests_only {
+        return Err("`court-jester ci` does not support --tests-only".into());
     }
+    if args.test_quality_max_mutants.is_none() && !args.test_files.is_empty() {
+        return Err("`court-jester ci --test-file` requires --test-quality".into());
+    }
+    if args.test_quality_max_mutants.is_some() && args.test_files.is_empty() {
+        return Err(
+            "`court-jester ci --test-quality` requires an authoritative --test-file".into(),
+        );
+    }
+    let test_entrypoints = ci_test_entrypoints(repo_dir, &args.test_files)?;
     let base = require_base(args)?.to_string();
     let head = args.head.clone().unwrap_or_else(|| "HEAD".into());
     let baseline_temp = archive_baseline_tree(repo_dir, &base)?;
@@ -1116,52 +1307,91 @@ async fn run_ci_for_repo(repo_dir: &Path, args: &CliArgs) -> Result<CiRunResult,
     } else {
         ci_unified_diff(repo_dir, &base, &head)?
     };
+    let diff = (!diff.is_empty()).then_some(diff);
     let complexity_threshold = resolve_complexity_threshold(args)?;
-    let mut files = Vec::new();
+    let mut prepared_files = Vec::new();
     let mut skipped_files = Vec::new();
-    let mut verdict = VerificationVerdict::Pass;
-
     for (relative_path, language) in &changed_files {
-        let baseline_path = baseline_temp.path().join(relative_path);
-        let baseline_code = baseline_path
-            .is_file()
-            .then(|| read_file(&baseline_path.to_string_lossy()))
-            .transpose()?;
         let absolute = repo_dir.join(relative_path);
         if !absolute.is_file() {
             skipped_files.push(relative_path.clone());
             continue;
         }
-        let absolute_string = absolute.to_string_lossy().to_string();
+        let absolute_string = absolute.to_string_lossy().into_owned();
         let code = read_file(&absolute_string)?;
-        let project_dir = args
-            .project_dir
-            .clone()
-            .or_else(|| Some(repo_dir.to_string_lossy().into_owned()));
+        let candidate_count = if test_entrypoints.for_language(*language).is_some() {
+            tools::verify::test_quality_candidate_count(
+                &code,
+                language,
+                ci_source_mode(relative_path, *language),
+                Some(absolute_string.as_str()),
+                diff.as_deref(),
+            )
+            // Allocation is advisory; the per-file stage owns and reports planning errors.
+            .unwrap_or(0)
+        } else {
+            0
+        };
+        prepared_files.push(CiPreparedFile {
+            relative_path: relative_path.clone(),
+            language: *language,
+            absolute_string,
+            code,
+            candidate_count,
+        });
+    }
+    let quality_allocations = args
+        .test_quality_max_mutants
+        .map(|max_mutants| {
+            ci_quality_allocations(
+                max_mutants,
+                &prepared_files
+                    .iter()
+                    .map(|file| file.candidate_count)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .unwrap_or_else(|| vec![0; prepared_files.len()]);
+
+    let project_dir = args
+        .project_dir
+        .clone()
+        .or_else(|| Some(repo_dir.to_string_lossy().into_owned()));
+    let mut files = Vec::new();
+    let mut verdict = VerificationVerdict::Pass;
+    for (file_index, prepared) in prepared_files.into_iter().enumerate() {
+        let baseline_path = baseline_temp.path().join(&prepared.relative_path);
+        let baseline_code = baseline_path
+            .is_file()
+            .then(|| read_file(&baseline_path.to_string_lossy()))
+            .transpose()?;
+        let test_entrypoint = test_entrypoints.for_language(prepared.language);
+        let test_quality_max_mutants = args.test_quality_max_mutants.map(|_| {
+            test_entrypoint
+                .map(|_| quality_allocations[file_index])
+                .unwrap_or(0)
+        });
         let report = tools::verify::verify(
-            &code,
-            language,
+            &prepared.code,
+            &prepared.language,
             tools::verify::VerifyOptions {
-                test_code: None,
-                test_source_file: None,
+                test_code: test_entrypoint.map(|entrypoint| entrypoint.code.as_str()),
+                test_source_file: test_entrypoint.map(|entrypoint| entrypoint.source_file.as_str()),
                 test_runner: args.test_runner,
+                test_quality_max_mutants,
                 complexity_threshold,
                 complexity_metric: args.complexity_metric,
                 project_dir: project_dir.as_deref(),
                 lint_config_path: args.config_path.as_deref(),
                 lint_virtual_file_path: None,
-                diff: if diff.is_empty() {
-                    None
-                } else {
-                    Some(diff.as_str())
-                },
+                diff: diff.as_deref(),
                 suppressions: None,
                 suppression_source: None,
                 auto_seed: !args.no_auto_seed,
                 base_code: baseline_code.as_deref(),
                 base_source_file: baseline_path.to_str(),
                 base_project_dir: baseline_temp.path().to_str(),
-                source_file: Some(absolute_string.as_str()),
+                source_file: Some(prepared.absolute_string.as_str()),
                 output_dir: args.output_dir.as_deref(),
                 report_level: args.report_level,
                 execute_gate: args.execute_gate,
@@ -1187,8 +1417,8 @@ async fn run_ci_for_repo(repo_dir: &Path, args: &CliArgs) -> Result<CiRunResult,
         let file_verdict = ci_selected_verdict(&report, &gates);
         verdict = aggregate_verdict(verdict, file_verdict);
         files.push(CiFileResult {
-            file: relative_path.clone(),
-            language: *language,
+            file: prepared.relative_path,
+            language: prepared.language,
             verdict: file_verdict,
             failing_gates,
             report,
@@ -1198,6 +1428,14 @@ async fn run_ci_for_repo(repo_dir: &Path, args: &CliArgs) -> Result<CiRunResult,
     if !skipped_files.is_empty() {
         verdict = VerificationVerdict::Inconclusive;
     }
+    let test_quality = args.test_quality_max_mutants.map(|max_mutants| {
+        ci_test_quality_summary(
+            max_mutants,
+            files
+                .iter()
+                .filter_map(|file| tools::verify::test_quality_summary(&file.report)),
+        )
+    });
     Ok(CiRunResult {
         base,
         head,
@@ -1206,6 +1444,7 @@ async fn run_ci_for_repo(repo_dir: &Path, args: &CliArgs) -> Result<CiRunResult,
         checked_files: files.len(),
         skipped_files,
         files,
+        test_quality,
         verdict,
     })
 }
@@ -1266,6 +1505,17 @@ fn verdict_label(verdict: &VerificationVerdict) -> &'static str {
     }
 }
 
+fn ci_test_quality_brief(summary: &CiTestQualitySummary) -> String {
+    format!(
+        "planned={}, killed={}, survived={}, unjudged={}, coupling={}",
+        summary.counts.planned,
+        summary.counts.killed,
+        summary.counts.survived,
+        summary.counts.unjudged,
+        summary.counts.coupling
+    )
+}
+
 fn render_ci_human(result: &CiRunResult) -> String {
     let mut out = String::new();
     out.push_str(&format!("CI: {}\n", verdict_label(&result.verdict)));
@@ -1279,6 +1529,12 @@ fn render_ci_human(result: &CiRunResult) -> String {
     out.push_str(&format!("Gates: {}\n", result.gates.join(", ")));
     if !result.skipped_files.is_empty() {
         out.push_str(&format!("Skipped: {}\n", result.skipped_files.join(", ")));
+    }
+    if let Some(summary) = &result.test_quality {
+        out.push_str(&format!(
+            "Test quality: {}\n",
+            ci_test_quality_brief(summary)
+        ));
     }
     if result
         .files
@@ -1474,6 +1730,12 @@ fn render_ci_github(result: &CiRunResult) -> String {
             }
         }
     }
+    if let Some(summary) = &result.test_quality {
+        lines.push(format!(
+            "court-jester test quality: {}",
+            ci_test_quality_brief(summary)
+        ));
+    }
     lines.push(format!(
         "court-jester ci: {} ({} checked file(s), gates: {})",
         verdict_label(&result.verdict),
@@ -1484,7 +1746,7 @@ fn render_ci_github(result: &CiRunResult) -> String {
 }
 
 fn ci_json_value(result: &CiRunResult, report_level: ReportLevel) -> serde_json::Value {
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "base": result.base,
         "head": result.head,
         "gates": result.gates,
@@ -1499,7 +1761,12 @@ fn ci_json_value(result: &CiRunResult, report_level: ReportLevel) -> serde_json:
             failing_gates: file.failing_gates.clone(),
             report: tools::verify::report_json_value(&file.report, report_level),
         }).collect::<Vec<_>>(),
-    })
+    });
+    if let Some(summary) = &result.test_quality {
+        value["test_quality"] =
+            serde_json::to_value(summary).expect("test-quality summary serialization cannot fail");
+    }
+    value
 }
 
 fn exit_for_verdict(verdict: &VerificationVerdict) {
@@ -1767,6 +2034,7 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
     } else {
         parse_flags(rest)?
     };
+    validate_test_quality_flag(cmd, &args)?;
     validate_runtime_flags(cmd, &args)?;
     validate_policy_flags(cmd, &args)?;
     if cmd == "replay" {
@@ -1909,6 +2177,13 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
             Ok(())
         }
         "verify" => {
+            if args.test_files.len() > 1 {
+                return Err("`court-jester verify` accepts exactly one --test-file".into());
+            }
+            if args.test_quality_max_mutants.is_some() && args.test_files.len() != 1 {
+                return Err("--test-quality requires exactly one authoritative --test-file".into());
+            }
+            let test_file = args.test_files.first().map(String::as_str);
             let file = require_file(&args)?.to_string();
             let language = require_language(&args)?;
             let code = read_file(&file)?;
@@ -1916,7 +2191,7 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
             validate_harness_args_in_context(&args.harness_args, &context)?;
             let project_dir_owned = context.workspace_root.to_string_lossy().into_owned();
             let complexity_threshold = resolve_complexity_threshold(&args)?;
-            let test_code = read_optional_file(args.test_file.as_deref())?;
+            let test_code = read_optional_file(test_file)?;
             let suppressions = read_optional_file(args.suppressions_file.as_deref())?;
             if let Some(raw) = suppressions.as_deref() {
                 serde_json::from_str::<serde_json::Value>(raw).map_err(|e| {
@@ -1935,8 +2210,9 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
                 .transpose()?;
             let opts = tools::verify::VerifyOptions {
                 test_code: test_code.as_deref(),
-                test_source_file: args.test_file.as_deref(),
+                test_source_file: test_file,
                 test_runner: args.test_runner,
+                test_quality_max_mutants: args.test_quality_max_mutants,
                 complexity_threshold,
                 complexity_metric: args.complexity_metric,
                 project_dir: Some(project_dir_owned.as_str()),
@@ -2160,10 +2436,16 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_ci_gates, parse_flags, resolve_complexity_threshold, run_ci_for_repo};
+    use super::{
+        ci_quality_allocations, ci_test_entrypoints, ci_test_quality_summary, parse_ci_gates,
+        parse_flags, parse_replay_flags, render_ci_github, render_ci_human,
+        resolve_complexity_threshold, run_ci_for_repo, validate_test_quality_flag, CiRunResult,
+        CiTestQualitySummary,
+    };
+    use court_jester::tools::verify::TestQualitySummary;
     use court_jester::types::{
         ComplexityMetric, ExecuteGate, NativeFuzzEngine, ReportLevel, StageStatus, SummaryFormat,
-        TestRunner,
+        TestRunner, VerificationVerdict,
     };
     use std::fs;
     use std::path::Path;
@@ -2263,6 +2545,141 @@ mod tests {
         let args = parse_flags(&["--test-runner".into(), "bun".into()]).unwrap();
         assert_eq!(args.test_runner, TestRunner::Bun);
     }
+    #[test]
+    fn stable_test_quality_flag_parses_and_validates_bounds() {
+        let default = parse_flags(&["--test-quality".into()]).unwrap();
+        assert_eq!(default.test_quality_max_mutants, Some(8));
+
+        let explicit = parse_flags(&[
+            "--test-quality".into(),
+            "3".into(),
+            "--test-file".into(),
+            "test_target.py".into(),
+            "--test-file".into(),
+            "target.test.ts".into(),
+        ])
+        .unwrap();
+        assert_eq!(explicit.test_quality_max_mutants, Some(3));
+        assert_eq!(
+            explicit.test_files,
+            vec!["test_target.py".to_string(), "target.test.ts".to_string()]
+        );
+
+        let maximum = parse_flags(&["--test-quality".into(), "32".into()]).unwrap();
+        assert_eq!(maximum.test_quality_max_mutants, Some(32));
+
+        let above_maximum = parse_flags(&["--test-quality".into(), "33".into()]).unwrap_err();
+        assert!(above_maximum.contains("between 1 and 32"));
+        let error = parse_flags(&["--test-quality".into(), "0".into()]).unwrap_err();
+        assert!(error.contains("between 1 and 32"));
+    }
+
+    #[test]
+    fn test_quality_flag_is_limited_to_verify_and_ci() {
+        let args = parse_flags(&["--test-quality".into()]).unwrap();
+        validate_test_quality_flag("verify", &args).unwrap();
+        validate_test_quality_flag("ci", &args).unwrap();
+        for command in ["doctor", "analyze", "lint", "execute"] {
+            let error = validate_test_quality_flag(command, &args).unwrap_err();
+            assert_eq!(
+                error,
+                format!("--test-quality is not supported for `{command}`")
+            );
+        }
+
+        assert!(parse_flags(&["--experimental-test-quality".into()]).is_err());
+        assert!(parse_replay_flags(&["--experimental-test-quality".into()]).is_err());
+        assert!(parse_replay_flags(&["--test-quality".into()]).is_err());
+    }
+
+    #[test]
+    fn ci_test_entrypoints_are_language_keyed_and_order_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("quality.py"), "PYTHON").unwrap();
+        fs::write(dir.path().join("quality.tsx"), "TYPESCRIPT").unwrap();
+
+        for paths in [
+            vec!["quality.py".to_string(), "quality.tsx".to_string()],
+            vec!["quality.tsx".to_string(), "quality.py".to_string()],
+        ] {
+            let entrypoints = ci_test_entrypoints(dir.path(), &paths).unwrap();
+            assert_eq!(entrypoints.python.as_ref().unwrap().code, "PYTHON");
+            assert_eq!(entrypoints.typescript.as_ref().unwrap().code, "TYPESCRIPT");
+        }
+
+        let error = ci_test_entrypoints(
+            dir.path(),
+            &["first.py".to_string(), "second.py".to_string()],
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "`ci --test-quality` accepts at most one python --test-file; got 'first.py' and 'second.py'"
+        );
+        let error = ci_test_entrypoints(
+            dir.path(),
+            &["first.ts".to_string(), "second.tsx".to_string()],
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "`ci --test-quality` accepts at most one typescript --test-file; got 'first.ts' and 'second.tsx'"
+        );
+    }
+
+    #[test]
+    fn ci_quality_allocation_redistributes_without_exceeding_global_cap() {
+        assert_eq!(ci_quality_allocations(5, &[1, 0, 10]), vec![1, 0, 4]);
+        assert_eq!(ci_quality_allocations(5, &[10, 1, 10]), vec![2, 1, 2]);
+        assert_eq!(ci_quality_allocations(8, &[2, 1]), vec![2, 1]);
+        assert_eq!(ci_quality_allocations(3, &[10, 10, 10]), vec![1, 1, 1]);
+        assert_eq!(ci_quality_allocations(0, &[10, 10]), vec![0, 0]);
+        assert!(
+            ci_quality_allocations(5, &[1, 0, 10])
+                .into_iter()
+                .sum::<usize>()
+                <= 5
+        );
+    }
+
+    #[test]
+    fn ci_test_quality_summary_preserves_outcome_buckets_and_unjudged_math() {
+        let summary = ci_test_quality_summary(
+            8,
+            [
+                TestQualitySummary {
+                    planned: 4,
+                    killed: 1,
+                    survived: 0,
+                    invalid: 1,
+                    blocked: 1,
+                    no_coverage: 1,
+                    unjudged: 999,
+                    coupling: 2,
+                },
+                TestQualitySummary {
+                    planned: 2,
+                    killed: 1,
+                    survived: 1,
+                    invalid: 0,
+                    blocked: 0,
+                    no_coverage: 0,
+                    unjudged: 999,
+                    coupling: 0,
+                },
+            ],
+        );
+        assert_eq!(summary.counts.invalid, 1);
+        assert_eq!(summary.counts.blocked, 1);
+        assert_eq!(summary.counts.no_coverage, 1);
+        assert_eq!(summary.counts.unjudged, 3);
+
+        let json = serde_json::to_value(summary).unwrap();
+        assert_eq!(json["invalid"], 1);
+        assert_eq!(json["blocked"], 1);
+        assert_eq!(json["no_coverage"], 1);
+        assert_eq!(json["unjudged"], 3);
+    }
 
     #[test]
     fn ci_report_and_gate_flags_parse() {
@@ -2281,6 +2698,55 @@ mod tests {
         assert_eq!(args.head.as_deref(), Some("HEAD"));
         assert_eq!(args.gate.as_deref(), Some("complexity,portability"));
         assert_eq!(args.ci_report_format, super::CiReportFormat::Github);
+    }
+
+    #[test]
+    fn ci_human_and_github_quality_summaries_are_advisory_counts_only() {
+        let result = CiRunResult {
+            base: "base".into(),
+            head: "head".into(),
+            gates: vec!["test".into()],
+            changed_files: 0,
+            checked_files: 0,
+            skipped_files: Vec::new(),
+            files: Vec::new(),
+            test_quality: Some(CiTestQualitySummary {
+                max_mutants: 9,
+                counts: TestQualitySummary {
+                    planned: 9,
+                    killed: 2,
+                    survived: 3,
+                    invalid: 1,
+                    blocked: 1,
+                    no_coverage: 2,
+                    unjudged: 4,
+                    coupling: 5,
+                },
+            }),
+            verdict: VerificationVerdict::Pass,
+        };
+
+        for output in [render_ci_human(&result), render_ci_github(&result)] {
+            for expected in [
+                "planned=9",
+                "killed=2",
+                "survived=3",
+                "unjudged=4",
+                "coupling=5",
+            ] {
+                assert!(
+                    output.contains(expected),
+                    "missing '{expected}' in {output}"
+                );
+            }
+            let normalized = output.to_ascii_lowercase();
+            for forbidden in ["score", "percentage", "grade", "%"] {
+                assert!(
+                    !normalized.contains(forbidden),
+                    "unexpected '{forbidden}' in {output}"
+                );
+            }
+        }
     }
 
     #[test]

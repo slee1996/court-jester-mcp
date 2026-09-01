@@ -63,6 +63,7 @@ fn default_opts(test_code: Option<&str>) -> VerifyOptions<'_> {
         base_project_dir: None,
         test_runner: TestRunner::Auto,
         tests_only: false,
+        test_quality_max_mutants: None,
         complexity_threshold: None,
         complexity_metric: ComplexityMetric::Cyclomatic,
         project_dir: None,
@@ -396,6 +397,7 @@ async fn tests_only_verify_skips_execute_stage() {
         base_project_dir: None,
         test_runner: TestRunner::Auto,
         tests_only: true,
+        test_quality_max_mutants: None,
         complexity_threshold: None,
         complexity_metric: ComplexityMetric::Cyclomatic,
         project_dir: None,
@@ -443,6 +445,7 @@ async fn tests_only_verify_requires_authoritative_test() {
         base_project_dir: None,
         test_runner: TestRunner::Auto,
         tests_only: true,
+        test_quality_max_mutants: None,
         complexity_threshold: None,
         complexity_metric: ComplexityMetric::Cyclomatic,
         project_dir: None,
@@ -725,6 +728,7 @@ exit 1
             base_project_dir: None,
             test_runner: TestRunner::Auto,
             tests_only: false,
+            test_quality_max_mutants: None,
             complexity_threshold: None,
             complexity_metric: ComplexityMetric::Cyclomatic,
             project_dir: Some(project_dir.path().to_str().unwrap()),
@@ -2211,6 +2215,7 @@ async fn python_test_stage_can_import_source_module_from_sibling_path() {
         base_project_dir: None,
         test_runner: TestRunner::Auto,
         tests_only: false,
+        test_quality_max_mutants: None,
         complexity_threshold: None,
         complexity_metric: ComplexityMetric::Cyclomatic,
         project_dir: None,
@@ -2257,6 +2262,7 @@ async fn verify_with_threshold_adds_stage() {
         base_project_dir: None,
         test_runner: TestRunner::Auto,
         tests_only: false,
+        test_quality_max_mutants: None,
         complexity_threshold: Some(3),
         complexity_metric: ComplexityMetric::Cyclomatic,
         project_dir: None,
@@ -2311,6 +2317,7 @@ def changed(x: int) -> int:
             base_project_dir: None,
             test_runner: TestRunner::Auto,
             tests_only: false,
+            test_quality_max_mutants: None,
             complexity_threshold: Some(3),
             complexity_metric: ComplexityMetric::Cyclomatic,
             project_dir: None,
@@ -2373,6 +2380,7 @@ def classify(x: int) -> str:
             base_project_dir: None,
             test_runner: TestRunner::Auto,
             tests_only: false,
+            test_quality_max_mutants: None,
             complexity_threshold: Some(2),
             complexity_metric: ComplexityMetric::Cyclomatic,
             project_dir: None,
@@ -2446,6 +2454,7 @@ def check_access(a: bool, b: bool, c: bool) -> int:
             base_project_dir: None,
             test_runner: TestRunner::Auto,
             tests_only: false,
+            test_quality_max_mutants: None,
             complexity_threshold: Some(5),
             complexity_metric: ComplexityMetric::Cognitive,
             project_dir: None,
@@ -2600,6 +2609,7 @@ def changed(x: int) -> int:
         base_project_dir: None,
         test_runner: TestRunner::Auto,
         tests_only: false,
+        test_quality_max_mutants: None,
         complexity_threshold: None,
         complexity_metric: ComplexityMetric::Cyclomatic,
         project_dir: None,
@@ -2655,6 +2665,7 @@ async fn writes_report_to_output_dir() {
         base_project_dir: None,
         test_runner: TestRunner::Auto,
         tests_only: false,
+        test_quality_max_mutants: None,
         complexity_threshold: None,
         complexity_metric: ComplexityMetric::Cyclomatic,
         project_dir: None,
@@ -2748,6 +2759,7 @@ async fn rejected_only_fuzz_run_is_not_counted_as_pass_in_report_summary() {
         base_project_dir: None,
         test_runner: TestRunner::Auto,
         tests_only: false,
+        test_quality_max_mutants: None,
         complexity_threshold: None,
         complexity_metric: ComplexityMetric::Cyclomatic,
         project_dir: None,
@@ -2899,6 +2911,7 @@ async fn execute_findings_can_be_suppressed_without_failing_verify() {
             base_project_dir: None,
             test_runner: TestRunner::Auto,
             tests_only: false,
+            test_quality_max_mutants: None,
             complexity_threshold: None,
             complexity_metric: ComplexityMetric::Cyclomatic,
             project_dir: None,
@@ -2990,6 +3003,7 @@ def check_access(a: bool, b: bool, c: bool) -> int:
             base_project_dir: None,
             test_runner: TestRunner::Auto,
             tests_only: false,
+            test_quality_max_mutants: None,
             complexity_threshold: Some(2),
             complexity_metric: ComplexityMetric::Cyclomatic,
             project_dir: None,
@@ -3053,6 +3067,7 @@ def check_access(a: bool, b: bool, c: bool) -> int:
             base_project_dir: None,
             test_runner: TestRunner::Auto,
             tests_only: false,
+            test_quality_max_mutants: None,
             complexity_threshold: Some(2),
             complexity_metric: ComplexityMetric::Cyclomatic,
             project_dir: None,
@@ -3872,6 +3887,7 @@ export function add(input: number): number {
         base_project_dir: None,
         test_runner: TestRunner::Auto,
         tests_only: false,
+        test_quality_max_mutants: None,
         complexity_threshold: None,
         complexity_metric: ComplexityMetric::Cyclomatic,
         project_dir: Some(dir.path().to_str().unwrap()),
@@ -3997,6 +4013,7 @@ hostLabel("https://example.com");
             base_project_dir: None,
             test_runner: TestRunner::Auto,
             tests_only: false,
+            test_quality_max_mutants: None,
             complexity_threshold: None,
             complexity_metric: ComplexityMetric::Cyclomatic,
             project_dir: None,
@@ -4052,6 +4069,7 @@ hostLabel("https://example.com");
             base_project_dir: None,
             test_runner: TestRunner::Auto,
             tests_only: false,
+            test_quality_max_mutants: None,
             complexity_threshold: None,
             complexity_metric: ComplexityMetric::Cyclomatic,
             project_dir: None,
@@ -4121,6 +4139,7 @@ export const defaultHost = labels.hostLabel("https://example.com");
             base_project_dir: None,
             test_runner: TestRunner::Auto,
             tests_only: false,
+            test_quality_max_mutants: None,
             complexity_threshold: None,
             complexity_metric: ComplexityMetric::Cyclomatic,
             project_dir: Some(dir.path().to_str().unwrap()),
@@ -4202,6 +4221,7 @@ export const previewCity = primaryCity({ address: { city: "Boise" } });
             base_project_dir: None,
             test_runner: TestRunner::Auto,
             tests_only: false,
+            test_quality_max_mutants: None,
             complexity_threshold: None,
             complexity_metric: ComplexityMetric::Cyclomatic,
             project_dir: Some(dir.path().to_str().unwrap()),
@@ -4273,6 +4293,7 @@ def first_item(items):
             base_project_dir: None,
             test_runner: TestRunner::Auto,
             tests_only: false,
+            test_quality_max_mutants: None,
             complexity_threshold: None,
             complexity_metric: ComplexityMetric::Cyclomatic,
             project_dir: Some(dir.path().to_str().unwrap()),
@@ -4356,6 +4377,7 @@ def sort_items(items):
             base_project_dir: None,
             test_runner: TestRunner::Auto,
             tests_only: false,
+            test_quality_max_mutants: None,
             complexity_threshold: None,
             complexity_metric: ComplexityMetric::Cyclomatic,
             project_dir: Some(dir.path().to_str().unwrap()),
@@ -4431,6 +4453,7 @@ def sort_items(items):
             base_project_dir: None,
             test_runner: TestRunner::Auto,
             tests_only: false,
+            test_quality_max_mutants: None,
             complexity_threshold: None,
             complexity_metric: ComplexityMetric::Cyclomatic,
             project_dir: Some(dir.path().to_str().unwrap()),
@@ -4549,6 +4572,7 @@ assert.equal(displayHandle({ profile: { handle: " Admin " }, username: "root" })
         base_project_dir: None,
         test_runner: TestRunner::Auto,
         tests_only: false,
+        test_quality_max_mutants: None,
         complexity_threshold: None,
         complexity_metric: ComplexityMetric::Cyclomatic,
         project_dir: None,
@@ -4637,6 +4661,7 @@ test("add", () => {
             base_project_dir: None,
             test_runner: TestRunner::Auto,
             tests_only: true,
+            test_quality_max_mutants: None,
             complexity_threshold: None,
             complexity_metric: ComplexityMetric::Cyclomatic,
             project_dir: Some(dir.path().to_str().unwrap()),
@@ -5589,6 +5614,7 @@ assert Path(__file__).name == "test_app.py"
         base_project_dir: None,
         test_runner: TestRunner::Auto,
         tests_only: true,
+        test_quality_max_mutants: None,
         complexity_threshold: None,
         complexity_metric: ComplexityMetric::Cyclomatic,
         project_dir: Some(dir.path().to_str().unwrap()),
@@ -5664,6 +5690,7 @@ assert Path(__file__).name == "test_app.py"
         base_project_dir: None,
         test_runner: TestRunner::Auto,
         tests_only: true,
+        test_quality_max_mutants: None,
         complexity_threshold: None,
         complexity_metric: ComplexityMetric::Cyclomatic,
         project_dir: Some(dir.path().to_str().unwrap()),
@@ -5756,6 +5783,7 @@ assert.equal(primaryPlanCode({ plans: [null, ""] }), "FREE");
         base_project_dir: None,
         test_runner: TestRunner::Auto,
         tests_only: false,
+        test_quality_max_mutants: None,
         complexity_threshold: None,
         complexity_metric: ComplexityMetric::Cyclomatic,
         project_dir: None,
@@ -5828,6 +5856,7 @@ if (displayInitials("Spencer Lee") !== "SL") {
         base_project_dir: None,
         test_runner: TestRunner::Auto,
         tests_only: false,
+        test_quality_max_mutants: None,
         complexity_threshold: None,
         complexity_metric: ComplexityMetric::Cyclomatic,
         project_dir: None,
@@ -7935,5 +7964,1624 @@ export function reserve(quantity: number): number {
                     || finding["message"] != "quantity overflow"
             })),
         "the validation RangeError must not become a finding: {report:#?}"
+    );
+}
+
+fn parse_cli_json(output: &std::process::Output, context: &str) -> serde_json::Value {
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "{context} must be JSON ({error}); stdout={}; stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
+}
+
+fn run_cli_test_quality(
+    source: &Path,
+    test_file: &Path,
+    project: &Path,
+    language: &str,
+    runner: Option<&str>,
+    max_mutants: usize,
+) -> serde_json::Value {
+    let max_mutants = max_mutants.to_string();
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_court-jester"));
+    command.args([
+        "verify",
+        "--file",
+        source.to_str().unwrap(),
+        "--language",
+        language,
+        "--project-dir",
+        project.to_str().unwrap(),
+        "--test-file",
+        test_file.to_str().unwrap(),
+        "--tests-only",
+        "--test-quality",
+        max_mutants.as_str(),
+        "--report-level",
+        "full",
+    ]);
+    if let Some(runner) = runner {
+        command.args(["--test-runner", runner]);
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "test-quality verify failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    parse_cli_json(&output, "test-quality report")
+}
+
+fn run_git(project: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(project)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {} failed: stdout={}\nstderr={}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn initialize_git_project(project: &Path) {
+    run_git(project, &["init", "--quiet"]);
+    run_git(project, &["config", "user.email", "tests@example.com"]);
+    run_git(project, &["config", "user.name", "Court Jester Tests"]);
+}
+
+fn commit_git_project(project: &Path, message: &str) -> String {
+    run_git(project, &["add", "--all"]);
+    run_git(project, &["commit", "--quiet", "-m", message]);
+    run_git(project, &["rev-parse", "HEAD"]).trim().to_string()
+}
+
+fn run_cli_ci_test_quality(
+    project: &Path,
+    base: &str,
+    test_files: &[&Path],
+    max_mutants: usize,
+) -> (std::process::Output, serde_json::Value) {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_court-jester"));
+    command.current_dir(project).args([
+        "ci",
+        "--base",
+        base,
+        "--head",
+        "HEAD",
+        "--gate",
+        "test",
+        "--report",
+        "json",
+        "--report-level",
+        "full",
+    ]);
+    for test_file in test_files {
+        command.args(["--test-file", test_file.to_str().unwrap()]);
+    }
+    let max_mutants = max_mutants.to_string();
+    command.args(["--test-quality", max_mutants.as_str()]);
+    let output = command.output().unwrap();
+    let report = parse_cli_json(&output, "ci report");
+    (output, report)
+}
+
+fn test_quality_stage(report: &serde_json::Value) -> &serde_json::Value {
+    report["stages"]
+        .as_array()
+        .and_then(|stages| {
+            stages
+                .iter()
+                .find(|stage| stage["name"].as_str() == Some("test_quality"))
+        })
+        .unwrap_or_else(|| panic!("test_quality stage missing: {report:#?}"))
+}
+
+#[test]
+fn test_quality_classifies_direct_weak_and_boundary_asserting_tests() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("target.py");
+    let test_file = project.path().join("test_target.py");
+    fs::write(
+        &source,
+        "def eligible(total: int) -> bool:\n    return total >= 100\n",
+    )
+    .unwrap();
+    fs::write(&test_file, "import target\n\ntarget.eligible(100)\n").unwrap();
+
+    let weak_report = run_cli_test_quality(&source, &test_file, project.path(), "python", None, 1);
+    let weak = test_quality_stage(&weak_report);
+    assert_eq!(weak["status"].as_str(), Some("advisory"));
+    assert_eq!(weak["detail"]["experimental"].as_bool(), Some(false));
+    assert_eq!(weak["detail"]["mode"].as_str(), Some("advisory"));
+    assert_eq!(weak["detail"]["max_mutants"].as_u64(), Some(1));
+    assert_eq!(weak["detail"]["baseline_eligible"].as_bool(), Some(true));
+    assert_eq!(weak["detail"]["counts"]["planned"].as_u64(), Some(1));
+    assert_eq!(weak["detail"]["counts"]["survived"].as_u64(), Some(1));
+    assert_eq!(weak["detail"]["counts"]["killed"].as_u64(), Some(0));
+    assert_eq!(
+        weak["detail"]["mutants"][0]["outcome"].as_str(),
+        Some("survived")
+    );
+    assert_eq!(
+        weak["detail"]["mutants"][0]["entered_mutated_surface"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        weak["detail"]["mutants"][0]["test_status"].as_str(),
+        Some("passed")
+    );
+    assert_eq!(
+        weak["detail"]["mutants"][0]["mutation"]["operator"].as_str(),
+        Some("comparison_boundary")
+    );
+    assert!(
+        weak["detail"].get("score").is_none()
+            && weak["detail"].get("percentage").is_none()
+            && weak["detail"].get("grade").is_none(),
+        "test quality must report evidence rather than a synthetic score: {weak:#?}"
+    );
+    assert_eq!(
+        weak_report["verdict"].as_str(),
+        Some("pass"),
+        "a surviving mutant is advisory and must not change the verifier verdict"
+    );
+
+    fs::write(
+        &test_file,
+        "import target\n\nassert target.eligible(100) is True\n",
+    )
+    .unwrap();
+    let boundary_report =
+        run_cli_test_quality(&source, &test_file, project.path(), "python", None, 1);
+    let boundary = test_quality_stage(&boundary_report);
+    assert_eq!(boundary["status"].as_str(), Some("passed"));
+    assert_eq!(boundary["detail"]["counts"]["planned"].as_u64(), Some(1));
+    assert_eq!(boundary["detail"]["counts"]["killed"].as_u64(), Some(1));
+    assert_eq!(boundary["detail"]["counts"]["survived"].as_u64(), Some(0));
+    assert_eq!(
+        boundary["detail"]["mutants"][0]["outcome"].as_str(),
+        Some("killed")
+    );
+    assert_eq!(
+        boundary["detail"]["mutants"][0]["entered_mutated_surface"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        boundary["detail"]["mutants"][0]["test_status"].as_str(),
+        Some("failed")
+    );
+    assert_eq!(boundary_report["verdict"], weak_report["verdict"]);
+    assert_eq!(
+        boundary_report["strength"], weak_report["strength"],
+        "advisory observations must not alter verification strength"
+    );
+}
+
+#[test]
+fn test_quality_coupling_findings_are_scoped_to_the_selected_target() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("target.py");
+    let support = project.path().join("support.py");
+    let test_file = project.path().join("test_target.py");
+    fs::write(
+        &source,
+        "_RATE = 0.9\n\ndef eligible(total: int) -> bool:\n    return total >= 100\n",
+    )
+    .unwrap();
+    fs::write(&support, "_RATE = 0.5\n").unwrap();
+    fs::write(
+        &test_file,
+        "import support\nimport target\n\nassert support._RATE == 0.5\nassert target._RATE == 0.9\nassert target.eligible(100) is True\n",
+    )
+    .unwrap();
+
+    let report = run_cli_test_quality(&source, &test_file, project.path(), "python", None, 1);
+    let stage = test_quality_stage(&report);
+    let findings = stage["detail"]["coupling_findings"]
+        .as_array()
+        .expect("coupling findings");
+    assert_eq!(
+        findings.len(),
+        1,
+        "private access on an unrelated module must not be attributed to the target: {findings:#?}"
+    );
+    assert_eq!(findings[0]["kind"].as_str(), Some("private_target_access"));
+    assert_eq!(findings[0]["symbol"].as_str(), Some("target._RATE"));
+    assert_eq!(stage["status"].as_str(), Some("advisory"));
+    assert_eq!(report["verdict"].as_str(), Some("pass"));
+}
+
+#[test]
+fn test_quality_rejects_the_removed_experimental_flag() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("target.py");
+    let test_file = project.path().join("test_target.py");
+    fs::write(
+        &source,
+        "def eligible(total: int) -> bool:\n    return total >= 100\n",
+    )
+    .unwrap();
+    fs::write(
+        &test_file,
+        "import target\n\nassert target.eligible(100) is True\n",
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_court-jester"))
+        .args([
+            "verify",
+            "--file",
+            source.to_str().unwrap(),
+            "--language",
+            "python",
+            "--project-dir",
+            project.path().to_str().unwrap(),
+            "--test-file",
+            test_file.to_str().unwrap(),
+            "--experimental-test-quality",
+            "1",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "the experimental spelling must not remain as a compatibility alias"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--experimental-test-quality"),
+        "the CLI error must identify the removed option: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_quality_kills_typescript_public_boundary_mutant() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("target.ts");
+    let test_file = project.path().join("target.test.ts");
+    fs::write(
+        &source,
+        "export function eligible(total: number): boolean {\n  return total >= 100;\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        &test_file,
+        "import { eligible } from './target.ts';\nif (eligible(100) !== true) throw new Error('boundary changed');\n",
+    )
+    .unwrap();
+
+    let report = run_cli_test_quality(
+        &source,
+        &test_file,
+        project.path(),
+        "typescript",
+        Some("bun"),
+        1,
+    );
+    let stage = test_quality_stage(&report);
+    assert_eq!(stage["detail"]["experimental"].as_bool(), Some(false));
+    assert_eq!(stage["detail"]["mode"].as_str(), Some("advisory"));
+    assert_eq!(stage["detail"]["counts"]["planned"].as_u64(), Some(1));
+    assert_eq!(stage["detail"]["counts"]["killed"].as_u64(), Some(1));
+    assert_eq!(stage["detail"]["counts"]["survived"].as_u64(), Some(0));
+    assert_eq!(
+        stage["detail"]["mutants"][0]["entered_mutated_surface"].as_bool(),
+        Some(true)
+    );
+}
+
+#[test]
+fn ci_test_quality_uses_explicit_entrypoint_and_global_deterministic_budget() {
+    let project = tempfile::tempdir().unwrap();
+    initialize_git_project(project.path());
+    let a_source = project.path().join("a.py");
+    let b_source = project.path().join("b.py");
+    let test_file = project.path().join("quality_checks.py");
+    let wrong_language_test = project.path().join("wrong_language.test.ts");
+    fs::write(
+        &a_source,
+        "def at_least(value: int) -> bool:\n    # baseline first surface\n    return value >= 1\n\ndef at_most(value: int) -> bool:\n    # baseline second surface\n    return value <= 10\n",
+    )
+    .unwrap();
+    fs::write(
+        &b_source,
+        "def matches(value: int) -> bool:\n    # baseline first surface\n    return value == 2\n\ndef enabled() -> bool:\n    # baseline second surface\n    return True\n",
+    )
+    .unwrap();
+    fs::write(
+        &test_file,
+        "import a\nimport b\n\nassert a.at_least(1) is True\na.at_most(10)\nassert b.matches(2) is True\nassert b.enabled() is True\n",
+    )
+    .unwrap();
+    fs::write(
+        &wrong_language_test,
+        "throw new Error('TypeScript entrypoint must not run for Python targets');\n",
+    )
+    .unwrap();
+    let base = commit_git_project(project.path(), "baseline");
+
+    fs::write(
+        &a_source,
+        "def at_least(value: int) -> bool:\n    # candidate first surface\n    return value >= 1\n\ndef at_most(value: int) -> bool:\n    # candidate second surface\n    return value <= 10\n",
+    )
+    .unwrap();
+    fs::write(
+        &b_source,
+        "def matches(value: int) -> bool:\n    # candidate first surface\n    return value == 2\n\ndef enabled() -> bool:\n    # candidate second surface\n    return True\n",
+    )
+    .unwrap();
+    commit_git_project(project.path(), "candidate");
+
+    let (quality_output, quality_report) = run_cli_ci_test_quality(
+        project.path(),
+        &base,
+        &[wrong_language_test.as_path(), test_file.as_path()],
+        3,
+    );
+    assert!(
+        quality_output.status.success(),
+        "advisory quality evidence must not fail CI: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&quality_output.stdout),
+        String::from_utf8_lossy(&quality_output.stderr)
+    );
+    let files = quality_report["files"]
+        .as_array()
+        .expect("ci files must be reported");
+    assert_eq!(
+        files
+            .iter()
+            .map(|file| file["file"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["a.py", "b.py"],
+        "budget allocation order must be deterministic"
+    );
+
+    let a_quality = test_quality_stage(&files[0]["report"]);
+    let b_quality = test_quality_stage(&files[1]["report"]);
+    assert_eq!(a_quality["detail"]["max_mutants"].as_u64(), Some(2));
+    assert_eq!(b_quality["detail"]["max_mutants"].as_u64(), Some(1));
+    assert_eq!(a_quality["detail"]["counts"]["planned"].as_u64(), Some(2));
+    assert_eq!(b_quality["detail"]["counts"]["planned"].as_u64(), Some(1));
+    assert_eq!(a_quality["detail"]["counts"]["killed"].as_u64(), Some(1));
+    assert_eq!(a_quality["detail"]["counts"]["survived"].as_u64(), Some(1));
+    assert_eq!(b_quality["detail"]["counts"]["killed"].as_u64(), Some(1));
+    assert_eq!(b_quality["detail"]["counts"]["survived"].as_u64(), Some(0));
+
+    for (file, stage) in files.iter().zip([a_quality, b_quality]) {
+        assert_eq!(stage["detail"]["baseline_eligible"].as_bool(), Some(true));
+        let planned = stage["detail"]["counts"]["planned"].as_u64().unwrap();
+        let mutants = stage["detail"]["mutants"]
+            .as_array()
+            .expect("per-file mutant evidence");
+        assert_eq!(
+            mutants.len() as u64,
+            planned,
+            "{} must retain evidence for every planned mutant",
+            file["file"]
+        );
+        assert!(
+            mutants.iter().all(|mutant| {
+                mutant["mutation"]["surface_id"].is_string()
+                    && mutant["mutation"]["operator"].is_string()
+                    && mutant["outcome"].is_string()
+                    && mutant["entered_mutated_surface"].as_bool() == Some(true)
+            }),
+            "{} has incomplete mutant evidence: {mutants:#?}",
+            file["file"]
+        );
+    }
+
+    let sum_count = |name: &str| {
+        [a_quality, b_quality]
+            .iter()
+            .map(|stage| stage["detail"]["counts"][name].as_u64().unwrap())
+            .sum::<u64>()
+    };
+    let coupling = [a_quality, b_quality]
+        .iter()
+        .map(|stage| {
+            stage["detail"]["coupling_findings"]
+                .as_array()
+                .unwrap()
+                .len() as u64
+        })
+        .sum::<u64>();
+    assert_eq!(
+        quality_report["test_quality"],
+        serde_json::json!({
+            "max_mutants": 3,
+            "planned": sum_count("planned"),
+            "killed": sum_count("killed"),
+            "survived": sum_count("survived"),
+            "invalid": sum_count("invalid"),
+            "blocked": sum_count("blocked"),
+            "no_coverage": sum_count("no_coverage"),
+            "unjudged": sum_count("invalid") + sum_count("blocked") + sum_count("no_coverage"),
+            "coupling": coupling,
+        }),
+        "the CI aggregate must be derived exactly from per-file evidence"
+    );
+    assert_eq!(sum_count("planned"), 3);
+
+    assert_eq!(
+        a_quality["status"].as_str(),
+        Some("advisory"),
+        "the deliberately weak at_most assertion must produce advisory evidence"
+    );
+    assert_eq!(quality_report["verdict"].as_str(), Some("pass"));
+    assert_eq!(files[0]["verdict"].as_str(), Some("pass"));
+    assert_eq!(files[0]["report"]["verdict"].as_str(), Some("pass"));
+    assert!(
+        files[0]["failing_gates"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "an advisory survivor must not become a failing CI gate: {:#?}",
+        files[0]
+    );
+}
+
+fn ci_file<'a>(report: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    report["files"]
+        .as_array()
+        .and_then(|files| {
+            files
+                .iter()
+                .find(|file| file["file"].as_str() == Some(name))
+        })
+        .unwrap_or_else(|| panic!("CI report is missing {name}: {report:#?}"))
+}
+
+#[test]
+fn test_quality_attributes_same_line_mutations_to_the_exact_callable() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("target.ts");
+    let test_file = project.path().join("target.test.ts");
+    fs::write(
+        &source,
+        "export function lower(value: number): boolean { return value >= 0; } export function upper(value: number): boolean { return value <= 10; }\n",
+    )
+    .unwrap();
+    fs::write(
+        &test_file,
+        "import { lower, upper } from './target.ts';\nif (!lower(0) || !upper(10)) throw new Error('boundary changed');\n",
+    )
+    .unwrap();
+
+    let report = run_cli_test_quality(
+        &source,
+        &test_file,
+        project.path(),
+        "typescript",
+        Some("bun"),
+        2,
+    );
+    let mutants = test_quality_stage(&report)["detail"]["mutants"]
+        .as_array()
+        .expect("same-line mutant evidence");
+    assert_eq!(mutants.len(), 2, "{mutants:#?}");
+    let mut surfaces = mutants
+        .iter()
+        .map(|mutant| mutant["mutation"]["surface_id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    surfaces.sort_unstable();
+    assert_eq!(
+        surfaces,
+        ["lower:1", "upper:1"],
+        "each same-line callable must own only its byte-contained mutation"
+    );
+}
+
+#[test]
+fn test_quality_does_not_attribute_nested_arrow_mutation_to_exported_outer_function() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("target.ts");
+    let test_file = project.path().join("target.test.ts");
+    fs::write(
+        &source,
+        "export function outer(flag: boolean): boolean {\n  const nested = (value: number): boolean => value >= 1;\n  return flag && nested(1);\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        &test_file,
+        "import { outer } from './target.ts';\nif (outer(false) !== false) throw new Error('outer contract changed');\n",
+    )
+    .unwrap();
+
+    let report = run_cli_test_quality(
+        &source,
+        &test_file,
+        project.path(),
+        "typescript",
+        Some("bun"),
+        1,
+    );
+    let stage = test_quality_stage(&report);
+    assert_eq!(stage["detail"]["baseline_eligible"].as_bool(), Some(true));
+    assert_eq!(
+        stage["detail"]["counts"]["planned"].as_u64(),
+        Some(0),
+        "a nested callable's operator must not be planned against the exported outer surface: {stage:#?}"
+    );
+    assert_eq!(stage["detail"]["counts"]["survived"].as_u64(), Some(0));
+    assert!(
+        stage["detail"]["mutants"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "no misattributed outer mutant evidence may be emitted: {stage:#?}"
+    );
+}
+
+#[test]
+fn test_quality_attributes_same_line_class_methods_to_their_own_classes() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("target.ts");
+    let test_file = project.path().join("target.test.ts");
+    fs::write(
+        &source,
+        "export class A { same(value: number): boolean { return value >= 1; } } export class B { same(value: number): boolean { return value <= 2; } }\n",
+    )
+    .unwrap();
+    fs::write(
+        &test_file,
+        "import { A, B } from './target.ts';\nif (!new A().same(1) || !new B().same(2)) throw new Error('boundary changed');\n",
+    )
+    .unwrap();
+
+    let report = run_cli_test_quality(
+        &source,
+        &test_file,
+        project.path(),
+        "typescript",
+        Some("bun"),
+        2,
+    );
+    let stage = test_quality_stage(&report);
+    assert_eq!(stage["detail"]["baseline_eligible"].as_bool(), Some(true));
+    assert_eq!(stage["detail"]["counts"]["planned"].as_u64(), Some(2));
+    assert_eq!(stage["detail"]["counts"]["killed"].as_u64(), Some(2));
+    let mutants = stage["detail"]["mutants"]
+        .as_array()
+        .expect("same-line class method mutant evidence");
+    assert!(
+        mutants
+            .iter()
+            .all(|mutant| mutant["outcome"].as_str() == Some("killed")),
+        "both class method boundary mutants must be killed: {mutants:#?}"
+    );
+    let mut surfaces = mutants
+        .iter()
+        .map(|mutant| mutant["mutation"]["surface_id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    surfaces.sort_unstable();
+    assert_eq!(surfaces, ["A#same:1", "B#same:1"]);
+}
+
+#[test]
+fn test_quality_ignores_typescript_type_booleans_but_mutates_runtime_booleans() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("target.ts");
+    let test_file = project.path().join("target.test.ts");
+    fs::write(
+        &source,
+        "export interface Config { enabled: true; }\nexport function enabled(config: { expected: false }): boolean {\n  void config;\n  return true;\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        &test_file,
+        "import { enabled } from './target.ts';\nif (enabled({ expected: false }) !== true) throw new Error('runtime boolean changed');\n",
+    )
+    .unwrap();
+
+    let report = run_cli_test_quality(
+        &source,
+        &test_file,
+        project.path(),
+        "typescript",
+        Some("bun"),
+        3,
+    );
+    let stage = test_quality_stage(&report);
+    assert_eq!(
+        stage["detail"]["counts"]["planned"].as_u64(),
+        Some(1),
+        "interface and parameter type literals are not executable mutation candidates: {stage:#?}"
+    );
+    let mutation = &stage["detail"]["mutants"][0]["mutation"];
+    assert_eq!(mutation["operator"].as_str(), Some("boolean_literal"));
+    assert_eq!(mutation["original"].as_str(), Some("true"));
+    assert_eq!(mutation["line"].as_u64(), Some(4));
+}
+
+#[test]
+fn test_quality_does_not_treat_a_bare_package_stem_collision_as_the_target() {
+    let project = tempfile::tempdir().unwrap();
+    let src_dir = project.path().join("src");
+    let package_dir = project.path().join("node_modules").join("target");
+    fs::create_dir_all(&src_dir).unwrap();
+    fs::create_dir_all(&package_dir).unwrap();
+    let source = src_dir.join("target.ts");
+    let test_file = project.path().join("target.test.ts");
+    fs::write(
+        package_dir.join("package.json"),
+        r#"{"name":"target","type":"module","exports":"./index.js"}"#,
+    )
+    .unwrap();
+    fs::write(package_dir.join("index.js"), "export const _secret = 7;\n").unwrap();
+    fs::write(
+        &source,
+        "export function eligible(value: number): boolean {\n  return value >= 1;\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        &test_file,
+        "import * as external from 'target';\nimport { eligible } from './src/target.ts';\nif (external._secret !== 7 || !eligible(1)) throw new Error('bad result');\n",
+    )
+    .unwrap();
+
+    let report = run_cli_test_quality(
+        &source,
+        &test_file,
+        project.path(),
+        "typescript",
+        Some("bun"),
+        1,
+    );
+    assert!(
+        test_quality_stage(&report)["detail"]["coupling_findings"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "a bare external package is not a local import of the same-stem target: {report:#?}"
+    );
+}
+
+#[test]
+fn test_quality_side_effect_import_does_not_create_a_private_target_binding() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("target.ts");
+    let test_file = project.path().join("target.test.ts");
+    fs::write(
+        &source,
+        "export function eligible(value: number): boolean {\n  return value >= 1;\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        &test_file,
+        "import { expect, test } from 'bun:test';\nimport './target.ts';\nimport { eligible } from './target.ts';\nconst target = { _private: 7 };\ntest('side effect import', () => {\n  expect(target._private).toBe(7);\n  expect(eligible(1)).toBe(true);\n});\n",
+    )
+    .unwrap();
+
+    let report = run_cli_test_quality(
+        &source,
+        &test_file,
+        project.path(),
+        "typescript",
+        Some("bun"),
+        1,
+    );
+    assert!(
+        test_quality_stage(&report)["detail"]["coupling_findings"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "a side-effect-only import must not bind a same-named local object: {report:#?}"
+    );
+}
+
+#[test]
+fn test_quality_ignores_introspection_of_an_unrelated_object() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("target.py");
+    let test_file = project.path().join("test_target.py");
+    fs::write(
+        &source,
+        "def eligible(value: int) -> bool:\n    return value >= 1\n",
+    )
+    .unwrap();
+    fs::write(
+        &test_file,
+        "import inspect\nimport target as t\n\nclass Unrelated:\n    pass\n\nassert 'Unrelated' in inspect.getsource(Unrelated)\nassert t.eligible(1) is True\n",
+    )
+    .unwrap();
+
+    let report = run_cli_test_quality(&source, &test_file, project.path(), "python", None, 1);
+    assert!(
+        test_quality_stage(&report)["detail"]["coupling_findings"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "the short target alias must not match arbitrary text inside another introspection call: {report:#?}"
+    );
+}
+
+#[test]
+fn test_quality_resolves_qualified_python_module_import_to_the_target_file() {
+    let project = tempfile::tempdir().unwrap();
+    let package = project.path().join("pkg");
+    fs::create_dir_all(&package).unwrap();
+    let source = package.join("target.py");
+    let test_file = project.path().join("test_target.py");
+    fs::write(package.join("__init__.py"), "_cache = 'package-init'\n").unwrap();
+    fs::write(
+        &source,
+        "_cache = 'target-module'\n\ndef eligible(value: int) -> bool:\n    return value >= 1\n",
+    )
+    .unwrap();
+    fs::write(
+        &test_file,
+        "import pkg.target as t\n\nassert t._cache == 'target-module'\nassert t.eligible(1) is True\n",
+    )
+    .unwrap();
+
+    let report = run_cli_test_quality(&source, &test_file, project.path(), "python", None, 1);
+    let findings = test_quality_stage(&report)["detail"]["coupling_findings"]
+        .as_array()
+        .expect("qualified Python coupling findings");
+    assert_eq!(
+        findings.len(),
+        1,
+        "pkg.target must resolve to target.py rather than pkg/__init__.py: {findings:#?}"
+    );
+    assert_eq!(findings[0]["kind"].as_str(), Some("private_target_access"));
+    assert_eq!(findings[0]["symbol"].as_str(), Some("t._cache"));
+}
+
+#[test]
+fn test_quality_tracks_unaliased_qualified_python_import_without_binding_package_root() {
+    let project = tempfile::tempdir().unwrap();
+    let package = project.path().join("pkg");
+    fs::create_dir_all(&package).unwrap();
+    let source = package.join("target.py");
+    let test_file = project.path().join("test_target.py");
+    fs::write(package.join("__init__.py"), "_cache = 'package-init'\n").unwrap();
+    fs::write(
+        &source,
+        "_cache = 'target-module'\n\ndef eligible(value: int) -> bool:\n    return value >= 1\n",
+    )
+    .unwrap();
+    fs::write(
+        &test_file,
+        "import pkg.target\n\nassert pkg._cache == 'package-init'\nassert pkg.target._cache == 'target-module'\nassert pkg.target.eligible(1) is True\n",
+    )
+    .unwrap();
+
+    let report = run_cli_test_quality(&source, &test_file, project.path(), "python", None, 1);
+    let findings = test_quality_stage(&report)["detail"]["coupling_findings"]
+        .as_array()
+        .expect("unaliased qualified Python coupling findings");
+    assert_eq!(
+        findings.len(),
+        1,
+        "the package root must not inherit target-module coupling: {findings:#?}"
+    );
+    assert_eq!(findings[0]["symbol"].as_str(), Some("pkg.target._cache"));
+}
+
+#[test]
+fn test_quality_ignores_shadowed_typescript_target_parameter() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("target.ts");
+    let test_file = project.path().join("target.test.ts");
+    fs::write(
+        &source,
+        "export const _cache = 1;\nexport function eligible(value: number): boolean {\n  return value >= 1;\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        &test_file,
+        "import * as target from './target.ts';\nfunction localCache(target: { _cache: number }): number { return target._cache; }\nconst local = { _cache: 2 };\nif (localCache(local) !== 2) throw new Error('bad local');\nif (target._cache !== 1 || !target.eligible(1)) throw new Error('bad target');\n",
+    )
+    .unwrap();
+
+    let report = run_cli_test_quality(
+        &source,
+        &test_file,
+        project.path(),
+        "typescript",
+        Some("bun"),
+        1,
+    );
+    let findings = test_quality_stage(&report)["detail"]["coupling_findings"]
+        .as_array()
+        .expect("TypeScript shadowing coupling findings");
+    assert_eq!(
+        findings.len(),
+        1,
+        "shadowed target parameter must not be attributed to the imported target: {findings:#?}"
+    );
+    assert_eq!(findings[0]["symbol"].as_str(), Some("target._cache"));
+    assert_eq!(findings[0]["line"].as_u64(), Some(5));
+}
+
+#[test]
+fn test_quality_ignores_shadowed_python_target_parameter() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("target.py");
+    let test_file = project.path().join("test_target.py");
+    fs::write(
+        &source,
+        "_cache = 1\n\ndef eligible(value: int) -> bool:\n    return value >= 1\n",
+    )
+    .unwrap();
+    fs::write(
+        &test_file,
+        "import target\n\ndef local_cache(target):\n    return target._cache\n\nlocal = type('Local', (), {'_cache': 2})()\nassert local_cache(local) == 2\nassert target._cache == 1\nassert target.eligible(1) is True\n",
+    )
+    .unwrap();
+
+    let report = run_cli_test_quality(&source, &test_file, project.path(), "python", None, 1);
+    let findings = test_quality_stage(&report)["detail"]["coupling_findings"]
+        .as_array()
+        .expect("Python shadowing coupling findings");
+    assert_eq!(
+        findings.len(),
+        1,
+        "shadowed target parameter must not be attributed to the imported target: {findings:#?}"
+    );
+    assert_eq!(findings[0]["symbol"].as_str(), Some("target._cache"));
+    assert_eq!(findings[0]["line"].as_u64(), Some(8));
+}
+
+#[test]
+fn test_quality_ignores_nearer_sibling_module_when_root_target_is_selected() {
+    let project = tempfile::tempdir().unwrap();
+    let tests_dir = project.path().join("tests");
+    fs::create_dir_all(&tests_dir).unwrap();
+    let source = project.path().join("target.py");
+    let sibling = tests_dir.join("target.py");
+    let test_file = tests_dir.join("test_target.py");
+    fs::write(
+        &source,
+        "_cache = 'selected-root'\n\ndef eligible(value: int) -> bool:\n    return value >= 1\n",
+    )
+    .unwrap();
+    fs::write(&sibling, "_cache = 'nearer-sibling'\n").unwrap();
+    fs::write(
+        &test_file,
+        "import target\nassert target._cache == 'nearer-sibling'\n",
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_court-jester"))
+        .args([
+            "verify",
+            "--file",
+            source.to_str().unwrap(),
+            "--language",
+            "python",
+            "--project-dir",
+            project.path().to_str().unwrap(),
+            "--test-file",
+            test_file.to_str().unwrap(),
+            "--tests-only",
+            "--test-quality",
+            "1",
+            "--report-level",
+            "full",
+        ])
+        .output()
+        .unwrap();
+    let report = parse_cli_json(&output, "nearer-sibling coupling report");
+    assert!(
+        test_quality_stage(&report)["detail"]["coupling_findings"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "the test directory's sibling target.py is not the selected root target.py: {report:#?}"
+    );
+}
+
+#[test]
+fn test_quality_respects_python_comprehension_shadowing_and_outer_scope() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("target.py");
+    let test_file = project.path().join("test_target.py");
+    fs::write(
+        &source,
+        "class Cache:\n    _cache = 2\n\n_cache = Cache()\n\ndef eligible(value: int) -> bool:\n    return value >= 1\n",
+    )
+    .unwrap();
+    fs::write(
+        &test_file,
+        "import target\nvalues = [target._cache for target in [target._cache]]\nassert values == [2]\nassert target._cache is not None\nassert target.eligible(1) is True\n",
+    )
+    .unwrap();
+
+    let report = run_cli_test_quality(&source, &test_file, project.path(), "python", None, 1);
+    let findings = test_quality_stage(&report)["detail"]["coupling_findings"]
+        .as_array()
+        .expect("comprehension coupling findings");
+    assert_eq!(
+        findings.len(),
+        2,
+        "the comprehension target shadows only its body, not its iterable or outer scope: {findings:#?}"
+    );
+    assert!(
+        findings
+            .iter()
+            .all(|finding| finding["symbol"].as_str() == Some("target._cache")),
+        "{findings:#?}"
+    );
+    let mut lines = findings
+        .iter()
+        .map(|finding| finding["line"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    lines.sort_unstable();
+    assert_eq!(lines, [2, 4]);
+}
+
+#[test]
+fn test_quality_respects_function_scoped_typescript_var_shadowing() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("target.ts");
+    let test_file = project.path().join("target.test.ts");
+    fs::write(
+        &source,
+        "export const _cache = 1;\nexport function eligible(value: number): boolean {\n  return value >= 1;\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        &test_file,
+        "import * as target from './target.ts';\nfunction localCache(): number {\n  if (true) { var target = { _cache: 2 }; }\n  return target._cache;\n}\nif (localCache() !== 2) throw new Error('bad local');\nif (target._cache !== 1 || !target.eligible(1)) throw new Error('bad target');\n",
+    )
+    .unwrap();
+
+    let report = run_cli_test_quality(
+        &source,
+        &test_file,
+        project.path(),
+        "typescript",
+        Some("bun"),
+        1,
+    );
+    let findings = test_quality_stage(&report)["detail"]["coupling_findings"]
+        .as_array()
+        .expect("function-scoped var coupling findings");
+    assert_eq!(
+        findings.len(),
+        1,
+        "nested-block var shadows the imported target throughout its function: {findings:#?}"
+    );
+    assert_eq!(findings[0]["symbol"].as_str(), Some("target._cache"));
+    assert_eq!(findings[0]["line"].as_u64(), Some(7));
+}
+
+#[test]
+fn malformed_authoritative_sources_report_coupling_errors_without_partial_findings() {
+    let cases = [
+        (
+            "python",
+            "target.py",
+            "test_target.py",
+            "_cache = 7\n\ndef eligible(value: int) -> bool:\n    return value >= 1\n",
+            "import target\nassert target._cache == 7\nassert target.eligible(1)\nif (\n",
+            None,
+        ),
+        (
+            "typescript",
+            "target.ts",
+            "target.test.ts",
+            "export const _cache = 7;\nexport function eligible(value: number): boolean {\n  return value >= 1;\n}\n",
+            "import * as target from './target.ts';\nif (target._cache !== 7 || !target.eligible(1)) throw new Error('bad');\nfunction broken(\n",
+            Some("bun"),
+        ),
+    ];
+
+    for (language, source_name, test_name, code, tests, runner) in cases {
+        let project = tempfile::tempdir().unwrap();
+        let source = project.path().join(source_name);
+        let test_file = project.path().join(test_name);
+        fs::write(&source, code).unwrap();
+        fs::write(&test_file, tests).unwrap();
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_court-jester"));
+        command.args([
+            "verify",
+            "--file",
+            source.to_str().unwrap(),
+            "--language",
+            language,
+            "--project-dir",
+            project.path().to_str().unwrap(),
+            "--test-file",
+            test_file.to_str().unwrap(),
+            "--tests-only",
+            "--test-quality",
+            "1",
+            "--report-level",
+            "full",
+        ]);
+        if let Some(runner) = runner {
+            command.args(["--test-runner", runner]);
+        }
+        let output = command.output().unwrap();
+        let report = parse_cli_json(&output, "malformed authoritative report");
+        let stage = test_quality_stage(&report);
+        assert_eq!(
+            stage["status"].as_str(),
+            Some("advisory"),
+            "coupling analysis failure remains advisory for {language}: {stage:#?}"
+        );
+        assert_eq!(stage["detail"]["mode"].as_str(), Some("advisory"));
+        assert!(
+            stage["detail"]["coupling_error"]
+                .as_str()
+                .is_some_and(|error| !error.is_empty()),
+            "malformed {language} test must retain its coupling error: {stage:#?}"
+        );
+        assert!(
+            stage["detail"]["coupling_findings"]
+                .as_array()
+                .is_some_and(Vec::is_empty),
+            "malformed {language} test must not leak partial coupling findings: {stage:#?}"
+        );
+    }
+}
+
+#[test]
+fn test_quality_redacts_and_bounds_mutant_failure_excerpt() {
+    const SECRET_VALUE: &str = "violet-cedar-7409-correct-horse";
+    const SECRET_LINE: &str = "DATABASE_PASSWORD=violet-cedar-7409-correct-horse";
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("target.py");
+    let test_file = project.path().join("test_target.py");
+    fs::write(&source, "def enabled() -> bool:\n    return True\n").unwrap();
+    fs::write(
+        &test_file,
+        format!(
+            "import sys\nimport target\nvalue = target.enabled()\nif not value:\n    print({secret:?}, file=sys.stderr)\nassert value is True\n",
+            secret = SECRET_LINE,
+        ),
+    )
+    .unwrap();
+
+    let report = run_cli_test_quality(&source, &test_file, project.path(), "python", None, 1);
+    let mutant = &test_quality_stage(&report)["detail"]["mutants"][0];
+    assert_eq!(mutant["outcome"].as_str(), Some("killed"));
+    let excerpt = mutant["failure_excerpt"]
+        .as_str()
+        .expect("bounded mutant failure excerpt");
+    assert!(
+        !excerpt.contains(SECRET_VALUE),
+        "raw opaque secret leaked in {excerpt:?}"
+    );
+    assert!(
+        excerpt.contains("[REDACTED]"),
+        "redacted excerpt must use the stable marker: {excerpt:?}"
+    );
+    assert!(
+        excerpt.chars().count() <= 1_000,
+        "failure excerpt exceeded its serialization bound"
+    );
+}
+
+#[test]
+fn test_quality_parses_tsx_coupling_and_retains_authoritative_test_path() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("target.ts");
+    let test_file = project.path().join("target.test.tsx");
+    fs::write(
+        &source,
+        "export function eligible(value: number): boolean {\n  return value >= 2;\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("tsconfig.json"),
+        r#"{"compilerOptions":{"jsx":"react","jsxFactory":"h"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        &test_file,
+        "import { expect, test } from 'bun:test';\nimport * as target from './target.ts';\nconst h = (..._args: unknown[]) => ({});\nfunction View() { return <target._Private />; }\ntest('tsx target', () => {\n  void View;\n  expect(target.eligible(2)).toBe(true);\n});\n",
+    )
+    .unwrap();
+
+    let report = run_cli_test_quality(
+        &source,
+        &test_file,
+        project.path(),
+        "typescript",
+        Some("bun"),
+        1,
+    );
+    let findings = test_quality_stage(&report)["detail"]["coupling_findings"]
+        .as_array()
+        .expect("TSX coupling findings");
+    let finding = findings
+        .iter()
+        .find(|finding| finding["symbol"].as_str() == Some("target._Private"))
+        .unwrap_or_else(|| panic!("TSX private target access was not reported: {findings:#?}"));
+    assert_eq!(finding["kind"].as_str(), Some("private_target_access"));
+    let reported_path = finding["test_source_file"]
+        .as_str()
+        .expect("coupling provenance must retain the authoritative test path");
+    assert_eq!(
+        normalize_logged_path(reported_path),
+        normalize_logged_path(&test_file.to_string_lossy())
+    );
+}
+
+#[test]
+fn test_quality_baseline_process_blocker_prevents_mutant_execution() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("target.py");
+    let test_file = project.path().join("test_target.py");
+    let execution_log = project.path().join("authoritative-runs.log");
+    fs::write(
+        &source,
+        "def eligible(value: int) -> bool:\n    return value >= 1\n",
+    )
+    .unwrap();
+    fs::write(
+        &test_file,
+        format!(
+            "from pathlib import Path\nimport socket\nimport sys\nimport target\nPath({log:?}).open('a').write('run\\n')\nassert target.eligible(1) is True\ntry:\n    socket.create_connection(('127.0.0.1', 9), timeout=0.01)\nexcept PermissionError as error:\n    print(error, file=sys.stderr)\n",
+            log = execution_log.to_string_lossy(),
+        ),
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_court-jester"))
+        .args([
+            "verify",
+            "--file",
+            source.to_str().unwrap(),
+            "--language",
+            "python",
+            "--project-dir",
+            project.path().to_str().unwrap(),
+            "--test-file",
+            test_file.to_str().unwrap(),
+            "--tests-only",
+            "--test-quality",
+            "1",
+            "--report-level",
+            "full",
+        ])
+        .output()
+        .unwrap();
+    let report = parse_cli_json(&output, "blocked-baseline test-quality report");
+    let test_stage = report["stages"]
+        .as_array()
+        .and_then(|stages| {
+            stages
+                .iter()
+                .find(|stage| stage["name"].as_str() == Some("test"))
+        })
+        .expect("authoritative test stage");
+    assert_eq!(test_stage["status"].as_str(), Some("inconclusive"));
+    let quality_stage = test_quality_stage(&report);
+    assert_eq!(
+        quality_stage["detail"]["baseline_eligible"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        quality_stage["detail"]["counts"]["planned"].as_u64(),
+        Some(0)
+    );
+    let runs = fs::read_to_string(&execution_log).expect("baseline authoritative run");
+    assert_eq!(
+        runs.lines().count(),
+        1,
+        "a baseline process blocker must prevent all mutant test executions"
+    );
+}
+
+#[test]
+fn unsupported_commands_reject_test_quality() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_court-jester"))
+        .args(["doctor", "--test-quality", "1"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "doctor must not silently accept a verify/ci-only option"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--test-quality"),
+        "the CLI error must identify the unsupported option: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_quality_cli_cardinality_and_mode_errors_precede_input_lookup() {
+    let cases: Vec<(&str, Vec<&str>, Vec<&str>)> = vec![
+        (
+            "verify quality without a test",
+            vec!["verify", "--test-quality", "1"],
+            vec!["--test-quality", "exactly one", "--test-file"],
+        ),
+        (
+            "verify quality with two tests",
+            vec![
+                "verify",
+                "--test-quality",
+                "1",
+                "--test-file",
+                "a.py",
+                "--test-file",
+                "b.py",
+            ],
+            vec!["verify", "exactly one", "--test-file"],
+        ),
+        (
+            "CI quality without a test",
+            vec!["ci", "--test-quality", "1"],
+            vec!["ci", "--test-quality", "requires", "--test-file"],
+        ),
+        (
+            "CI test without quality mode",
+            vec!["ci", "--test-file", "a.py"],
+            vec!["ci", "--test-file", "requires", "--test-quality"],
+        ),
+        (
+            "CI tests-only",
+            vec!["ci", "--tests-only"],
+            vec!["ci", "does not support", "--tests-only"],
+        ),
+    ];
+
+    for (label, args, expected_fragments) in cases {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_court-jester"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{label} must be a CLI usage error: stdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            expected_fragments
+                .iter()
+                .all(|fragment| stderr.contains(fragment)),
+            "{label} returned the wrong usage error: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_quality_plans_exported_typescript_class_method_boundary() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("target.ts");
+    let test_file = project.path().join("target.test.ts");
+    fs::write(
+        &source,
+        "export class Threshold {\n  accepts(value: number): boolean {\n    return value >= 1;\n  }\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        &test_file,
+        "import { Threshold } from './target.ts';\nif (!new Threshold().accepts(1)) throw new Error('boundary changed');\n",
+    )
+    .unwrap();
+
+    let report = run_cli_test_quality(
+        &source,
+        &test_file,
+        project.path(),
+        "typescript",
+        Some("bun"),
+        1,
+    );
+    let stage = test_quality_stage(&report);
+    assert_eq!(stage["detail"]["counts"]["planned"].as_u64(), Some(1));
+    assert_eq!(stage["detail"]["counts"]["killed"].as_u64(), Some(1));
+    let mutation = &stage["detail"]["mutants"][0]["mutation"];
+    assert_eq!(mutation["operator"].as_str(), Some("comparison_boundary"));
+    assert_eq!(mutation["surface_id"].as_str(), Some("Threshold#accepts:2"));
+}
+
+#[test]
+fn ci_test_quality_rejects_duplicate_same_language_entrypoints() {
+    let project = tempfile::tempdir().unwrap();
+    initialize_git_project(project.path());
+    let source = project.path().join("target.py");
+    let first_test = project.path().join("first_test.py");
+    let second_test = project.path().join("second_test.py");
+    fs::write(
+        &source,
+        "def eligible(value: int) -> bool:\n    return value >= 1\n",
+    )
+    .unwrap();
+    fs::write(&first_test, "import target\nassert target.eligible(1)\n").unwrap();
+    fs::write(&second_test, "import target\nassert target.eligible(1)\n").unwrap();
+    let base = commit_git_project(project.path(), "baseline");
+    fs::write(
+        &source,
+        "def eligible(value: int) -> bool:\n    # changed\n    return value >= 1\n",
+    )
+    .unwrap();
+    commit_git_project(project.path(), "candidate");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_court-jester"))
+        .current_dir(project.path())
+        .args([
+            "ci",
+            "--base",
+            &base,
+            "--head",
+            "HEAD",
+            "--report",
+            "json",
+            "--test-quality",
+            "1",
+            "--test-file",
+            first_test.to_str().unwrap(),
+            "--test-file",
+            second_test.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "CI must reject two Python authoritative entrypoints"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("at most one") && stderr.to_ascii_lowercase().contains("python"),
+        "unexpected duplicate-entrypoint error: {stderr}"
+    );
+}
+
+#[test]
+fn ci_test_quality_routes_polyglot_entrypoints_in_both_argument_orders() {
+    let project = tempfile::tempdir().unwrap();
+    initialize_git_project(project.path());
+    let python_source = project.path().join("python_target.py");
+    let typescript_source = project.path().join("typescript_target.ts");
+    let python_test = project.path().join("quality_checks.py");
+    let typescript_test = project.path().join("quality_checks.test.ts");
+    fs::write(
+        &python_source,
+        "def eligible(value: int) -> bool:\n    return value >= 1\n",
+    )
+    .unwrap();
+    fs::write(
+        &typescript_source,
+        "export function eligible(value: number): boolean {\n  return value >= 1;\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        &python_test,
+        "import python_target\nassert python_target.eligible(1) is True\n",
+    )
+    .unwrap();
+    fs::write(
+        &typescript_test,
+        "import { expect, test } from 'bun:test';\nimport { eligible } from './typescript_target.ts';\ntest('boundary', () => expect(eligible(1)).toBe(true));\n",
+    )
+    .unwrap();
+    let base = commit_git_project(project.path(), "baseline");
+    fs::write(
+        &python_source,
+        "def eligible(value: int) -> bool:\n    # changed\n    return value >= 1\n",
+    )
+    .unwrap();
+    fs::write(
+        &typescript_source,
+        "export function eligible(value: number): boolean {\n  // changed\n  return value >= 1;\n}\n",
+    )
+    .unwrap();
+    commit_git_project(project.path(), "candidate");
+
+    for test_files in [
+        [python_test.as_path(), typescript_test.as_path()],
+        [typescript_test.as_path(), python_test.as_path()],
+    ] {
+        let (output, report) = run_cli_ci_test_quality(project.path(), &base, &test_files, 2);
+        assert!(
+            output.status.success(),
+            "polyglot advisory CI failed: stdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for file_name in ["python_target.py", "typescript_target.ts"] {
+            let stage = test_quality_stage(&ci_file(&report, file_name)["report"]);
+            assert_eq!(
+                stage["detail"]["baseline_eligible"].as_bool(),
+                Some(true),
+                "{file_name} did not receive its language entrypoint: {stage:#?}"
+            );
+            assert_eq!(stage["detail"]["counts"]["planned"].as_u64(), Some(1));
+            assert_eq!(stage["detail"]["counts"]["killed"].as_u64(), Some(1));
+        }
+    }
+}
+
+#[test]
+fn ci_global_quality_cap_redistributes_past_unavailable_files() {
+    let project = tempfile::tempdir().unwrap();
+    initialize_git_project(project.path());
+    let no_candidate = project.path().join("a_no_candidate.py");
+    let no_entrypoint = project.path().join("b_no_entrypoint.ts");
+    let first_candidate = project.path().join("c_candidate.py");
+    let second_candidate = project.path().join("d_candidate.py");
+    let test_file = project.path().join("quality_checks.py");
+    fs::write(
+        &no_candidate,
+        "def identity(value: int) -> int:\n    return value\n",
+    )
+    .unwrap();
+    fs::write(
+        &no_entrypoint,
+        "export function eligible(value: number): boolean {\n  return value >= 1;\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        &first_candidate,
+        "def lower(value: int) -> bool:\n    return value >= 1\n",
+    )
+    .unwrap();
+    fs::write(
+        &second_candidate,
+        "def upper(value: int) -> bool:\n    return value <= 10\n",
+    )
+    .unwrap();
+    fs::write(
+        &test_file,
+        "import a_no_candidate\nimport c_candidate\nimport d_candidate\nassert a_no_candidate.identity(1) == 1\nassert c_candidate.lower(1)\nassert d_candidate.upper(10)\n",
+    )
+    .unwrap();
+    let base = commit_git_project(project.path(), "baseline");
+    fs::write(
+        &no_candidate,
+        "def identity(value: int) -> int:\n    # changed\n    return value\n",
+    )
+    .unwrap();
+    fs::write(
+        &no_entrypoint,
+        "export function eligible(value: number): boolean {\n  // changed\n  return value >= 1;\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        &first_candidate,
+        "def lower(value: int) -> bool:\n    # changed\n    return value >= 1\n",
+    )
+    .unwrap();
+    fs::write(
+        &second_candidate,
+        "def upper(value: int) -> bool:\n    # changed\n    return value <= 10\n",
+    )
+    .unwrap();
+    commit_git_project(project.path(), "candidate");
+
+    let (_, report) = run_cli_ci_test_quality(project.path(), &base, &[test_file.as_path()], 2);
+    let no_candidate_stage = test_quality_stage(&ci_file(&report, "a_no_candidate.py")["report"]);
+    assert_eq!(
+        no_candidate_stage["detail"]["counts"]["planned"].as_u64(),
+        Some(0)
+    );
+    assert!(
+        no_candidate_stage["message"]
+            .as_str()
+            .is_some_and(|message| message.to_ascii_lowercase().contains("candidate")),
+        "no-candidate stage must explain why it did not consume budget: {no_candidate_stage:#?}"
+    );
+    let no_entrypoint_stage = test_quality_stage(&ci_file(&report, "b_no_entrypoint.ts")["report"]);
+    assert_eq!(
+        no_entrypoint_stage["detail"]["counts"]["planned"].as_u64(),
+        Some(0)
+    );
+    assert!(
+        no_entrypoint_stage["message"]
+            .as_str()
+            .is_some_and(|message| message.to_ascii_lowercase().contains("entrypoint")),
+        "missing language entrypoint must remain explicit: {no_entrypoint_stage:#?}"
+    );
+    for file_name in ["c_candidate.py", "d_candidate.py"] {
+        let stage = test_quality_stage(&ci_file(&report, file_name)["report"]);
+        assert_eq!(
+            stage["detail"]["counts"]["planned"].as_u64(),
+            Some(1),
+            "available candidate budget was not redistributed to {file_name}: {stage:#?}"
+        );
+    }
+    assert_eq!(report["test_quality"]["planned"].as_u64(), Some(2));
+}
+
+#[test]
+fn ci_candidate_with_zero_quota_retains_budget_exhausted_stage() {
+    let project = tempfile::tempdir().unwrap();
+    initialize_git_project(project.path());
+    let sources = ["a.py", "b.py", "c.py"].map(|name| project.path().join(name));
+    let test_file = project.path().join("quality_checks.py");
+    for (index, source) in sources.iter().enumerate() {
+        fs::write(
+            source,
+            format!("def eligible_{index}(value: int) -> bool:\n    return value >= {index}\n"),
+        )
+        .unwrap();
+    }
+    fs::write(
+        &test_file,
+        "import a\nimport b\nimport c\nassert a.eligible_0(0)\nassert b.eligible_1(1)\nassert c.eligible_2(2)\n",
+    )
+    .unwrap();
+    let base = commit_git_project(project.path(), "baseline");
+    for (index, source) in sources.iter().enumerate() {
+        fs::write(
+            source,
+            format!(
+                "def eligible_{index}(value: int) -> bool:\n    # changed\n    return value >= {index}\n"
+            ),
+        )
+        .unwrap();
+    }
+    commit_git_project(project.path(), "candidate");
+
+    let (_, report) = run_cli_ci_test_quality(project.path(), &base, &[test_file.as_path()], 2);
+    assert_eq!(
+        test_quality_stage(&ci_file(&report, "a.py")["report"])["detail"]["counts"]["planned"]
+            .as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        test_quality_stage(&ci_file(&report, "b.py")["report"])["detail"]["counts"]["planned"]
+            .as_u64(),
+        Some(1)
+    );
+    let exhausted = test_quality_stage(&ci_file(&report, "c.py")["report"]);
+    assert_eq!(exhausted["detail"]["counts"]["planned"].as_u64(), Some(0));
+    assert!(
+        exhausted["message"].as_str().is_some_and(|message| {
+            let message = message.to_ascii_lowercase();
+            message.contains("global") && message.contains("budget") && message.contains("exhaust")
+        }),
+        "candidate-bearing zero quota must be distinguishable from no candidates: {exhausted:#?}"
+    );
+}
+
+#[test]
+fn ci_nonzero_unjudged_equals_invalid_blocked_and_no_coverage() {
+    let project = tempfile::tempdir().unwrap();
+    initialize_git_project(project.path());
+    let source = project.path().join("target.py");
+    let test_file = project.path().join("quality_checks.py");
+    fs::write(&source, "def enabled() -> bool:\n    return True\n").unwrap();
+    fs::write(
+        &test_file,
+        "import subprocess\nimport target\nvalue = target.enabled()\nif not value:\n    subprocess.run(['echo', 'blocked'], check=True)\nassert value is True\n",
+    )
+    .unwrap();
+    let base = commit_git_project(project.path(), "baseline");
+    fs::write(
+        &source,
+        "def enabled() -> bool:\n    # changed\n    return True\n",
+    )
+    .unwrap();
+    commit_git_project(project.path(), "candidate");
+
+    let (output, report) =
+        run_cli_ci_test_quality(project.path(), &base, &[test_file.as_path()], 1);
+    assert!(
+        output.status.success(),
+        "a blocked mutant remains advisory: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary = &report["test_quality"];
+    let invalid = summary["invalid"].as_u64().unwrap();
+    let blocked = summary["blocked"].as_u64().unwrap();
+    let no_coverage = summary["no_coverage"].as_u64().unwrap();
+    let unjudged = summary["unjudged"].as_u64().unwrap();
+    assert!(
+        unjudged > 0,
+        "the real process-policy blocker must exercise a nonzero unjudged bucket: {report:#?}"
+    );
+    assert_eq!(unjudged, invalid + blocked + no_coverage);
+    assert_eq!(
+        summary["unjudged"],
+        test_quality_stage(&ci_file(&report, "target.py")["report"])["detail"]["counts"]["blocked"],
+        "the single blocked campaign must aggregate without fabricating invalid mutants"
     );
 }

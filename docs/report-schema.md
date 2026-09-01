@@ -51,8 +51,57 @@ Each stage has this shape:
 - `portability`
 - `execute`
 - `test`
+- `test_quality` (present when the stable advisory opt-in is requested)
 
 Lint is advisory by design. Portability is advisory after a successful repository-native fallback and inconclusive when loading prevents behavioral execution.
+
+### Stable advisory test-quality detail
+
+`--test-quality [N]` adds the non-gating `test_quality` stage after authoritative baseline-test and coverage eligibility are established. Direct `verify` requires exactly one `--test-file`. In `ci`, `--test-file` is repeatable with at most one Python and one TypeScript/TSX entrypoint; the matching entrypoint is selected for each target language. The default budget is 8 and the valid range is 1 through 32.
+
+Full stage detail has these stable fields:
+
+```json
+{
+  "experimental": false,
+  "mode": "advisory",
+  "max_mutants": 8,
+  "baseline_eligible": true,
+  "counts": {
+    "planned": 4,
+    "killed": 3,
+    "survived": 1,
+    "invalid": 0,
+    "blocked": 0,
+    "no_coverage": 0
+  },
+  "mutants": [],
+  "coupling_findings": [],
+  "planning_error": null,
+  "coupling_error": null
+}
+```
+
+- `experimental` remains in schema v3 and is always `false` for the stable feature.
+- `mode` is always `advisory`.
+- `max_mutants` is the direct campaign cap or, in a CI per-file stage, that file's deterministic share of the global cap. The CI aggregate exposes the configured global cap separately.
+- `baseline_eligible` states whether the original authoritative test passed, entered every required surface, and used supported instrumentation.
+- `counts` contains bounded `planned`, `killed`, `survived`, `invalid`, `blocked`, and `no_coverage` observations.
+- `mutants` contains per-candidate mutation identity and location, operator, original and replacement source, behavioral witness, outcome, exact target-entry evidence, test status, process diagnostics, duration, and bounded failure excerpt.
+- `coupling_findings` contains only target-resolved `private_target_access`, `private_target_import`, `private_target_spy`, and `target_source_introspection` evidence. Each finding includes the normalized authoritative `test_source_file`; its line, column, symbol, evidence, and message are attributable to that test file. This additive provenance field is authoritative even when the same target is analyzed from multiple test entrypoints. Unrelated private-looking members, blanket mock usage, and text matches without target binding are outside this contract. Coupling evidence is independent of mutation outcomes.
+- `planning_error` and `coupling_error` are nullable diagnostics. They never become a kill or a verifier failure.
+
+Outcome meanings are deliberately asymmetric:
+
+- `killed` requires an eligible baseline, a valid mutant, exact entry into the mutated public surface, and authoritative-test failure. A target-originated assertion failure or exception may be a kill; infrastructure failure may not.
+- `survived` requires the same eligibility, validity, and exact entry, followed by authoritative-test success. It identifies one reached behavioral distinction the test did not detect, not a globally weak test.
+- `invalid` means the mutation could not be applied, parsed, or validated while preserving the required callable surface.
+- `blocked` means runner, instrumentation, timeout, memory, sandbox, or other non-target infrastructure prevented judgment.
+- `no_coverage` means the valid mutant ran without exact entry into its mutated surface.
+
+Only `killed` and `survived` are judged outcomes. `invalid`, `blocked`, and `no_coverage` are unjudged and must never be folded into kills or treated as negative test results. Coupling findings remain separate because mutation sensitivity cannot establish implementation independence.
+
+The stage status is informational. `passed` means every planned mutant was killed with no coupling, unjudged outcome, mutation-planning diagnostic, or baseline infrastructure blocker. `advisory` means at least one survivor, coupling finding, or unjudged outcome exists, or mutation planning produced a diagnostic, or a non-target authoritative baseline infrastructure blocker prevented the campaign; `advisory` remains reachable even when every mutant count and the coupling count are zero. `skipped` is reserved for a blocker-free inability to run a campaign with no coupling finding, including no eligible candidates, no share of the global CI budget, or no matching authoritative test entrypoint. None of these statuses changes top-level `verdict`, `strength`, process exit status, or CI gates. The schema deliberately provides no quality score, percentage, grade, threshold, or synthetic pass/fail field.
 
 ## Coverage contract
 
@@ -95,7 +144,7 @@ Differential repros embed base/candidate local source closures and a dependency 
 
 ## Full, minimal, and repair output
 
-`--report-level full` retains complete stage detail, structured findings, repros, and execution diagnostics. `--report-level minimal` keeps the verdict/strength, stage statuses and durations, actionable findings/repros, summary counts, and coverage summary while omitting verbose parse and harness detail. Consumers MUST use values, not field presence, to make gate decisions.
+`--report-level full` retains complete stage detail, structured findings, repros, and execution diagnostics. `--report-level minimal` keeps the verdict/strength, stage statuses and durations, actionable findings/repros, summary counts, and coverage summary while omitting verbose parse and harness detail. For `test_quality`, both levels retain the stable detail fields listed above, including per-mutant evidence, coupling findings, and nullable planning/coupling errors. Consumers MUST use values, not field presence, to make gate decisions.
 
 `--summary repair-json` emits only:
 
@@ -115,7 +164,25 @@ Differential repros embed base/candidate local source closures and a dependency 
 
 ## CI and exit codes
 
-`court-jester ci` defaults to `parse,lint,coverage,portability,execute,test`; `--gate` selects a comma-separated subset or `all`. Aggregate and per-file results use typed verdicts, with fail taking precedence over inconclusive, then pass. CI JSON uses the same typed contract as `verify`.
+`court-jester ci` defaults to `parse,lint,coverage,portability,execute,test`; `--gate` selects a comma-separated subset or `all`. Aggregate and per-file results use typed verdicts, with fail taking precedence over inconclusive, then pass. CI JSON uses the same typed contract as `verify`. When test quality is requested, every file report retains its own `test_quality` stage and the CI object adds this exact aggregate derived from those stages:
+
+```json
+{
+  "test_quality": {
+    "max_mutants": 8,
+    "planned": 8,
+    "killed": 6,
+    "survived": 1,
+    "invalid": 0,
+    "blocked": 1,
+    "no_coverage": 0,
+    "unjudged": 1,
+    "coupling": 2
+  }
+}
+```
+
+`max_mutants` is the configured global per-command budget. `planned`, `killed`, `survived`, `invalid`, `blocked`, `no_coverage`, and `coupling` are sums of the corresponding per-file evidence; `unjudged` is the derived sum `invalid + blocked + no_coverage`. The separate unjudged outcome totals are required in machine-readable JSON so consumers can distinguish mutation validity, infrastructure, and coverage problems. Candidate allocation is deterministic across files and required surfaces, aggregate `planned` never exceeds `max_mutants`, and valid underfilling remains explicit when candidates or matching authoritative tests are unavailable. Human and GitHub summaries may collapse `invalid`, `blocked`, and `no_coverage` into a single `unjudged` count and render planned/killed/survived/unjudged/coupling without a score. The quality aggregate and per-file quality stages are always advisory and cannot affect CI verdict or selected gates.
 
 For `verify` and `ci`:
 
@@ -141,3 +208,5 @@ Benchmark artifacts from earlier releases remain historical evidence only. They 
 ## Benchmark artifact boundary
 
 The Python benchmark has its own immutable `artifact_schema_version: 1`; every `matrix.json`, `run.json`, `result.json`, summary, and evidence manifest also records `verify_schema_version_required: 3`. Missing, mixed, or mismatched versions are abstentions and are excluded from semantic gates unless an explicit legacy mode labels them as historical. Evidence bundles are checksummed and redaction-aware. Optional shadow JSONL records carry `blocking_mode: shadow` and never alter task success. Gate decisions are emitted separately as `none`, `private-beta-default`, or `strict-heldout` and are ineligible when required cells or metrics are missing.
+
+This section defines the format of artifacts generated or supplied to the general benchmark harness. It does not claim that a test-quality-specific matrix, classification oracle, result set, or evidence bundle is committed, and none of those artifacts gates the advisory 0.2.16 feature.

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tree_sitter::Parser;
 
-use crate::tools::{analyze, diff, domain, lint, sandbox, synthesize};
+use crate::tools::{analyze, diff, domain, lint, sandbox, synthesize, test_quality};
 use crate::types::*;
 
 pub struct VerifyOptions<'a> {
@@ -15,6 +15,7 @@ pub struct VerifyOptions<'a> {
     pub test_source_file: Option<&'a str>,
     pub test_runner: TestRunner,
     pub tests_only: bool,
+    pub test_quality_max_mutants: Option<usize>,
     pub complexity_threshold: Option<usize>,
     pub complexity_metric: ComplexityMetric,
     pub project_dir: Option<&'a str>,
@@ -858,18 +859,70 @@ fn instrument_source_for_surfaces(
         name.rsplit(['.', '#']).next().unwrap_or(name)
     }
 
+    fn enclosing_named_node(
+        mut node: tree_sitter::Node<'_>,
+        kinds: &[&str],
+        code: &str,
+    ) -> Option<String> {
+        while let Some(parent) = node.parent() {
+            if kinds.contains(&parent.kind()) {
+                return parent
+                    .child_by_field_name("name")
+                    .and_then(|name| name.utf8_text(code.as_bytes()).ok())
+                    .map(str::to_owned);
+            }
+            if matches!(
+                parent.kind(),
+                "function_definition"
+                    | "function_declaration"
+                    | "method_definition"
+                    | "arrow_function"
+                    | "function_expression"
+            ) {
+                return None;
+            }
+            node = parent;
+        }
+        None
+    }
+
+    fn syntax_identity(node: tree_sitter::Node<'_>, syntax_name: &str, code: &str) -> String {
+        if node.kind() == "method_definition" {
+            if let Some(class_name) =
+                enclosing_named_node(node, &["class_declaration", "class"], code)
+            {
+                return format!("{class_name}#{syntax_name}");
+            }
+        }
+        if matches!(node.kind(), "method_definition" | "pair") {
+            if let Some(object_name) = enclosing_named_node(node, &["variable_declarator"], code) {
+                return format!("{object_name}.{syntax_name}");
+            }
+        }
+        syntax_name.to_string()
+    }
+
     fn matching_target<'a>(
         targets: &'a [InstrumentationTarget<'_>],
         line: usize,
+        identity: &str,
         syntax_name: &str,
         qualified_name_allowed: bool,
     ) -> Option<&'a InstrumentationTarget<'a>> {
-        targets.iter().find(|target| {
+        if let Some(target) = targets
+            .iter()
+            .find(|target| target.line == line && target.analyzer_name == identity)
+        {
+            return Some(target);
+        }
+        let mut fallback = targets.iter().filter(|target| {
             target.line == line
                 && (target.analyzer_name == syntax_name
                     || (qualified_name_allowed
                         && unqualified_name(target.analyzer_name) == syntax_name))
-        })
+        });
+        let matched = fallback.next()?;
+        fallback.next().is_none().then_some(matched)
     }
 
     fn instrument_callable(
@@ -927,7 +980,7 @@ fn instrument_source_for_surfaces(
                 .filter(|value| matches!(value.kind(), "arrow_function" | "function_expression"));
             if let (Some(name), Some(callable)) = (name, callable) {
                 if let (Some(target), Some(body)) = (
-                    matching_target(targets, line, name, false),
+                    matching_target(targets, line, name, name, false),
                     callable.child_by_field_name("body"),
                 ) {
                     instrument_callable(
@@ -950,8 +1003,9 @@ fn instrument_source_for_surfaces(
                 .child_by_field_name("value")
                 .filter(|value| matches!(value.kind(), "arrow_function" | "function_expression"));
             if let (Some(name), Some(callable)) = (name, callable) {
+                let identity = syntax_identity(node, name, code);
                 if let (Some(target), Some(body)) = (
-                    matching_target(targets, line, name, true),
+                    matching_target(targets, line, &identity, name, true),
                     callable.child_by_field_name("body"),
                 ) {
                     instrument_callable(
@@ -972,7 +1026,10 @@ fn instrument_source_for_surfaces(
             if let (Some(name), Some(body)) = (name, node.child_by_field_name("body")) {
                 let qualified_name_allowed =
                     *language == Language::TypeScript && node.kind() == "method_definition";
-                if let Some(target) = matching_target(targets, line, name, qualified_name_allowed) {
+                let identity = syntax_identity(node, name, code);
+                if let Some(target) =
+                    matching_target(targets, line, &identity, name, qualified_name_allowed)
+                {
                     instrument_callable(
                         node,
                         body,
@@ -4535,6 +4592,882 @@ fn skipped_execute_stage(reason: &str, message: &str) -> VerificationStage {
     }
 }
 
+struct AuthoritativeTestOutcome {
+    result: ExecutionResult,
+    overlay: InstrumentationOverlay,
+    entered_surfaces: HashSet<String>,
+    has_non_target_blocker: bool,
+    has_assertion_failure: bool,
+    test_ok: bool,
+    covered_required: usize,
+    duration_ms: u64,
+    selected_test_runner: TestRunner,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_authoritative_test(
+    code: &str,
+    tests: &str,
+    required_functions: &[&FunctionInfo],
+    language: &Language,
+    verification_context: &VerificationContext,
+    opts: &VerifyOptions<'_>,
+    candidate_source_file: Option<&str>,
+    candidate_test_source_file: Option<&str>,
+) -> AuthoritativeTestOutcome {
+    let runner_probe = if test_code_has_imports(tests, language) {
+        tests.to_string()
+    } else {
+        format!("{code}\n\n{tests}")
+    };
+    let selected_test_runner = match language {
+        Language::TypeScript => match opts.test_runner {
+            TestRunner::Auto if sandbox::typescript_code_requires_bun_runtime(&runner_probe) => {
+                TestRunner::Bun
+            }
+            other => other,
+        },
+        Language::Python => TestRunner::Auto,
+    };
+    let project_dir = verification_context
+        .candidate
+        .workspace_root
+        .to_string_lossy()
+        .into_owned();
+    let prepared = prepare_authoritative_test(
+        code,
+        tests,
+        required_functions,
+        language,
+        verification_context.candidate.target_source.mode,
+        selected_test_runner,
+        Some(project_dir.as_str()),
+        candidate_source_file,
+        candidate_test_source_file,
+    );
+    let execution_project = prepared.project_dir.as_deref();
+    let execution_source = prepared.source_file.as_deref();
+    let start = Instant::now();
+    let result = if !prepared.overlay.supported {
+        err_execution_result(
+            prepared
+                .overlay
+                .reason
+                .as_deref()
+                .unwrap_or("authoritative-test instrumentation is unsupported"),
+        )
+    } else {
+        let harness_context = authoritative_execution_context(
+            &verification_context.candidate,
+            execution_project,
+            execution_source,
+        );
+        let source_mode = harness_context
+            .test_source
+            .as_ref()
+            .map(|source| source.mode)
+            .unwrap_or(harness_context.target_source.mode);
+        let (runtime, test_adapter) = authoritative_harness_runtime(
+            *language,
+            selected_test_runner,
+            &runner_probe,
+            &harness_context,
+        );
+        let artifact = if prepared._root.is_some() {
+            execution_source
+                .and_then(|source| {
+                    Path::new(source)
+                        .strip_prefix(&harness_context.workspace_root)
+                        .ok()
+                        .map(Path::to_path_buf)
+                })
+                .map(|relative_path| HarnessArtifact::Existing { relative_path })
+                .unwrap_or_else(|| HarnessArtifact::Generated {
+                    code: prepared.code.clone(),
+                    relative_path: authoritative_artifact_path(
+                        &harness_context,
+                        execution_project,
+                        execution_source,
+                        source_mode,
+                    ),
+                })
+        } else if let Some(relative_path) = execution_source.and_then(|source| {
+            let source = Path::new(source);
+            source
+                .is_file()
+                .then(|| source.strip_prefix(&harness_context.workspace_root).ok())
+                .flatten()
+                .map(Path::to_path_buf)
+        }) {
+            HarnessArtifact::Existing { relative_path }
+        } else {
+            HarnessArtifact::Generated {
+                code: prepared.code.clone(),
+                relative_path: authoritative_artifact_path(
+                    &harness_context,
+                    execution_project,
+                    execution_source,
+                    source_mode,
+                ),
+            }
+        };
+        let mut limits = sandbox_options(
+            opts,
+            language,
+            test_timeout(),
+            opts.memory_mb,
+            execution_project,
+            execution_source,
+        );
+        limits.instrumentation_target = prepared
+            .instrumented_source
+            .as_ref()
+            .and(candidate_source_file);
+        limits.instrumented_source = prepared.instrumented_source.as_deref();
+        sandbox::execute_harness(
+            &harness_context,
+            HarnessSpec {
+                kind: HarnessKind::AuthoritativeTest,
+                runtime,
+                test_adapter,
+                source_mode,
+                artifact,
+                args: Vec::new(),
+                network: opts.network,
+            },
+            limits,
+        )
+        .await
+        .process
+    };
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let test_output = format!("{}\n{}", result.stdout, result.stderr);
+    let entered_surfaces = parse_target_entered_events(&test_output);
+    let has_non_target_blocker = has_non_target_blocking_diagnostic(&result.diagnostics);
+    let has_assertion_failure = !has_non_target_blocker
+        && (test_output.contains("Assertion failed")
+            || test_output.contains("AssertionError")
+            || result.diagnostics.iter().any(|diagnostic| {
+                diagnostic.kind == FailureKind::AssertionFailure
+                    && diagnostic.component == DiagnosticComponent::AuthoritativeTestRunner
+            }));
+    let test_ok = result.exit_code == Some(0)
+        && !result.timed_out
+        && !result.memory_error
+        && !has_assertion_failure;
+    let covered_required = required_functions
+        .iter()
+        .filter(|function| {
+            entered_surfaces.contains(&format!("{}:{}", function.name, function.line))
+        })
+        .count();
+    AuthoritativeTestOutcome {
+        result,
+        overlay: prepared.overlay,
+        entered_surfaces,
+        has_non_target_blocker,
+        has_assertion_failure,
+        test_ok,
+        covered_required,
+        duration_ms,
+        selected_test_runner,
+    }
+}
+
+fn report_secret_value_end(bytes: &[u8], mut index: usize) -> usize {
+    while index < bytes.len()
+        && !bytes[index].is_ascii_whitespace()
+        && !matches!(
+            bytes[index],
+            b',' | b';' | b')' | b']' | b'}' | b'\'' | b'"' | b'&'
+        )
+    {
+        index += 1;
+    }
+    index
+}
+
+fn report_key_tokens(key: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut previous_was_lowercase = false;
+    for character in key.chars() {
+        if !character.is_ascii_alphanumeric() {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            previous_was_lowercase = false;
+            continue;
+        }
+        if character.is_ascii_uppercase() && previous_was_lowercase && !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+        current.push(character.to_ascii_lowercase());
+        previous_was_lowercase = character.is_ascii_lowercase();
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn is_sensitive_report_key(key: &str) -> bool {
+    let tokens = report_key_tokens(key);
+    tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "apikey" | "token" | "secret" | "password" | "authorization" | "cookie"
+        )
+    }) || tokens
+        .windows(2)
+        .any(|pair| pair[0] == "api" && pair[1] == "key")
+}
+
+fn report_text_secret_ranges(text: &str) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let lower = text.to_ascii_lowercase();
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_alphanumeric() || matches!(bytes[index], b'_' | b'-') {
+            let key_start = index;
+            while index < bytes.len()
+                && (bytes[index].is_ascii_alphanumeric() || matches!(bytes[index], b'_' | b'-'))
+            {
+                index += 1;
+            }
+            let key = &text[key_start..index];
+            if is_sensitive_report_key(key) {
+                let mut separator = index;
+                if separator < bytes.len() && matches!(bytes[separator], b'\'' | b'"') {
+                    separator += 1;
+                }
+                while separator < bytes.len() && bytes[separator].is_ascii_whitespace() {
+                    separator += 1;
+                }
+                if separator < bytes.len() && matches!(bytes[separator], b'=' | b':') {
+                    let mut value_start = separator + 1;
+                    while value_start < bytes.len() && bytes[value_start].is_ascii_whitespace() {
+                        value_start += 1;
+                    }
+                    let (redact_start, redact_end) = if value_start < bytes.len()
+                        && matches!(bytes[value_start], b'\'' | b'"')
+                    {
+                        let quote = bytes[value_start];
+                        let content_start = value_start + 1;
+                        let content_end = bytes[content_start..]
+                            .iter()
+                            .position(|byte| *byte == quote)
+                            .map(|offset| content_start + offset)
+                            .unwrap_or(bytes.len());
+                        (content_start, content_end)
+                    } else if key.eq_ignore_ascii_case("authorization")
+                        && lower[value_start..].starts_with("bearer")
+                    {
+                        let mut credential_start = value_start + "bearer".len();
+                        while credential_start < bytes.len()
+                            && bytes[credential_start].is_ascii_whitespace()
+                        {
+                            credential_start += 1;
+                        }
+                        (
+                            credential_start,
+                            report_secret_value_end(bytes, credential_start),
+                        )
+                    } else {
+                        (value_start, report_secret_value_end(bytes, value_start))
+                    };
+                    if redact_start < redact_end {
+                        ranges.push((redact_start, redact_end));
+                    }
+                }
+            }
+            continue;
+        }
+        index += 1;
+    }
+
+    for (pattern, preserve_prefix) in [
+        ("bearer ", true),
+        ("ghp_", false),
+        ("github_pat_", false),
+        ("sk-", false),
+    ] {
+        let mut offset = 0;
+        while let Some(relative) = lower[offset..].find(pattern) {
+            let start = offset + relative;
+            if start > 0
+                && (bytes[start - 1].is_ascii_alphanumeric()
+                    || matches!(bytes[start - 1], b'_' | b'-'))
+            {
+                offset = start + pattern.len();
+                continue;
+            }
+            let value_start = if preserve_prefix {
+                let mut value_start = start + pattern.len();
+                while value_start < bytes.len() && bytes[value_start].is_ascii_whitespace() {
+                    value_start += 1;
+                }
+                value_start
+            } else {
+                start
+            };
+            let value_end = report_secret_value_end(bytes, value_start);
+            if value_start < value_end {
+                ranges.push((value_start, value_end));
+            }
+            offset = (start + pattern.len()).min(lower.len());
+            if offset == lower.len() {
+                break;
+            }
+        }
+    }
+    ranges.sort_unstable();
+    ranges
+}
+
+fn sanitize_report_text(text: &str) -> String {
+    let mut ranges = report_text_secret_ranges(text).into_iter();
+    let Some((mut range_start, mut range_end)) = ranges.next() else {
+        return text.to_string();
+    };
+    let mut merged = Vec::new();
+    for (start, end) in ranges {
+        if start <= range_end {
+            range_end = range_end.max(end);
+        } else {
+            merged.push((range_start, range_end));
+            range_start = start;
+            range_end = end;
+        }
+    }
+    merged.push((range_start, range_end));
+
+    let mut sanitized = String::with_capacity(text.len());
+    let mut copied_until = 0;
+    for (start, end) in merged {
+        sanitized.push_str(&text[copied_until..start]);
+        sanitized.push_str("[REDACTED]");
+        copied_until = end;
+    }
+    sanitized.push_str(&text[copied_until..]);
+    sanitized
+}
+
+fn sanitize_report_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => *text = sanitize_report_text(text),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                sanitize_report_value(item);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for (key, value) in fields {
+                if is_sensitive_report_key(key) && value.is_string() {
+                    *value = serde_json::Value::String("[REDACTED]".into());
+                } else {
+                    sanitize_report_value(value);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn clipped_test_failure(result: &ExecutionResult) -> String {
+    let diagnostic = result
+        .stderr
+        .lines()
+        .filter(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("event")
+                        .and_then(|event| event.as_str())
+                        .map(str::to_owned)
+                })
+                .as_deref()
+                != Some("target_entered")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    sanitize_report_text(diagnostic.trim())
+        .chars()
+        .take(1_000)
+        .collect()
+}
+
+fn test_quality_functions(
+    analysis: &AnalysisResult,
+    source_file: Option<&str>,
+    diff_text: Option<&str>,
+) -> Vec<FunctionInfo> {
+    let candidates = if let Some(diff_text) = diff_text {
+        let ranges = source_file
+            .map(|path| diff::parse_changed_lines_for_file(diff_text, path))
+            .unwrap_or_else(|| diff::parse_changed_lines(diff_text));
+        analyze::filter_changed_functions(analysis, &ranges)
+    } else {
+        analysis.functions.clone()
+    };
+    candidates
+        .into_iter()
+        .filter(|function| {
+            function.is_exported
+                && !function.is_nested
+                && (!function.is_method
+                    || function
+                        .invocation_target
+                        .as_deref()
+                        .is_some_and(|target| !target.trim().is_empty()))
+        })
+        .collect()
+}
+
+pub fn test_quality_candidate_count(
+    code: &str,
+    language: &Language,
+    source_mode: SourceMode,
+    source_file: Option<&str>,
+    diff: Option<&str>,
+) -> Result<usize, String> {
+    let context = SourceContext {
+        language: *language,
+        mode: source_mode,
+        source_file: source_file.map(PathBuf::from),
+        virtual_file_path: None,
+    };
+    let analysis = analyze::analyze_with_context(code, &context);
+    if analysis.parse_error {
+        let message = analysis
+            .parse_diagnostics
+            .first()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .unwrap_or("test-quality source analysis failed");
+        return Err(sanitize_report_text(message));
+    }
+    let functions = test_quality_functions(&analysis, source_file, diff);
+    let required_functions = functions.iter().collect::<Vec<_>>();
+    test_quality::plan_mutations(
+        code,
+        *language,
+        source_mode,
+        &required_functions,
+        usize::MAX,
+    )
+    .map(|planned| planned.len())
+}
+
+fn skipped_test_quality_stage(max_mutants: usize, reason: impl Into<String>) -> VerificationStage {
+    VerificationStage {
+        name: "test_quality".into(),
+        status: StageStatus::Skipped,
+        duration_ms: 0,
+        detail: Some(serde_json::json!({
+            "experimental": false,
+            "mode": "advisory",
+            "max_mutants": max_mutants,
+            "baseline_eligible": false,
+            "planning_error": null,
+            "counts": {
+                "planned": 0,
+                "killed": 0,
+                "survived": 0,
+                "invalid": 0,
+                "blocked": 0,
+                "no_coverage": 0,
+            },
+            "mutants": [],
+            "coupling_findings": [],
+            "coupling_error": null,
+        })),
+        message: Some(reason.into()),
+    }
+}
+
+fn ensure_test_quality_stage(
+    stages: &mut Vec<VerificationStage>,
+    max_mutants: Option<usize>,
+    reason: &str,
+) {
+    if let Some(max_mutants) = max_mutants {
+        if !stages.iter().any(|stage| stage.name == "test_quality") {
+            stages.push(skipped_test_quality_stage(max_mutants, reason));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_test_quality_stage(
+    code: &str,
+    tests: &str,
+    required_functions: &[&FunctionInfo],
+    language: &Language,
+    verification_context: &VerificationContext,
+    opts: &VerifyOptions<'_>,
+    candidate_source_file: Option<&str>,
+    candidate_test_source_file: Option<&str>,
+    baseline: &AuthoritativeTestOutcome,
+    max_mutants: usize,
+) -> VerificationStage {
+    let started = Instant::now();
+    let test_source_mode = candidate_test_source_file
+        .map(|path| source_mode_for_path(Path::new(path), *language))
+        .unwrap_or_else(|| SourceMode::for_language(language));
+    let coupling_result = test_quality::analyze_coupling(
+        code,
+        tests,
+        *language,
+        test_source_mode,
+        candidate_source_file,
+        candidate_test_source_file,
+    );
+    let (coupling_findings, coupling_error) = match coupling_result {
+        Ok(findings) => (findings, None),
+        Err(error) => (Vec::new(), Some(sanitize_report_text(&error))),
+    };
+    let baseline_eligible = baseline.overlay.supported
+        && baseline.test_ok
+        && !baseline.has_non_target_blocker
+        && baseline.covered_required == required_functions.len()
+        && !required_functions.is_empty();
+    let unsupported_overlay_reason = (!baseline.overlay.supported).then(|| {
+        baseline
+            .overlay
+            .reason
+            .clone()
+            .unwrap_or_else(|| "authoritative-test instrumentation is unsupported".into())
+    });
+    let planning_limit = if max_mutants == 0 { 1 } else { max_mutants };
+    let planned = match test_quality::plan_mutations(
+        code,
+        *language,
+        verification_context.candidate.target_source.mode,
+        required_functions,
+        planning_limit,
+    ) {
+        Ok(planned) => planned,
+        Err(error) => {
+            let error = sanitize_report_text(&error);
+            return VerificationStage {
+                name: "test_quality".into(),
+                status: StageStatus::Advisory,
+                duration_ms: started.elapsed().as_millis() as u64,
+                detail: Some(serde_json::json!({
+                    "experimental": false,
+                    "mode": "advisory",
+                    "max_mutants": max_mutants,
+                    "baseline_eligible": baseline_eligible,
+                    "planning_error": error,
+                    "counts": {
+                        "planned": 0,
+                        "killed": 0,
+                        "survived": 0,
+                        "invalid": 0,
+                        "blocked": 0,
+                        "no_coverage": 0,
+                    },
+                    "mutants": [],
+                    "coupling_findings": coupling_findings,
+                    "coupling_error": coupling_error,
+                })),
+                message: Some("Test-quality mutation planning failed".into()),
+            };
+        }
+    };
+    if planned.is_empty() {
+        return VerificationStage {
+            name: "test_quality".into(),
+            status: if !baseline.overlay.supported
+                || baseline.has_non_target_blocker
+                || !coupling_findings.is_empty()
+                || coupling_error.is_some()
+            {
+                StageStatus::Advisory
+            } else {
+                StageStatus::Skipped
+            },
+            duration_ms: started.elapsed().as_millis() as u64,
+            detail: Some(serde_json::json!({
+                "experimental": false,
+                "mode": "advisory",
+                "max_mutants": max_mutants,
+                "baseline_eligible": baseline_eligible,
+                "planning_error": null,
+                "counts": {
+                    "planned": 0,
+                    "killed": 0,
+                    "survived": 0,
+                    "invalid": 0,
+                    "blocked": 0,
+                    "no_coverage": 0,
+                },
+                "mutants": [],
+                "coupling_findings": coupling_findings,
+                "coupling_error": coupling_error,
+            })),
+            message: Some("no bounded mutation candidates were available".into()),
+        };
+    }
+    if max_mutants == 0 && !planned.is_empty() {
+        return VerificationStage {
+            name: "test_quality".into(),
+            status: if !baseline.overlay.supported
+                || baseline.has_non_target_blocker
+                || !coupling_findings.is_empty()
+                || coupling_error.is_some()
+            {
+                StageStatus::Advisory
+            } else {
+                StageStatus::Skipped
+            },
+            duration_ms: started.elapsed().as_millis() as u64,
+            detail: Some(serde_json::json!({
+                "experimental": false,
+                "mode": "advisory",
+                "max_mutants": 0,
+                "baseline_eligible": baseline_eligible,
+                "planning_error": null,
+                "counts": {
+                    "planned": 0,
+                    "killed": 0,
+                    "survived": 0,
+                    "invalid": 0,
+                    "blocked": 0,
+                    "no_coverage": 0,
+                },
+                "mutants": [],
+                "coupling_findings": coupling_findings,
+                "coupling_error": coupling_error,
+            })),
+            message: Some("global CI mutation budget was exhausted before this file".into()),
+        };
+    }
+    if !baseline_eligible {
+        let status = if !baseline.overlay.supported
+            || baseline.has_non_target_blocker
+            || !coupling_findings.is_empty()
+            || coupling_error.is_some()
+        {
+            StageStatus::Advisory
+        } else {
+            StageStatus::Skipped
+        };
+        return VerificationStage {
+            name: "test_quality".into(),
+            status,
+            duration_ms: started.elapsed().as_millis() as u64,
+            detail: Some(serde_json::json!({
+                "experimental": false,
+                "mode": "advisory",
+                "max_mutants": max_mutants,
+                "baseline_eligible": false,
+                "planning_error": null,
+                "counts": {
+                    "planned": 0,
+                    "killed": 0,
+                    "survived": 0,
+                    "invalid": 0,
+                    "blocked": 0,
+                    "no_coverage": 0,
+                },
+                "mutants": [],
+                "coupling_findings": coupling_findings,
+                "coupling_error": coupling_error,
+            })),
+            message: Some(if let Some(reason) = unsupported_overlay_reason {
+                reason
+            } else if baseline.has_non_target_blocker {
+                "Mutation campaign skipped because the clean baseline was blocked by non-target test infrastructure"
+                    .into()
+            } else {
+                "Mutation campaign skipped because the baseline test did not pass cleanly with complete target entry"
+                    .into()
+            }),
+        };
+    }
+
+    let planned_count = planned.len();
+    let mut killed = 0usize;
+    let mut survived = 0usize;
+    let mut invalid = 0usize;
+    let mut blocked = 0usize;
+    let mut no_coverage = 0usize;
+    let mut observations = Vec::with_capacity(planned_count);
+    for candidate in planned {
+        let mutated_code = match test_quality::apply_mutation(code, &candidate) {
+            Ok(mutated) => mutated,
+            Err(error) => {
+                invalid += 1;
+                observations.push(serde_json::json!({
+                    "mutation": candidate,
+                    "outcome": "invalid",
+                    "reason": error,
+                }));
+                continue;
+            }
+        };
+        let mutant_analysis = analyze::analyze_with_context(
+            &mutated_code,
+            &verification_context.candidate.target_source,
+        );
+        if mutant_analysis.parse_error {
+            invalid += 1;
+            let reason = mutant_analysis
+                .parse_diagnostics
+                .first()
+                .map(|diagnostic| sanitize_report_text(&diagnostic.message))
+                .unwrap_or_else(|| "mutant did not parse".into());
+            observations.push(serde_json::json!({
+                "mutation": candidate,
+                "outcome": "invalid",
+                "reason": reason,
+            }));
+            continue;
+        }
+        let mutant_functions = required_functions
+            .iter()
+            .filter_map(|required| {
+                mutant_analysis.functions.iter().find(|function| {
+                    function.name == required.name && function.line == required.line
+                })
+            })
+            .collect::<Vec<_>>();
+        if mutant_functions.len() != required_functions.len() {
+            invalid += 1;
+            observations.push(serde_json::json!({
+                "mutation": candidate,
+                "outcome": "invalid",
+                "reason": "mutant changed the required callable surface",
+            }));
+            continue;
+        }
+        let outcome = run_authoritative_test(
+            &mutated_code,
+            tests,
+            &mutant_functions,
+            language,
+            verification_context,
+            opts,
+            candidate_source_file,
+            candidate_test_source_file,
+        )
+        .await;
+        let entered_mutated_surface = outcome.entered_surfaces.contains(&candidate.surface_id);
+        let (classification, reason) =
+            if !outcome.overlay.supported || outcome.has_non_target_blocker {
+                blocked += 1;
+                (
+                    "blocked",
+                    outcome
+                        .overlay
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "test infrastructure blocked mutant execution".into()),
+                )
+            } else if !entered_mutated_surface {
+                no_coverage += 1;
+                (
+                    "no_coverage",
+                    "authoritative test did not enter the mutated surface".into(),
+                )
+            } else if outcome.test_ok {
+                survived += 1;
+                (
+                    "survived",
+                    format!(
+                        "test passed after changing `{}` to `{}`; exercise the {}",
+                        candidate.original, candidate.replacement, candidate.witness
+                    ),
+                )
+            } else {
+                killed += 1;
+                (
+                    "killed",
+                    "authoritative test failed after entering the mutated surface".into(),
+                )
+            };
+        observations.push(serde_json::json!({
+            "mutation": candidate,
+            "outcome": classification,
+            "reason": reason,
+            "entered_mutated_surface": entered_mutated_surface,
+            "test_status": if outcome.has_non_target_blocker {
+                "inconclusive"
+            } else if outcome.test_ok {
+                "passed"
+            } else {
+                "failed"
+            },
+            "exit_code": outcome.result.exit_code,
+            "timed_out": outcome.result.timed_out,
+            "memory_error": outcome.result.memory_error,
+            "assertion_failure": outcome.has_assertion_failure,
+            "failure_excerpt": clipped_test_failure(&outcome.result),
+            "duration_ms": outcome.duration_ms,
+        }));
+    }
+
+    let status = if survived > 0
+        || !coupling_findings.is_empty()
+        || invalid > 0
+        || blocked > 0
+        || no_coverage > 0
+    {
+        StageStatus::Advisory
+    } else if planned_count > 0 && killed == planned_count {
+        StageStatus::Passed
+    } else {
+        StageStatus::Skipped
+    };
+    let message = if survived > 0 {
+        Some(format!(
+            "{survived} behavior-changing mutant{} survived the authoritative test",
+            if survived == 1 { "" } else { "s" }
+        ))
+    } else if !coupling_findings.is_empty() {
+        Some(format!(
+            "{} implementation-coupling finding{} require review",
+            coupling_findings.len(),
+            if coupling_findings.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ))
+    } else if invalid > 0 || blocked > 0 || no_coverage > 0 {
+        Some("Some mutants could not be judged by the authoritative test".into())
+    } else {
+        None
+    };
+    VerificationStage {
+        name: "test_quality".into(),
+        status,
+        duration_ms: started.elapsed().as_millis() as u64,
+        detail: Some(serde_json::json!({
+            "experimental": false,
+            "mode": "advisory",
+            "max_mutants": max_mutants,
+            "baseline_eligible": true,
+            "planning_error": null,
+            "counts": {
+                "planned": planned_count,
+                "killed": killed,
+                "survived": survived,
+                "invalid": invalid,
+                "blocked": blocked,
+                "no_coverage": no_coverage,
+            },
+            "mutants": observations,
+            "coupling_findings": coupling_findings,
+            "coupling_error": coupling_error,
+        })),
+        message,
+    }
+}
+
 /// Run the full verification pipeline: parse → complexity → lint → synthesize+execute → test.
 pub async fn verify(
     code: &str,
@@ -4565,6 +5498,11 @@ pub async fn verify(
                     "Execution skipped because verification context could not be resolved",
                 ));
             }
+            ensure_test_quality_stage(
+                &mut stages,
+                opts.test_quality_max_mutants,
+                "Mutation campaign skipped because verification context was unavailable",
+            );
             return finalize_report(
                 build_report(stages, opts.coverage_gate),
                 opts.output_dir,
@@ -4664,6 +5602,11 @@ pub async fn verify(
                 "Execution skipped because the source did not parse",
             ));
         }
+        ensure_test_quality_stage(
+            &mut stages,
+            opts.test_quality_max_mutants,
+            "Mutation campaign skipped because the source did not parse",
+        );
         return finalize_report(
             build_report(stages, opts.coverage_gate),
             opts.output_dir,
@@ -4788,6 +5731,11 @@ pub async fn verify(
             detail: None,
             message: Some("tests_only mode requires an authoritative test".into()),
         });
+        ensure_test_quality_stage(
+            &mut stages,
+            opts.test_quality_max_mutants,
+            "Mutation campaign skipped because no authoritative test was available",
+        );
         return finalize_report(
             build_report(stages, opts.coverage_gate),
             opts.output_dir,
@@ -6096,209 +7044,62 @@ pub async fn verify(
 
     // Stage 5: Test (if test_code provided) — this IS authoritative
     if let Some(tests) = effective_test_code {
-        let required_candidates = if let Some(diff_text) = opts.diff {
-            let ranges = candidate_source_file_owned
-                .as_deref()
-                .map(|path| diff::parse_changed_lines_for_file(diff_text, path))
-                .unwrap_or_else(|| diff::parse_changed_lines(diff_text));
-            analyze::filter_changed_functions(&analysis, &ranges)
-        } else {
-            analysis.functions.clone()
-        };
-        let required_functions = required_candidates
-            .iter()
-            .filter(|function| {
-                function.is_exported
-                    && !function.is_nested
-                    && (!function.is_method
-                        || function
-                            .invocation_target
-                            .as_deref()
-                            .is_some_and(|target| !target.trim().is_empty()))
-            })
-            .collect::<Vec<_>>();
-        let runner_probe = if test_code_has_imports(tests, language) {
-            tests.to_string()
-        } else {
-            format!("{code}\n\n{tests}")
-        };
-        let selected_test_runner = match language {
-            Language::TypeScript => match opts.test_runner {
-                TestRunner::Auto
-                    if sandbox::typescript_code_requires_bun_runtime(&runner_probe) =>
-                {
-                    TestRunner::Bun
-                }
-                other => other,
-            },
-            Language::Python => TestRunner::Auto,
-        };
-        let prepared = prepare_authoritative_test(
+        let required_candidates =
+            test_quality_functions(&analysis, candidate_source_file_owned.as_deref(), opts.diff);
+        let required_functions = required_candidates.iter().collect::<Vec<_>>();
+        let baseline_test = run_authoritative_test(
             code,
             tests,
             &required_functions,
             language,
-            verification_context.candidate.target_source.mode,
-            selected_test_runner,
-            Some(
-                verification_context
-                    .candidate
-                    .workspace_root
-                    .to_string_lossy()
-                    .as_ref(),
-            ),
+            &verification_context,
+            &opts,
             candidate_source_file_owned.as_deref(),
             candidate_test_source_file_owned.as_deref(),
-        );
-        let execution_project = prepared.project_dir.as_deref();
-        let execution_source = prepared.source_file.as_deref();
-        let start = Instant::now();
-        let test_result = if !prepared.overlay.supported {
-            err_execution_result(
-                prepared
-                    .overlay
-                    .reason
-                    .as_deref()
-                    .unwrap_or("authoritative-test instrumentation is unsupported"),
-            )
-        } else {
-            let harness_context = authoritative_execution_context(
-                &verification_context.candidate,
-                execution_project,
-                execution_source,
-            );
-            let source_mode = harness_context
-                .test_source
-                .as_ref()
-                .map(|source| source.mode)
-                .unwrap_or(harness_context.target_source.mode);
-            let (runtime, test_adapter) = authoritative_harness_runtime(
-                *language,
-                selected_test_runner,
-                &runner_probe,
-                &harness_context,
-            );
-            let artifact = if prepared._root.is_some() {
-                execution_source
-                    .and_then(|source| {
-                        Path::new(source)
-                            .strip_prefix(&harness_context.workspace_root)
-                            .ok()
-                            .map(Path::to_path_buf)
-                    })
-                    .map(|relative_path| HarnessArtifact::Existing { relative_path })
-                    .unwrap_or_else(|| HarnessArtifact::Generated {
-                        code: prepared.code.clone(),
-                        relative_path: authoritative_artifact_path(
-                            &harness_context,
-                            execution_project,
-                            execution_source,
-                            source_mode,
-                        ),
-                    })
-            } else if let Some(relative_path) = execution_source.and_then(|source| {
-                let source = Path::new(source);
-                source
-                    .is_file()
-                    .then(|| source.strip_prefix(&harness_context.workspace_root).ok())
-                    .flatten()
-                    .map(Path::to_path_buf)
-            }) {
-                HarnessArtifact::Existing { relative_path }
-            } else {
-                HarnessArtifact::Generated {
-                    code: prepared.code.clone(),
-                    relative_path: authoritative_artifact_path(
-                        &harness_context,
-                        execution_project,
-                        execution_source,
-                        source_mode,
-                    ),
-                }
-            };
-            let mut limits = sandbox_options(
-                &opts,
-                language,
-                test_timeout(),
-                opts.memory_mb,
-                execution_project,
-                execution_source,
-            );
-            limits.instrumentation_target = prepared
-                .instrumented_source
-                .as_ref()
-                .and(candidate_source_file_owned.as_deref());
-            limits.instrumented_source = prepared.instrumented_source.as_deref();
-            sandbox::execute_harness(
-                &harness_context,
-                HarnessSpec {
-                    kind: HarnessKind::AuthoritativeTest,
-                    runtime,
-                    test_adapter,
-                    source_mode,
-                    artifact,
-                    args: Vec::new(),
-                    network: opts.network,
-                },
-                limits,
-            )
-            .await
-            .process
-        };
-        let test_ms = start.elapsed().as_millis() as u64;
-        let test_output = format!("{}\n{}", test_result.stdout, test_result.stderr);
-        let entered_surfaces = parse_target_entered_events(&test_output);
-        let has_non_target_blocker = has_non_target_blocking_diagnostic(&test_result.diagnostics);
-        let has_assertion_failure = !has_non_target_blocker
-            && (test_output.contains("Assertion failed")
-                || test_output.contains("AssertionError")
-                || test_result.diagnostics.iter().any(|diagnostic| {
-                    diagnostic.kind == FailureKind::AssertionFailure
-                        && diagnostic.component == DiagnosticComponent::AuthoritativeTestRunner
-                }));
-        let test_ok = test_result.exit_code == Some(0)
-            && !test_result.timed_out
-            && !test_result.memory_error
-            && !has_assertion_failure;
-        let covered_required = required_functions
-            .iter()
-            .filter(|function| {
-                entered_surfaces.contains(&format!("{}:{}", function.name, function.line))
-            })
-            .count();
+        )
+        .await;
+        let test_result = &baseline_test.result;
+        let entered_surfaces = &baseline_test.entered_surfaces;
+        let has_non_target_blocker = baseline_test.has_non_target_blocker;
+        let has_assertion_failure = baseline_test.has_assertion_failure;
+        let test_ok = baseline_test.test_ok;
+        let covered_required = baseline_test.covered_required;
 
-        let mut test_detail = serde_json::to_value(&test_result).unwrap();
+        let mut test_detail = serde_json::to_value(test_result).unwrap();
         test_detail["assertion_failure"] = serde_json::Value::Bool(has_assertion_failure);
         test_detail["non_target_blocking"] = serde_json::Value::Bool(has_non_target_blocker);
-        test_detail["instrumentation_overlay"] = serde_json::to_value(&prepared.overlay).unwrap();
-        test_detail["target_entered_surfaces"] = serde_json::to_value(&entered_surfaces).unwrap();
+        test_detail["instrumentation_overlay"] =
+            serde_json::to_value(&baseline_test.overlay).unwrap();
+        test_detail["target_entered_surfaces"] = serde_json::to_value(entered_surfaces).unwrap();
         test_detail["authoritative_test_covered_surfaces"] =
             serde_json::Value::from(covered_required);
         test_detail["tests_only"] = serde_json::Value::Bool(opts.tests_only);
         test_detail["test_runner_requested"] = serde_json::to_value(opts.test_runner).unwrap();
-        test_detail["test_runner_selected"] = serde_json::to_value(selected_test_runner).unwrap();
+        test_detail["test_runner_selected"] =
+            serde_json::to_value(baseline_test.selected_test_runner).unwrap();
+        sanitize_report_value(&mut test_detail);
         stages.push(VerificationStage {
             name: "test".into(),
-            status: if !prepared.overlay.supported || has_non_target_blocker {
+            status: if !baseline_test.overlay.supported || has_non_target_blocker {
                 StageStatus::Inconclusive
             } else if test_ok {
                 StageStatus::Passed
             } else {
                 StageStatus::Failed
             },
-            duration_ms: test_ms,
+            duration_ms: baseline_test.duration_ms,
             detail: Some(test_detail),
-            message: if !prepared.overlay.supported {
-                prepared.overlay.reason.clone()
+            message: if !baseline_test.overlay.supported {
+                baseline_test.overlay.reason.clone()
             } else if test_ok {
                 None
             } else {
-                Some(test_result.stderr.clone())
+                Some(sanitize_report_text(&test_result.stderr))
             },
         });
 
         if !opts.tests_only
-            && prepared.overlay.supported
+            && baseline_test.overlay.supported
             && (test_ok || !entered_surfaces.is_empty())
         {
             let authoritative_source = candidate_test_source_file_owned
@@ -6376,7 +7177,7 @@ pub async fn verify(
                 .map(|function| {
                     let surface_id = format!("{}:{}", function.name, function.line);
                     let reached =
-                        prepared.overlay.supported && entered_surfaces.contains(&surface_id);
+                        baseline_test.overlay.supported && entered_surfaces.contains(&surface_id);
                     let checked = reached && test_ok;
                     let status = if checked {
                         FuzzFunctionStatus::CheckedViaAuthoritativeTest
@@ -6392,8 +7193,8 @@ pub async fn verify(
                             "authoritative test reached the exact surface before test completion"
                                 .into(),
                         )
-                    } else if !prepared.overlay.supported {
-                        Some(prepared.overlay.reason.clone().unwrap_or_else(|| {
+                    } else if !baseline_test.overlay.supported {
+                        Some(baseline_test.overlay.reason.clone().unwrap_or_else(|| {
                             "authoritative-test instrumentation is unsupported".into()
                         }))
                     } else if !test_ok {
@@ -6422,8 +7223,8 @@ pub async fn verify(
                 && coverage_functions.iter().all(|function| {
                     function.status == FuzzFunctionStatus::CheckedViaAuthoritativeTest
                 });
-            let coverage_message = if !prepared.overlay.supported {
-                prepared.overlay.reason.clone()
+            let coverage_message = if !baseline_test.overlay.supported {
+                baseline_test.overlay.reason.clone()
             } else if coverage_functions.is_empty() {
                 Some("tests-only mode selected no required exported surfaces".into())
             } else if !all_required_checked {
@@ -6449,8 +7250,32 @@ pub async fn verify(
                 message: coverage_message,
             });
         }
+        if opts.test_code.is_some() {
+            if let Some(max_mutants) = opts.test_quality_max_mutants {
+                stages.push(
+                    run_test_quality_stage(
+                        code,
+                        tests,
+                        &required_functions,
+                        language,
+                        &verification_context,
+                        &opts,
+                        candidate_source_file_owned.as_deref(),
+                        candidate_test_source_file_owned.as_deref(),
+                        &baseline_test,
+                        max_mutants,
+                    )
+                    .await,
+                );
+            }
+        }
     }
 
+    ensure_test_quality_stage(
+        &mut stages,
+        opts.test_quality_max_mutants,
+        "Mutation campaign skipped because no explicit authoritative test entrypoint was available",
+    );
     finalize_report(
         build_report(stages, opts.coverage_gate),
         opts.output_dir,
@@ -7259,6 +8084,17 @@ fn minimal_stage_view(stage: &VerificationStage) -> serde_json::Value {
                 "findings_summary": detail.get("findings_summary").cloned().unwrap_or_else(|| serde_json::json!({})),
                 "plan": minimal_plan_counts(detail),
             })),
+            "test_quality" => Some(serde_json::json!({
+                "experimental": false,
+                "mode": "advisory",
+                "max_mutants": detail.get("max_mutants").cloned().unwrap_or_else(|| serde_json::Value::from(0)),
+                "baseline_eligible": detail.get("baseline_eligible").cloned().unwrap_or(serde_json::Value::Bool(false)),
+                "counts": detail.get("counts").cloned().unwrap_or_else(|| serde_json::json!({})),
+                "mutants": detail.get("mutants").cloned().unwrap_or_else(|| serde_json::json!([])),
+                "coupling_findings": detail.get("coupling_findings").cloned().unwrap_or_else(|| serde_json::json!([])),
+                "planning_error": detail.get("planning_error").cloned().unwrap_or(serde_json::Value::Null),
+                "coupling_error": detail.get("coupling_error").cloned().unwrap_or(serde_json::Value::Null),
+            })),
             "lint" => Some(serde_json::json!({
                 "diagnostics": detail.get("diagnostics").cloned().unwrap_or_else(|| serde_json::json!([])),
                 "runner_diagnostics": detail.get("runner_diagnostics").cloned().unwrap_or_else(|| serde_json::json!([])),
@@ -7292,7 +8128,7 @@ pub fn report_json_value(
     report: &VerificationReport,
     report_level: ReportLevel,
 ) -> serde_json::Value {
-    match report_level {
+    let mut value = match report_level {
         ReportLevel::Minimal => serde_json::json!({
             "schema_version": report.schema_version,
             "verdict": report.verdict,
@@ -7308,11 +8144,14 @@ pub fn report_json_value(
                 .collect::<Vec<_>>(),
         }),
         ReportLevel::Full => serde_json::to_value(report).unwrap_or_else(|_| serde_json::json!({})),
-    }
+    };
+    sanitize_report_value(&mut value);
+    value
 }
 
 fn clip_human(text: &str, limit: usize) -> String {
-    let trimmed = text.trim();
+    let sanitized = sanitize_report_text(text);
+    let trimmed = sanitized.trim();
     if trimmed.chars().count() <= limit {
         return trimmed.to_string();
     }
@@ -7325,6 +8164,65 @@ fn human_number(detail: &serde_json::Value, key: &str) -> usize {
         .get(key)
         .and_then(|value| value.as_u64())
         .unwrap_or(0) as usize
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct TestQualitySummary {
+    pub planned: usize,
+    pub killed: usize,
+    pub survived: usize,
+    pub invalid: usize,
+    pub blocked: usize,
+    pub no_coverage: usize,
+    pub unjudged: usize,
+    pub coupling: usize,
+}
+
+impl TestQualitySummary {
+    pub fn add(&mut self, other: Self) {
+        self.planned += other.planned;
+        self.killed += other.killed;
+        self.survived += other.survived;
+        self.invalid += other.invalid;
+        self.blocked += other.blocked;
+        self.no_coverage += other.no_coverage;
+        self.unjudged = self.invalid + self.blocked + self.no_coverage;
+        self.coupling += other.coupling;
+    }
+}
+
+pub fn test_quality_summary(report: &VerificationReport) -> Option<TestQualitySummary> {
+    let detail = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "test_quality")?
+        .detail
+        .as_ref()?;
+    let counts = detail.get("counts");
+    let count = |key: &str| {
+        counts
+            .and_then(|counts| counts.get(key))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(0)
+    };
+    let invalid = count("invalid");
+    let blocked = count("blocked");
+    let no_coverage = count("no_coverage");
+    Some(TestQualitySummary {
+        planned: count("planned"),
+        killed: count("killed"),
+        survived: count("survived"),
+        invalid,
+        blocked,
+        no_coverage,
+        unjudged: invalid + blocked + no_coverage,
+        coupling: detail
+            .get("coupling_findings")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0),
+    })
 }
 fn stage_status_text(status: StageStatus) -> &'static str {
     match status {
@@ -7441,6 +8339,17 @@ pub fn report_human_summary(report: &VerificationReport) -> String {
                         })
                         .unwrap_or(0);
                     extra = format!("checked={checked}, factory={factory}, reached={reached}, skipped={skipped}");
+                }
+                "test_quality" => {
+                    let quality = test_quality_summary(report).unwrap_or_default();
+                    extra = format!(
+                        "planned={}, killed={}, survived={}, unjudged={}, coupling={}",
+                        quality.planned,
+                        quality.killed,
+                        quality.survived,
+                        quality.unjudged,
+                        quality.coupling
+                    );
                 }
                 "lint" => {
                     let issues = detail
@@ -7769,6 +8678,7 @@ fn write_report(
 
     let mut json_value = serde_json::to_value(&persisted).ok()?;
     set_repro_commands(&mut json_value, path.to_string_lossy().as_ref());
+    sanitize_report_value(&mut json_value);
 
     match serde_json::to_string_pretty(&json_value) {
         Ok(json) => {
@@ -8692,6 +9602,121 @@ pub async fn replay_report_with_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn report_text_sanitizer_redacts_credentials_without_erasing_diagnostics() {
+        let input = "request failed: API_KEY=alpha123 password: hunter2\nDATABASE_PASSWORD=dbopaque OPENAI_API_KEY=aiopaque ACCESS_TOKEN=accessopaque CLIENT_SECRET=clientopaque GITHUB_TOKEN=githubopaque monkey=visible\n{\"token\":\"json-token\",\"cookie\":\"session=abc\"}\nAuthorization: Bearer bearer-token\nghp_deadbeef github_pat_123 sk-live-key";
+        let sanitized = sanitize_report_text(input);
+        assert!(sanitized.contains("request failed:"), "{sanitized}");
+        assert!(
+            sanitized.contains("\"token\":\"[REDACTED]\""),
+            "{sanitized}"
+        );
+        assert!(sanitized.contains("Bearer [REDACTED]"), "{sanitized}");
+        assert!(sanitized.contains("monkey=visible"), "{sanitized}");
+        for secret in [
+            "alpha123",
+            "hunter2",
+            "json-token",
+            "session=abc",
+            "bearer-token",
+            "ghp_deadbeef",
+            "github_pat_123",
+            "sk-live-key",
+            "dbopaque",
+            "aiopaque",
+            "accessopaque",
+            "clientopaque",
+            "githubopaque",
+        ] {
+            assert!(
+                !sanitized.contains(secret),
+                "{secret} leaked in {sanitized}"
+            );
+        }
+    }
+
+    #[test]
+    fn structured_sensitive_report_fields_are_redacted() {
+        let mut value = serde_json::json!({
+            "diagnostic": "request failed",
+            "api_key": "structured-secret",
+            "DATABASE_PASSWORD": "database-secret",
+            "openaiApiKey": "openai-secret",
+            "ACCESS_TOKEN": "access-secret",
+            "CLIENT_SECRET": "client-secret",
+            "GITHUB_TOKEN": "github-secret",
+            "monkey": "visible",
+            "nested": { "Authorization": "Bearer nested-secret" },
+        });
+        sanitize_report_value(&mut value);
+        assert_eq!(value["diagnostic"], "request failed");
+        assert_eq!(value["api_key"], "[REDACTED]");
+        assert_eq!(value["nested"]["Authorization"], "[REDACTED]");
+        for key in [
+            "DATABASE_PASSWORD",
+            "openaiApiKey",
+            "ACCESS_TOKEN",
+            "CLIENT_SECRET",
+            "GITHUB_TOKEN",
+        ] {
+            assert_eq!(value[key], "[REDACTED]", "{key}");
+        }
+        assert_eq!(value["monkey"], "visible");
+    }
+
+    #[test]
+    fn report_failure_bound_is_applied_after_secret_redaction() {
+        let result = ExecutionResult {
+            stdout: String::new(),
+            stderr: format!("{} token=secret-beyond-bound", "x".repeat(990)),
+            exit_code: Some(1),
+            duration_ms: 1,
+            timed_out: false,
+            memory_error: false,
+            termination: None,
+            diagnostics: Vec::new(),
+        };
+        let clipped = clipped_test_failure(&result);
+        assert!(!clipped.contains("secret"), "{clipped}");
+        assert!(clipped.contains("[RE"), "{clipped}");
+        assert!(clipped.chars().count() <= 1_000);
+    }
+
+    #[test]
+    fn candidate_count_uses_runtime_surface_eligibility() {
+        let code = "export function publicFn(value: number) { return value < 1; }\nfunction internalFn(value: number) { return value > 1; }\n";
+        let count = test_quality_candidate_count(
+            code,
+            &Language::TypeScript,
+            SourceMode::TypeScript,
+            Some("/repo/source.ts"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn same_line_class_methods_are_instrumented_by_qualified_identity() {
+        let code = "export class A { same(value: number) { return value < 0; } } export class B { same(value: number) { return value > 0; } }";
+        let analysis = analyze::analyze(code, &Language::TypeScript);
+        let functions = analysis
+            .functions
+            .iter()
+            .filter(|function| matches!(function.name.as_str(), "A#same" | "B#same"))
+            .collect::<Vec<_>>();
+        assert_eq!(functions.len(), 2, "{:#?}", analysis.functions);
+        let instrumented = instrument_source_for_surfaces(
+            code,
+            &functions,
+            &Language::TypeScript,
+            SourceMode::TypeScript,
+        )
+        .unwrap();
+        assert_eq!(instrumented.matches("A#same:1").count(), 1);
+        assert_eq!(instrumented.matches("B#same:1").count(), 1);
+    }
 
     #[test]
     fn typescript_surface_events_bypass_captured_console_error() {

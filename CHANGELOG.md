@@ -4,6 +4,10 @@ This changelog tracks user-visible verifier semantics, report-shape changes, and
 
 ## Unreleased
 
+## 0.2.16 - 2026-08-30
+
+Stable advisory test-quality analysis is now available through `--test-quality [N]` for direct `verify` and changed-file `ci`. Bounded behavior-sensitive mutants run through authoritative tests and report `killed`, `survived`, `invalid`, `blocked`, and `no_coverage` outcomes without changing the verifier verdict, strength, process exit, or CI gate. CI applies one deterministic global mutant cap across changed files, while target-aware coupling findings remain separate from mutation outcomes and retain the normalized authoritative `test_source_file`. See [docs/release-notes-0.2.16.md](docs/release-notes-0.2.16.md) for the complete behavior, limitations, and verification commands.
+
 ## 0.2.15 - 2026-08-15
 
 Artifact-equivalence repair for issues #41–#47. TypeScript verification now resolves `keyof typeof` domains through workspace-package re-exports, applies constrained generic domains, keeps multiline union arms inside their declared field, synthesizes callback return shapes, retains valid per-surface planned calls when sibling surfaces are unsupported, and supplies real `URL` instances for platform-typed inputs. Generated TypeScript overlays erase type-only target dependencies and route named barrel imports to their exporting leaves without evaluating unrelated runtime branches. Corpus mutation preserves required object keys, container shape, and `URL` internal slots, so generated valid-input campaigns no longer report target crashes caused by the harness itself. Project-runner failures caused by lost Vitest globals and exact sandbox process-spawn denials are now blocking environment diagnostics rather than target assertion failures. See [docs/release-notes-0.2.15.md](docs/release-notes-0.2.15.md) for the full red/green evidence.

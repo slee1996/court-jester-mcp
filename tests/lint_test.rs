@@ -173,6 +173,7 @@ fn verify_keeps_python_lint_runner_errors_advisory() {
             base_project_dir: None,
             test_runner: TestRunner::Auto,
             tests_only: false,
+            test_quality_max_mutants: None,
             complexity_threshold: None,
             complexity_metric: ComplexityMetric::Cyclomatic,
             project_dir: Some(project.path().to_str().unwrap()),

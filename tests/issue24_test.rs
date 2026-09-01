@@ -15,6 +15,7 @@ fn options() -> VerifyOptions<'static> {
         base_project_dir: None,
         test_runner: TestRunner::Auto,
         tests_only: false,
+        test_quality_max_mutants: None,
         complexity_threshold: None,
         complexity_metric: ComplexityMetric::Cyclomatic,
         project_dir: None,

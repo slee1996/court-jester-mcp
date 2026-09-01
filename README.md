@@ -141,17 +141,33 @@ court-jester verify \
   --project-dir .
 ```
 
-TypeScript with an authoritative test file:
+TypeScript with an authoritative test file and the stable advisory behavior-sensitivity check:
 
 ```bash
 court-jester verify \
   --file src/semver.ts \
   --language typescript \
   --project-dir . \
-  --test-file tests/semver.test.ts
+  --test-file tests/semver.test.ts \
+  --test-quality 8
 ```
 
-TypeScript `--test-file` uses `--test-runner auto` by default. That path now prefers Bun when the authoritative test imports `bun:test`; otherwise it uses the Node path. Use `--test-runner node|bun|repo-native` to override.
+Direct `verify` requires exactly one `--test-file` when `--test-quality [N]` is enabled. Omitting `N` uses 8 mutants; explicit budgets must be from 1 through 32. `--tests-only` is optional: without it, the normal verification pipeline runs before the advisory `test_quality` stage.
+
+TypeScript `--test-file` uses `--test-runner auto` by default. That path prefers Bun when the authoritative test imports `bun:test`; otherwise it uses the Node path. Use `--test-runner node|bun|repo-native` to override.
+
+The bounded campaign uses conservative comparison-boundary, equality, condition-negation, and boolean mutants. A mutant is judged only after the authoritative test enters its exact mutated public surface:
+
+- `killed`: the entered mutant made the authoritative test fail;
+- `survived`: the entered mutant left the authoritative test passing, producing a concrete missing-observation witness;
+- `invalid`: the mutation could not be applied or validated;
+- `blocked`: runner, instrumentation, sandbox, timeout, memory, or other infrastructure prevented judgment;
+- `no_coverage`: the authoritative test did not enter the exact mutated surface.
+
+Only `killed` and `survived` are judged outcomes. `invalid`, `blocked`, and `no_coverage` are explicit unjudged evidence, never failed kills. Target-aware private access/import/spy and source-introspection findings are reported separately because mutation sensitivity cannot prove implementation independence; each finding names its normalized authoritative `test_source_file`.
+
+The feature is advisory: it never changes `verdict`, `strength`, process exit status, or CI gates. It emits no score, percentage, grade, or threshold.
+
 
 Source directives:
 
@@ -205,15 +221,21 @@ court-jester execute  [OPTIONS]
 court-jester --help
 ```
 
-Changed-files CI wrapper:
+Changed-files CI wrapper with explicit, repeatable language entrypoints:
 
 ```bash
 court-jester ci \
   --base origin/main \
-  --gate complexity,portability,execute \
+  --head HEAD \
+  --project-dir . \
+  --test-file tests/test_all.py \
+  --test-file tests/all.test.ts \
+  --test-quality 8 \
   --report github \
   --report-level minimal
 ```
+
+In `ci`, `--test-file` is repeatable with at most one Python entrypoint and at most one TypeScript/TSX entrypoint. Court Jester selects the matching entrypoint for each changed target by language; it does not infer source-to-test mappings. The `--test-quality N` cap is global for the entire CI command, not per file. Candidate allocation is deterministic across changed files and their required public surfaces, never exceeds `N`, and may explicitly underfill when candidates or matching tests are unavailable. `--tests-only` remains unsupported in CI. Per-file and aggregate output reports planned, killed, survived, unjudged, and coupling counts without a score.
 
 ## What `verify` Does
 
@@ -228,6 +250,7 @@ court-jester ci \
 | `portability` | Preserves strict-Node portability issues separately from behavior | No |
 | `execute` | Synthesized fuzz/property checks in a sandbox | Yes |
 | `test` | Optional caller-supplied test file | Yes |
+| `test_quality` | Optional bounded mutation sensitivity and target-aware coupling evidence | No, advisory only |
 
 The important stage is `execute`: Court Jester synthesizes a language-specific harness from the AST, runs it in a sandbox, and reports the concrete repro when something breaks.
 
@@ -246,9 +269,10 @@ Core flags:
 
 Useful `verify` flags:
 
-- `--test-file <PATH>`: add an authoritative test stage
+- `--test-file <PATH>`: add exactly one authoritative test stage
 - `--test-runner auto|node|bun|repo-native`: choose how TypeScript authoritative tests execute
 - `--tests-only`: skip fuzz execute and run only the authoritative test stage
+- `--test-quality [N]`: run a stable advisory behavior-sensitivity campaign (default 8; range 1..32); requires `--test-file`
 - `--output-dir <PATH>`: persist JSON reports
 - `--report-level full|minimal`: choose full debug output or CI-sized reports
 - `--suppressions-file <PATH>`: JSON suppression rules for known findings
@@ -288,7 +312,7 @@ Use `court-jester --help` for the full CLI help text.
 Verify and persisted reports carry `schema_version: 3` at the top level. Reports expose typed `verdict` and `strength`; stages use `status` values such as `passed`, `failed`, `inconclusive`, `advisory`, and `skipped`. The stability contract for keys and findings lives in [docs/report-schema.md](docs/report-schema.md).
 
 The intended repair view is `court-jester verify ... --summary repair-json`: it returns `recommended_action` (`repair`, `inspect_environment`, `add_contract_or_test`, or `none`) without changing the exit code.
-Benchmark evidence is a separate contract: matrix, run, result, summary, and evidence-manifest files use `artifact_schema_version: 1` and require verifier schema `3`. Missing or mixed versions are abstentions (or hard errors in strict evidence mode), not successful runs. The benchmark supports `--verify-runtime-profile local-trusted|isolated`, `--doctor-report`, `--gate-policy none|private-beta-default|strict-heldout`, `--evidence-bundle`, and opt-in `--shadow-records`; shadow records never change run success.
+Benchmark evidence is a separate contract: when matrix, run, result, summary, or evidence-manifest files are generated or supplied, they use `artifact_schema_version: 1` and require verifier schema `3`. Missing or mixed versions are abstentions (or hard errors in strict evidence mode), not successful runs. This format contract does not imply that a test-quality-specific matrix, oracle, result set, or evidence bundle is committed or gates the advisory feature. The general benchmark harness supports `--verify-runtime-profile local-trusted|isolated`, `--doctor-report`, `--gate-policy none|private-beta-default|strict-heldout`, `--evidence-bundle`, and opt-in `--shadow-records`; shadow records never change run success.
 
 The repository's working install and source URLs intentionally retain the historical `court-jester-mcp` GitHub path until a confirmed remote rename; do not substitute an unverified URL.
 
