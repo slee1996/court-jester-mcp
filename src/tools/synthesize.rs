@@ -171,12 +171,9 @@ pub fn synthesize_plan_for_verification(
             continue;
         }
         let closed_domain = !domains.is_empty() && domains.iter().all(|domain| domain.closed);
-        let contract_valid = input.classification == InputClassification::Valid
-            && (closed_domain
-                || input
-                    .sources
-                    .iter()
-                    .any(|source| source.kind == DomainSourceKind::ValidationGuard));
+        // Predicate-derived examples explore branches, including rejection
+        // branches. Their provenance is not an input-admission contract.
+        let contract_valid = input.classification == InputClassification::Valid && closed_domain;
         seed_inputs
             .entry(
                 input

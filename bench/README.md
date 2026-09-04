@@ -14,6 +14,12 @@ The harness is intentionally separate from the Rust CLI. `court-jester` stays fo
 - public and hidden evaluators
 - result aggregation
 
+## Focused verification regression suite
+
+`python3 -m bench.fuzz_effectiveness --binary target/release/court-jester` runs the versioned local verification cases. Suite v2 separates mutation detection, clean controls, and expected uncertain observations. The unchanged TypeScript predicate fixture is an observation: its open input annotation does not prove that the explicit exception is a bug. It must retain the finding with unknown input classification and an inconclusive verdict, not count toward mutation recall. Results from v1 and v2 are not directly comparable.
+
+The evaluator requires declared finding fields and consistent CLI verdict/exit codes (pass/0, fail/1, inconclusive/3). Inconclusive is not automatically an infrastructure failure. These small seeded cases are regression evidence, not a general accuracy estimate.
+
 ## Recent Writeups
 
 Benchmark writeups:

@@ -58,6 +58,12 @@ def evaluate_case(case: dict[str, Any], report: dict[str, Any]) -> dict[str, Any
     actual_verdict = report.get("verdict")
     if actual_verdict != expected_verdict:
         mismatches.append(f"verdict: expected {expected_verdict!r}, got {actual_verdict!r}")
+    if "_benchmark_exit_code" in report:
+        expected_exit = {"pass": 0, "fail": 1, "inconclusive": 3}.get(actual_verdict)
+        if expected_exit is None or report["_benchmark_exit_code"] != expected_exit:
+            mismatches.append(
+                f"verifier exit {report['_benchmark_exit_code']} is inconsistent with verdict {actual_verdict!r}"
+            )
 
     expected_stage = case.get("expected_stage")
     actual_stage: dict[str, Any] | None = None
@@ -86,6 +92,11 @@ def evaluate_case(case: dict[str, Any], report: dict[str, Any]) -> dict[str, Any
         finding_matched = any(
             finding.get("location", {}).get("function") == expected_finding.get("function")
             and finding.get("category") == expected_finding.get("category")
+            and all(
+                finding.get(key) == value
+                for key, value in expected_finding.items()
+                if key not in ("function", "category")
+            )
             for finding in findings
         )
         if not finding_matched:
@@ -119,6 +130,7 @@ def evaluate_case(case: dict[str, Any], report: dict[str, Any]) -> dict[str, Any
 def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
     mutations = [result for result in results if result["kind"] == "mutation"]
     controls = [result for result in results if result["kind"] == "control"]
+    observations = [result for result in results if result["kind"] == "observation"]
     detected = sum(result["matched"] for result in mutations)
     clean = sum(result["matched"] for result in controls)
     return {
@@ -130,6 +142,8 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
         "controls": len(controls),
         "controls_clean": clean,
         "specificity": clean / len(controls) if controls else None,
+        "observations": len(observations),
+        "observations_matched": sum(result["matched"] for result in observations),
     }
 
 
@@ -242,11 +256,6 @@ def run_case(binary: Path, case: dict[str, Any], output_dir: Path) -> dict[str, 
     result["duration_ms"] = duration_ms
     result["verifier_exit_code"] = report["_benchmark_exit_code"]
     result["report_path"] = report.get("report_path")
-    if report["_benchmark_exit_code"] not in (0, 1):
-        result["matched"] = False
-        result["mismatches"].append(
-            f"verifier infrastructure exit code {report['_benchmark_exit_code']}"
-        )
     return result
 
 

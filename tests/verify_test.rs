@@ -554,6 +554,22 @@ async fn target_errors_during_property_evaluation_do_not_impersonate_checks() {
 }
 
 #[tokio::test]
+async fn predicate_seed_provenance_does_not_prove_input_admission() {
+    for (language, code) in [
+        (Language::Python, "def inspect(value: str) -> str:\n    if value == 'reserved':\n        raise ValueError('reserved value is not accepted')\n    return value\n"),
+        (Language::TypeScript, "export function inspect(value: string): string { if (value === 'reserved') { throw new RangeError('reserved value is not accepted'); } return value; }"),
+    ] {
+        let mut opts = default_opts(None);
+        opts.inferred_oracle_gate = InferredOracleGate::Fail;
+        let report = verify(code, &language, opts).await;
+        assert_eq!(report.verdict, VerificationVerdict::Inconclusive, "{}", report_human_summary(&report));
+        let repair = repair_summary(&report, &language);
+        assert!(repair.findings.iter().any(|finding| finding.message.contains("reserved value") && finding.input_classification == InputClassification::Unknown), "guard-derived exception must remain visible without invented admission");
+        assert_eq!(report.summary.findings.gating, 0);
+    }
+}
+
+#[tokio::test]
 async fn unclassified_typescript_exceptions_remain_observations_under_strict_gating() {
     for exception in [
         "new Error('unspecified contract')",
@@ -5159,7 +5175,11 @@ hostLabel("https://example.com");
         .find(|stage| stage.name == "execute")
         .and_then(|stage| stage.detail.as_ref())
         .expect("execute stage should be present");
-    assert_eq!(unseeded_execute["no_inputs_reached"].as_u64(), Some(0));
+    // Without the concrete URL from the caller, predicate examples reach
+    // rejection branches but do not establish any accepted invocation.
+    assert_eq!(unseeded_execute["no_inputs_reached"].as_u64(), Some(1));
+    assert_eq!(unseeded_execute["valid_invocations"].as_u64(), Some(0));
+    assert_eq!(report_unseeded.verdict, VerificationVerdict::Inconclusive);
     assert_eq!(unseeded_execute["seed_input_count"].as_u64(), Some(0));
 }
 
@@ -9021,7 +9041,7 @@ export const resolved = resolveSettings(null);
 }
 
 #[tokio::test]
-async fn object_predicate_seed_reaches_overflow_crash() {
+async fn object_predicate_seed_retains_uncertain_exception() {
     let code = r#"
 export function routeJob(input: { kind: string; attempts: number }): string {
   if (input.kind === "priority" && input.attempts === 7) {
@@ -9039,8 +9059,8 @@ export function routeJob(input: { kind: string; attempts: number }): string {
         .expect("execute stage");
     assert_eq!(
         execute.status,
-        StageStatus::Failed,
-        "the predicate-derived object must reproduce the crash: {report:#?}"
+        StageStatus::Inconclusive,
+        "the predicate-derived object must retain the uncertain exception: {report:#?}"
     );
     let findings = execute
         .detail
@@ -9051,7 +9071,7 @@ export function routeJob(input: { kind: string; attempts: number }): string {
         finding["location"]["function"] == "routeJob"
             && finding["error_type"] == "RangeError"
             && finding["message"] == "priority retry overflow"
-            && finding["input_classification"] == "valid"
+            && finding["input_classification"] == "unknown"
             && finding["repro"]["arguments"][0]["json_value"]
                 == serde_json::json!({
                     "kind": "priority",
@@ -9082,7 +9102,7 @@ export function dispatch(input: { kind: string; attempts: number }): string {
         .expect("execute stage");
     assert_eq!(
         execute.status,
-        StageStatus::Failed,
+        StageStatus::Inconclusive,
         "the complete multiline predicate row must reach the guarded exception: {report:#?}"
     );
     assert!(
@@ -9093,6 +9113,7 @@ export function dispatch(input: { kind: string; attempts: number }): string {
             .is_some_and(|findings| findings.iter().any(|finding| {
                 finding["location"]["function"] == "dispatch"
                     && finding["message"] == "multiline guarded failure"
+                    && finding["input_classification"] == "unknown"
                     && finding["repro"]["arguments"][0]["json_value"]
                         == serde_json::json!({
                             "kind": "priority",

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "suite": "fuzz-effectiveness-v1",
+  "suite": "fuzz-effectiveness-v2",
   "cases": [
     {
       "id": "python-predicate-seed-crash",
@@ -14,13 +14,13 @@
     },
     {
       "id": "typescript-predicate-seed-crash",
-      "kind": "mutation",
+      "kind": "observation",
       "technique": "predicate_aware_seed",
       "source": "repos/fuzz_effectiveness/typescript_predicate_crash.ts",
       "language": "typescript",
-      "expected_verdict": "fail",
-      "expected_stage": {"name": "execute", "status": "failed"},
-      "expected_finding": {"function": "routeJob", "category": "exception"}
+      "expected_verdict": "inconclusive",
+      "expected_stage": {"name": "execute", "status": "inconclusive"},
+      "expected_finding": {"function": "routeJob", "category": "exception", "input_classification": "unknown"}
     },
     {
       "id": "python-stateful-second-step-crash",
