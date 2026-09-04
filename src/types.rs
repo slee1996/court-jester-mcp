@@ -1608,6 +1608,10 @@ pub enum DomainNode {
     Set(Box<DomainNode>),
     Map(Box<DomainNode>, Box<DomainNode>),
     Object(Vec<DomainField>),
+    Instance {
+        name: String,
+        fields: Vec<DomainField>,
+    },
     Opaque(String),
 }
 

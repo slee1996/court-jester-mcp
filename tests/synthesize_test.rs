@@ -3354,6 +3354,53 @@ fn jazzer_adapter_exports_async_fuzz_target_for_supported_api_surfaces() {
 }
 
 #[test]
+fn python_nominal_inputs_do_not_reuse_dictionary_corpus_rows() {
+    let analysis = analyze("from dataclasses import dataclass\n@dataclass\nclass Payload:\n    value: int\ndef read(value: Payload) -> int:\n    return value.value\n", &Language::Python);
+    let mut plan = build_verification_plan(
+        &analysis.functions,
+        &analysis.classes,
+        &analysis.aliases,
+        &Language::Python,
+        &[],
+        &[],
+        &[],
+    );
+    let surface_id = plan.parameter_domains[0].surface_id.clone();
+    plan.inputs.push(PlannedInput {
+        surface_id,
+        arguments: PlannedArguments {
+            positional: vec![DomainLiteral {
+                expression: "{'value': 987654321}".into(),
+                json_value: Some(serde_json::json!({"value": 987654321})),
+            }],
+            named: BTreeMap::new(),
+        },
+        classification: InputClassification::Unknown,
+        sources: vec![DomainSource {
+            kind: DomainSourceKind::CoverageCorpus,
+            symbol: Some("read".into()),
+            source_file: None,
+            line: None,
+        }],
+    });
+    let generated = synthesize_plan_for_verification(
+        &analysis.functions,
+        &analysis.classes,
+        &analysis.aliases,
+        &Language::Python,
+        &plan,
+    );
+    assert!(
+        !generated.code.contains("987654321"),
+        "dictionary corpus row must not be passed as a nominal instance"
+    );
+    assert!(
+        generated.code.contains("Payload("),
+        "nominal construction must remain available"
+    );
+}
+
+#[test]
 fn verification_plan_renders_coverage_corpus_seed() {
     let analysis = analyze(
         "def explode(value: str) -> str:\n    normalized = str(value)\n    score = sum((index + 1) * ord(char) for index, char in enumerate(normalized))\n    if len(normalized) == 10 and score == 5686:\n        raise IndexError('plateau crash')\n    return 'ok'\n",

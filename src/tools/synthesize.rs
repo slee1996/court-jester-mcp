@@ -159,6 +159,17 @@ pub fn synthesize_plan_for_verification(
             .iter()
             .filter(|domain| domain.surface_id == input.surface_id)
             .collect::<Vec<_>>();
+        if matches!(language, Language::Python)
+            && domain::classify_input(
+                &input.arguments,
+                &domains
+                    .iter()
+                    .map(|domain| (*domain).clone())
+                    .collect::<Vec<_>>(),
+            ) == InputClassification::Invalid
+        {
+            continue;
+        }
         let closed_domain = !domains.is_empty() && domains.iter().all(|domain| domain.closed);
         let contract_valid = input.classification == InputClassification::Valid
             && (closed_domain

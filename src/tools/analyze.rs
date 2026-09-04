@@ -1825,17 +1825,14 @@ fn extract_python_class_fields(class_node: &tree_sitter::Node, source: &[u8]) ->
                             }
                         }
                     } else if inner.kind() == "assignment" {
-                        // `y: str = "hello"` — annotated assignment with default
-                        let full = text(&inner, source);
-                        // Look for the pattern: name: type = value
-                        if let Some(colon_pos) = full.find(':') {
-                            let name = full[..colon_pos].trim();
-                            let rest = &full[colon_pos + 1..];
-                            let (type_ann, _default) = if let Some(eq_pos) = rest.find('=') {
-                                (rest[..eq_pos].trim(), rest[eq_pos + 1..].trim())
-                            } else {
-                                (rest.trim(), "")
-                            };
+                        // An annotated assignment may have no default; punctuation
+                        // inside its annotation is not an assignment operator.
+                        if let (Some(left), Some(annotation)) = (
+                            inner.child_by_field_name("left"),
+                            inner.child_by_field_name("type"),
+                        ) {
+                            let name = text(&left, source);
+                            let type_ann = text(&annotation, source);
                             if !name.is_empty() && !name.contains(' ') {
                                 fields.push(FieldInfo {
                                     name: name.to_string(),
@@ -1845,7 +1842,7 @@ fn extract_python_class_fields(class_node: &tree_sitter::Node, source: &[u8]) ->
                                         Some(type_ann.to_string())
                                     },
                                     optional: false,
-                                    has_default: true,
+                                    has_default: inner.child_by_field_name("right").is_some(),
                                 });
                             }
                         }

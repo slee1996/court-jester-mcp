@@ -44,6 +44,8 @@ The built-in Python query-string, PEP440, and cookie semantic campaigns retain t
 
 For Python values outside JSON's representable domain (including strings with lone Unicode surrogates), the optional `json_value` is unavailable rather than invalid JSON. Such rows are excluded from the JSON corpus, and diagnostic text escapes unsupported characters so reporting itself does not crash. The separate Python expression remains the repro representation for these values.
 
+Python named classes retain nominal identity as an `instance` domain with a name and fields. They are not structural JSON objects and do not acquire closed-domain admission from their fields. Direct `TypedDict` declarations retain structural object domains. JSON input validation checks nested collection elements and required object fields; incompatible saved Python rows are skipped before synthesis. This does not establish support for every constructor shape or make runtime instances replayable.
+
 Strength describes evidence, not the verdict: a parse failure can be `parse_only`; completed static checks can be `static_checked`; a valid invocation without an evaluated oracle is `runtime_smoke`; an evaluated runtime/type/declared/generic oracle is `property_checked`; and a completed authoritative test is `authoritative_tests`.
 
 ## Stage contract

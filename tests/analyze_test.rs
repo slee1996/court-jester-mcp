@@ -8,6 +8,83 @@ use court_jester::tools::domain::{build_verification_plan, classify_input, domai
 use court_jester::types::Language;
 
 #[test]
+fn python_class_annotations_do_not_imply_defaults() {
+    let analysis = analyze(
+        "class Payload:\n    required: int\n    optional: str = 'x'\n    token: Literal['x=y']\n",
+        &Language::Python,
+    );
+    let fields = &analysis.classes[0].fields;
+    assert_eq!(fields[2].type_annotation.as_deref(), Some("Literal['x=y']"));
+    assert_eq!(
+        fields
+            .iter()
+            .map(|field| (field.name.as_str(), field.has_default))
+            .collect::<Vec<_>>(),
+        vec![("required", false), ("optional", true), ("token", false)]
+    );
+}
+
+#[test]
+fn python_nominal_domains_reject_dictionary_substitutes_recursively() {
+    use court_jester::types::{DomainLiteral, InputClassification, PlannedArguments};
+    let code = "from typing import TypedDict\nclass Payload:\n    value: int\nclass Row(TypedDict):\n    value: int\n";
+    for (annotation, value, expected) in [
+        (
+            "Payload",
+            serde_json::json!({"value": 1}),
+            InputClassification::Invalid,
+        ),
+        (
+            "list[Payload]",
+            serde_json::json!([{"value": 1}]),
+            InputClassification::Invalid,
+        ),
+        (
+            "dict[str, Payload]",
+            serde_json::json!({"item": {"value": 1}}),
+            InputClassification::Invalid,
+        ),
+        (
+            "Row",
+            serde_json::json!({"value": 1}),
+            InputClassification::Valid,
+        ),
+        ("Row", serde_json::json!({}), InputClassification::Invalid),
+        (
+            "Row",
+            serde_json::json!({"value": "wrong"}),
+            InputClassification::Invalid,
+        ),
+    ] {
+        let analysis = analyze(
+            &format!("{code}def read(value: {annotation}): pass\n"),
+            &Language::Python,
+        );
+        let plan = build_verification_plan(
+            &analysis.functions,
+            &analysis.classes,
+            &analysis.aliases,
+            &Language::Python,
+            &[],
+            &[],
+            &[],
+        );
+        let args = PlannedArguments {
+            positional: vec![DomainLiteral {
+                expression: value.to_string(),
+                json_value: Some(value),
+            }],
+            named: Default::default(),
+        };
+        assert_eq!(
+            classify_input(&args, &plan.parameter_domains),
+            expected,
+            "{annotation}"
+        );
+    }
+}
+
+#[test]
 fn typescript_null_and_undefined_remain_distinct_in_planned_domains() {
     use court_jester::types::InputClassification;
     for (parameter, expected) in [

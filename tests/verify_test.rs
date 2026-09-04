@@ -57,6 +57,28 @@ fn assert_log_contains_path(log: &str, prefix: &str, expected: &Path) {
 }
 
 #[tokio::test]
+async fn python_named_inputs_reach_the_target_as_instances() {
+    let code = "from dataclasses import dataclass\n@dataclass\nclass Payload:\n    value: int\ndef read(value: Payload) -> int:\n    return value.value\n";
+    let report = verify(code, &Language::Python, default_opts(None)).await;
+    assert_eq!(
+        report.verdict,
+        VerificationVerdict::Pass,
+        "{}",
+        report_human_summary(&report)
+    );
+    assert_eq!(report.summary.findings.total, 0);
+    let detail = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .unwrap()
+        .detail
+        .as_ref()
+        .unwrap();
+    assert!(detail["valid_invocations"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
 async fn python_property_replay_handles_containers_and_abstains_on_runtime_values() {
     for (declarations, annotation, expected) in [
         ("", "tuple[int, ...]", ReplayOutcome::Reproduced),

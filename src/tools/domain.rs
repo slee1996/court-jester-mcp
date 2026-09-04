@@ -222,6 +222,17 @@ fn domain_inner(
             })
             .collect();
         stack.pop();
+        if matches!(language, Language::Python)
+            && !class
+                .bases
+                .iter()
+                .any(|base| base.rsplit('.').next() == Some("TypedDict"))
+        {
+            return DomainNode::Instance {
+                name: class.name.clone(),
+                fields,
+            };
+        }
         return DomainNode::Object(fields);
     }
     let alias = aliases.iter().find(|item| item.name == text);
@@ -1123,6 +1134,7 @@ fn representative_domain_json(
             .first()
             .and_then(|literal| literal.json_value.clone()),
         DomainNode::Opaque(_) => None,
+        DomainNode::Instance { .. } => None,
     }
 }
 
@@ -1135,6 +1147,28 @@ fn representative_domain_literal(
         expression: render_json_literal(&json, language),
         json_value: Some(json),
     })
+}
+
+fn matches_json_domain(value: &serde_json::Value, domain: &DomainNode) -> Option<bool> {
+    value_matches_domain(
+        &DomainLiteral {
+            expression: value.to_string(),
+            json_value: Some(value.clone()),
+        },
+        domain,
+    )
+}
+
+fn all_domain_matches(matches: impl IntoIterator<Item = Option<bool>>) -> Option<bool> {
+    let mut unknown = false;
+    for matched in matches {
+        match matched {
+            Some(false) => return Some(false),
+            None => unknown = true,
+            Some(true) => {}
+        }
+    }
+    (!unknown).then_some(true)
 }
 
 fn value_matches_domain(value: &DomainLiteral, domain: &DomainNode) -> Option<bool> {
@@ -1174,12 +1208,44 @@ fn value_matches_domain(value: &DomainLiteral, domain: &DomainNode) -> Option<bo
         DomainNode::Float => Some(json.is_number()),
         DomainNode::String => Some(json.is_string()),
         DomainNode::Bytes => Some(false),
+        DomainNode::Instance { .. } => Some(false),
         DomainNode::Literal(_) => unreachable!("literal domains are matched by expression above"),
         DomainNode::Nullable(_) | DomainNode::Union(_) => {
             unreachable!("composite domains are matched before JSON projection")
         }
-        DomainNode::Array(_) | DomainNode::Tuple(_) | DomainNode::Set(_) => Some(json.is_array()),
-        DomainNode::Map(_, _) | DomainNode::Object(_) => Some(json.is_object()),
+        DomainNode::Array(inner) | DomainNode::Set(inner) => match json.as_array() {
+            Some(values) => {
+                all_domain_matches(values.iter().map(|value| matches_json_domain(value, inner)))
+            }
+            None => Some(false),
+        },
+        DomainNode::Tuple(items) => match json.as_array() {
+            Some(values) if values.len() == items.len() => all_domain_matches(
+                values
+                    .iter()
+                    .zip(items)
+                    .map(|(value, domain)| matches_json_domain(value, domain)),
+            ),
+            _ => Some(false),
+        },
+        DomainNode::Map(key, value) => match json.as_object() {
+            Some(values) => all_domain_matches(values.iter().flat_map(|(name, item)| {
+                [
+                    matches_json_domain(&serde_json::Value::String(name.clone()), key),
+                    matches_json_domain(item, value),
+                ]
+            })),
+            None => Some(false),
+        },
+        DomainNode::Object(fields) => match json.as_object() {
+            Some(values) => {
+                all_domain_matches(fields.iter().map(|field| match values.get(&field.name) {
+                    Some(value) => matches_json_domain(value, &field.domain),
+                    None => Some(field.optional),
+                }))
+            }
+            None => Some(false),
+        },
     }
 }
 
