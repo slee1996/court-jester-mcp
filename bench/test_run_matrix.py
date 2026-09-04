@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -223,6 +224,77 @@ class RunMatrixSchedulingTest(unittest.TestCase):
 
 
 class RunMatrixOutputContractTest(unittest.TestCase):
+    def test_custom_summary_cannot_overwrite_existing_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            summary = root / "old-summary.json"
+            summary.write_text("preserve this summary", encoding="utf-8")
+            with (
+                mock.patch.object(sys, "argv", self.matrix_argv(root / "new", "--dry-run", "--summary-json", str(summary))),
+                mock.patch("bench.run_matrix.run_serial_plan") as execute,
+            ):
+                with self.assertRaisesRegex(SystemExit, "cannot claim matrix summary"):
+                    main()
+            execute.assert_not_called()
+            self.assertEqual(summary.read_text(), "preserve this summary")
+
+    def test_default_runs_have_independent_evidence_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # Keep a historical result alongside current matrices.
+            historical = root / "dev"
+            historical.mkdir()
+            (historical / "result.json").write_text("legacy evidence", encoding="utf-8")
+            argv = self.matrix_argv(root, "--dry-run")
+            output_flag = argv.index("--output-dir")
+            del argv[output_flag:output_flag + 2]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch("bench.run_matrix.DEFAULT_OUTPUT_ROOT", root),
+                redirect_stdout(StringIO()),
+            ):
+                self.assertEqual(main(), 0)
+                first = next(root.glob("matrix-*"))
+                original = {path.relative_to(first): path.read_bytes() for path in first.rglob("*") if path.is_file()}
+                self.assertEqual(main(), 0)
+            runs = list(root.glob("matrix-*"))
+            self.assertEqual(len(runs), 2)
+            self.assertEqual(original, {path.relative_to(first): path.read_bytes() for path in first.rglob("*") if path.is_file()})
+            self.assertEqual((historical / "result.json").read_text(), "legacy evidence")
+            for run in runs:
+                self.assertEqual(len(list(run.glob("*/result.json"))), 1)
+                self.assertTrue((run / "summary.json").is_file())
+
+    def test_concurrent_matrix_processes_cannot_share_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            for initially_empty in (False, True):
+                output = Path(directory) / str(initially_empty)
+                if initially_empty:
+                    output.mkdir()
+                command = [sys.executable, "-m", "bench.run_matrix", *self.matrix_argv(output, "--dry-run")[1:]]
+                processes = [subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(2)]
+                messages = [process.communicate(timeout=30) for process in processes]
+                self.assertEqual(sorted(process.returncode for process in processes), [0, 1], messages)
+                self.assertEqual(len(list(output.glob("*/result.json"))), 1)
+                self.assertEqual(json.loads((output / "matrix.json").read_text())["expected_total"], 1)
+                self.assertTrue((output / "summary.json").is_file())
+
+    def test_existing_output_is_rejected_before_execution_without_changing_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            previous = output / "matrix.json"
+            previous.write_text('{"historical": true}\n', encoding="utf-8")
+            with (
+                mock.patch.object(sys, "argv", self.matrix_argv(output, "--dry-run")),
+                mock.patch("bench.run_matrix.run_serial_plan", return_value=(0, 0)) as execute,
+                mock.patch("bench.summarize_runs.build_summary", return_value={}),
+            ):
+                with self.assertRaisesRegex(SystemExit, "output directory.*not empty"):
+                    main()
+            execute.assert_not_called()
+            self.assertEqual(previous.read_text(), '{"historical": true}\n')
+            self.assertEqual(list(output.iterdir()), [previous])
+
     def matrix_argv(self, output_dir: Path, *extra: str) -> list[str]:
         return [
             "run_matrix",

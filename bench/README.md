@@ -311,6 +311,8 @@ The harness can now validate policy flow, result logging, `court-jester` CLI int
 
 ## Local Smoke Test
 
+Each invocation owns one evidence directory. By default, the runner creates a unique `bench/results/matrix-*` directory and prints its path. An explicit `--output-dir` must be new or empty; concurrent claims and reuse of completed or interrupted matrices are rejected before execution. Choose a new directory for retries. Historical artifacts are never cleared or merged into a new run. An explicit `--summary-json` destination must also be unused. Summarize the printed directory, not the parent containing multiple matrices.
+
 Dry-run the matrix:
 
 ```bash
@@ -335,8 +337,7 @@ python -m bench.run_matrix \
   --task-set external-known-good-replay \
   --models noop \
   --policies required-final \
-  --use-task-gold-patches \
-  --output-dir bench/results/dev
+  --use-task-gold-patches
 ```
 
 This is intended for known-good control runs on upstream-derived tasks. The runner will apply `gold_patch_path`, then run `verify`, public checks, and hidden checks normally.
@@ -351,8 +352,7 @@ Run the local already-correct control corpus without gold patches:
 python -m bench.run_matrix \
   --task-set known-good-corpus \
   --models noop \
-  --policies required-final \
-  --output-dir bench/results/dev
+  --policies required-final
 ```
 
 Run the sample task with the local replay model:
@@ -361,8 +361,7 @@ Run the sample task with the local replay model:
 python -m bench.run_matrix \
   --tasks py-semantic-profile-empty-name \
   --models replay-fixed-profile,noop \
-  --policies baseline,required-final \
-  --output-dir bench/results/dev
+  --policies baseline,required-final
 ```
 
 Run the same task against local Codex and Claude Code CLIs:
@@ -371,8 +370,7 @@ Run the same task against local Codex and Claude Code CLIs:
 python -m bench.run_matrix \
   --tasks py-semantic-profile-empty-name \
   --models codex-default,claude-default \
-  --policies required-final \
-  --output-dir bench/results/dev
+  --policies required-final
 ```
 
 Run the current strict utility benchmark:
@@ -438,7 +436,7 @@ python -m bench.run_matrix \
 Summarize results:
 
 ```bash
-python -m bench.summarize_runs bench/results/dev
+python -m bench.summarize_runs bench/results/matrix-REPLACE_WITH_PRINTED_ID
 ```
 
 Watch a run live in the local dashboard:

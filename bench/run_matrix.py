@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import random
+import tempfile
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -35,6 +36,27 @@ from .runner import run_single
 
 
 MAX_DOCTOR_REPORT_AGE_SECONDS = 60 * 60
+DEFAULT_OUTPUT_ROOT = BENCH_ROOT / "results"
+
+
+def claim_output_directory(requested: str | None) -> Path:
+    """Claim one immutable matrix namespace before any cells are executed."""
+    try:
+        if requested is None:
+            DEFAULT_OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+            output = Path(tempfile.mkdtemp(prefix="matrix-", dir=DEFAULT_OUTPUT_ROOT))
+        else:
+            output = Path(requested).resolve()
+            output.mkdir(parents=True, exist_ok=True)
+            if any(output.iterdir()):
+                raise SystemExit(f"output directory is not empty: {output}; choose a new directory")
+        # Exclusive creation arbitrates simultaneous claims of an empty explicit
+        # directory. Keep the artifact even after interruption; never reuse it.
+        with (output / "matrix.json").open("x", encoding="utf-8"):
+            pass
+        return output
+    except OSError as exc:
+        raise SystemExit(f"cannot claim matrix output directory: {exc}") from exc
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,8 +67,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policies", default="", help="Comma-separated policy ids.")
     parser.add_argument(
         "--output-dir",
-        default=str(BENCH_ROOT / "results" / "dev"),
-        help="Directory for benchmark run artifacts.",
+        default=None,
+        help="New or empty directory for this matrix; defaults to a unique directory under bench/results.",
     )
     parser.add_argument(
         "--repeats",
@@ -491,9 +513,15 @@ def main() -> int:
             raise SystemExit("held-out suite lock mismatch")
     if args.shadow_records and not args.shadow_records.parent.exists():
         raise SystemExit(f"shadow records parent does not exist: {args.shadow_records.parent}")
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = claim_output_directory(args.output_dir)
+    print(f"matrix output: {output_dir}")
     summary_path = args.summary_json or output_dir / "summary.json"
+    try:
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        with summary_path.open("x", encoding="utf-8"):
+            pass
+    except OSError as exc:
+        raise SystemExit(f"cannot claim matrix summary artifact: {exc}") from exc
     gate_payload: dict[str, Any] = {
         "policy": args.gate_policy,
         "eligible": False,
