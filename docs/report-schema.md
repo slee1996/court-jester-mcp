@@ -26,6 +26,18 @@ Verdict precedence is fail > inconclusive > pass:
 
 An advisory finding or advisory lint/portability warning remains visible without changing a pass to a fail. `--inferred-oracle-gate fail` promotes low-confidence inferred semantic findings to the gate; the default is `advisory`.
 
+Generated Python and TypeScript campaigns preserve admission evidence for planned rows validated against closed parameter domains or supported validation guards. An exception from the initial target call on such a row is a target exception, including custom exception classes; it is not silently discarded because of its exception name. Input mutation does not inherit admission evidence, and shrinking an admitted exception must retain an admitted input. Open-ended type annotations alone do not establish an exception-free domain. These admission checks are not a general proof of a function's full contract.
+
+Python exceptions not classified by the current target-exception rules are retained as low-confidence observations with `input_classification: unknown`. Strict inferred-oracle gating does not turn these observations into proven failures. Without resolving authoritative evidence, verification is inconclusive and recommends adding a contract or test; an independently admitted target failure still gates. Arguments outside a finite declared domain can be classified as rejected. These domain checks derive from the function signature, even when no seed rows exist, and use bound argument slots rather than raw signature positions.
+
+An observed unknown exception closes its invocation with `unclassified_exception`, contributing to `unknown_completed`, not valid-invocation or oracle-check credit. Python factory actions also emit matched start/completion records and preserve an action trace for uncertain exceptions. This does not yet make their replay a complete stateful reproduction. Legacy exception-class heuristics and validation-guard admission remain limitations; this behavior is not a complete general exception-contract model.
+
+A run in which a surface rejects every generated input has an inconclusive execute stage, even when its harness exits successfully. A pass still requires the repository's ordinary tests and review before shipping.
+
+The built-in Python query-string, PEP440, and cookie semantic campaigns retain the original case arguments and the compared observation. Their `oracle.expected` string contains JSON-encoded expected data; replay repeats the same projection/comparison rather than merely expecting the target to throw. These findings remain low-confidence inferred evidence under the existing gate policy. `not_reproduced` means that particular stored observation did not recur, not that every behavior of the edited implementation is correct; run verification and repository tests again.
+
+For Python values outside JSON's representable domain (including strings with lone Unicode surrogates), the optional `json_value` is unavailable rather than invalid JSON. Such rows are excluded from the JSON corpus, and diagnostic text escapes unsupported characters so reporting itself does not crash. The separate Python expression remains the repro representation for these values.
+
 Strength describes evidence, not the verdict: a parse failure can be `parse_only`; completed static checks can be `static_checked`; a valid invocation without an evaluated oracle is `runtime_smoke`; an evaluated runtime/type/declared/generic oracle is `property_checked`; and a completed authoritative test is `authoritative_tests`.
 
 ## Stage contract
@@ -110,7 +122,9 @@ The default `--coverage-gate changed-exports` requires every changed exported/in
 Coverage entries use typed statuses:
 
 - `checked_direct`
+- `reached_direct`
 - `reached_via_factory`
+- `reached_via_authoritative_test`
 - `checked_via_factory`
 - `checked_via_caller`
 - `checked_via_authoritative_test`
@@ -125,9 +139,23 @@ Coverage entries use typed statuses:
 
 Every entry also has `required`, `invocation_path`, and an optional `reason`. A factory/caller reach event alone is not behavioral checking. `CoverageSummary` reports `required`, `behaviorally_checked`, `reached_only`, `no_inputs_reached`, `skipped`, and `blocked`.
 
+Direct generated coverage additionally requires a matched completed invocation classified valid, with outcome `passed` or `target_exception`. Entry without that evidence is `reached_direct`, not `checked_direct`. Rejected, invalid, unknown, and interrupted invocations do not supply this credit. Python interpreter shutdown leaves an unfinished invocation open rather than reporting it as a rejection.
+
+Execute detail's `harness_events.surfaces` maps exact surface identifiers to `started`, `completed`, `valid_completed`, `rejected`, `invalid_completed`, and `unknown_completed` counts. Duplicate invocation identities are protocol errors. `valid_invocations` counts valid completed invocation records; `functions_with_valid_invocations` retains the legacy function-outcome count used by `summary.fuzz_pass`. Textual `FUZZ` summaries cannot increase the invocation count. These counters reflect the harness's classifications; they do not independently establish the soundness of generated input admission or prove an application-specific property.
+
+Harness protocol 2 adds `oracle_evaluated` records with the active `surface_id`, `iteration`, nonempty `oracle_id`, and boolean `passed`. Per-surface `passed_oracles` and `failed_oracles` count observed checks from valid completed units; their sum supplies execute `evaluated_oracles` and property strength. Return annotations alone no longer supply that count. Rejected, invalid, unknown, and unfinished units receive no check credit. Minimization and replay do not add to campaign counts. A passed unit cannot contain a failed check. The decoder accepts legacy protocol-1 streams without check records, rejects check records labeled version 1, and rejects mixed-version streams.
+
+Direct generated Python assertions and TypeScript property evaluations emit these records. Semantic-template and factory/caller paths without matched check records do not acquire property strength from their annotations. Input admission and authoritative-test coverage have separate evidence requirements; these check counters do not certify them.
+
 In `--tests-only`, the supplied test process is the sole behavioral gate: each required surface must emit its matching entry event. A passing test that does not cover all required surfaces is inconclusive.
 
 ## Findings and repros
+
+Executable argument expressions and replay snippets are not display-truncated. Diagnostic messages and human previews remain bounded. This preserves long supported data arguments; it does not imply every runtime object can be serialized or every inferred property has a complete replay implementation.
+
+Direct TypeScript property findings persist the campaign's evaluator and required helper definitions in their replay snippets. Minimization repeats that evaluator, and replay requires the same failure identity after the initial invocation completes. An initial target exception with copied property diagnostic text does not prove that the property reproduced. This does not extend to every Python, stateful, or semantic-template replay path.
+
+TypeScript repro JSON and saved corpus values use tagged transport values: `{"type":"undefined"}` and `{"type":"number","value":...}`, where the number value is one of `"NaN"`, `"Infinity"`, `"-Infinity"`, or `"-0"`. Ordinary objects matching reserved tag shapes are escaped in `{"type":"object","value":...}` envelopes. Tags apply recursively to nested data. Corpus reuse decodes these transport values into executable expressions; ordinary JSON domain inputs are not globally reinterpreted as tags. Object keys remain data, including `__proto__`. Malformed escape envelopes and corpus rows exceeding the decoding depth bound are skipped without preventing subsequent valid rows from running.
 
 Execute detail contains typed `findings`, `suppressed_findings`, and `findings_summary`; it does not contain the obsolete `fuzz_failures` arrays. A finding includes:
 

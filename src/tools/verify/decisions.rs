@@ -290,6 +290,7 @@ fn diagnostic_from_stage(
                                 | "checked_via_caller"
                                 | "checked_via_authoritative_test"
                                 | "reached_via_factory"
+                                | "reached_direct"
                                 | "reached_via_authoritative_test"
                         )
                     )
@@ -373,7 +374,9 @@ fn diagnostic_from_stage(
                 // A target finding is authoritative and must not be replaced by
                 // a generic nonzero-exit diagnostic. Resource/process causes are
                 // retained alongside that finding.
-                if !(assertion_failure
+                if !(termination.kind == ProcessTerminationKind::Exited
+                    && termination.exit_code == Some(0)
+                    || assertion_failure
                     || has_target_finding
                         && termination.kind == ProcessTerminationKind::Exited
                         && termination.exit_code != Some(0))
@@ -429,6 +432,12 @@ fn diagnostic_from_stage(
                     },
                     if is_test {
                         FailureKind::ToolFailure
+                    } else if detail
+                        .and_then(|value| value.get("no_inputs_reached"))
+                        .and_then(|value| value.as_u64())
+                        .is_some_and(|count| count > 0)
+                    {
+                        FailureKind::AmbiguousGeneratedInput
                     } else {
                         FailureKind::HarnessProtocol
                     },
@@ -807,9 +816,9 @@ fn coverage_summary_from_stages(stages: &[VerificationStage]) -> CoverageSummary
                     | "checked_via_caller"
                     | "checked_via_authoritative_test",
                 ) if required => summary.behaviorally_checked += 1,
-                Some("reached_via_factory" | "reached_via_authoritative_test") if required => {
-                    summary.reached_only += 1
-                }
+                Some(
+                    "reached_direct" | "reached_via_factory" | "reached_via_authoritative_test",
+                ) if required => summary.reached_only += 1,
                 Some("blocked_module_load") => summary.blocked += 1,
                 Some(
                     "skipped_no_fuzzable_surface"
@@ -871,7 +880,8 @@ fn compute_report_summary(stages: &[VerificationStage]) -> ReportSummary {
                                 "checked_direct"
                                 | "checked_via_factory"
                                 | "checked_via_caller"
-                                | "checked_via_authoritative_test",
+                                | "checked_via_authoritative_test"
+                                | "reached_direct",
                             ) => summary.functions_fuzzed += 1,
                             Some("blocked_module_load") => {
                                 summary.functions_blocked_module_load += 1
@@ -888,7 +898,8 @@ fn compute_report_summary(stages: &[VerificationStage]) -> ReportSummary {
                     .and_then(|value| serde_json::from_value(value.clone()).ok())
                     .unwrap_or_default();
                 summary.fuzz_pass = detail
-                    .get("valid_invocations")
+                    .get("functions_with_valid_invocations")
+                    .or_else(|| detail.get("valid_invocations"))
                     .and_then(|value| value.as_u64())
                     .unwrap_or(0) as usize;
                 summary.fuzz_no_inputs_reached = detail

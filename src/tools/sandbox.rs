@@ -7,8 +7,9 @@ mod process;
 use process::{launch_failure, run_launch_command, termination};
 
 pub use events::{
-    parse_harness_events, HarnessEventSummary, HARNESS_EVENT_MAX_LINE_BYTES,
-    HARNESS_EVENT_MAX_RECORDS, HARNESS_EVENT_PROTOCOL_VERSION, HARNESS_EVENT_SENTINEL,
+    parse_harness_events, HarnessEventSummary, HarnessSurfaceEvidence,
+    HARNESS_EVENT_MAX_LINE_BYTES, HARNESS_EVENT_MAX_RECORDS, HARNESS_EVENT_PROTOCOL_VERSION,
+    HARNESS_EVENT_SENTINEL,
 };
 
 /// Describe the in-memory instrumentation overlay used for authoritative tests.

@@ -4,7 +4,7 @@ for _surface_id, _rows in _CJ_CORPORA.items():
     _serializable = []
     for _row in _rows:
         try:
-            _json.dumps(_row, ensure_ascii=False, allow_nan=False)
+            _json.dumps(_row, ensure_ascii=False, allow_nan=False).encode("utf-8")
             _serializable.append(_row)
         except Exception:
             pass

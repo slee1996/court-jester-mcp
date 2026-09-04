@@ -55,6 +55,472 @@ fn assert_log_contains_path(log: &str, prefix: &str, expected: &Path) {
     );
 }
 
+#[tokio::test]
+async fn closed_keyword_domain_uses_bound_slot_after_variadic_arguments() {
+    let code = "def label(value: int, *values: int, mode: bool) -> str:\n    if values:\n        raise ValueError('valid keyword, unknown state contract')\n    return str(mode)\n";
+    let report = verify(code, &Language::Python, default_opts(None)).await;
+    assert_eq!(
+        report.verdict,
+        VerificationVerdict::Inconclusive,
+        "{}",
+        report_human_summary(&report)
+    );
+    assert!(
+        repair_summary(&report, &Language::Python)
+            .findings
+            .iter()
+            .any(|finding| finding.error_type.as_deref() == Some("ValueError")),
+        "a variadic element must not be checked against the keyword's finite domain"
+    );
+}
+
+#[tokio::test]
+async fn admitted_python_failure_is_not_hidden_by_an_unclassified_exception() {
+    let code = "from typing import Literal\ndef broken(value: Literal['ready']) -> str:\n    raise ValueError('admitted failure')\ndef uncertain(value: str) -> str:\n    raise RuntimeError('unknown contract')\n";
+    let report = verify(code, &Language::Python, default_opts(None)).await;
+    assert_eq!(
+        report.verdict,
+        VerificationVerdict::Fail,
+        "{}",
+        report_human_summary(&report)
+    );
+    assert!(report
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.domain == FailureDomain::TargetCode
+            && diagnostic.impact == DiagnosticImpact::Gating));
+    assert!(report
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.kind == FailureKind::AmbiguousGeneratedInput));
+}
+
+#[tokio::test]
+async fn unclassified_python_exceptions_remain_observations_under_strict_gating() {
+    for error in ["ValueError", "RuntimeError", "DomainFailure"] {
+        let code = format!("class DomainFailure(Exception):\n    pass\ndef inspect(value: str) -> str:\n    raise {error}('unspecified input contract')\n");
+        let mut opts = default_opts(None);
+        opts.inferred_oracle_gate = InferredOracleGate::Fail;
+        let report = verify(&code, &Language::Python, opts).await;
+        assert_eq!(
+            report.verdict,
+            VerificationVerdict::Inconclusive,
+            "{error}: {}",
+            report_human_summary(&report)
+        );
+        let repair = repair_summary(&report, &Language::Python);
+        assert_eq!(repair.recommended_action, "add_contract_or_test");
+        assert!(repair
+            .findings
+            .iter()
+            .any(|finding| finding.error_type.as_deref() == Some(error)
+                && finding.input_classification == InputClassification::Unknown));
+        assert_eq!(report.summary.findings.gating, 0);
+        assert!(report
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.kind != FailureKind::NonzeroExit));
+    }
+}
+
+#[tokio::test]
+async fn property_strength_counts_observed_checks_even_without_return_annotations() {
+    for (language, clean, buggy) in [
+        (
+            Language::Python,
+            "def echo(value: int):\n    return value\n",
+            "def echo(value: int) -> int:\n    return 'wrong'\n",
+        ),
+        (
+            Language::TypeScript,
+            "export function echo(value: number) { return value; }",
+            "export function echo(value: number): number { return 'wrong' as unknown as number; }",
+        ),
+    ] {
+        for (code, expect_failure) in [(clean, false), (buggy, true)] {
+            let report = verify(code, &language, default_opts(None)).await;
+            assert_eq!(
+                report.strength,
+                VerificationStrength::PropertyChecked,
+                "{language:?}: {}",
+                report_human_summary(&report)
+            );
+            let detail = report
+                .stages
+                .iter()
+                .find(|stage| stage.name == "execute")
+                .and_then(|stage| stage.detail.as_ref())
+                .unwrap();
+            let surfaces = detail["harness_events"]["surfaces"].as_object().unwrap();
+            let passed: u64 = surfaces
+                .values()
+                .map(|surface| surface["passed_oracles"].as_u64().unwrap())
+                .sum();
+            let failed: u64 = surfaces
+                .values()
+                .map(|surface| surface["failed_oracles"].as_u64().unwrap())
+                .sum();
+            assert_eq!(detail["evaluated_oracles"], passed + failed);
+            assert!(passed + failed > 0);
+            assert_eq!(failed > 0, expect_failure);
+            if expect_failure {
+                assert_eq!(passed, 0);
+                assert_eq!(
+                    detail["valid_invocations"], failed,
+                    "minimization must not inflate campaign check counts"
+                );
+            }
+            assert_eq!(
+                report.verdict,
+                if expect_failure {
+                    VerificationVerdict::Fail
+                } else {
+                    VerificationVerdict::Pass
+                }
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn annotations_without_executed_checks_do_not_supply_property_strength() {
+    for (language, code) in [
+        (
+            Language::Python,
+            "import time\ndef snapshot(value: int) -> dict:\n    return {'value': value, 'time': time.time()}\n",
+        ),
+        (
+            Language::TypeScript,
+            "export function snapshot(value: number): { value: number, time: number } { return { value, time: Date.now() }; }",
+        ),
+    ] {
+        let report = verify(code, &language, default_opts(None)).await;
+        assert_eq!(
+            report.verdict,
+            VerificationVerdict::Pass,
+            "{language:?}: {}",
+            report_human_summary(&report)
+        );
+        assert_eq!(
+            report.strength,
+            VerificationStrength::RuntimeSmoke,
+            "{language:?}: an unsupported return annotation is not an executed check"
+        );
+    }
+}
+
+#[tokio::test]
+async fn typescript_property_replay_repeats_the_recorded_check() {
+    for (directive, signature, buggy, repaired) in [
+        ("bounded", "grow(value: string): string", "return value + '!';", "return value;"),
+        ("idempotent", "normalize(value: string): string", "return value + '!';", "return value.trim();"),
+        ("involution", "flip(value: string): string", "return value + '!';", "return value.split('').reverse().join('');"),
+        ("monotonic", "scale(value: number): number", "return -value;", "return value;"),
+        ("order_invariant", "summarize(values: number[]): number", "return values[0] ?? 0;", "return values.length;"),
+        ("nonneg", "score(value: number): number", "return -1;", "return Math.abs(value);"),
+        ("nonempty_string", "displayLabel(value: string): string", "return '';", "return value.trim() || 'unnamed';"),
+        ("permutation", "keep(values: number[]): number[]", "return [];", "return [...values];"),
+        ("clamped", "clamp(value: number, lo: number, hi: number): number", "return hi + 1;", "return Math.min(Math.max(value, Math.min(lo, hi)), Math.max(lo, hi));"),
+        ("symmetric", "combine(left: number, right: number): number", "return left - right;", "return left + right;"),
+        ("no_nullish_string", "serialize(value: Record<string, unknown>): string", "return Object.values(value).map(String).join(',');", "return Object.values(value).filter(item => item != null).map(String).join(',');"),
+        ("sorted", "arrange(values: number[]): number[]", "return [...values].reverse();", "return [...values].sort((a, b) => a - b);"),
+        ("antisymmetric", "compareValues(left: number, right: number): number", "return 1;", "return Object.is(left, right) ? 0 : Number.isNaN(left) ? 1 : Number.isNaN(right) ? -1 : left < right ? -1 : left > right ? 1 : 0;"),
+        ("", "label(value: string): string", "return 42 as unknown as string;", "return value;"),
+    ] {
+        let project = tempfile::tempdir().unwrap();
+        let source = project.path().join("target.ts");
+        let code = format!("// court-jester-properties {directive}\nexport function {signature} {{ {buggy} }}");
+        fs::write(&source, &code).unwrap();
+        let mut opts = default_opts(None);
+        opts.source_file = source.to_str();
+        opts.project_dir = project.path().to_str();
+        let report = verify(&code, &Language::TypeScript, opts).await;
+        let execute = report.stages.iter().find(|stage| stage.name == "execute")
+            .and_then(|stage| stage.detail.as_ref()).unwrap();
+        assert_eq!(execute["harness_events"]["harness_completed"], true, "large property reports must drain before process exit");
+        let repair = repair_summary(&report, &Language::TypeScript);
+        let finding = repair.findings.iter().find(|finding| finding.severity == FindingSeverity::PropertyViolation)
+            .unwrap_or_else(|| panic!("missing {directive} property finding: {}", report_human_summary(&report)));
+        let path = project.path().join("repair.json");
+        fs::write(&path, serde_json::to_vec(&repair).unwrap()).unwrap();
+        for expected in [ReplayOutcome::Reproduced, ReplayOutcome::NotReproduced] {
+            if expected == ReplayOutcome::NotReproduced {
+                fs::write(&source, format!("export function {signature} {{ {repaired} }}")).unwrap();
+            }
+            let replay = replay_report(path.to_str().unwrap(), &finding.id, None,
+                RuntimeProfile::LocalTrusted, DEFAULT_PYTHON_DOCKER_IMAGE, DEFAULT_TYPESCRIPT_DOCKER_IMAGE).await.unwrap();
+            assert_eq!(replay.outcome, expected, "{directive}: {replay:?}");
+        }
+        // An initial target exception with the same diagnostic wording is not
+        // evidence that the recorded property was evaluated and violated.
+        fs::write(&source, format!("export function {signature} {{ throw new Error({}); }}", serde_json::to_string(&finding.message).unwrap())).unwrap();
+        let replay = replay_report(path.to_str().unwrap(), &finding.id, None,
+            RuntimeProfile::LocalTrusted, DEFAULT_PYTHON_DOCKER_IMAGE, DEFAULT_TYPESCRIPT_DOCKER_IMAGE).await.unwrap();
+        assert_eq!(replay.outcome, ReplayOutcome::NotReproduced, "initial target exception must not impersonate the property: {replay:?}");
+    }
+}
+
+#[tokio::test]
+async fn long_admitted_arguments_remain_executable_after_report_persistence() {
+    let value = format!("{}'\\\"tail", "long-input-".repeat(32));
+    let literal = serde_json::to_string(&value).unwrap();
+    for (language, filename, code, repaired) in [
+        (Language::Python, "target.py", format!("from typing import Literal\ndef consume(value: Literal[{literal}]) -> str:\n    raise ValueError('missing admitted branch')\n"), "def consume(value: str) -> str:\n    return value\n"),
+        (Language::TypeScript, "target.ts", format!("export function consume(value: {literal}): string {{ throw new Error('missing admitted branch'); }}"), "export function consume(value: string): string { return value; }"),
+    ] {
+        let project = tempfile::tempdir().unwrap();
+        let source = project.path().join(filename);
+        fs::write(&source, &code).unwrap();
+        let mut opts = default_opts(None);
+        opts.project_dir = project.path().to_str();
+        opts.source_file = source.to_str();
+        let report = verify(&code, &language, opts).await;
+        let repair = repair_summary(&report, &language);
+        let finding = repair.findings.iter().find(|finding| finding.location.function == "consume")
+            .unwrap_or_else(|| panic!("missing long-input finding: {}", report_human_summary(&report)));
+        assert!(finding.repro.arguments[0].expression.len() > 240, "executable expressions must not be display-truncated");
+        assert_eq!(finding.repro.arguments[0].json_value, Some(serde_json::json!(value)));
+        let path = project.path().join("repair.json");
+        fs::write(&path, serde_json::to_vec(&repair).unwrap()).unwrap();
+        for expected in [ReplayOutcome::Reproduced, ReplayOutcome::NotReproduced] {
+            if expected == ReplayOutcome::NotReproduced {
+                fs::write(&source, repaired).unwrap();
+            }
+            let replay = replay_report(path.to_str().unwrap(), &finding.id, None,
+                RuntimeProfile::LocalTrusted, DEFAULT_PYTHON_DOCKER_IMAGE, DEFAULT_TYPESCRIPT_DOCKER_IMAGE).await.unwrap();
+            assert_eq!(replay.outcome, expected, "{language:?}: {replay:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn closed_input_contract_exceptions_are_not_silently_rejected() {
+    for (language, source, error_type) in [
+        (Language::Python, "from typing import Literal\ndef label(value: Literal['draft', 'published']) -> str:\n    if value == 'draft':\n        return 'Draft'\n    raise ValueError('missing declared branch')\n", "ValueError"),
+        (Language::Python, "from typing import Literal\nclass DomainFailure(Exception):\n    pass\ndef label(value: Literal['draft', 'published']) -> str:\n    if value == 'draft':\n        return 'Draft'\n    raise DomainFailure('missing declared branch')\n", "DomainFailure"),
+        (Language::Python, "from typing import Literal\ndef label(value: Literal['draft', 'published']) -> str:\n    if value == 'draft':\n        return 'Draft'\n    raise AssertionError('missing declared branch')\n", "AssertionError"),
+        (Language::TypeScript, "export function label(value: 'draft' | 'published'): string { if (value === 'draft') return 'Draft'; throw new Error('missing declared branch'); }", "Error"),
+        (Language::TypeScript, "class DomainFailure extends Error {}\nexport function label(value: 'draft' | 'published'): string { if (value === 'draft') return 'Draft'; throw new DomainFailure('missing declared branch'); }", "DomainFailure"),
+    ] {
+        let report = verify(source, &language, default_opts(None)).await;
+        assert_eq!(report.verdict, VerificationVerdict::Fail, "{language:?}: {}", report_human_summary(&report));
+        let findings = report.stages.iter().find(|stage| stage.name == "execute")
+            .and_then(|stage| stage.detail.as_ref()).and_then(|detail| detail["findings"].as_array()).unwrap();
+        let finding = findings.iter().find(|finding| finding["error_type"] == error_type).expect("admitted-input exception finding");
+        assert_eq!(finding["input_classification"], "valid");
+        assert_eq!(finding["category"], "exception");
+        assert!(finding["repro"]["snippet"].as_str().unwrap().contains("published"), "minimization must retain an admitted counterexample");
+    }
+}
+
+#[tokio::test]
+async fn closed_input_contract_clean_controls_stay_clean() {
+    for (language, source) in [
+        (Language::Python, "from typing import Literal\ndef label(value: Literal['draft', 'published']) -> str:\n    if value == 'draft':\n        return 'Draft'\n    if value == 'published':\n        return 'Published'\n    raise ValueError('outside declared domain')\n"),
+        (Language::TypeScript, "export function label(value: 'draft' | 'published'): string { if (value === 'draft') return 'Draft'; if (value === 'published') return 'Published'; throw new Error('outside declared domain'); }"),
+    ] {
+        let report = verify(source, &language, default_opts(None)).await;
+        assert_eq!(report.verdict, VerificationVerdict::Pass, "{language:?}: {}", report_human_summary(&report));
+        assert_eq!(report.summary.findings.total, 0);
+    }
+}
+
+#[tokio::test]
+async fn semantic_observation_replays_and_stops_when_recorded_expectation_is_met() {
+    let cases = [
+        (
+            "pep440_version_ordering",
+            "compare_versions",
+            "left: str, right: str",
+            "int",
+            "return 0",
+            false,
+        ),
+        (
+            "pep440_specifier_membership",
+            "allows",
+            "version: str, specifier: str",
+            "bool",
+            "return True",
+            false,
+        ),
+        (
+            "pep440_filter_prerelease",
+            "filter_versions",
+            "candidates: list[str], specifier: str",
+            "list[str]",
+            "return []",
+            false,
+        ),
+        (
+            "cookie_value_quote",
+            "format_cookie_value",
+            "value: str",
+            "str",
+            "return value.strip().strip(chr(34))",
+            false,
+        ),
+        (
+            "cookie_header_quote",
+            "build_cookie_header",
+            "cookies: dict[str, str | None]",
+            "str",
+            "cookies.clear(); return ''",
+            false,
+        ),
+        (
+            "query_string_serializer",
+            "canonical_query",
+            "params: dict[str, object]",
+            "str",
+            "return ''",
+            true,
+        ),
+    ];
+    for (property, name, signature, return_type, body, query) in cases {
+        for (body, default_verdict) in [
+            (body, Some(VerificationVerdict::Pass)),
+            ("raise RuntimeError('unavailable')", None),
+            ("return object()", None),
+        ] {
+            let project = tempfile::tempdir().unwrap();
+            let source = project.path().join("target.py");
+            let code = format!("# court-jester-properties {property}\ndef {name}({signature}) -> {return_type}:\n    {body}\n");
+            fs::write(&source, &code).unwrap();
+            let mut options = default_opts(None);
+            options.source_file = source.to_str();
+            options.project_dir = project.path().to_str();
+            let report = verify(&code, &Language::Python, options).await;
+            if let Some(default_verdict) = default_verdict {
+                assert_eq!(
+                    report.verdict,
+                    default_verdict,
+                    "inferred observations remain advisory by default: {}",
+                    report_human_summary(&report)
+                );
+            }
+            assert!(
+                report
+                    .diagnostics
+                    .iter()
+                    .all(|diagnostic| diagnostic.kind != FailureKind::HarnessProtocol),
+                "{name}: {:?}",
+                report.diagnostics
+            );
+            let repair = repair_summary(&report, &Language::Python);
+            let finding = repair
+                .findings
+                .iter()
+                .find(|finding| finding.oracle.kind == OracleKind::InferredSemantic)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing {property} observation for {body}: {}\n{:?}",
+                        report_human_summary(&report),
+                        report
+                            .stages
+                            .iter()
+                            .find(|stage| stage.name == "execute")
+                            .and_then(|stage| stage.detail.as_ref())
+                            .map(|detail| &detail["execution"]["stderr"])
+                    )
+                });
+            assert_eq!(finding.confidence, FindingConfidence::Low);
+            assert!(finding.oracle.expected.is_some());
+            if name == "build_cookie_header" {
+                assert!(
+                    finding.repro.arguments[0]
+                        .json_value
+                        .as_ref()
+                        .unwrap()
+                        .as_object()
+                        .unwrap()
+                        .contains_key("session"),
+                    "target mutation must not change the recorded input"
+                );
+            }
+            let id = finding.id.clone();
+            let expected = finding.oracle.expected.as_ref().unwrap().clone();
+            let report_path = project.path().join("repair.json");
+            fs::write(&report_path, serde_json::to_vec(&repair).unwrap()).unwrap();
+            let replay = replay_report(
+                report_path.to_str().unwrap(),
+                &id,
+                None,
+                RuntimeProfile::LocalTrusted,
+                DEFAULT_PYTHON_DOCKER_IMAGE,
+                DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                replay.outcome,
+                ReplayOutcome::Reproduced,
+                "{property}: {replay:?}"
+            );
+            // This replacement satisfies this recorded observation; it is not a
+            // claim that a constant implementation satisfies the entire contract.
+            let value = format!(
+                "__import__('json').loads({})",
+                serde_json::to_string(&expected).unwrap()
+            );
+            let value = if query {
+                format!("__import__('urllib.parse', fromlist=['urlencode']).urlencode(list(map(tuple, {value})))")
+            } else {
+                value
+            };
+            fs::write(&source, format!("def {name}(*args):\n    return {value}\n")).unwrap();
+            let replay = replay_report(
+                report_path.to_str().unwrap(),
+                &id,
+                None,
+                RuntimeProfile::LocalTrusted,
+                DEFAULT_PYTHON_DOCKER_IMAGE,
+                DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                replay.outcome,
+                ReplayOutcome::NotReproduced,
+                "{property}: {replay:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn generated_invocation_counts_match_completed_lifecycle_records() {
+    let report = verify(
+        "def identity(value: int) -> int:\n    return value\n",
+        &Language::Python,
+        default_opts(None),
+    )
+    .await;
+    assert_eq!(report.verdict, VerificationVerdict::Pass);
+    let detail = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .unwrap()
+        .detail
+        .as_ref()
+        .unwrap();
+    let surfaces = detail["harness_events"]["surfaces"].as_object().unwrap();
+    let count: u64 = surfaces
+        .values()
+        .map(|value| value["valid_completed"].as_u64().unwrap())
+        .sum();
+    assert!(
+        count > 1,
+        "multiple fuzz iterations must not be collapsed into one invocation"
+    );
+    assert_eq!(detail["valid_invocations"].as_u64(), Some(count));
+    assert_eq!(
+        report.summary.fuzz_pass, 1,
+        "function counts remain distinct from invocation counts"
+    );
+}
+
 fn default_opts(test_code: Option<&str>) -> VerifyOptions<'_> {
     VerifyOptions {
         test_code,
@@ -2122,6 +2588,7 @@ def filter_versions(candidates: list[str], specifier: str) -> list[str]:
     let mut opts = default_opts(None);
     opts.source_file = Some(source_path_string.as_str());
     opts.project_dir = Some(project_dir_string.as_str());
+    opts.inferred_oracle_gate = InferredOracleGate::Fail;
     let report = verify(code, &Language::Python, opts).await;
 
     assert!(
@@ -2179,6 +2646,7 @@ def build_cookie_header(cookies: Mapping[str, str | None]) -> str:
     let mut opts = default_opts(None);
     opts.source_file = Some(source_path_string.as_str());
     opts.project_dir = Some(project_dir_string.as_str());
+    opts.inferred_oracle_gate = InferredOracleGate::Fail;
     let report = verify(code, &Language::Python, opts).await;
 
     assert!(
@@ -2751,7 +3219,7 @@ async fn no_report_without_output_dir() {
 }
 
 #[tokio::test]
-async fn rejected_only_fuzz_run_is_not_counted_as_pass_in_report_summary() {
+async fn unclassified_only_fuzz_run_is_not_counted_as_pass_in_report_summary() {
     let dir = tempfile::tempdir().unwrap();
     let code = "class ValidationError(Exception):\n    pass\n\ndef always_reject(x: int) -> int:\n    raise ValidationError('nope')";
     let opts = VerifyOptions {
@@ -2812,10 +3280,12 @@ async fn rejected_only_fuzz_run_is_not_counted_as_pass_in_report_summary() {
     assert_eq!(summary["coverage"]["required"].as_u64(), Some(1));
     assert_eq!(
         summary["coverage"]["behaviorally_checked"].as_u64(),
-        Some(1)
+        Some(0)
     );
+    assert_eq!(summary["coverage"]["reached_only"].as_u64(), Some(1));
     assert_eq!(summary["coverage"]["no_inputs_reached"].as_u64(), Some(1));
-    assert_eq!(summary["findings"]["total"].as_u64(), Some(0));
+    assert_eq!(summary["findings"]["total"].as_u64(), Some(1));
+    assert_eq!(summary["findings"]["gating"].as_u64(), Some(0));
 }
 
 #[tokio::test]
@@ -2855,14 +3325,8 @@ export function compareScore(a: number, b: number): number {
     let mut crash_only_opts = default_opts(None);
     crash_only_opts.execute_gate = ExecuteGate::Crash;
     let report = verify(code, &Language::TypeScript, crash_only_opts).await;
-    assert!(
-        matches!(
-            report.verdict,
-            VerificationVerdict::Inconclusive | VerificationVerdict::Fail
-        ),
-        "crash-only gating must not produce a passing verdict while the property harness exits nonzero: {:#?}",
-        report.stages
-    );
+    assert_eq!(report.verdict, VerificationVerdict::Pass,
+        "a completed, reproducible property violation is retained but not gated by crash-only policy: {:#?}", report.stages);
 
     let execute_stage = report
         .stages
@@ -2871,8 +3335,8 @@ export function compareScore(a: number, b: number): number {
         .expect("execute stage should be present");
     assert_eq!(
         execute_stage.status,
-        StageStatus::Inconclusive,
-        "the ungated property finding is not a failed stage"
+        StageStatus::Passed,
+        "the selected crash gate is satisfied while property findings remain visible"
     );
     let stdout = execute_stage.detail.as_ref().unwrap()["execution"]["stdout"]
         .as_str()
@@ -3123,13 +3587,13 @@ def check_access(a: bool, b: bool, c: bool) -> int:
 }
 
 #[tokio::test]
-async fn value_error_is_treated_as_a_crash() {
+async fn uncontracted_value_error_is_retained_as_an_uncertain_observation() {
     let code = "def normalize_timezone(value: str) -> str:\n    raise ValueError('invalid timezone offset')";
     let report = verify(code, &Language::Python, default_opts(None)).await;
 
     assert!(
         report.verdict != VerificationVerdict::Pass,
-        "value errors should fail verify"
+        "unclassified exceptions must not yield a pass"
     );
 
     let exec_stage = report
@@ -3139,7 +3603,7 @@ async fn value_error_is_treated_as_a_crash() {
         .expect("execute stage should be present");
     assert!(
         exec_stage.status != StageStatus::Passed,
-        "value error should be treated as a crash"
+        "unclassified exception needs contract evidence"
     );
 
     let failures = exec_stage
@@ -3464,6 +3928,31 @@ def create_counter():
     assert!(finding["repro"]["case_label"]
         .as_str()
         .is_some_and(|label| label.contains("push")));
+}
+
+#[tokio::test]
+async fn changed_factory_signature_keeps_unchanged_action_declarations() {
+    let code = "export function createCounter() {\n let calls = 0;\n function push(value: number): number {\n  calls += 1;\n  if (calls === 2) throw new ReferenceError('second action failed');\n  return value;\n }\n return { push };\n}\n";
+    let diff = "@@ -1,1 +1,1 @@\n-export function createCounter(old?: number) {\n+export function createCounter() {\n";
+    let mut options = default_opts(None);
+    options.diff = Some(diff);
+    let report = verify(code, &Language::TypeScript, options).await;
+    let findings = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .and_then(|stage| stage.detail.as_ref())
+        .and_then(|detail| detail["findings"].as_array())
+        .expect("execute findings");
+    assert!(
+        findings.iter().any(
+            |finding| finding["location"]["function"] == "createCounter().push"
+                && finding["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("second action failed"))
+        ),
+        "changed factory lost its unchanged action context: {findings:?}"
+    );
 }
 
 #[tokio::test]
@@ -4502,7 +4991,7 @@ def sort_items(items):
 }
 
 #[tokio::test]
-async fn findings_truncate_large_inputs_and_messages() {
+async fn findings_preserve_executable_inputs_and_truncate_display_messages() {
     let code =
         "def explode(name: str) -> str:\n    if len(name) < 1000:\n        return name\n    raise TypeError('x' * 500)";
     let report = verify(code, &Language::Python, default_opts(None)).await;
@@ -4530,8 +5019,8 @@ async fn findings_truncate_large_inputs_and_messages() {
         .expect("failure message should be present");
 
     assert!(
-        input.len() <= 270 && input.contains("[truncated "),
-        "expected truncated input, got: {input}"
+        input.len() > 1000 && !input.contains("[truncated "),
+        "executable input must not contain a display truncation marker"
     );
     assert!(
         message.len() <= 270 && message.contains("[truncated "),
@@ -9782,7 +10271,7 @@ async fn auto_runner_prefers_exact_node_test_file_over_package_vitest() {
 }
 
 #[tokio::test]
-async fn python_validation_errors_are_rejected_and_complete_the_harness() {
+async fn authoritative_python_test_can_resolve_unclassified_generated_exceptions() {
     let project = tempfile::tempdir().unwrap();
     let source = project.path().join("target.py");
     let test_file = project.path().join("test_target.py");
@@ -9798,7 +10287,11 @@ async fn python_validation_errors_are_rejected_and_complete_the_harness() {
     let report = verify(code, &Language::Python, opts).await;
 
     assert_eq!(report.verdict, VerificationVerdict::Pass, "{report:#?}");
-    assert_eq!(report.summary.findings.total, 0, "{report:#?}");
+    assert_eq!(report.summary.findings.gating, 0, "{report:#?}");
+    assert!(repair_summary(&report, &Language::Python)
+        .findings
+        .iter()
+        .all(|finding| finding.input_classification == InputClassification::Unknown));
     let execute = report
         .stages
         .iter()
@@ -9812,7 +10305,7 @@ async fn python_validation_errors_are_rejected_and_complete_the_harness() {
 }
 
 #[tokio::test]
-async fn python_domain_rejections_do_not_become_process_failures() {
+async fn unclassified_python_domain_exceptions_do_not_become_process_failures() {
     let code = r#"class PolicyError(RuntimeError):
     pass
 
@@ -9826,7 +10319,12 @@ def load_policy(path: str) -> str:
         VerificationVerdict::Inconclusive,
         "{report:#?}"
     );
-    assert_eq!(report.summary.findings.total, 0, "{report:#?}");
+    assert!(report.summary.findings.total > 0, "{report:#?}");
+    assert_eq!(report.summary.findings.gating, 0, "{report:#?}");
+    assert!(repair_summary(&report, &Language::Python)
+        .findings
+        .iter()
+        .all(|finding| finding.input_classification == InputClassification::Unknown));
     assert!(
         report
             .diagnostics
@@ -9839,11 +10337,19 @@ def load_policy(path: str) -> str:
         .iter()
         .find(|stage| stage.name == "execute")
         .expect("execute stage");
-    assert_eq!(execute.status, StageStatus::Passed);
+    assert_eq!(execute.status, StageStatus::Inconclusive);
+    assert!(report
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.kind == FailureKind::AmbiguousGeneratedInput));
+    assert_eq!(
+        repair_summary(&report, &Language::Python).recommended_action,
+        "add_contract_or_test"
+    );
 }
 
 #[tokio::test]
-async fn python_harness_emits_completion_during_interpreter_shutdown() {
+async fn python_interpreter_shutdown_does_not_invent_a_completed_rejection() {
     let code = "def stop(value: str) -> str:\n    raise SystemExit('stop')\n";
     let report = verify(code, &Language::Python, default_opts(None)).await;
     let execute = report
@@ -9855,13 +10361,24 @@ async fn python_harness_emits_completion_during_interpreter_shutdown() {
 
     assert_eq!(
         execute["harness_events"]["harness_completed"].as_bool(),
-        Some(true),
+        Some(false),
         "{report:#?}"
     );
-    assert!(report.diagnostics.iter().all(|diagnostic| {
-        diagnostic.kind != FailureKind::HarnessProtocol
-            || !diagnostic.message.contains("harness_completed")
-    }));
+    let invocation = &execute["harness_events"]["surfaces"]["stop:1"];
+    assert_eq!(invocation["started"], 1);
+    assert_eq!(invocation["completed"], 0);
+    assert_eq!(invocation["rejected"], 0);
+    assert_eq!(execute["valid_invocations"], 0);
+    assert_eq!(report.summary.coverage.behaviorally_checked, 0);
+    let coverage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "coverage")
+        .and_then(|stage| stage.detail.as_ref())
+        .unwrap();
+    assert_eq!(coverage["counts"]["reached_direct"], 1);
+    assert_eq!(coverage["counts"]["checked_direct"], 0);
+    assert_ne!(report.verdict, VerificationVerdict::Pass);
 }
 
 #[tokio::test]

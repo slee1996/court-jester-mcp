@@ -91,7 +91,14 @@ fn literal(raw: &str, language: &Language) -> Option<DomainLiteral> {
     if text.is_empty() {
         return None;
     }
-    let bytes_literal = matches!(language, Language::Python) && text.starts_with('b');
+    let bytes_literal = matches!(language, Language::Python)
+        && text.find(['\'', '"']).is_some_and(|quote_index| {
+            matches!(
+                text[..quote_index].to_ascii_lowercase().as_str(),
+                "b" | "br" | "rb"
+            ) && text.len() > quote_index + 1
+                && text.as_bytes().last() == text.as_bytes().get(quote_index)
+        });
     let json_value = match text {
         "true" | "True" => Some(serde_json::Value::Bool(true)),
         "false" | "False" => Some(serde_json::Value::Bool(false)),

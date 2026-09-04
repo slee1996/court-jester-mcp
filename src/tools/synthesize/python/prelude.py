@@ -15,7 +15,7 @@ _CJ_ACTIVE_UNITS = set()
 _CJ_HARNESS_COMPLETED = False
 def _cj_event(event, data=None):
     global _CJ_SEQUENCE
-    payload = {"protocol_version": 1, "sequence": _CJ_SEQUENCE, "event": event}
+    payload = {"protocol_version": 2, "sequence": _CJ_SEQUENCE, "event": event}
     if data is not None:
         payload["data"] = data
     print("__COURT_JESTER_EVENT_JSON__" + _json.dumps(payload, ensure_ascii=False), flush=True)
@@ -42,12 +42,21 @@ def _cj_unit_completed(surface_id, iteration, outcome):
     })
     _CJ_ACTIVE_UNITS.discard((str(surface_id), int(iteration)))
     _CJ_COMPLETED_UNITS += 1
+def _cj_checked(oracle_id, condition):
+    passed = bool(condition)
+    if len(_CJ_ACTIVE_UNITS) == 1:
+        surface_id, iteration = next(iter(_CJ_ACTIVE_UNITS))
+        _cj_event("oracle_evaluated", {"surface_id": surface_id, "iteration": iteration,
+                                      "oracle_id": oracle_id, "passed": passed})
+    return passed
 def _cj_complete_harness():
     global _CJ_HARNESS_COMPLETED
     if _CJ_HARNESS_COMPLETED:
         return
-    for _surface_id, _iteration in sorted(_CJ_ACTIVE_UNITS):
-        _cj_unit_completed(_surface_id, _iteration, "rejected")
+    # Interpreter shutdown does not prove the outcome of an interrupted call.
+    # Leave its unit open so the reducer retains partial execution evidence.
+    if _CJ_ACTIVE_UNITS:
+        return
     _CJ_HARNESS_COMPLETED = True
     _cj_event("harness_completed", {"completed_units": _CJ_COMPLETED_UNITS})
 _atexit.register(_cj_complete_harness)
@@ -70,13 +79,13 @@ def _finding_id(function):
     return f"fuzz:{symbol}:{ordinal}"
 def _json_value(value):
     try:
-        _json.dumps(value, ensure_ascii=False, allow_nan=False)
+        _json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
         return value
     except Exception:
         return None
 def _repro_case(args, input_text=None):
     values = list(args) if isinstance(args, (list, tuple)) else [args]
-    return {"arguments": [{"expression": _short_repr(value), "json_value": _json_value(value)} for value in values], "input_text": input_text}
+    return {"arguments": [{"expression": repr(value), "json_value": _json_value(value)} for value in values], "input_text": input_text}
 def _shrink_candidates(value):
     seen = set()
     def add(candidate):
@@ -153,7 +162,7 @@ def _minimize_failure(original, reproduce, severity, oracle_id):
     except Exception: preserved = False
     return ("preserved" if preserved else "failed", attempts, current if preserved else original)
 def _replay_snippet(function, args, severity, oracle_kind, category, error_type):
-    rendered = ", ".join(_short_repr(value) for value in (args if isinstance(args, (list, tuple)) else [args]))
+    rendered = ", ".join(repr(value) for value in (args if isinstance(args, (list, tuple)) else [args]))
     payload = {"severity": severity, "oracle_kind": oracle_kind, "category": category}
     return ("import json as _replay_json\n_reproduced = False\ntry:\n"
             + f"    {function}({rendered})\n"
@@ -161,28 +170,74 @@ def _replay_snippet(function, args, severity, oracle_kind, category, error_type)
             + f"    _reproduced = type(_replay_error).__name__ == {error_type!r}\n"
             + "print('__COURT_JESTER_REPLAY_JSON__')\n"
             + f"print(_replay_json.dumps(dict({payload!r}, reproduced=_reproduced), ensure_ascii=False))")
-def _emit_finding(function, args, error, severity="crash", oracle_kind="runtime_contract", oracle_provenance="language_runtime", confidence="high", category="exception", expected=None, actual=None, input_classification="valid", case_label=None, minimize=None, invocation_path="direct"):
+def _emit_finding(function, args, error, severity="crash", oracle_kind="runtime_contract", oracle_provenance="language_runtime", confidence="high", category="exception", expected=None, actual=None, input_classification="valid", case_label=None, minimize=None, invocation_path="direct", replay_snippet=None):
     oracle_id = f"{oracle_kind}:{_sanitize_symbol(function)}"
     status, attempts, minimized = ("not_needed", 0, args) if minimize is None else minimize
     original_case = _repro_case(args, case_label)
     minimized_case = None if status in ("not_needed", "failed") else _repro_case(minimized, case_label)
     repro_args = minimized if minimized_case is not None else args
     expectation = {"severity": severity, "oracle_kind": oracle_kind, "category": category}
-    repro = {"kind": "function_call", "function": str(function), "arguments": original_case["arguments"], "input_text": original_case["input_text"], "case_label": case_label, "snippet": _replay_snippet(function, repro_args, severity, oracle_kind, category, type(error).__name__), "command": None, "expectation": expectation}
+    repro = {"kind": "function_call", "function": str(function), "arguments": original_case["arguments"], "input_text": original_case["input_text"], "case_label": case_label, "snippet": replay_snippet if replay_snippet is not None else _replay_snippet(function, repro_args, severity, oracle_kind, category, type(error).__name__), "command": None, "expectation": expectation}
     record = {"id": _finding_id(function), "severity": severity, "confidence": confidence, "category": category, "location": {"source_file": "", "function": str(function), "line": 0, "invocation_path": invocation_path}, "oracle": {"id": oracle_id, "kind": oracle_kind, "provenance": oracle_provenance, "confidence": confidence, "expected": expected, "actual": actual if actual is not None else _clip_text(error)}, "input_classification": input_classification, "repro": repro, "minimization": {"status": status, "attempts": attempts, "original": original_case, "minimized": minimized_case}, "error_type": type(error).__name__, "message": _clip_text(error), "suppressed": False}
     _FUZZ_RESULTS.append(record)
     _cj_event("finding", {"finding": record})
+
+def _semantic_check(name, target, args, expected, projection, label):
+    """Own one immutable semantic case from invocation through persisted replay."""
+    projections = {
+        "identity": (lambda value: value, "_value"),
+        "sign": (lambda value: 1 if value > 0 else (-1 if value < 0 else 0), "(1 if _value > 0 else (-1 if _value < 0 else 0))"),
+        "bool": (bool, "bool(_value)"),
+        "list": (list, "list(_value)"),
+        "query_pairs": (lambda value: _parse_qsl(value, keep_blank_values=True), "_parse_qsl(_value, keep_blank_values=True)"),
+    }
+    project, expression = projections[projection]
+    original = _copy.deepcopy(args)
+    actual = None
+    target_error = None
+    try:
+        _value = target(*_copy.deepcopy(original))
+        actual = project(_value)
+    except Exception as error:
+        target_error = error
+    if target_error is None and actual == expected:
+        return 0
+    error = target_error or AssertionError(f"{label}: {actual!r} != {expected!r}")
+    payload = {"severity": "property_violation", "oracle_kind": "inferred_semantic", "category": "property"}
+    # Re-execute the same observation, not merely a call that is expected to
+    # throw. Literal case data is complete; display truncation is never code.
+    snippet = ("import json as _replay_json\nfrom urllib.parse import parse_qsl as _parse_qsl\n"
+               + "_reproduced = False\ntry:\n"
+               + f"    _value = {name}(*{original!r})\n"
+               + f"    _observed = {expression}\n"
+               + (f"    _reproduced = _observed != {expected!r}\n" if target_error is None else "")
+               + "except Exception as _error:\n"
+               + (f"    _reproduced = type(_error).__name__ == {type(target_error).__name__!r}\n" if target_error is not None else "    pass\n")
+               + "print('__COURT_JESTER_REPLAY_JSON__')\n"
+               + f"print(_replay_json.dumps(dict({payload!r}, reproduced=_reproduced)))")
+    _emit_finding(name, original, error, "property_violation", "inferred_semantic", "name_heuristic", "low", "property",
+                  expected=_json.dumps(expected, ensure_ascii=False), actual=_clip_text(repr(actual)) if target_error is None else _clip_text(target_error),
+                  case_label=label, replay_snippet=snippet)
+    return 1
 def _is_generated_collaborator_mismatch(error):
     if not isinstance(error, AttributeError):
         return False
     message = str(error)
     return "object has no attribute 'execute'" in message or 'object has no attribute "execute"' in message
 
-def _emit_error(function, args, error, properties=(), reproduce=None, case_label=None, invocation_path="direct"):
+def _emit_uncertain_exception(function, args, error, case_label=None, invocation_path="direct"):
+    _emit_finding(function, args, error, "crash", "runtime_contract", "observed_call", "low", "exception",
+                  input_classification="unknown", case_label=case_label, invocation_path=invocation_path)
+
+def _outside_closed_domain(args, domains):
+    return any(index < len(args) and not any(_same_input(args[index], value) for value in values)
+               for index, values in domains)
+
+def _emit_error(function, args, error, properties=(), reproduce=None, case_label=None, invocation_path="direct", target_exception=False):
     if _is_generated_collaborator_mismatch(error):
         return
 
-    is_property = isinstance(error, AssertionError)
+    is_property = isinstance(error, AssertionError) and not target_exception
     declared = any(name in properties for name in ("idempotent", "bounded", "nonneg", "sorted", "permutation", "clamped", "symmetric", "no_nullish_string", "antisymmetric", "involution", "monotonic", "order_invariant"))
     kind = "declared_property" if is_property and declared else ("generic_property" if is_property else "runtime_contract")
     provenance = "source_directive" if kind == "declared_property" else "language_runtime"
@@ -205,7 +260,10 @@ _CRASH_TYPES = (TypeError, AttributeError, KeyError, IndexError, RecursionError,
 
 _FUZZ_TEXT_LIMIT = 240
 def _clip_text(value, limit=_FUZZ_TEXT_LIMIT):
-    text = str(value)
+    # Python strings can contain lone surrogates, which neither UTF-8 nor the
+    # report's JSON string type can represent. Escape display text; the replay
+    # expression retains the original Python value independently.
+    text = str(value).encode("utf-8", errors="backslashreplace").decode("utf-8")
     if len(text) <= limit:
         return text
     return f"{text[:limit]}... [truncated {len(text) - limit} chars]"
@@ -286,6 +344,23 @@ def _fuzz_like_seed(value):
 def _fuzz_seed_row(seed_rows):
     row = _copy.deepcopy(_rng.choice(seed_rows))
     return row if _rng.random() < 0.65 else [_fuzz_like_seed(item) for item in row]
+
+def _same_input(left, right, depth=0):
+    """Admission proofs require exact data, not permissive output consistency."""
+    if depth > 32 or type(left) is not type(right):
+        return False
+    if left is None or type(left) in (bool, int, str, bytes):
+        return left == right
+    if type(left) is float:
+        return left.hex() == right.hex()
+    if type(left) in (list, tuple):
+        return len(left) == len(right) and all(_same_input(a, b, depth + 1) for a, b in zip(left, right))
+    if type(left) is dict:
+        return len(left) == len(right) and all(
+            any(_same_input(key, other, depth + 1) and _same_input(value, right[other], depth + 1) for other in right)
+            for key, value in left.items()
+        )
+    return False
 
 _CJ_CORPORA = {}
 def _behavior_signature(outcome, value):

@@ -833,6 +833,7 @@ fn apply_nuxt_runtime_coverage(
             && matches!(
                 function.status,
                 FuzzFunctionStatus::CheckedDirect
+                    | FuzzFunctionStatus::ReachedDirect
                     | FuzzFunctionStatus::ReachedViaFactory
                     | FuzzFunctionStatus::CheckedViaFactory
                     | FuzzFunctionStatus::CheckedViaCaller
@@ -923,14 +924,30 @@ fn parse_target_entered_events(stderr: &str) -> HashSet<String> {
     entered
 }
 
-fn apply_runtime_coverage_proof(coverage: &mut [FuzzFunctionCoverage], stderr: &str) {
-    let entered = parse_target_entered_events(stderr);
+fn apply_runtime_coverage_proof(
+    coverage: &mut [FuzzFunctionCoverage],
+    execution: &ExecutionResult,
+) {
+    let entered = parse_target_entered_events(&execution.stderr);
+    let completed = sandbox::parse_harness_events(&execution.stdout).ok();
     for item in coverage {
         let proved = entered.iter().any(|surface| {
             surface == &item.function
                 || surface.starts_with(&format!("{}:", item.function))
                 || surface.contains(&format!("().{}", item.function))
         });
+        if item.status == FuzzFunctionStatus::CheckedDirect && proved {
+            let identity = format!("{}:{}", item.function, item.line);
+            let valid_completed = completed
+                .as_ref()
+                .and_then(|summary| summary.surfaces.get(&identity))
+                .is_some_and(|evidence| evidence.valid_completed > 0);
+            if !valid_completed {
+                item.status = FuzzFunctionStatus::ReachedDirect;
+                item.reason =
+                    Some("target entered but no valid completed invocation was recorded".into());
+            }
+        }
         if !proved
             && matches!(
                 item.status,
@@ -2000,6 +2017,7 @@ fn coverage_counts(entries: &[FuzzFunctionCoverage]) -> serde_json::Value {
     let mut counts = serde_json::Map::new();
     for status in [
         FuzzFunctionStatus::CheckedDirect,
+        FuzzFunctionStatus::ReachedDirect,
         FuzzFunctionStatus::ReachedViaFactory,
         FuzzFunctionStatus::ReachedViaAuthoritativeTest,
         FuzzFunctionStatus::CheckedViaFactory,
@@ -3939,8 +3957,10 @@ fn parse_fuzz_outcomes(stdout: &str) -> Vec<FuzzOutcome> {
             .unwrap_or(0);
         let status = if crash_count > 0 {
             FuzzOutcomeStatus::Crashed
-        } else {
+        } else if pass_count > 0 {
             FuzzOutcomeStatus::Passed
+        } else {
+            FuzzOutcomeStatus::NoInputsReached
         };
 
         outcomes.push(FuzzOutcome {
@@ -4030,8 +4050,9 @@ fn findings_summary(
         by_oracle_kind: BTreeMap::new(),
     };
     for finding in findings {
-        let advisory = finding.confidence == FindingConfidence::Low
-            && inferred_gate == InferredOracleGate::Advisory;
+        let advisory = finding.input_classification != InputClassification::Valid
+            || finding.confidence == FindingConfidence::Low
+                && inferred_gate == InferredOracleGate::Advisory;
         if advisory {
             summary.advisory += 1;
         } else {
@@ -4067,6 +4088,7 @@ fn finding_fails_execute_gate(
     inferred_gate: InferredOracleGate,
 ) -> bool {
     gate != ExecuteGate::None
+        && finding.input_classification == InputClassification::Valid
         && !(finding.confidence == FindingConfidence::Low
             && inferred_gate == InferredOracleGate::Advisory)
         && (gate == ExecuteGate::All
@@ -4085,11 +4107,9 @@ fn execute_stage_ok(
     {
         return false;
     }
-    if !active_findings.is_empty()
-        && active_findings.iter().all(|finding| {
-            finding.message.starts_with("Comparator")
-                && finding.minimization.status == MinimizationStatus::Failed
-        })
+    if active_findings
+        .iter()
+        .any(|finding| finding.input_classification == InputClassification::Unknown)
     {
         return false;
     }
@@ -5551,6 +5571,27 @@ pub async fn verify(
         } else {
             analysis.functions.clone()
         };
+        // A diff selects execution owners, not fragments of their declaration
+        // context. An edited factory still needs unchanged nested signatures
+        // to exercise its returned actions. Keep those declarations available
+        // without admitting unrelated top-level functions to the campaign.
+        let nested_context = analysis
+            .functions
+            .iter()
+            .filter(|nested| {
+                nested.is_nested
+                    && functions_to_fuzz.iter().any(|owner| {
+                        !owner.is_nested
+                            && owner.line <= nested.line
+                            && owner.end_line >= nested.end_line
+                    })
+                    && !functions_to_fuzz.iter().any(|selected| {
+                        selected.name == nested.name && selected.line == nested.line
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        functions_to_fuzz.extend(nested_context);
         let mut fixture_rows = Vec::new();
         let mut inferred_fixture_properties: HashMap<String, Vec<String>> = HashMap::new();
         let mut inferred_context_properties: HashMap<String, Vec<String>> = HashMap::new();
@@ -5956,7 +5997,7 @@ pub async fn verify(
                 module_load_blocked,
             );
             apply_context_dependent_coverage(&mut coverage, &context_dependent_surfaces);
-            apply_runtime_coverage_proof(&mut coverage, &exec_result.stderr);
+            apply_runtime_coverage_proof(&mut coverage, &exec_result);
             if let Some(blocker) = &nuxt_runtime_blocker {
                 apply_nuxt_runtime_coverage(&mut coverage, blocker);
             }
@@ -6524,8 +6565,44 @@ pub async fn verify(
             );
             let summary =
                 findings_summary(&failures, &suppressed_failures, opts.inferred_oracle_gate);
+            let unclassified_exceptions = failures
+                .iter()
+                .filter(|finding| finding.input_classification == InputClassification::Unknown)
+                .map(|finding| finding.occurrences.max(1))
+                .sum::<usize>();
+            if unclassified_exceptions > 0 {
+                harness_diagnostics.push(FailureDiagnostic {
+                    domain: FailureDomain::VerifierHarness,
+                    kind: FailureKind::AmbiguousGeneratedInput,
+                    component: DiagnosticComponent::FuzzHarness,
+                    impact: DiagnosticImpact::Blocking,
+                    message: "exception observed without evidence establishing whether the input should be accepted or rejected; add a contract or authoritative test".into(),
+                    process: None, limits: None,
+                });
+                if let Some(finding) = failures.iter().find(|finding| {
+                    finding_fails_execute_gate(
+                        opts.execute_gate,
+                        finding,
+                        opts.inferred_oracle_gate,
+                    )
+                }) {
+                    harness_diagnostics.push(FailureDiagnostic {
+                        domain: FailureDomain::TargetCode,
+                        kind: if finding.category == FindingCategory::Property {
+                            FailureKind::AssertionFailure
+                        } else {
+                            FailureKind::TargetException
+                        },
+                        component: DiagnosticComponent::Target,
+                        impact: DiagnosticImpact::Gating,
+                        message: finding.message.clone(),
+                        process: None,
+                        limits: None,
+                    });
+                }
+            }
             let fuzz_outcomes = parse_fuzz_outcomes(&exec_result.stdout);
-            let valid_invocations = fuzz_outcomes
+            let functions_with_valid_invocations = fuzz_outcomes
                 .iter()
                 .filter(|outcome| {
                     matches!(
@@ -6536,28 +6613,30 @@ pub async fn verify(
                         .is_some_and(|blocker| blocker.blocks_surface(&outcome.function))
                 })
                 .count();
-            let completed_functions: HashSet<&str> = fuzz_outcomes
-                .iter()
-                .filter(|outcome| {
-                    matches!(
-                        outcome.status,
-                        FuzzOutcomeStatus::Passed | FuzzOutcomeStatus::Crashed
-                    ) && !nuxt_runtime_blocker
-                        .as_ref()
-                        .is_some_and(|blocker| blocker.blocks_surface(&outcome.function))
+            let invocation_events = sandbox::parse_harness_events(&exec_result.stdout).ok();
+            let surface_evidence = invocation_events
+                .as_ref()
+                .into_iter()
+                .flat_map(|events| events.surfaces.iter())
+                .filter(|(surface, _)| {
+                    !nuxt_runtime_blocker.as_ref().is_some_and(|blocker| {
+                        blocker.blocks_surface(
+                            surface
+                                .rsplit_once(':')
+                                .map_or(surface.as_str(), |(name, _)| name),
+                        )
+                    })
                 })
-                .map(|outcome| outcome.function.as_str())
-                .collect();
-            let evaluated_oracles = functions_to_fuzz
+                .map(|(_, evidence)| evidence)
+                .collect::<Vec<_>>();
+            let valid_invocations = surface_evidence
                 .iter()
-                .filter(|func| {
-                    completed_functions.contains(func.name.as_str())
-                        && func
-                            .return_type
-                            .as_deref()
-                            .is_some_and(|value| !value.trim().is_empty())
-                })
-                .count();
+                .map(|evidence| evidence.valid_completed)
+                .sum::<usize>();
+            let evaluated_oracles = surface_evidence
+                .iter()
+                .map(|evidence| evidence.passed_oracles + evidence.failed_oracles)
+                .sum::<usize>();
             let no_inputs_reached = fuzz_outcomes
                 .iter()
                 .filter(|outcome| outcome.status == FuzzOutcomeStatus::NoInputsReached)
@@ -6569,7 +6648,7 @@ pub async fn verify(
                 &failures,
                 &suppressed_failures,
                 module_load_blocked,
-            );
+            ) && no_inputs_reached == 0;
             let harness_event_detail = {
                 let combined = format!("{}\n{}", exec_result.stdout, exec_result.stderr);
                 if combined.contains(sandbox::HARNESS_EVENT_SENTINEL) {
@@ -6581,6 +6660,7 @@ pub async fn verify(
                             "target_resolved": summary.target_resolved,
                             "target_ready": summary.target_ready,
                             "harness_completed": summary.harness_completed,
+                            "surfaces": summary.surfaces,
                         }),
                         Err(error) => {
                             let diagnostic = FailureDiagnostic {
@@ -6726,7 +6806,9 @@ pub async fn verify(
                 "module_load_blocked": module_load_blocked,
                 "environment_setup": environment_setup,
                 "valid_invocations": valid_invocations,
+                "functions_with_valid_invocations": functions_with_valid_invocations,
                 "evaluated_oracles": evaluated_oracles,
+                "unclassified_exceptions": unclassified_exceptions,
                 "no_inputs_reached": no_inputs_reached,
                 "findings": failures,
                 "suppressed_findings": suppressed_failures,
@@ -6753,27 +6835,10 @@ pub async fn verify(
                 status: if exec_ok {
                     StageStatus::Passed
                 } else if execute_gate_failed(
-                    ExecuteGate::Crash,
-                    &failures,
-                    opts.inferred_oracle_gate,
-                ) || (execute_gate_failed(
                     opts.execute_gate,
                     &failures,
                     opts.inferred_oracle_gate,
-                ) && !failures
-                    .iter()
-                    .filter(|finding| {
-                        finding_fails_execute_gate(
-                            opts.execute_gate,
-                            finding,
-                            opts.inferred_oracle_gate,
-                        )
-                    })
-                    .all(|finding| {
-                        finding.message.starts_with("Comparator")
-                            && finding.minimization.status == MinimizationStatus::Failed
-                    }))
-                {
+                ) {
                     StageStatus::Failed
                 } else {
                     StageStatus::Inconclusive
@@ -7270,15 +7335,16 @@ pub fn repair_summary(report: &VerificationReport, language: &Language) -> Repai
             let non_target_blocker = report.diagnostics.iter().any(|diagnostic| {
                 diagnostic.impact == DiagnosticImpact::Blocking
                     && diagnostic.domain != FailureDomain::TargetCode
-                    && diagnostic.kind != FailureKind::ContractViolation
+                    && !matches!(
+                        diagnostic.kind,
+                        FailureKind::ContractViolation
+                            | FailureKind::AmbiguousGeneratedInput
+                            | FailureKind::InvalidGeneratedInput
+                    )
             });
             let infrastructure = non_target_blocker
                 || findings.iter().any(|finding| {
                     !finding.suppressed && finding.severity == FindingSeverity::Infrastructure
-                })
-                || report.stages.iter().any(|stage| {
-                    stage.status == StageStatus::Inconclusive
-                        && matches!(stage.name.as_str(), "portability" | "execute")
                 });
             if infrastructure {
                 "inspect_environment"

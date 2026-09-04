@@ -160,11 +160,16 @@ fn assert_advisory_contract(plan: &VerificationPlan, function_name: &str, contra
 }
 
 fn assert_advisory_semantic_probe(code: &str, function_name: &str) {
+    let shared_python = code.contains(&format!("_semantic_check(\"{function_name}\""));
     let python_prefix = format!("_emit_finding(\"{function_name}\"");
     let typescript_prefix = format!("_emitFinding(\"{function_name}\"");
     let emission = code
         .lines()
-        .find(|line| line.contains(&python_prefix) || line.contains(&typescript_prefix))
+        .find(|line| {
+            line.contains(&python_prefix)
+                || line.contains(&typescript_prefix)
+                || (shared_python && line.contains("_emit_finding(name, original, error"))
+        })
         .unwrap_or_else(|| panic!("missing semantic finding emission for {function_name}"));
     assert!(
         emission.contains("\"inferred_semantic\", \"name_heuristic\", \"low\""),
@@ -346,7 +351,7 @@ fn python_callable_results_do_not_use_object_identity_for_consistency() {
     let analysis = analyze(source, &Language::Python);
     let code = synthesize_calls(&analysis, &Language::Python);
     assert!(
-        code.contains("assert _consistency_eq(_result, _result_b)"),
+        code.contains("assert _cj_checked(\"consistent\", _consistency_eq(_result, _result_b))"),
         "implicit consistency must ignore fresh callable identity, got: {code}"
     );
 
@@ -371,7 +376,7 @@ fn python_set_members_use_semantic_consistency_equality() {
     let analysis = analyze(source, &Language::Python);
     let code = synthesize_calls(&analysis, &Language::Python);
     assert!(
-        code.contains("assert _consistency_eq(_result, _result_b)"),
+        code.contains("assert _cj_checked(\"consistent\", _consistency_eq(_result, _result_b))"),
         "set results must retain semantic consistency checking, got: {code}"
     );
 
@@ -426,7 +431,8 @@ fn python_query_string_serializer_gets_semantic_examples() {
     assert_advisory_contract(&plan, "canonical_query", "query_string_serializer");
     assert_advisory_semantic_probe(&code, "canonical_query");
     assert!(
-        code.contains("_query_pairs = _parse_qsl(_query_result, keep_blank_values=True)"),
+        code.contains("_parse_qsl(value, keep_blank_values=True)")
+            && code.contains("_expected_pairs, \"query_pairs\""),
         "query-string probe must parse the serialized output, got: {code}"
     );
     assert!(
@@ -2658,6 +2664,7 @@ export function createCounter() {
     function reset(): number { count = 0; return count; }
     return { add, reset };
 }
+
 "#;
     let typescript_analysis = analyze(typescript_source, &Language::TypeScript);
     let typescript = synthesize_calls(&typescript_analysis, &Language::TypeScript);
@@ -2692,6 +2699,41 @@ def create_counter():
 }
 
 // ── Method skipping (Change 3) ──────────────────────────────────────────────
+
+#[test]
+fn selected_factory_keeps_nested_context_without_selecting_sibling_factory() {
+    for (language, source, selected, excluded) in [
+        (
+            Language::Python,
+            "def selected():\n    def action(value: int) -> int:\n        return value\n    return {'action': action}\n\ndef excluded():\n    def action(value: str) -> str:\n        return value.strip()\n    return {'action': action}\n",
+            "selected",
+            "excluded",
+        ),
+        (
+            Language::TypeScript,
+            "export function selected() {\n function action(value: number): number { return value; }\n return { action };\n}\nexport function excluded() {\n function action(value: string): string { return value.trim(); }\n return { action };\n}\n",
+            "selected",
+            "excluded",
+        ),
+    ] {
+        let analysis = analyze(source, &language);
+        let mut plan = build_verification_plan(
+            &analysis.functions, &analysis.classes, &analysis.aliases, &language,
+            &[], &[], &[],
+        );
+        for surface in &mut plan.surfaces {
+            surface.invocable &= surface.symbol == selected;
+        }
+        let harness = synthesize_plan_for_verification(
+            &analysis.functions, &analysis.classes, &analysis.aliases, &language, &plan,
+        );
+        assert!(harness.code.contains("selected().action"), "selected factory lost its action");
+        assert!(!harness.code.contains("excluded().action"), "unselected factory was exercised");
+        assert!(!harness.coverage.iter().any(|entry| entry.function == "action"),
+            "a nested declaration must not become a standalone invocation");
+        assert!(!harness.coverage.iter().any(|entry| entry.function == excluded));
+    }
+}
 
 #[test]
 fn python_skips_methods_in_fuzz() {

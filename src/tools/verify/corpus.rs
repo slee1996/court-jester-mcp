@@ -2,8 +2,8 @@
 
 use crate::tools::domain;
 use crate::types::{
-    DomainSource, DomainSourceKind, FunctionInfo, InputClassification, Language, PlannedArguments,
-    PlannedInput,
+    DomainLiteral, DomainSource, DomainSourceKind, FunctionInfo, InputClassification, Language,
+    PlannedArguments, PlannedInput,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -11,6 +11,70 @@ use std::path::{Path, PathBuf};
 pub(super) type PersistentCorpus = BTreeMap<String, Vec<Vec<serde_json::Value>>>;
 
 const CORPUS_MARKER: &str = "__COURT_JESTER_CORPUS_JSON__";
+
+// Only corpus values use the tagged transport encoding. Ordinary JSON domain
+// inputs must not reinterpret user objects that happen to resemble these tags.
+fn typescript_corpus_expression(value: &serde_json::Value, depth: usize) -> Option<String> {
+    if depth > 64 {
+        return None;
+    }
+    fn object(fields: &serde_json::Map<String, serde_json::Value>, depth: usize) -> Option<String> {
+        let entries = fields
+            .iter()
+            .map(|(key, value)| {
+                Some(format!(
+                    "[{}]: {}",
+                    serde_json::to_string(key).ok()?,
+                    typescript_corpus_expression(value, depth + 1)?
+                ))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(format!("{{{}}}", entries.join(", ")))
+    }
+    match value {
+        serde_json::Value::Object(fields) => {
+            if fields.len() == 1
+                && fields.get("type").and_then(|value| value.as_str()) == Some("undefined")
+            {
+                return Some("undefined".into());
+            }
+            if fields.len() == 2 {
+                match (
+                    fields.get("type").and_then(|value| value.as_str()),
+                    fields.get("value"),
+                ) {
+                    (Some("number"), Some(serde_json::Value::String(value)))
+                        if matches!(value.as_str(), "NaN" | "Infinity" | "-Infinity" | "-0") =>
+                    {
+                        return Some(value.clone())
+                    }
+                    (Some("object"), Some(value)) => return object(value.as_object()?, depth),
+                    _ => {}
+                }
+            }
+            object(fields, depth)
+        }
+        serde_json::Value::Array(values) => Some(format!(
+            "[{}]",
+            values
+                .iter()
+                .map(|value| typescript_corpus_expression(value, depth + 1))
+                .collect::<Option<Vec<_>>>()?
+                .join(", ")
+        )),
+        _ => serde_json::to_string(value).ok(),
+    }
+}
+
+fn corpus_literal(value: &serde_json::Value, language: &Language) -> Option<DomainLiteral> {
+    match language {
+        Language::Python => Some(domain::literal_from_json_value(value.clone(), language)),
+        Language::TypeScript => Some(DomainLiteral {
+            expression: typescript_corpus_expression(value, 0)?,
+            json_value: Some(value.clone()),
+        }),
+    }
+}
 
 fn stable_corpus_key(source_file: Option<&str>, language: &Language) -> String {
     let mut hash = 0xcbf29ce484222325u64;
@@ -73,8 +137,14 @@ pub(super) fn corpus_inputs(
             }
             let mut positional = Vec::new();
             let mut named = BTreeMap::new();
-            for (param, value) in params.iter().zip(row) {
-                let literal = domain::literal_from_json_value(value.clone(), language);
+            let Some(literals) = row
+                .iter()
+                .map(|value| corpus_literal(value, language))
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            for (param, literal) in params.iter().zip(literals) {
                 if matches!(language, Language::Python) && param.keyword_only {
                     named.insert(param.name.clone(), literal);
                 } else {

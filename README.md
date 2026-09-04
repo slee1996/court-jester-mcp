@@ -9,10 +9,10 @@ AI coding agents confidently ship code that looks right but quietly breaks on ed
 Today, the clearest way to think about Court Jester is: a strong alpha for Python and TypeScript repair loops, especially on library and utility code, not a polished universal answer for arbitrary repos.
 
 ```text
-agent edits code -> court-jester verify -> fast concrete failure?
-                                        |
-                             yes: repair from repro
-                             no:  ship with more confidence
+agent edits code -> court-jester verify
+                     fail: repair from repro, then reverify
+             inconclusive: resolve missing evidence or environment
+                     pass: continue repository tests and review
 ```
 
 It is just a CLI. No MCP transport, editor plugin, or custom agent integration layer is required.
@@ -118,7 +118,8 @@ Prompt snippet:
 
 ```text
 After every code change, run `court-jester verify --file <changed-file> --language <python|typescript>`.
-Repair when `verdict: fail`; inspect the report and add a contract or authoritative test when `verdict: inconclusive`; ship only when `verdict: pass`.
+Repair when `verdict: fail`; inspect the report and add a contract or authoritative test when `verdict: inconclusive`.
+After `verdict: pass`, continue the repository's normal tests and review. A pass is scoped evidence, not proof that the change is correct or ready to ship.
 Treat persisted findings and their replay commands as the repair contract.
 ```
 

@@ -3,7 +3,7 @@ let _seed = 42;
 let _cjSequence = 0;
 let _cjCompletedUnits = 0;
 function _cjEvent(event: string, data?: unknown): void {
-  const payload: Record<string, unknown> = { protocol_version: 1, sequence: _cjSequence, event };
+  const payload: Record<string, unknown> = { protocol_version: 2, sequence: _cjSequence, event };
   if (data !== undefined) payload.data = data;
   console.log("__COURT_JESTER_EVENT_JSON__" + JSON.stringify(payload));
   _cjSequence++;
@@ -227,7 +227,7 @@ function _isReservedReproObject(value: Record<string, unknown>): boolean {
     keys.length === 2
     && value.type === "number"
     && keys.includes("value")
-    && (value.value === "NaN" || value.value === "Infinity" || value.value === "-Infinity")
+    && (value.value === "NaN" || value.value === "Infinity" || value.value === "-Infinity" || value.value === "-0")
   ) return true;
   return keys.length === 2 && value.type === "object" && keys.includes("value");
 }
@@ -238,6 +238,7 @@ function _reproJsonValue(value: unknown, ancestors = new Set<object>()): unknown
     if (Number.isNaN(value)) return { type: "number", value: "NaN" };
     if (value === Infinity) return { type: "number", value: "Infinity" };
     if (value === -Infinity) return { type: "number", value: "-Infinity" };
+    if (Object.is(value, -0)) return { type: "number", value: "-0" };
     return value;
   }
   if (value === null || typeof value === "string" || typeof value === "boolean") return value;
@@ -361,10 +362,27 @@ function _fuzzLikeSeed(value: unknown): unknown {
   return _cloneSeed(value);
 }
 
-type _FuzzInput = { args: unknown[]; predicateValid: boolean };
+type _FuzzInput = { args: unknown[]; contractValid: boolean };
+function _sameInput(left: unknown, right: unknown, depth = 0): boolean {
+  if (depth > 32) return false;
+  if (Object.is(left, right)) return true;
+  if (left === null || right === null || typeof left !== "object" || typeof right !== "object") return false;
+  const prototype = Object.getPrototypeOf(left);
+  if (prototype !== Object.getPrototypeOf(right) || (!Array.isArray(left) && prototype !== Object.prototype && prototype !== null)) return false;
+  const keys = Reflect.ownKeys(left);
+  if (keys.length !== Reflect.ownKeys(right).length) return false;
+  return keys.every((key) => {
+    const a = Object.getOwnPropertyDescriptor(left, key);
+    const b = Object.getOwnPropertyDescriptor(right, key);
+    return a !== undefined && b !== undefined && "value" in a && "value" in b && _sameInput(a.value, b.value, depth + 1);
+  });
+}
 function _fuzzSeedRow(seedRows: _FuzzInput[]): _FuzzInput {
-  const row = _cloneSeed(seedRows[_fuzzIntRange(0, seedRows.length - 1)].args);
-  return { args: _fuzzRand() < 0.65 ? row : row.map(_fuzzLikeSeed), predicateValid: false };
+  const seed = seedRows[_fuzzIntRange(0, seedRows.length - 1)];
+  const row = _cloneSeed(seed.args);
+  return _fuzzRand() < 0.65
+    ? { args: row, contractValid: seed.contractValid }
+    : { args: row.map(_fuzzLikeSeed), contractValid: false };
 }
 
 const _cjCorpora = new Map<string, unknown[][]>();
@@ -466,7 +484,7 @@ function _findingId(name: string): string {
 function _reproCase(args: unknown[], inputText: string | null = null): Record<string, unknown> {
   return {
     arguments: args.map((value) => ({
-      expression: _shortJson(value),
+      expression: _reproExpression(value),
       json_value: (() => { try { return _reproJsonValue(value); } catch { return null; } })(),
     })),
     input_text: inputText,
@@ -533,11 +551,11 @@ function _minimizeFailure(original: unknown[], reproduce: (candidate: unknown[])
   }
   return [reproduce(current) ? "preserved" : "failed", attempts, current];
 }
-function _emitFinding(name: string, args: unknown[], error: unknown, severity = "crash", oracleKind = "runtime_contract", provenance = "language_runtime", confidence = "high", category = "exception", minimize: [string, number, unknown[]] | null = null, invocationPath: unknown = "direct", caseLabel: string | null = null, sourceLine = 0): void {
+function _emitFinding(name: string, args: unknown[], error: unknown, severity = "crash", oracleKind = "runtime_contract", provenance = "language_runtime", confidence = "high", category = "exception", minimize: [string, number, unknown[]] | null = null, invocationPath: unknown = "direct", caseLabel: string | null = null, sourceLine = 0, replaySnippet: string | null = null): void {
   const status = minimize?.[0] ?? "not_needed"; const attempts = minimize?.[1] ?? 0; const minimized = status === "not_needed" || status === "failed" ? null : _reproCase(minimize![2], caseLabel); const reproArgs = minimized ? minimize![2] : args;
   const expectation = { severity, oracle_kind: oracleKind, category }; const message = error instanceof Error ? error.message : String(error);
   const errorType = error instanceof Error ? error.constructor.name : "unknown";
-  const snippet = `// Court Jester replay snippet\nlet _reproduced = false;\ntry { (${name} as Function)(${reproArgs.map((value) => _shortJson(value)).join(", ")}); } catch (_replayError) { _reproduced = _replayError instanceof Error && _replayError.constructor.name === ${JSON.stringify(errorType)}; }\nconsole.log("__COURT_JESTER_REPLAY_JSON__");\nconsole.log(JSON.stringify({reproduced:_reproduced,severity:${JSON.stringify(severity)},oracle_kind:${JSON.stringify(oracleKind)},category:${JSON.stringify(category)}}));`;
+  const snippet = replaySnippet ?? `// Court Jester replay snippet\nlet _reproduced = false;\ntry { (${name} as Function)(${reproArgs.map((value) => _reproExpression(value)).join(", ")}); } catch (_replayError) { _reproduced = _replayError instanceof Error && _replayError.constructor.name === ${JSON.stringify(errorType)}; }\nconsole.log("__COURT_JESTER_REPLAY_JSON__");\nconsole.log(JSON.stringify({reproduced:_reproduced,severity:${JSON.stringify(severity)},oracle_kind:${JSON.stringify(oracleKind)},category:${JSON.stringify(category)}}));`;
   const record: Record<string, unknown> = { id: _findingId(name), severity, confidence, category, location: { source_file: "", function: name, line: sourceLine, invocation_path: invocationPath }, oracle: { id: `${oracleKind}:${_sanitizeSymbol(name)}`, kind: oracleKind, provenance, confidence, actual: message }, input_classification: "valid", repro: { kind: "function_call", function: name, arguments: _reproCase(args, caseLabel).arguments, case_label: caseLabel, snippet, command: null, expectation }, minimization: { status, attempts, original: _reproCase(args, caseLabel), minimized }, error_type: errorType, message, suppressed: false };
   _fuzzResults.push(record);
   _cjEvent("finding", { finding: record });
@@ -555,6 +573,119 @@ function _declaredPropertyForFailure(error: unknown): string | null {
     ["Order invariance violated", "order_invariant"],
   ];
   return mappings.find(([prefix]) => error.message.startsWith(prefix))?.[1] ?? null;
+}
+function _evaluateProperties(fn: (args: unknown[]) => unknown, args: unknown[], result: unknown, expectedType: string | null, properties: string[], onCheck: (oracleId: string, passed: boolean) => void = () => {}): void {
+  const violates = (oracleId: string, condition: boolean): boolean => { onCheck(oracleId, !condition); return condition; };
+  // Type check
+  if (expectedType !== null && violates("return_type", typeof result !== expectedType)) {
+    throw new Error(`Return type mismatch: expected ${expectedType}, got ${typeof result}`);
+  }
+  // Consistency: same input → same output
+  if (properties.includes("consistent")) {
+    const result2 = fn(_cloneSeed(args));
+    if (violates("consistent", !_nanSafeEq(result, result2))) {
+      throw new Error(`Inconsistent: ${JSON.stringify(result)} !== ${JSON.stringify(result2)}`);
+    }
+  }
+  // Idempotency: f(f(x)) === f(x)
+  if (properties.includes("idempotent")) {
+    const result3 = fn([result]);
+    if (violates("idempotent", !_nanSafeEq(result, result3))) {
+      throw new Error(`Not idempotent: ${JSON.stringify(result)} -> ${JSON.stringify(result3)}`);
+    }
+  }
+  if (properties.includes("involution")) {
+    const involutionResult = fn([_cloneSeed(result)]);
+    if (violates("involution", !_nanSafeEq(args[0], involutionResult))) {
+      throw new Error(`Involution violated: ${JSON.stringify(args[0])} -> ${JSON.stringify(result)} -> ${JSON.stringify(involutionResult)}`);
+    }
+  }
+  if (properties.includes("monotonic") && typeof args[0] === "number" && Number.isFinite(args[0]) && typeof result === "number") {
+    const monotonicArgs = _cloneSeed(args);
+    monotonicArgs[0] = args[0] + 1;
+    const monotonicResult = fn(monotonicArgs);
+    if (violates("monotonic", typeof monotonicResult !== "number" || !(monotonicResult >= result))) {
+      throw new Error(`Monotonicity violated: f(${JSON.stringify(args[0])})=${JSON.stringify(result)} > f(${JSON.stringify(monotonicArgs[0])})=${JSON.stringify(monotonicResult)}`);
+    }
+  }
+  if (properties.includes("order_invariant") && Array.isArray(args[0])) {
+    const reorderedArgs = _cloneSeed(args);
+    reorderedArgs[0] = [...args[0]].reverse();
+    const reorderedResult = fn(reorderedArgs);
+    if (violates("order_invariant", !_nanSafeEq(result, reorderedResult))) {
+      throw new Error(`Order invariance violated: ${JSON.stringify(result)} != ${JSON.stringify(reorderedResult)}`);
+    }
+  }
+  // Boundedness: len(f(x)) <= len(x)
+  if (properties.includes("bounded") && ((typeof args[0] === "string" && typeof result === "string") || (Array.isArray(args[0]) && Array.isArray(result)))) {
+    const inp = args[0];
+    if (violates("bounded", (result as any).length > (inp as any).length)) {
+      throw new Error(`Not bounded: output length ${(result as any).length} > input length ${(inp as any).length}`);
+    }
+  }
+  // Non-negativity: f(x) >= 0
+  if (properties.includes("nonneg") && typeof result === "number" && violates("nonneg", result < 0)) {
+    throw new Error(`Non-negative violation: ${result} < 0`);
+  }
+  // Non-empty string: identifier/display helpers should not emit blanks.
+  if (properties.includes("nonempty_string") && typeof result === "string" && violates("nonempty_string", result.trim().length === 0)) {
+    throw new Error(`Blank string output: ${JSON.stringify(result)}`);
+  }
+  if (properties.includes("sorted") && _isPrimitiveSortableArray(result)) {
+    if (violates("sorted", result.some((value, index) => index > 0 && result[index - 1] > value))) {
+      throw new Error(`Not sorted: ${JSON.stringify(result)}`);
+    }
+  }
+  if (properties.includes("permutation") && args.length >= 1 && Array.isArray(args[0]) && Array.isArray(result)) {
+    if (violates("permutation", !_samePrimitiveMultiset(args[0] as unknown[], result))) {
+      throw new Error(`Permutation violated: ${JSON.stringify(result)} vs ${JSON.stringify(args[0])}`);
+    }
+  }
+  if (properties.includes("clamped") && args.length >= 3 && typeof args[0] === "number" && typeof args[1] === "number" && typeof args[2] === "number" && typeof result === "number") {
+    const lo = Math.min(args[1], args[2]);
+    const hi = Math.max(args[1], args[2]);
+    if (violates("clamped:bounds", result < lo || result > hi)) {
+      throw new Error(`Clamp bounds violated: ${JSON.stringify(result)} not in [${JSON.stringify(lo)}, ${JSON.stringify(hi)}]`);
+    }
+    if (args[0] >= lo && args[0] <= hi && violates("clamped:passthrough", result !== args[0])) {
+      throw new Error(`Clamp passthrough violated: ${JSON.stringify(result)} != ${JSON.stringify(args[0])}`);
+    }
+  }
+  // Serialized/canonical string helpers should not emit nullish sentinel
+  // text when the input structure contains null or undefined values.
+  if (properties.includes("no_nullish_string") && typeof result === "string") {
+    const firstArg = args[0];
+    if (_containsNullish(firstArg) && violates("no_nullish_string", _stringLeaksNullish(result))) {
+      throw new Error(`Nullish string leak: ${JSON.stringify(result)}`);
+    }
+  }
+  // Symmetry: f(a,b) == f(b,a)
+  if (properties.includes("symmetric") && args.length === 2) {
+    const resultRev = fn([args[1], args[0]]);
+    if (violates("symmetric", !_nanSafeEq(result, resultRev))) {
+      throw new Error(`Not symmetric: f(a,b)=${JSON.stringify(result)} != f(b,a)=${JSON.stringify(resultRev)}`);
+    }
+  }
+  // Comparator contract: compare(a,a) == 0 and sign(compare(a,b)) == -sign(compare(b,a))
+  if (properties.includes("comparator") && args.length === 2) {
+    const selfCmp = fn([args[0], args[0]]);
+    if (violates("comparator:self", _cmpSign(selfCmp) !== 0)) {
+      throw new Error(`Comparator self-compare should be zero: ${JSON.stringify(selfCmp)}`);
+    }
+    const resultRev = fn([args[1], args[0]]);
+    if (violates("comparator:reverse", _cmpSign(result) !== -_cmpSign(resultRev))) {
+      throw new Error(`Comparator antisymmetry violated: ${JSON.stringify(result)} vs ${JSON.stringify(resultRev)}`);
+    }
+  }
+}
+function _propertyReplaySnippet(name: string, args: unknown[], expectedType: string | null, properties: string[], failureIdentity: string, severity: string, oracleKind: string, category: string): string {
+  // Persist the actual evaluator and its pure dependencies. Replay neither
+  // regenerates inputs nor guesses an oracle from a diagnostic message.
+  const helpers = [_cloneSeedFallback, _cloneSeed, _nanSafeEq, _containsNullish,
+    _stringLeaksNullish, _cmpSign, _isPrimitiveSortableArray, _samePrimitiveMultiset,
+    _declaredPropertyForFailure, _failureIdentity, _evaluateProperties]
+    .map((helper) => helper.toString()).join("\n");
+  return `${helpers}\nconst _args = ${_reproExpression(args)};\nlet _reproduced = false;\nlet _checking = false;\ntry {\n  const _invoke = (args: unknown[]) => (${name} as Function)(...args);\n  const _result = _invoke(_cloneSeed(_args));\n  _checking = true;\n  _evaluateProperties(_invoke, _args, _result, ${JSON.stringify(expectedType)}, ${JSON.stringify(properties)});\n} catch (_error) { _reproduced = _checking && _failureIdentity(_error) === ${JSON.stringify(failureIdentity)}; }\nconsole.log("__COURT_JESTER_REPLAY_JSON__");\nconsole.log(JSON.stringify({ reproduced: _reproduced, severity: ${JSON.stringify(severity)}, oracle_kind: ${JSON.stringify(oracleKind)}, category: ${JSON.stringify(category)} }));`;
 }
 function _fuzzOne(
   name: string,
@@ -578,7 +709,7 @@ function _fuzzOne(
     allInputs.push(seed);
   }
   for (const omission of defaultOmissionRows) {
-    allInputs.push({ args: omission, predicateValid: false });
+    allInputs.push({ args: omission, contractValid: false });
   }
   const edgePools: unknown[][] = [];
   for (let pi = 0; pi < paramTypes.length; pi++) {
@@ -588,7 +719,7 @@ function _fuzzOne(
     for (const ev of edges) {
       const row = genArgs();
       row[pi] = _cloneSeed(ev);
-      allInputs.push({ args: row, predicateValid: false });
+      allInputs.push({ args: row, contractValid: false });
     }
   }
   if (seedRows.length === 0) {
@@ -600,7 +731,7 @@ function _fuzzOne(
             const row = genArgs();
             row[left] = _cloneSeed(leftEdge);
             row[right] = _cloneSeed(rightEdge);
-            allInputs.push({ args: row, predicateValid: false });
+            allInputs.push({ args: row, contractValid: false });
             pairwiseEdgeRows++;
             if (pairwiseEdgeRows >= 128) break pairwiseEdges;
           }
@@ -609,141 +740,42 @@ function _fuzzOne(
     }
   }
   for (let i = 0; i < iters; i++) {
-    allInputs.push(seedRows.length > 0 ? _fuzzSeedRow(seedRows) : { args: genArgs(), predicateValid: false });
+    allInputs.push(seedRows.length > 0 ? _fuzzSeedRow(seedRows) : { args: genArgs(), contractValid: false });
   }
   const maxCampaignInputs = allInputs.length + iters;
   for (let i = 0; i < allInputs.length; i++) {
-    const { args, predicateValid } = allInputs[i];
-    let predicateTargetException = false;
+    const { args, contractValid } = allInputs[i];
+    let contractTargetException = false;
+    let checkingProperties = false;
     try {
       _targetEntered(`${name}:${sourceLine}`, i);
       let result: unknown;
       try {
         result = fn(_cloneSeed(args));
       } catch (error) {
-        predicateTargetException = predicateValid;
+        contractTargetException = contractValid;
         throw error;
       }
-      // Type check
-      if (expectedType !== null && typeof result !== expectedType) {
-        throw new Error(`Return type mismatch: expected ${expectedType}, got ${typeof result}`);
-      }
-      // Consistency: same input → same output
-      if (properties.includes("consistent")) {
-        const result2 = fn(_cloneSeed(args));
-        if (!_nanSafeEq(result, result2)) {
-          throw new Error(`Inconsistent: ${JSON.stringify(result)} !== ${JSON.stringify(result2)}`);
-        }
-      }
-      // Idempotency: f(f(x)) === f(x)
-      if (properties.includes("idempotent")) {
-        const result3 = fn([result]);
-        if (!_nanSafeEq(result, result3)) {
-          throw new Error(`Not idempotent: ${JSON.stringify(result)} -> ${JSON.stringify(result3)}`);
-        }
-      }
-      if (properties.includes("involution")) {
-        const involutionResult = fn([_cloneSeed(result)]);
-        if (!_nanSafeEq(args[0], involutionResult)) {
-          throw new Error(`Involution violated: ${JSON.stringify(args[0])} -> ${JSON.stringify(result)} -> ${JSON.stringify(involutionResult)}`);
-        }
-      }
-      if (properties.includes("monotonic") && typeof args[0] === "number" && Number.isFinite(args[0]) && typeof result === "number") {
-        const monotonicArgs = _cloneSeed(args);
-        monotonicArgs[0] = args[0] + 1;
-        const monotonicResult = fn(monotonicArgs);
-        if (typeof monotonicResult !== "number" || !(monotonicResult >= result)) {
-          throw new Error(`Monotonicity violated: f(${JSON.stringify(args[0])})=${JSON.stringify(result)} > f(${JSON.stringify(monotonicArgs[0])})=${JSON.stringify(monotonicResult)}`);
-        }
-      }
-      if (properties.includes("order_invariant") && Array.isArray(args[0])) {
-        const reorderedArgs = _cloneSeed(args);
-        reorderedArgs[0] = [...args[0]].reverse();
-        const reorderedResult = fn(reorderedArgs);
-        if (!_nanSafeEq(result, reorderedResult)) {
-          throw new Error(`Order invariance violated: ${JSON.stringify(result)} != ${JSON.stringify(reorderedResult)}`);
-        }
-      }
-      // Boundedness: len(f(x)) <= len(x)
-      if (properties.includes("bounded")) {
-        const inp = args[0];
-        if ((typeof inp === "string" && typeof result === "string" && (result as string).length > (inp as string).length) ||
-            (Array.isArray(inp) && Array.isArray(result) && (result as unknown[]).length > (inp as unknown[]).length)) {
-          throw new Error(`Not bounded: output length ${(result as any).length} > input length ${(inp as any).length}`);
-        }
-      }
-      // Non-negativity: f(x) >= 0
-      if (properties.includes("nonneg") && typeof result === "number" && result < 0) {
-        throw new Error(`Non-negative violation: ${result} < 0`);
-      }
-      // Non-empty string: identifier/display helpers should not emit blanks.
-      if (properties.includes("nonempty_string") && typeof result === "string" && result.trim().length === 0) {
-        throw new Error(`Blank string output: ${JSON.stringify(result)}`);
-      }
-      if (properties.includes("sorted") && _isPrimitiveSortableArray(result)) {
-        for (let i = 1; i < result.length; i++) {
-          if (result[i - 1] > result[i]) {
-            throw new Error(`Not sorted: ${JSON.stringify(result)}`);
-          }
-        }
-      }
-      if (properties.includes("permutation") && args.length >= 1 && Array.isArray(args[0]) && Array.isArray(result)) {
-        if (!_samePrimitiveMultiset(args[0] as unknown[], result)) {
-          throw new Error(`Permutation violated: ${JSON.stringify(result)} vs ${JSON.stringify(args[0])}`);
-        }
-      }
-      if (properties.includes("clamped") && args.length >= 3 && typeof args[0] === "number" && typeof args[1] === "number" && typeof args[2] === "number" && typeof result === "number") {
-        const lo = Math.min(args[1], args[2]);
-        const hi = Math.max(args[1], args[2]);
-        if (result < lo || result > hi) {
-          throw new Error(`Clamp bounds violated: ${JSON.stringify(result)} not in [${JSON.stringify(lo)}, ${JSON.stringify(hi)}]`);
-        }
-        if (args[0] >= lo && args[0] <= hi && result !== args[0]) {
-          throw new Error(`Clamp passthrough violated: ${JSON.stringify(result)} != ${JSON.stringify(args[0])}`);
-        }
-      }
-      // Serialized/canonical string helpers should not emit nullish sentinel
-      // text when the input structure contains null or undefined values.
-      if (properties.includes("no_nullish_string") && typeof result === "string") {
-        const firstArg = args[0];
-        if (_containsNullish(firstArg) && _stringLeaksNullish(result)) {
-          throw new Error(`Nullish string leak: ${JSON.stringify(result)}`);
-        }
-      }
-      // Symmetry: f(a,b) == f(b,a)
-      if (properties.includes("symmetric") && args.length === 2) {
-        const resultRev = fn([args[1], args[0]]);
-        if (!_nanSafeEq(result, resultRev)) {
-          throw new Error(`Not symmetric: f(a,b)=${JSON.stringify(result)} != f(b,a)=${JSON.stringify(resultRev)}`);
-        }
-      }
-      // Comparator contract: compare(a,a) == 0 and sign(compare(a,b)) == -sign(compare(b,a))
-      if (properties.includes("comparator") && args.length === 2) {
-        const selfCmp = fn([args[0], args[0]]);
-        if (_cmpSign(selfCmp) !== 0) {
-          throw new Error(`Comparator self-compare should be zero: ${JSON.stringify(selfCmp)}`);
-        }
-        const resultRev = fn([args[1], args[0]]);
-        if (_cmpSign(result) !== -_cmpSign(resultRev)) {
-          throw new Error(`Comparator antisymmetry violated: ${JSON.stringify(result)} vs ${JSON.stringify(resultRev)}`);
-        }
-      }
+      checkingProperties = true;
+      _evaluateProperties(fn, args, result, expectedType, properties, (oracleId, passed) => {
+        _cjEvent("oracle_evaluated", { surface_id: `${name}:${sourceLine}`, iteration: i, oracle_id: oracleId, passed });
+      });
       if (_retainCorpusInput(corpus, behaviorSignatures, _behaviorSignature("passed", result), args)
           && allInputs.length < maxCampaignInputs) {
-        allInputs.push({ args: _mutateCorpusRow(args), predicateValid: false });
+        allInputs.push({ args: _mutateCorpusRow(args), contractValid: false });
       }
       _cjUnitCompleted(`${name}:${sourceLine}`, i, "passed");
       pass++;
     } catch (e: unknown) {
-      const targetException = _isCrash(e) || predicateTargetException;
+      const targetException = _isCrash(e) || contractTargetException;
       if (_retainCorpusInput(corpus, behaviorSignatures, _behaviorSignature(targetException ? "crash" : "rejected", e), args)
           && allInputs.length < maxCampaignInputs) {
-        allInputs.push({ args: _mutateCorpusRow(args), predicateValid: false });
+        allInputs.push({ args: _mutateCorpusRow(args), contractValid: false });
       }
       if (targetException) {
         crash++;
         _cjUnitCompleted(`${name}:${sourceLine}`, i, "target_exception");
-        const propertyFailure = !predicateTargetException && e instanceof Error && !(e instanceof TypeError || e instanceof RangeError || e instanceof ReferenceError || e instanceof URIError);
+        const propertyFailure = !contractTargetException && e instanceof Error && !(e instanceof TypeError || e instanceof RangeError || e instanceof ReferenceError || e instanceof URIError);
         const failedProperty = _declaredPropertyForFailure(e);
         const declared = propertyFailure && failedProperty !== null && declaredProperties.includes(failedProperty);
         const oracleKind = declared ? "declared_property" : (propertyFailure ? "generic_property" : "runtime_contract");
@@ -752,14 +784,23 @@ function _fuzzOne(
         const severity = propertyFailure ? "property_violation" : "crash";
         const failureIdentity = _failureIdentity(e);
         const minimized = _minimizeFailure(args, (candidate) => {
+          // Shrinking cannot carry the original input's admission proof to a
+          // different value. Restrict contract exceptions to admitted seed rows.
+          if (contractTargetException && !seedRows.some((seed) => seed.contractValid && _sameInput(candidate, seed.args))) return false;
+          let candidateChecking = false;
           try {
-            fn(candidate);
+            const candidateResult = fn(_cloneSeed(candidate));
+            candidateChecking = true;
+            if (checkingProperties) _evaluateProperties(fn, candidate, candidateResult, expectedType, properties);
             return false;
           } catch (candidateError) {
-            return _isCrash(candidateError) && _failureIdentity(candidateError) === failureIdentity;
+            return (!checkingProperties || candidateChecking) && (contractTargetException || _isCrash(candidateError)) && _failureIdentity(candidateError) === failureIdentity;
           }
         });
-        _emitFinding(name, args, e, severity, oracleKind, provenance, confidence, propertyFailure ? "property" : "exception", minimized, "direct", null, sourceLine);
+        const replayArgs = minimized[0] === "preserved" ? minimized[2] : args;
+        const category = propertyFailure ? "property" : "exception";
+        const replaySnippet = checkingProperties ? _propertyReplaySnippet(name, replayArgs, expectedType, properties, failureIdentity, severity, oracleKind, category) : null;
+        _emitFinding(name, args, e, severity, oracleKind, provenance, confidence, category, minimized, "direct", null, sourceLine, replaySnippet);
         if (crash === 1) firstCrash = `  CRASH ${name}(${_shortJson(args)}): ${_clipText(e)}`;
       } else {
         reject++;

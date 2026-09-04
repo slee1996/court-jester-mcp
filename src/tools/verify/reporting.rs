@@ -358,15 +358,21 @@ pub fn report_human_summary(report: &VerificationReport) -> String {
                         .and_then(|value| value.as_u64())
                         .unwrap_or(0);
                     let reached = counts
-                        .get("reached_via_factory")
-                        .and_then(|value| value.as_u64())
+                        .as_object()
+                        .map(|counts| {
+                            counts
+                                .iter()
+                                .filter(|(key, _)| key.starts_with("reached_"))
+                                .map(|(_, value)| value.as_u64().unwrap_or(0))
+                                .sum::<u64>()
+                        })
                         .unwrap_or(0);
                     let skipped = counts
                         .as_object()
                         .map(|obj| {
                             obj.iter()
                                 .filter(|(key, _)| {
-                                    !key.starts_with("checked_") && *key != "reached_via_factory"
+                                    !key.starts_with("checked_") && !key.starts_with("reached_")
                                 })
                                 .map(|(_, value)| value.as_u64().unwrap_or(0))
                                 .sum()

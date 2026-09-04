@@ -62,10 +62,48 @@ pub fn synthesize_calls_for(
 #[derive(Clone)]
 struct PlannedSeedInput {
     arguments: PlannedArguments,
-    predicate_valid: bool,
+    contract_valid: bool,
 }
 
 type PlannedSeedInputs = HashMap<String, Vec<PlannedSeedInput>>;
+
+fn finite_declared_literals(
+    domain: &DomainNode,
+    language: &Language,
+) -> Option<Vec<DomainLiteral>> {
+    match domain {
+        DomainNode::Literal(values) if !values.is_empty() => Some(values.clone()),
+        DomainNode::Boolean => Some(
+            [false, true]
+                .into_iter()
+                .map(|value| {
+                    crate::tools::domain::literal_from_json_value(
+                        serde_json::json!(value),
+                        language,
+                    )
+                })
+                .collect(),
+        ),
+        DomainNode::Nullable(inner) => {
+            let mut values = finite_declared_literals(inner, language)?;
+            values.push(crate::tools::domain::literal_from_json_value(
+                serde_json::Value::Null,
+                language,
+            ));
+            Some(values)
+        }
+        DomainNode::Union(items) => Some(
+            items
+                .iter()
+                .map(|item| finite_declared_literals(item, language))
+                .collect::<Option<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect(),
+        ),
+        _ => None,
+    }
+}
 
 pub fn synthesize_plan_for(
     functions: &[FunctionInfo],
@@ -86,14 +124,19 @@ pub fn synthesize_plan_for_verification(
     language: &Language,
     plan: &VerificationPlan,
 ) -> FuzzPlan {
-    let invocable_functions = functions
+    // Invocation selection must not erase declaration context. Nested functions
+    // are not direct execution units, but their signatures belong to the factory
+    // that returns them. The renderers exclude nested declarations from direct
+    // calls and resolve them within their owning factory's source range.
+    let synthesis_functions = functions
         .iter()
         .filter(|function| {
-            plan.surfaces.iter().any(|surface| {
-                surface.invocable
-                    && surface.symbol == function.name
-                    && surface.line == function.line
-            })
+            function.is_nested
+                || plan.surfaces.iter().any(|surface| {
+                    surface.invocable
+                        && surface.symbol == function.name
+                        && surface.line == function.line
+                })
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -110,11 +153,18 @@ pub fn synthesize_plan_for_verification(
         {
             safe_dependency_surfaces.insert(input.surface_id.clone());
         }
-        let predicate_valid = input.classification == InputClassification::Valid
-            && input
-                .sources
-                .iter()
-                .any(|source| source.kind == DomainSourceKind::ValidationGuard);
+        let domains = plan
+            .parameter_domains
+            .iter()
+            .filter(|domain| domain.surface_id == input.surface_id)
+            .collect::<Vec<_>>();
+        let closed_domain = !domains.is_empty() && domains.iter().all(|domain| domain.closed);
+        let contract_valid = input.classification == InputClassification::Valid
+            && (closed_domain
+                || input
+                    .sources
+                    .iter()
+                    .any(|source| source.kind == DomainSourceKind::ValidationGuard));
         seed_inputs
             .entry(
                 input
@@ -127,12 +177,12 @@ pub fn synthesize_plan_for_verification(
             .or_default()
             .push(PlannedSeedInput {
                 arguments: input.arguments.clone(),
-                predicate_valid,
+                contract_valid,
             });
     }
     let safe_dependency_surfaces = safe_dependency_surfaces.into_iter().collect::<Vec<_>>();
     synthesize_plan_legacy(
-        &invocable_functions,
+        &synthesis_functions,
         classes,
         aliases,
         language,
@@ -450,7 +500,43 @@ fn factory_callable_coverage(
     coverage
 }
 
-fn python_seed_rows_expr(func: &FunctionInfo, seed_inputs: &PlannedSeedInputs) -> String {
+fn python_rejection_domains(func: &FunctionInfo, analysis: &AnalysisResult) -> String {
+    let domains = func
+        .params
+        .iter()
+        .filter(|param| !param.is_variadic())
+        .enumerate()
+        .filter_map(|(index, param)| {
+            let annotation = param
+                .type_annotation
+                .as_deref()
+                .map(|value| func.resolved_type_annotation(value));
+            let domain = domain::domain_for_annotation(
+                annotation.as_deref(),
+                &analysis.aliases,
+                &analysis.classes,
+                &Language::Python,
+            );
+            let values = finite_declared_literals(&domain, &Language::Python)?;
+            Some(format!(
+                "({index}, [{}])",
+                values
+                    .iter()
+                    .map(|value| value.expression.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{domains}]")
+}
+
+fn python_seed_rows_expr(
+    func: &FunctionInfo,
+    seed_inputs: &PlannedSeedInputs,
+    contract_only: bool,
+) -> String {
     let Some(rows) = seed_inputs.get(&func.name) else {
         return "[]".to_string();
     };
@@ -467,6 +553,7 @@ fn python_seed_rows_expr(func: &FunctionInfo, seed_inputs: &PlannedSeedInputs) -
     format!(
         "[{}]",
         rows.iter()
+            .filter(|row| !contract_only || row.contract_valid)
             .map(|row| {
                 let row = &row.arguments;
                 let mut values = Vec::new();
@@ -523,14 +610,14 @@ fn ts_seed_rows(func: &FunctionInfo, seed_inputs: &PlannedSeedInputs) -> String 
     rows.iter()
         .map(|row| {
             format!(
-                "{{ args: [{}], predicateValid: {} }}",
+                "{{ args: [{}], contractValid: {} }}",
                 row.arguments
                     .positional
                     .iter()
                     .map(|item| item.expression.as_str())
                     .collect::<Vec<_>>()
                     .join(", "),
-                row.predicate_valid,
+                row.contract_valid,
             )
         })
         .collect::<Vec<_>>()
@@ -916,6 +1003,8 @@ fn synthesize_python(
             r#"
 _all_inputs = []
 _seed_rows = {seed_rows}
+_contract_rows = {contract_rows}
+_rejection_domains = {rejection_domains}
 _corpus = []
 _behavior_signatures = set()
 {edge_case_setup}
@@ -929,11 +1018,17 @@ _max_campaign_inputs = len(_all_inputs) + {FUZZ_ITERATIONS}
 _pass = 0
 _reject = 0
 _crash = 0
+_unknown = 0
 for _iteration, _args in enumerate(_all_inputs):
+    _contract_target_exception = False
     try:
         _call_args = _copy.deepcopy(_args)
         _target_entered("{name}:{line}", _iteration)
-        _result = _materialize_if_iterator({name}({call}))
+        try:
+            _result = _materialize_if_iterator({name}({call}))
+        except Exception:
+            _contract_target_exception = any(_same_input(_args, _row) for _row in _contract_rows)
+            raise
         _pass += 1
 {type_check}
 {idempotency_check}
@@ -952,17 +1047,23 @@ for _iteration, _args in enumerate(_all_inputs):
             _all_inputs.append(_mutate_corpus_row(_args))
         _cj_unit_completed("{name}:{line}", _iteration, "passed")
     except Exception as _e:
-        if _retain_corpus_input(_corpus, _behavior_signatures, _behavior_signature("crash" if _is_crash(_e) else "rejected", _e), _args) and len(_all_inputs) < _max_campaign_inputs:
+        _outside_contract = _outside_closed_domain(_args, _rejection_domains)
+        _target_exception = not _outside_contract and (_contract_target_exception or _is_crash(_e))
+        if _retain_corpus_input(_corpus, _behavior_signatures, _behavior_signature("crash" if _target_exception else "rejected", _e), _args) and len(_all_inputs) < _max_campaign_inputs:
             _all_inputs.append(_mutate_corpus_row(_args))
-        if _is_crash(_e):
+        if _target_exception:
             _crash += 1
             _cj_unit_completed("{name}:{line}", _iteration, "target_exception")
-            _emit_error("{name}", _args, _e, [{declared_properties}], lambda _candidate: _reproduces_python(_candidate, _e, lambda: {name}({candidate_call})), invocation_path="direct")
+            _emit_error("{name}", _args, _e, [{declared_properties}], lambda _candidate: (not _contract_target_exception or any(_same_input(_candidate, _row) for _row in _contract_rows)) and _reproduces_python(_candidate, _e, lambda: {name}({candidate_call})), invocation_path="direct", target_exception=_contract_target_exception)
             if _crash == 1:
                 print(f"  CRASH {name}({{_short_repr(_args)}}): {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
-        else:
+        elif _outside_contract:
             _reject += 1
             _cj_unit_completed("{name}:{line}", _iteration, "rejected")
+        else:
+            _unknown += 1
+            _cj_unit_completed("{name}:{line}", _iteration, "unclassified_exception")
+            _emit_uncertain_exception("{name}", _args, _e)
 _CJ_CORPORA["{name}:{line}"] = _corpus[:64]
 {query_string_semantic_check}
 {pep440_version_ordering_check}
@@ -970,10 +1071,12 @@ _CJ_CORPORA["{name}:{line}"] = _corpus[:64]
 {pep440_filter_prerelease_check}
 {cookie_value_quote_check}
 {cookie_header_quote_check}
-_total = _pass + _reject + _crash
+_total = _pass + _reject + _crash + _unknown
 if _crash > 0:
     print(f"FUZZ {name}: {{_pass}} passed, {{_reject}} rejected, {{_crash}} CRASHED (of {{_total}})")
     _fuzz_failures += 1
+elif _unknown > 0:
+    print(f"FUZZ {name}: {{_pass}} passed, {{_reject}} rejected, 0 CRASHED, {{_unknown}} unclassified (of {{_total}})")
 elif _pass == 0:
     print(f"FUZZ {name}: all {{_total}} inputs rejected (nothing tested)")
     _fuzz_failures += 1
@@ -984,7 +1087,9 @@ else:
             candidate_call = candidate_call,
             declared_properties = declared_properties,
             edge_case_setup = edge_case_setup,
-            seed_rows = python_seed_rows_expr(func, seed_inputs),
+            seed_rows = python_seed_rows_expr(func, seed_inputs, false),
+            contract_rows = python_seed_rows_expr(func, seed_inputs, true),
+            rejection_domains = python_rejection_domains(func, analysis),
             type_check = python_type_check(ret_type, type_defs),
             line = func.line,
             idempotency_check = python_idempotency_check(func, &callable_params, type_defs),
@@ -1091,6 +1196,7 @@ else:
 # Stateful factory action-sequence campaign: {name}
 _factory_pass = 0
 _factory_crash = 0
+_factory_unknown = 0
 _known_factory_callables = {known_specs_expr}
 _action_keys = list(_known_factory_callables)
 for _fi in range({iters}):
@@ -1100,12 +1206,13 @@ for _fi in range({iters}):
     _active_factory_args = []
     _active_factory_kwargs = {{}}
     _action_trace = []
+    _active_factory_unit = None
     try:
         _factory_result = {name}({factory_args})
         _action_plan = list(_action_keys)
         for _ in range(_fuzz_int_range(2, 5)):
             _action_plan.append(_rng.choice(_action_keys))
-        for _action in _action_plan:
+        for _step_index, _action in enumerate(_action_plan):
             _spec = _known_factory_callables[_action]
             if callable(_factory_result) and len(_action_keys) == 1:
                 _candidate = _factory_result
@@ -1121,21 +1228,29 @@ for _fi in range({iters}):
             _active_factory_args = _spec["args"]()
             _active_factory_kwargs = _spec["kwargs"]()
             _action_trace.append({{"action": _action, "args": _copy.deepcopy(_active_factory_args), "kwargs": _copy.deepcopy(_active_factory_kwargs)}})
-            _target_entered(_active_factory_surface)
-            _candidate(*_active_factory_args, **_active_factory_kwargs)
+            _active_factory_unit = _fi * (len(_action_keys) + 5) + _step_index
+            _target_entered(_active_factory_surface, _active_factory_unit)
+            _candidate(*_copy.deepcopy(_active_factory_args), **_copy.deepcopy(_active_factory_kwargs))
+            _cj_unit_completed(_active_factory_surface, _active_factory_unit, "passed")
+            _active_factory_unit = None
         _factory_pass += 1
     except Exception as _e:
+        if _active_factory_unit is not None:
+            _cj_unit_completed(_active_factory_surface, _active_factory_unit, "target_exception" if _is_crash(_e) else "unclassified_exception")
         if _is_crash(_e):
             _factory_crash += 1
             _emit_finding(_active_factory_surface, _active_factory_args, _e, "crash", "runtime_contract", "observed_call", "high", "exception", case_label=_clip_text(_action_trace), invocation_path={{"factory": {{"factory": "{name}", "callable": _active_factory_callable}}}})
             if _factory_crash == 1:
                 print(f"  CRASH {{_active_factory_surface}} after actions {{_clip_text(_action_trace)}}: {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
-_factory_total = _factory_pass + _factory_crash
+        else:
+            _factory_unknown += 1
+            _emit_uncertain_exception(_active_factory_surface, _active_factory_args, _e, case_label=_clip_text(_action_trace), invocation_path={{"factory": {{"factory": "{name}", "callable": _active_factory_callable}}}})
+_factory_total = _factory_pass + _factory_crash + _factory_unknown
 if _factory_crash > 0:
     print(f"FUZZ {name} (factory state machine): {{_factory_pass}} passed, {{_factory_crash}} CRASHED (of {{_factory_total}}) [actions: {nested_names}]")
     _fuzz_failures += 1
 else:
-    print(f"FUZZ {name} (factory state machine): {{_factory_pass}} passed (of {{_factory_total}}) [actions: {nested_names}]")
+    print(f"FUZZ {name} (factory state machine): {{_factory_pass}} passed, 0 rejected, 0 CRASHED, {{_factory_unknown}} unclassified (of {{_factory_total}}) [actions: {nested_names}]")
 "#,
             func_line = func.line,
             name = func.name,
@@ -1278,7 +1393,7 @@ fn python_type_check(ret_type: &str, _type_defs: &HashMap<&str, &ClassInfo>) -> 
         t if t.contains("None") => return String::new(), // optional return, skip
         _ => return String::new(),
     };
-    format!("        assert {check}, f\"Return type mismatch: got {{type(_result).__name__}}\"")
+    format!("        assert _cj_checked(\"return_type\", {check}), f\"Return type mismatch: got {{type(_result).__name__}}\"")
 }
 
 fn is_idempotent_candidate_type(type_name: &str) -> bool {
@@ -1758,7 +1873,7 @@ fn python_idempotency_check(
         && has_declared_property(func, "idempotent")
     {
         format!(
-            "        _result2 = {name}(_result)\n        assert _nan_eq(_result, _result2), f\"Not idempotent: {{repr(_result)}} -> {{repr(_result2)}}\"",
+            "        _result2 = {name}(_result)\n        assert _cj_checked(\"idempotent\", _nan_eq(_result, _result2)), f\"Not idempotent: {{repr(_result)}} -> {{repr(_result2)}}\"",
             name = func.name,
         )
     } else {
@@ -1774,7 +1889,7 @@ fn python_consistency_check(func: &FunctionInfo, call_args: &[String]) -> String
     // Run the same input twice, verify same output
     let call = call_args.join(", ");
     format!(
-        "        _repeat_args = _copy.deepcopy(_args)\n        _result_b = _materialize_if_iterator({name}({call}))\n        assert _consistency_eq(_result, _result_b), f\"Inconsistent: {{repr(_result)}} != {{repr(_result_b)}}\"",
+        "        _repeat_args = _copy.deepcopy(_args)\n        _result_b = _materialize_if_iterator({name}({call}))\n        assert _cj_checked(\"consistent\", _consistency_eq(_result, _result_b)), f\"Inconsistent: {{repr(_result)}} != {{repr(_result_b)}}\"",
         name = func.name,
     )
 }
@@ -1789,7 +1904,7 @@ fn python_boundedness_check(func: &FunctionInfo, params: &[&ParamInfo]) -> Strin
         || (starts_with_any(param_type, &["list", "List"])
             && starts_with_any(ret_type, &["list", "List"]));
     if types_match && has_declared_property(func, "bounded") {
-        "        assert len(_result) <= len(_args[0]), f\"Not bounded: len({repr(_result)}) > len({repr(_args[0])})\"".to_string()
+        "        assert _cj_checked(\"bounded\", len(_result) <= len(_args[0])), f\"Not bounded: len({repr(_result)}) > len({repr(_args[0])})\"".to_string()
     } else {
         String::new()
     }
@@ -1798,7 +1913,7 @@ fn python_boundedness_check(func: &FunctionInfo, params: &[&ParamInfo]) -> Strin
 fn python_nonneg_check(func: &FunctionInfo) -> String {
     let ret_type = func.return_type.as_deref().unwrap_or("");
     if (ret_type == "int" || ret_type == "float") && has_declared_property(func, "nonneg") {
-        "        assert _result >= 0, f\"Non-negative violation: {repr(_result)} < 0\"".to_string()
+        "        assert _cj_checked(\"nonneg\", _result >= 0), f\"Non-negative violation: {repr(_result)} < 0\"".to_string()
     } else {
         String::new()
     }
@@ -1809,7 +1924,7 @@ fn python_clamped_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
         return String::new();
     }
 
-    "        if all(isinstance(_value, (int, float)) and not isinstance(_value, bool) for _value in (_args[0], _args[1], _args[2], _result)):\n            _lo = min(_args[1], _args[2])\n            _hi = max(_args[1], _args[2])\n            assert _lo <= _result <= _hi, f\"Clamp bounds violated: {repr(_result)} not in [{repr(_lo)}, {repr(_hi)}]\"\n            if _lo <= _args[0] <= _hi:\n                assert _result == _args[0], f\"Clamp passthrough violated: {repr(_result)} != {repr(_args[0])}\"".to_string()
+    "        if all(isinstance(_value, (int, float)) and not isinstance(_value, bool) for _value in (_args[0], _args[1], _args[2], _result)):\n            _lo = min(_args[1], _args[2])\n            _hi = max(_args[1], _args[2])\n            assert _cj_checked(\"clamped\", _lo <= _result <= _hi), f\"Clamp bounds violated: {repr(_result)} not in [{repr(_lo)}, {repr(_hi)}]\"\n            if _lo <= _args[0] <= _hi:\n                assert _cj_checked(\"clamped\", _result == _args[0]), f\"Clamp passthrough violated: {repr(_result)} != {repr(_args[0])}\"".to_string()
 }
 
 fn python_sorted_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
@@ -1817,7 +1932,7 @@ fn python_sorted_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
         return String::new();
     }
 
-    "        if isinstance(_result, (list, tuple)) and all(isinstance(_item, (int, float, str)) for _item in _result):\n            assert list(_result) == sorted(_result), f\"Not sorted: {repr(_result)}\"".to_string()
+    "        if isinstance(_result, (list, tuple)) and all(isinstance(_item, (int, float, str)) for _item in _result):\n            assert _cj_checked(\"sorted\", list(_result) == sorted(_result)), f\"Not sorted: {repr(_result)}\"".to_string()
 }
 
 fn python_permutation_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
@@ -1825,7 +1940,7 @@ fn python_permutation_check(func: &FunctionInfo, params: &[&ParamInfo]) -> Strin
         return String::new();
     }
 
-    "        if isinstance(_args[0], (list, tuple)) and isinstance(_result, (list, tuple)):\n            assert _multiset_counts(_result) == _multiset_counts(_args[0]), f\"Permutation violated: {repr(_result)} vs {repr(_args[0])}\"".to_string()
+    "        if isinstance(_args[0], (list, tuple)) and isinstance(_result, (list, tuple)):\n            assert _cj_checked(\"permutation\", _multiset_counts(_result) == _multiset_counts(_args[0])), f\"Permutation violated: {repr(_result)} vs {repr(_args[0])}\"".to_string()
 }
 
 fn python_palindrome_check(func: &FunctionInfo) -> String {
@@ -1833,7 +1948,7 @@ fn python_palindrome_check(func: &FunctionInfo) -> String {
         return String::new();
     }
 
-    "        if isinstance(_result, (list, tuple, str)):\n            assert _is_palindrome_sequence(_result), f\"Palindrome violated: {repr(_result)}\"".to_string()
+    "        if isinstance(_result, (list, tuple, str)):\n            assert _cj_checked(\"palindrome\", _is_palindrome_sequence(_result)), f\"Palindrome violated: {repr(_result)}\"".to_string()
 }
 
 fn python_nullish_string_leak_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
@@ -1852,7 +1967,7 @@ fn python_nullish_string_leak_check(func: &FunctionInfo, params: &[&ParamInfo]) 
                 || infer_python_contract(func, params) == Some(ContractKind::MappingSerializer))
                 && likely_nullish_string_leak(&func.name)))
     {
-        "        if _contains_nullish(_args[0]) and _string_leaks_nullish(_result):\n            raise AssertionError(f\"Nullish string leak: {repr(_result)}\")".to_string()
+        "        if _contains_nullish(_args[0]):\n            assert _cj_checked(\"no_nullish_string\", not _string_leaks_nullish(_result)), f\"Nullish string leak: {repr(_result)}\"".to_string()
     } else {
         String::new()
     }
@@ -1864,24 +1979,14 @@ fn python_query_string_semantic_check(func: &FunctionInfo, params: &[&ParamInfo]
     }
 
     format!(
-        r#"try:
-    _query_label = "tag/nullish"
-    _query_cases = [
-        ("tag/nullish", {{"tag": ["pro", None, " beta "]}}, [("tag", "pro"), ("tag", "beta")]),
-        ("blank scalar", {{"q": "  ", "page": 2}}, [("page", "2")]),
-        ("accent fold", {{"q": "naïve café"}}, [("q", _ascii_fold("naïve café"))]),
-        ("nested non-scalars", {{"filters": [{{"label": "pro"}}, None, " beta "]}}, [("filters", "beta")]),
-    ]
-    for _query_label, _query_input, _expected_pairs in _query_cases:
-        _query_result = {name}(_query_input)
-        _query_pairs = _parse_qsl(_query_result, keep_blank_values=True)
-        assert _query_pairs == _expected_pairs, f"Query semantics ({{_query_label}}): {{_query_pairs!r}} != {{_expected_pairs!r}} from {{repr(_query_result)}}"
-except Exception as _e:
-    if _is_crash(_e):
-        _crash += 1
-        _emit_finding("{name}", [_query_input], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", case_label=_query_label)
-        if _crash == 1:
-            print(f"  CRASH {name}(query semantics): {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
+        r#"_query_cases = [
+    ("tag/nullish", {{"tag": ["pro", None, " beta "]}}, [("tag", "pro"), ("tag", "beta")]),
+    ("blank scalar", {{"q": "  ", "page": 2}}, [("page", "2")]),
+    ("accent fold", {{"q": "naïve café"}}, [("q", _ascii_fold("naïve café"))]),
+    ("nested non-scalars", {{"filters": [{{"label": "pro"}}, None, " beta "]}}, [("filters", "beta")]),
+]
+for _query_label, _query_input, _expected_pairs in _query_cases:
+    _crash += _semantic_check("{name}", {name}, [_query_input], _expected_pairs, "query_pairs", "Query semantics (" + _query_label + ")")
 "#,
         name = func.name,
     )
@@ -1905,28 +2010,18 @@ fn python_pep440_version_ordering_check(func: &FunctionInfo, params: &[&ParamInf
     }
 
     format!(
-        r#"try:
-    _pep440_label = "rc before final"
-    _pep440_cases = [
-        ("dev before alpha", "1.0.dev1", "1.0a1", -1),
-        ("alpha before beta", "1.0a1", "1.0b1", -1),
-        ("beta before rc", "1.0b1", "1.0rc1", -1),
-        ("rc before final", "1.0rc1", "1.0", -1),
-        ("final before post", "1.0", "1.0.post1", -1),
-        ("release segment numeric ordering", "1.2", "1.10", -1),
-        ("equivalent release forms", "1.0", "1.0.0", 0),
-    ]
-    for _pep440_label, _left, _right, _expected in _pep440_cases:
-        _actual = {name}(_left, _right)
-        assert _cmp_sign(_actual) == _cmp_sign(_expected), f"PEP 440 version ordering ({{_pep440_label}}): {{_actual!r}} != {{_expected!r}}"
-        _reverse = {name}(_right, _left)
-        assert _cmp_sign(_reverse) == -_cmp_sign(_expected), f"PEP 440 version ordering reverse ({{_pep440_label}}): {{_reverse!r}} != {{-_cmp_sign(_expected)!r}}"
-except Exception as _e:
-    if _is_crash(_e):
-        _crash += 1
-        _emit_finding("{name}", [_left, _right], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", case_label=_pep440_label)
-        if _crash == 1:
-            print(f"  CRASH {name}(pep440 version ordering): {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
+        r#"_pep440_cases = [
+    ("dev before alpha", "1.0.dev1", "1.0a1", -1),
+    ("alpha before beta", "1.0a1", "1.0b1", -1),
+    ("beta before rc", "1.0b1", "1.0rc1", -1),
+    ("rc before final", "1.0rc1", "1.0", -1),
+    ("final before post", "1.0", "1.0.post1", -1),
+    ("release segment numeric ordering", "1.2", "1.10", -1),
+    ("equivalent release forms", "1.0", "1.0.0", 0),
+]
+for _pep440_label, _left, _right, _expected in _pep440_cases:
+    _crash += _semantic_check("{name}", {name}, [_left, _right], _expected, "sign", "PEP 440 version ordering (" + _pep440_label + ")")
+    _crash += _semantic_check("{name}", {name}, [_right, _left], -_expected, "sign", "PEP 440 version ordering reverse (" + _pep440_label + ")")
 "#,
         name = func.name,
     )
@@ -1947,24 +2042,15 @@ fn python_pep440_specifier_membership_check(func: &FunctionInfo, params: &[&Para
     }
 
     format!(
-        r#"try:
-    _specifier_label = "prerelease excluded by default"
-    _specifier_cases = [
-        ("inclusive lower bound", "1.0", ">=1.0", True),
-        ("exclusive upper bound", "2.0.0", "<2.0", False),
-        ("compatible includes patch", "1.4.5", "~=1.4", True),
-        ("compatible excludes next minor", "1.5.0", "~=1.4.5", False),
-        ("prerelease excluded by default", "1.0a1", ">=1.0", False),
-    ]
-    for _specifier_label, _version, _specifier, _expected in _specifier_cases:
-        _actual = bool({name}(_version, _specifier))
-        assert _actual is _expected, f"PEP 440 specifier membership ({{_specifier_label}}): {{_actual!r}} != {{_expected!r}}"
-except Exception as _e:
-    if _is_crash(_e):
-        _crash += 1
-        _emit_finding("{name}", [_left, _right], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", case_label=_specifier_label)
-        if _crash == 1:
-            print(f"  CRASH {name}(pep440 specifier membership): {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
+        r#"_specifier_cases = [
+    ("inclusive lower bound", "1.0", ">=1.0", True),
+    ("exclusive upper bound", "2.0.0", "<2.0", False),
+    ("compatible includes patch", "1.4.5", "~=1.4", True),
+    ("compatible excludes next minor", "1.5.0", "~=1.4.5", False),
+    ("prerelease excluded by default", "1.0a1", ">=1.0", False),
+]
+for _specifier_label, _version, _specifier, _expected in _specifier_cases:
+    _crash += _semantic_check("{name}", {name}, [_version, _specifier], _expected, "bool", "PEP 440 specifier membership (" + _specifier_label + ")")
 "#,
         name = func.name,
     )
@@ -1987,23 +2073,14 @@ fn python_pep440_filter_prerelease_check(func: &FunctionInfo, params: &[&ParamIn
     }
 
     format!(
-        r#"try:
-    _filter_label = "prerelease-only fallback"
-    _filter_cases = [
-        ("stable lower bound", ["1.2", "1.3"], ">=1.3", ["1.3"]),
-        ("prerelease-only fallback", ["1.2", "1.5a1"], ">=1.5", ["1.5a1"]),
-        ("empty specifier preserves prerelease-only input", ["1.0a1"], "", ["1.0a1"]),
-        ("stable match suppresses prerelease fallback", ["1.5a1", "1.5"], ">=1.5", ["1.5"]),
-    ]
-    for _filter_label, _candidates, _specifier, _expected in _filter_cases:
-        _actual = _materialize_if_iterator({name}(_copy.deepcopy(_candidates), _specifier))
-        assert _actual == _expected, f"PEP 440 prerelease filter ({{_filter_label}}): {{_actual!r}} != {{_expected!r}}"
-except Exception as _e:
-    if _is_crash(_e):
-        _crash += 1
-        _emit_finding("{name}", [_value, _filter], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", case_label=_filter_label)
-        if _crash == 1:
-            print(f"  CRASH {name}(pep440 filter prerelease): {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
+        r#"_filter_cases = [
+    ("stable lower bound", ["1.2", "1.3"], ">=1.3", ["1.3"]),
+    ("prerelease-only fallback", ["1.2", "1.5a1"], ">=1.5", ["1.5a1"]),
+    ("empty specifier preserves prerelease-only input", ["1.0a1"], "", ["1.0a1"]),
+    ("stable match suppresses prerelease fallback", ["1.5a1", "1.5"], ">=1.5", ["1.5"]),
+]
+for _filter_label, _candidates, _specifier, _expected in _filter_cases:
+    _crash += _semantic_check("{name}", {name}, [_candidates, _specifier], _expected, "list", "PEP 440 prerelease filter (" + _filter_label + ")")
 "#,
         name = func.name,
     )
@@ -2019,21 +2096,12 @@ fn python_cookie_value_quote_check(func: &FunctionInfo, params: &[&ParamInfo]) -
     }
 
     format!(
-        r#"try:
-    _cookie_value_label = "already quoted value round-trips"
-    _cookie_value_cases = [
-        ("already quoted value round-trips", '"two words"', '"two words"'),
-        ("unquoted value is trimmed", "  dark  ", "dark"),
-    ]
-    for _cookie_value_label, _cookie_value, _expected in _cookie_value_cases:
-        _actual = {name}(_cookie_value)
-        assert _actual == _expected, f"Cookie value quoting ({{_cookie_value_label}}): {{_actual!r}} != {{_expected!r}}"
-except Exception as _e:
-    if _is_crash(_e):
-        _crash += 1
-        _emit_finding("{name}", [_cookie_value], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", case_label=_cookie_value_label)
-        if _crash == 1:
-            print(f"  CRASH {name}(cookie value quote): {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
+        r#"_cookie_value_cases = [
+    ("already quoted value round-trips", '"two words"', '"two words"'),
+    ("unquoted value is trimmed", "  dark  ", "dark"),
+]
+for _cookie_value_label, _cookie_value, _expected in _cookie_value_cases:
+    _crash += _semantic_check("{name}", {name}, [_cookie_value], _expected, "identity", "Cookie value quoting (" + _cookie_value_label + ")")
 "#,
         name = func.name,
     )
@@ -2051,22 +2119,13 @@ fn python_cookie_header_quote_check(func: &FunctionInfo, params: &[&ParamInfo]) 
     }
 
     format!(
-        r#"try:
-    _cookie_header_label = "quoted value round-trips"
-    _cookie_header_cases = [
-        ("quoted value round-trips", {{"session": '"two words"'}}, 'session="two words"'),
-        ("separator value is quoted", {{"token": "a,b"}}, 'token="a,b"'),
-        ("none values are skipped", {{"theme": "dark", "empty": None}}, "theme=dark"),
-    ]
-    for _cookie_header_label, _cookies, _expected in _cookie_header_cases:
-        _actual = {name}(_copy.deepcopy(_cookies))
-        assert _actual == _expected, f"Cookie header quoting ({{_cookie_header_label}}): {{_actual!r}} != {{_expected!r}}"
-except Exception as _e:
-    if _is_crash(_e):
-        _crash += 1
-        _emit_finding("{name}", [_cookie_header], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", case_label=_cookie_header_label)
-        if _crash == 1:
-            print(f"  CRASH {name}(cookie header quote): {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
+        r#"_cookie_header_cases = [
+    ("quoted value round-trips", {{"session": '"two words"'}}, 'session="two words"'),
+    ("separator value is quoted", {{"token": "a,b"}}, 'token="a,b"'),
+    ("none values are skipped", {{"theme": "dark", "empty": None}}, "theme=dark"),
+]
+for _cookie_header_label, _cookies, _expected in _cookie_header_cases:
+    _crash += _semantic_check("{name}", {name}, [_cookies], _expected, "identity", "Cookie header quoting (" + _cookie_header_label + ")")
 "#,
         name = func.name,
     )
@@ -2077,7 +2136,7 @@ fn python_comparator_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String
         || has_declared_property(func, "antisymmetric")
     {
         format!(
-            "        _self_cmp = {name}(_args[0], _args[0])\n        assert _cmp_sign(_self_cmp) == 0, f\"Comparator self-compare should be zero: {{repr(_self_cmp)}}\"\n        _rev_cmp = {name}(_args[1], _args[0])\n        assert _cmp_sign(_result) == -_cmp_sign(_rev_cmp), f\"Comparator antisymmetry violated: {{repr(_result)}} vs {{repr(_rev_cmp)}}\"",
+            "        _self_cmp = {name}(_args[0], _args[0])\n        assert _cj_checked(\"comparator\", _cmp_sign(_self_cmp) == 0), f\"Comparator self-compare should be zero: {{repr(_self_cmp)}}\"\n        _rev_cmp = {name}(_args[1], _args[0])\n        assert _cj_checked(\"comparator\", _cmp_sign(_result) == -_cmp_sign(_rev_cmp)), f\"Comparator antisymmetry violated: {{repr(_result)}} vs {{repr(_rev_cmp)}}\"",
             name = func.name,
         )
     } else {
@@ -2093,7 +2152,7 @@ fn python_symmetry_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
     let t1 = params[1].type_annotation.as_deref().unwrap_or("");
     if t0 == t1 && !t0.is_empty() && has_declared_property(func, "symmetric") {
         format!(
-            "        _result_sym = {name}(_args[1], _args[0])\n        assert _nan_eq(_result, _result_sym), f\"Not symmetric: {{repr(_result)}} != {{repr(_result_sym)}}\"",
+            "        _result_sym = {name}(_args[1], _args[0])\n        assert _cj_checked(\"symmetric\", _nan_eq(_result, _result_sym)), f\"Not symmetric: {{repr(_result)}} != {{repr(_result_sym)}}\"",
             name = func.name,
         )
     } else {
@@ -2122,7 +2181,7 @@ fn python_metamorphic_checks(func: &FunctionInfo, params: &[&ParamInfo]) -> Stri
         && param_type == return_type
     {
         checks.push(format!(
-            "        _involution_result = _materialize_if_iterator({})\n        assert _nan_eq(_args[0], _involution_result), f\"Involution violated: {{repr(_args[0])}} -> {{repr(_result)}} -> {{repr(_involution_result)}}\"",
+            "        _involution_result = _materialize_if_iterator({})\n        assert _cj_checked(\"metamorphic\", _nan_eq(_args[0], _involution_result)), f\"Involution violated: {{repr(_args[0])}} -> {{repr(_result)}} -> {{repr(_involution_result)}}\"",
             invoke("_copy.deepcopy(_result)")
         ));
     }
@@ -2132,7 +2191,7 @@ fn python_metamorphic_checks(func: &FunctionInfo, params: &[&ParamInfo]) -> Stri
         && matches!(return_type, "int" | "float")
     {
         checks.push(format!(
-            "        _monotonic_input = _copy.deepcopy(_args[0]) + 1\n        _monotonic_result = _materialize_if_iterator({})\n        assert _monotonic_result >= _result, f\"Monotonicity violated: f({{repr(_args[0])}})={{repr(_result)}} > f({{repr(_monotonic_input)}})={{repr(_monotonic_result)}}\"",
+            "        _monotonic_input = _copy.deepcopy(_args[0]) + 1\n        _monotonic_result = _materialize_if_iterator({})\n        assert _cj_checked(\"metamorphic\", _monotonic_result >= _result), f\"Monotonicity violated: f({{repr(_args[0])}})={{repr(_result)}} > f({{repr(_monotonic_input)}})={{repr(_monotonic_result)}}\"",
             invoke("_monotonic_input")
         ));
     }
@@ -2143,7 +2202,7 @@ fn python_metamorphic_checks(func: &FunctionInfo, params: &[&ParamInfo]) -> Stri
         || param_type.starts_with("Tuple[");
     if has_declared_property(func, "order_invariant") && orderable_input {
         checks.push(format!(
-            "        _order_input = type(_args[0])(reversed(_copy.deepcopy(_args[0])))\n        _order_result = _materialize_if_iterator({})\n        assert _nan_eq(_result, _order_result), f\"Order invariance violated: {{repr(_result)}} != {{repr(_order_result)}}\"",
+            "        _order_input = type(_args[0])(reversed(_copy.deepcopy(_args[0])))\n        _order_result = _materialize_if_iterator({})\n        assert _cj_checked(\"metamorphic\", _nan_eq(_result, _order_result)), f\"Order invariance violated: {{repr(_result)}} != {{repr(_order_result)}}\"",
             invoke("_order_input")
         ));
     }
@@ -2480,7 +2539,7 @@ fn synthesize_typescript(
                 };
             }
             let property_row = format!(
-                "{{ args: [{}], predicateValid: false }}",
+                "{{ args: [{}], contractValid: false }}",
                 property_row.join(", ")
             );
             seed_rows = if seed_rows.is_empty() {

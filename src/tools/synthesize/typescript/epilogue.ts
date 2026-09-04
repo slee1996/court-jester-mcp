@@ -15,17 +15,22 @@ for (const [surfaceId, rows] of _cjCorpora.entries()) {
 }
 console.log("__COURT_JESTER_CORPUS_JSON__" + JSON.stringify(_cjCorpusPayload));
 _cjEvent("harness_completed", { completed_units: _cjCompletedUnits });
+function _cjExitAfterFlush(code: number): void {
+  // Empty writes queue behind existing output. Once both streams have drained,
+  // terminate even if target code left timers or other handles open.
+  process.stdout.write("", () => process.stderr.write("", () => process.exit(code)));
+}
 if (_fuzzResults.length > 0) {
   console.log("__COURT_JESTER_FINDINGS_JSON__");
   console.log(JSON.stringify(_fuzzResults));
 }
 if (_fuzzResults.length > 0) {
   console.error(`Fuzz testing failed: ${_fuzzTotalFailures} function(s) had failures`);
-  process.exit(1);
+  _cjExitAfterFlush(1);
 } else if (_fuzzTotalFailures > 0) {
   console.log(`Fuzz campaign completed with ${_fuzzTotalFailures} all-rejected function(s)`);
-  process.exit(0);
+  _cjExitAfterFlush(0);
 } else {
   console.log("All fuzz tests passed");
-  process.exit(0);
+  _cjExitAfterFlush(0);
 }

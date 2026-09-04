@@ -129,6 +129,6 @@ fn harness_event_parser_enforces_version_order_bounds_and_deduplication() {
         bootstrap
     );
     assert!(parse_harness_events(&duplicate).is_err());
-    let bad_version = input.replace("\"protocol_version\":1", "\"protocol_version\":2");
+    let bad_version = input.replace("\"protocol_version\":1", "\"protocol_version\":3");
     assert!(parse_harness_events(&bad_version).is_err());
 }

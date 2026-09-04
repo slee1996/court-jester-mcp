@@ -8,6 +8,56 @@ use court_jester::tools::domain::{build_verification_plan, classify_input, domai
 use court_jester::types::Language;
 
 #[test]
+fn python_bytes_literal_prefix_does_not_capture_type_names() {
+    use court_jester::types::DomainNode;
+    assert!(matches!(
+        domain_for_annotation(Some("bool"), &[], &[], &Language::Python),
+        DomainNode::Boolean
+    ));
+    assert!(!matches!(
+        domain_for_annotation(Some("bytes"), &[], &[], &Language::Python),
+        DomainNode::Literal(_)
+    ));
+    assert!(!matches!(
+        domain_for_annotation(Some("business_type"), &[], &[], &Language::Python),
+        DomainNode::Literal(_)
+    ));
+    for literal in ["b'abc'", "B\"abc\"", "br'abc'", "rb'abc'"] {
+        assert!(
+            matches!(
+                domain_for_annotation(Some(literal), &[], &[], &Language::Python),
+                DomainNode::Literal(_)
+            ),
+            "{literal}"
+        );
+    }
+}
+
+#[test]
+fn python_variadic_parameters_preserve_binding_and_annotations() {
+    for code in [
+        "def f(*values: int, mode: bool, **options: str): pass",
+        "def f(*values, mode: bool, **options): pass",
+    ] {
+        let analysis = analyze(code, &Language::Python);
+        let params = &analysis.functions[0].params;
+        assert_eq!(params.len(), 3);
+        assert_eq!(params[0].name, "values");
+        assert!(params[0].is_positional_variadic());
+        assert!(params[0].optional);
+        assert_eq!(params[1].name, "mode");
+        assert!(params[1].keyword_only);
+        assert!(!params[1].is_variadic());
+        assert_eq!(params[2].name, "options");
+        assert!(params[2].is_keyword_variadic());
+        if code.contains("values:") {
+            assert_eq!(params[0].type_annotation.as_deref(), Some("int"));
+            assert_eq!(params[2].type_annotation.as_deref(), Some("str"));
+        }
+    }
+}
+
+#[test]
 fn python_function_with_types() {
     let code = "def greet(name: str, times: int = 1) -> str:\n    return name * times";
     let r = analyze(code, &Language::Python);

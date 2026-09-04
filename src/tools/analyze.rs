@@ -1698,7 +1698,16 @@ fn extract_python_params(func: &tree_sitter::Node, source: &[u8]) -> Vec<ParamIn
                 }
             }
             "typed_parameter" => {
-                let name = child.named_child(0).map(|n| text(&n, source)).unwrap_or("");
+                let parameter = child.named_child(0);
+                let variadic = parameter.and_then(|node| match node.kind() {
+                    "list_splat_pattern" => Some(VariadicKind::Positional),
+                    "dictionary_splat_pattern" => Some(VariadicKind::Keyword),
+                    _ => None,
+                });
+                let name = parameter
+                    .map(|n| text(&n, source))
+                    .unwrap_or("")
+                    .trim_start_matches('*');
                 if name != "self" && name != "cls" {
                     let type_ann = child
                         .child_by_field_name("type")
@@ -1708,9 +1717,12 @@ fn extract_python_params(func: &tree_sitter::Node, source: &[u8]) -> Vec<ParamIn
                         type_annotation: type_ann,
                         default_value: None,
                         keyword_only,
-                        optional: false,
-                        variadic: None,
+                        optional: variadic.is_some(),
+                        variadic,
                     });
+                }
+                if variadic.is_some() {
+                    keyword_only = true;
                 }
             }
             "default_parameter" => {
@@ -1768,6 +1780,7 @@ fn extract_python_params(func: &tree_sitter::Node, source: &[u8]) -> Vec<ParamIn
                         VariadicKind::Positional
                     }),
                 });
+                keyword_only = true;
             }
             _ => {}
         }

@@ -1,0 +1,129 @@
+# Product execution plan
+
+Objective: make Court Jester a dependable changed-code counterexample and repair product, implementing the full product assessment accepted by the user. Owner: Codex, product lead. Baseline: `a75dfd1`.
+
+This is a single-owner Plan-mode execution record. The completed historical release manifest is not repurposed. Product work is not complete until the acceptance below has direct current-build evidence. External recruitment, spending, and publication require explicit coordination; local implementation continues independently.
+
+## Acceptance and dependencies
+
+| ID | Outcome | Dependencies | Required evidence | State |
+| --- | --- | --- | --- | --- |
+| P1 | Input validity, expected rejection, target exceptions, and infrastructure are distinguished without exception-name-only verdicts | None | Bug/control pairs across Python and TypeScript; valid-domain example fails; unknown evidence abstains; full regression suite | In progress |
+| P2 | Coverage and strength derive from actual invocation/check evidence, not annotations or textual summaries | P1 | Missing/partial/rejected/timeout/property and authoritative-test event regressions, report consistency | In progress |
+| P3 | Existing semantic, stateful, special-value, and smoke regressions repaired at their owning boundaries | P1–P2 | All maintained Rust, smoke, effectiveness, benchmark and release gates pass | In progress |
+| P4 | Repair → replay against repaired candidate → opt-in regression export is an ordinary CLI workflow | P1–P3 | Original reproduces; repaired candidate does not; exported test fails before and passes after; inferred expectations never silently authoritative | In progress |
+| P5 | Repository configuration makes daily verification predictable | P1–P3 | Validated config, documented precedence, explicit source/test mappings, budgets and suppressions; committed vs working-tree selection tests | Pending |
+| P6 | Project-aware doctor and onboarding support the real configured entrypoint | P5 | Missing/broken/ready project probes, copyable recovery actions, fresh-user scripted acceptance | Pending |
+| P7 | Advisory test-quality claims have a reproducible classification corpus | P3 | Reached survivor, killed, invalid, blocked, no-coverage and coupling cases in Python/TypeScript; current-build evidence bundle | Pending |
+| P8 | Every release is gated by current-build trustworthy evidence | P3–P7 | Main/PR workflow coverage, regression/replay checks, build-bound benchmark artifacts, cause-separated abstentions, latency and cost measurement | Pending |
+| P9 | Design-partner rollout validates useful repairs and tolerable friction | P4–P8 | Consent-based rollout materials and measured participant repair outcomes, setup friction and continued usage; actual recruitment coordinated with user | Pending |
+
+## Product decisions
+
+- Primary value: one credible counterexample that leads to a useful repair, preserved as a regression.
+- Keep Python/TypeScript scope; do not broaden framework support before core evidence is reliable.
+- A pass is scoped evidence, not sufficient authorization to ship; uncertainty remains inconclusive.
+- Test quality remains advisory, with distinct judged/unjudged outcomes and no score.
+- Do not weaken gates or rewrite expected outcomes to hide observed bugs.
+- Repair shared invariants, not fixture/package/error-string special cases.
+
+## Evidence ledger
+
+- Initial worktree clean at `a75dfd1`. Prior refactor record reports 565 Rust passes/11 baseline failures; revalidate against current source before repair claims.
+- Product examination directly observed the literal-domain fixture returning pass despite rejecting a planned valid `published` input; Python `_is_crash` ignores exceptions outside a fixed list. Focused effectiveness suite matched 6/9 expectations, including two stateful misses and one clean-control abstention.
+- Next: reproduce current failures and inspect shared planning, generated execution, and evidence boundaries before changing behavior.
+
+### Increment 1: preserve factory declaration context
+
+- Reproduced existing factory failures: three verifier failures (coverage, Python second-step crash, TypeScript second-step crash). Reproduced the independent `value_error_is_treated_as_a_crash` failure.
+- Repaired the analysis-to-synthesis selection boundary: retain nested declarations as context while still excluding them from standalone execution. Diff selection now retains unchanged nested declarations owned by selected functions.
+- Added regression coverage for selected versus excluded sibling factories with same-named/differently typed actions, and a runtime regression where only a factory signature changes. The latter failed before its owning diff-context repair and passes afterward.
+- `cargo test --locked --test synthesize_test -- --test-threads=1`: 114 passed, none failed.
+- `cargo test --locked --test verify_test -- --test-threads=1`: 177 passed, five failed. Factory coverage and TypeScript stateful detection now pass. Remaining failures: Python stateful `ValueError`, direct `ValueError`, rejected-only accounting, PEP440 context, cookie context.
+- `cargo clippy --locked --all-targets -- -D warnings`, canonical formatting, and `git diff --check`: pass. Commands use the pinned Rust toolchain on PATH.
+- P3 is partially advanced, not complete. Next critical path is P1/P2: preserve input validity and oracle provenance through generated invocations, avoid exception-name-only rejection, and derive verdict evidence from actual completed checks. Replay of stateful findings also needs full action sequences rather than only the final call (P4).
+
+### Increment 2: preserve admitted inputs and report rejection honestly
+
+- Added Python/TypeScript closed-domain bug/control regressions. Confirmed the buggy Python case returned pass before repair. The shared planner now retains admission evidence from closed parameter domains and supported validation guards; both generated runtimes consume it for the initial target invocation. Custom exception classes and target assertions are covered, not just `ValueError`.
+- Admission is not inherited by mutations. Unmodified TypeScript seed copies retain it; Python rechecks exact admitted rows. Shrinking contract exceptions is limited to admitted inputs, using exact bounded data comparison rather than permissive output-consistency equality.
+- All-rejected execution is now inconclusive even after normal process exit. Fixed diagnostic reduction so exit zero is not labeled nonzero exit; missing input evidence is `ambiguous_generated_input`, with repair action `add_contract_or_test`. Updated the older rejection regression's stage expectation from passed to inconclusive while retaining its no-target-finding/no-process-failure assertions.
+- README now directs a pass to ordinary repository tests/review, not directly to shipping. Report documentation describes admission scope and its limits.
+- `cargo test --locked --test verify_test --test synthesize_test --no-fail-fast -- --test-threads=1`: synthesis 114 passed; verifier 180 passed/four failed. Remaining verifier failures: PEP440 context, cookie context, Python stateful `ValueError`, and open-string-domain `ValueError`.
+- Release build and strict Clippy pass. Rebuilt CLI sample plus extended smoke passes. Focused current-build effectiveness run matches 9/9 cases (7 mutation cases and 2 controls); this small regression suite is not a general precision/recall claim.
+- P1/P2 remain incomplete: open-domain rejection needs an explicit expectation model rather than blanket exception-class promotion; generated lifecycle currently overstates input validity and uses entry/text/annotation approximations for coverage/strength. Those boundaries need actual invocation/check records, including stateful actions, before trust requirements are complete.
+- Follow-up discovered in semantic templates: some failure-reporting branches reference argument variables from other templates, causing harness errors instead of preserving semantic counterexamples. Repair the shared semantic invocation/reporting boundary, including actual arguments and expected observations, rather than adding fixture-name exceptions.
+
+### Increment 3: semantic findings survive reporting and replay
+
+- Consolidated six Python semantic campaigns (query serialization, three PEP440 probes, and two cookie probes) onto a shared invocation/observation/report helper. Case arguments are copied before invocation, expected observations are serialized under the existing string-valued oracle contract, and replay repeats the same projection/comparison. Reversed comparator cases retain reversed arguments.
+- Removed template-local failure reporting that referenced another template's variables. Reporting now preserves every failing case rather than abandoning the campaign at its first assertion.
+- Added an end-to-end matrix covering six campaigns × incorrect output / thrown exception / invalid return shape. All 18 cases persist a finding, reproduce it, and stop reproducing when the recorded observation is satisfied. The replacement is explicitly a test of the recorded observation, not a claim that a constant implementation satisfies the entire API. A mutating mapping target verifies original-argument preservation.
+- The invalid-return-shape challenge exposed lone-surrogate Python strings crashing UTF-8 JSON output. JSON-value/corpus admission now rejects non-UTF-8 data; diagnostic text escapes unsupported characters. Original Python expression representation is separate from optional JSON data.
+- Existing context tests now explicitly opt into strict inferred-oracle gating when asserting failure. Added default-advisory assertions to the replay matrix; no inferred finding was promoted to authoritative evidence. Existing query diagnostic wording and stable oracle-id checks remain covered.
+- `cargo test --locked --test verify_test --test synthesize_test --no-fail-fast -- --test-threads=1`: synthesis 114 passed; verifier 183 passed/two failed (`python_factory_action_sequence_finds_second_step_crash`, `value_error_is_treated_as_a_crash`).
+- Strict Clippy, release build, formatting, and sample/extended CLI smoke pass. P1/P2 and the broader P4 workflow remain incomplete; semantic replay is one repaired path, not completion of general property/stateful replay or regression export.
+
+### Increment 4: count completed invocation evidence
+
+- The lifecycle reducer now aggregates exact per-surface started/completed, valid, rejected, invalid, and unknown outcomes. An open invocation does not count as completed. Duplicate invocation identities are rejected; a regression reproduced duplicate-count acceptance before the repair. Textual `FUZZ` lines cannot manufacture invocation evidence.
+- Direct generated coverage requires both target entry and a matched valid completion. Rejected-only and interrupted calls are `reached_direct`, excluded from behavioral coverage. Updated summary, human output, count maps, and framework-blocker transitions to consume the new status consistently.
+- Execute `valid_invocations` now counts matched valid lifecycle completions, not functions with a textual success/crash summary. The separate `functions_with_valid_invocations` retains the old function-count presentation for compatibility.
+- A failing shutdown regression showed Python's exit handler inventing a completed rejection for `SystemExit`. The handler now leaves interrupted units open; the report preserves partial execution and gives no behavioral credit. This replaces the previous test's synthetic-completion expectation with an explicit no-fabricated-outcome invariant.
+- `cargo test --locked --test harness_evidence_test --test verify_test --test synthesize_test --no-fail-fast -- --test-threads=1`: 3 lifecycle tests and 114 synthesis tests pass; verifier 184 pass/two previously known Python exception-classification failures. Strict Clippy, release build, formatting, and sample/extended smoke pass. Full-suite verification is being reconciled separately below.
+- P2 remains incomplete: generated starts still overstate admission, factory/caller and authoritative-test evidence need stronger completion ownership, and `evaluated_oracles` still approximates checks using return annotations. This increment repairs invocation reduction and direct coverage only; it does not claim those other evidence sources are sound.
+- Final-source `cargo test --locked --tests --no-fail-fast -- --test-threads=1`: 579 passed/six failed in the restricted environment. Two Docker-shared temporary-directory tests both pass when rerun with `cargo test --locked --lib temporary_directories_use_docker_shared_home -- --test-threads=1` outside the filesystem sandbox. Four behavioral failures remain: two Python exception-classification verifier tests and the two TypeScript special-value replay tests in `issue24_test`. This is not a clean full-suite result. Rebuilt `python3 -m bench.fuzz_effectiveness --binary target/release/court-jester` matches all nine focused cases (seven mutations/two controls).
+
+### Increment 5: separate executable repro data from display text
+
+- Reproduced persisted replay failure for an admitted string longer than the display limit, including quotes and a backslash. Python replay returned inconclusive because the generated call contained a truncation marker and an unterminated string literal.
+- Python and TypeScript repro argument fields and direct replay calls now use full expression rendering, not diagnostic-preview truncation. Messages and human previews keep their existing bounds.
+- The new public-workflow regression verifies both languages: save a repair report, reproduce the original exception, replace the candidate with an implementation accepting the recorded input, and observe `not_reproduced`. Updated the older display truncation regression to require intact executable arguments while retaining its bounded-message assertion.
+- Re-examined the two `issue24_test` failures: one assumes uncoalesced argument retention despite bounded grouped finding samples; the other asserts a shrink-attempt count rather than behavioral preservation. Do not simply relax these assertions. They still need serialization-focused regressions plus actual special-value replay, independent of grouping and shrinking strategy. General property replay still invokes only the target without repeating the property check and remains required P4 work.
+- Final-source `cargo test --locked --test verify_test --test synthesize_test --no-fail-fast -- --test-threads=1`: synthesis 114 passed; verifier 185 passed/two known Python exception-classification failures. `cargo clippy --locked --all-targets -- -D warnings`, release build, formatting, diff whitespace check, and rebuilt sample/extended smoke pass. No clean full-product completion claim is made.
+
+### Increment 6: replay TypeScript property evaluation
+
+- A public persisted-report regression reproduced the missing-check defect: a declared boundedness finding did not reproduce against the unchanged buggy candidate because replay only called the target.
+- Extracted direct TypeScript checks into one evaluator used by the campaign, minimizer, and persisted replay. Replay preserves evaluator/helper definitions and the selected checks rather than guessing a check from the function name. Minimized cases must still fail in the same execution phase and with the same failure identity.
+- Expanded the before/after matrix to fourteen cases: boundedness, idempotency, involution, monotonicity, order invariance, nonnegativity, nonempty strings, permutation, clamping, symmetry, nullish-string leakage, sortedness, comparator rules, and return type. Every case reproduces before replacement and stops afterward. These replacements test the recorded property, not a complete application contract.
+- An adversarial follow-up reproduced false replay when the initial target threw an exception with copied property wording. Replay now requires reaching property evaluation; initial target errors cannot impersonate that phase. The same phase distinction guards minimization.
+- Larger structured reports exposed Node forced-exit output loss at the pipe boundary. Shutdown now drains both stdout and stderr before explicitly exiting; it does not wait on target-owned open timers. This retains the existing open-handles lifecycle test and the new large-report completion assertion.
+- Removed the comparator-message/minimization-specific stage workaround. Default policy still gates property violations; crash-only policy retains completed property-only findings without blocking. Updated that regression to the intended policy now that minimization/replay actually preserve the property, rather than depending on failed minimization.
+- Python property/stateful replay, explicit check-event accounting, and general special-value report/replay tests remain required work. No inferred finding was promoted to authoritative evidence by this change.
+- Final-source `cargo test --locked --test verify_test --test synthesize_test --no-fail-fast -- --test-threads=1`: synthesis 114 passed; verifier 186 passed/two known Python exception-classification failures. Strict Clippy, release build, formatting, whitespace checks, and rebuilt sample/extended smoke pass. The focused fourteen-case replay matrix completes successfully; the full product remains incomplete.
+
+### Increment 7: derive property strength from observed checks
+
+- Removed the return-annotation approximation for `evaluated_oracles`. The shared lifecycle reducer now accumulates passed/failed check records only from matching valid completed units. Unknown, invalid, rejected, interrupted, mismatched, and contradictory evidence cannot supply property strength.
+- Instrumented direct generated Python assertions and TypeScript property comparisons at evaluation, preserving branch guards and lazy evaluation. Exceptions before a comparison, absent/inapplicable checks, minimization, and replay do not increase campaign counts.
+- Added harness protocol 2 for `oracle_evaluated`; retained protocol-1 decoding without synthetic check credit. Regression coverage rejects mixed versions and version-1 check records while preserving legacy invocation evidence.
+- End-to-end bug/control tests tie report counts to lifecycle aggregates, including failed checks and no minimization inflation. An unannotated function receives property strength when a consistency check actually runs. A time-dependent function with an unsupported object return annotation receives runtime-smoke strength when no check runs. The pre-change release binary was verified to incorrectly report `evaluated_oracles: 1` and `property_checked` for that latter fixture.
+- Initial candidate fixtures for the annotation regression still ran consistency checks; inspected the generator, replaced them with explicitly time-dependent fixtures, and verified the real pre-change false-strength behavior. The final test does not assume that an absent type check implies absence of every other check.
+- Existing callable/set consistency runtime tests retain their behavioral assertions; their source-shape checks now include the evidence wrapper. P2 remains incomplete for input admission, factory/caller ownership, and authoritative-test completion. Semantic-template paths without matched check records do not receive property strength from annotations.
+- Final-source `cargo test --locked --tests --no-fail-fast -- --test-threads=1`: 586 passed/six failed under the filesystem restriction. Both Docker-shared temporary-directory tests pass on the outside-sandbox rerun; the four remaining behavioral failures are the two known Python exception-classification cases and both `issue24_test` cases. Lifecycle tests: six passed. Synthesis: 114 passed. Verifier: 188 passed/two failed. Strict Clippy, release build, formatting, sample/extended smoke, and all nine focused effectiveness cases pass.
+- Rebuilt CLI on the same time-dependent fixture reports `evaluated_oracles: 0`, retains 37 valid campaign invocations, and reports `runtime_smoke`, completing the before/after evidence for removal of annotation-based strength.
+
+### Increment 8: preserve special values through corpus reuse and replay
+
+- Reworked the two historical special-value regressions around their actual contracts. Serialization assertions now inspect generated lifecycle finding records before bounded report coalescing. Collision assertions retain distinct special/ordinary encodings and add persisted before/after replay instead of depending on a particular shrink-attempt count. Existing bounded grouping behavior remains covered separately.
+- Added four numeric persisted replay pairs and three special/ordinary-object collision pairs, including negative zero. Reproduced negative zero being serialized as JSON `0`; the encoder now uses a distinct `-0` number tag and escapes ordinary objects with that tag shape.
+- Traced saved corpus values being rendered as ordinary JSON objects instead of decoded transport values. Added a corpus-only recursive decoder; ordinary JSON domain inputs keep their semantics. Nested tags and escape envelopes are restored correctly, and computed object keys preserve `__proto__` as data.
+- Thirteen runtime corpus round-trip cases and two malformed/deep-row cases verify actual target observations. The initial observation helper introduced automatic seeds that obscured corpus order; moved logging into a private helper so the test observes the saved input directly. Re-enabled the old literal-rendering behavior as a bounded verification mutation and confirmed the corrected test fails (`{type: 'undefined'}` reached the target instead of `undefined`); restored the decoder before final gates.
+- Malformed cached rows and depth-bound violations are skipped individually so subsequent valid saved rows still execute. Plan input classification remains unknown for corpus-derived cases; decoding does not promote admission confidence. Generated runtime admission is still separate P1/P2 work.
+- Final-source `cargo test --locked --tests --no-fail-fast -- --test-threads=1`: 590 passed/four failed in the restricted environment. Both Docker-shared temporary-directory tests pass outside that restriction. Only the two known Python exception-classification behavioral failures remain; all four special-value tests pass. Strict Clippy, release build, formatting, whitespace check, sample/extended smoke, and all nine focused effectiveness cases pass. The temporary old-decoder verification mutation is removed.
+
+### Increment 9: retain uncertain Python exceptions and repair signature binding
+
+- Unclassified Python exceptions now remain low-confidence, unknown-input observations rather than disappearing as rejections. Strict inferred gating cannot promote them into proven failures; unresolved observations yield inconclusive with a contract/test action. A separately admitted failure still gates. Authoritative tests can resolve generated uncertainty without deleting the observations.
+- Factory action calls now emit matched invocation lifecycle outcomes and retain uncertain exception/action traces. Unknown completions do not supply valid-invocation or property-check credit. General stateful replay remains unfinished.
+- Finite rejection domains are derived independently from declared signatures, not attached to optional seed rows. The original variadic regression exposed typed `*args` being parsed as a fixed parameter and missing keyword-only transitions after untyped splats. Both forms now retain their correct binding metadata and annotations.
+- The adjacent domain challenge found any Python identifier beginning with `b` was classified as a byte literal, including `bool`. Byte-literal recognition now requires a quoted literal with a valid byte prefix; tests retain real byte literals and reject ordinary type identifiers as literals.
+- Early versions of the binding test did not exercise nonempty variadic arguments and did not kill the incorrect slot mapping. The final fixture adds an integer argument to exercise generated edge rows. After the byte-literal repair, temporarily restoring raw signature indices makes the public test incorrectly return pass; restoring bound fixed-slot indexing yields the required inconclusive observation. The verification-only mutation and debug output are removed.
+- Removed the remaining comparator-message/minimization exception from execute-stage status; selected gating policy owns the verdict consistently.
+- Final-source `cargo test --locked --tests --no-fail-fast -- --test-threads=1`: 598 passed, two filesystem-restricted Docker-shared temporary-directory tests failed. Both pass with `cargo test --locked --lib temporary_directories_use_docker_shared_home -- --test-threads=1` outside that restriction. No behavioral test failures remain in this run; the verifier has 193 passing cases, synthesis 114, lifecycle seven, and special values four. Strict Clippy, formatting, whitespace checks, release build, rebuilt sample/extended smoke, and all nine focused effectiveness cases pass.
+- P1 remains in progress: legacy exception-class rules, validation-guard admission, and cross-runtime consistency still need repair. P4 still requires Python property/stateful replay and regression export; P5–P9 remain required. A passing maintained suite is not a claim that these outstanding acceptance criteria are complete.
+
+## Completion audit
+
+All P1–P9 remain required. Local gates do not substitute for actual design-partner results or current-build paired repair evidence. Record missing authority/data explicitly; do not call the full product objective complete on implementation alone.

@@ -964,6 +964,7 @@ pub enum UnitOutcome {
     Rejected,
     TargetException,
     InvalidGeneratedInput,
+    UnclassifiedException,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -996,6 +997,12 @@ pub enum HarnessEvent {
     },
     Finding {
         finding: VerificationFinding,
+    },
+    OracleEvaluated {
+        surface_id: String,
+        iteration: usize,
+        oracle_id: String,
+        passed: bool,
     },
     UnitCompleted {
         surface_id: String,
@@ -1257,6 +1264,7 @@ pub enum InvocationPath {
 #[serde(rename_all = "snake_case")]
 pub enum FuzzFunctionStatus {
     CheckedDirect,
+    ReachedDirect,
     ReachedViaFactory,
     ReachedViaAuthoritativeTest,
     CheckedViaFactory,
