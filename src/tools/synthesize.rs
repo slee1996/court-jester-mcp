@@ -3432,42 +3432,19 @@ fn ts_feature_flag_override_check(
     if !is_boolean_like_ts_type(&flag_value_type) {
         return String::new();
     }
-    let fallback_call = ts_call_with_args(func, &["{}"]);
-    let null_flags_call = ts_call_with_args(func, &["{ flags: null }"]);
-    let null_flag_value_call = ts_call_with_args(func, &["{ flags: { [_flagKey]: null } }"]);
-    let explicit_false_call = ts_call_with_args(func, &["{ flags: { [_flagKey]: false } }"]);
-
+    let call = ts_call_with_args(func, &["_args[0]"]);
     format!(
         r#"  {{
-    let _flagLabel = "explicit false override";
-    try {{
-      const _flagKey = "{flag_key}";
-      const _flagFallback = Boolean({fallback_call});
-      const _nullFlags = Boolean({null_flags_call});
-      if (_nullFlags !== _flagFallback) {{
-        throw new Error(`Feature flag semantics (flags null): ${{JSON.stringify(_nullFlags)}} !== ${{JSON.stringify(_flagFallback)}}`);
-      }}
-      const _nullFlagValue = Boolean({null_flag_value_call});
-      if (_nullFlagValue !== _flagFallback) {{
-        throw new Error(`Feature flag semantics (flag null): ${{JSON.stringify(_nullFlagValue)}} !== ${{JSON.stringify(_flagFallback)}}`);
-      }}
-      const _explicitFalse = Boolean({explicit_false_call});
-      if (_explicitFalse !== false) {{
-        throw new Error(`Feature flag semantics (explicit false): ${{JSON.stringify(_explicitFalse)}} !== false`);
-      }}
-    }} catch (_e: unknown) {{
-      _emitFinding("{name}", [], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", null, "direct", _flagLabel);
-      console.log(`  CRASH {name}(feature flag semantics): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
-      _fuzzTotalFailures++;
-    }}
+    const _flagKey = "{flag_key}";
+    _semanticCase("{name}", (_args: unknown[]) => {call},
+      [[{{}}], [{{ flags: null }}]], true, "boolean_equal", "Feature flag semantics (flags null)", true);
+    _semanticCase("{name}", (_args: unknown[]) => {call},
+      [[{{}}], [{{ flags: {{ [_flagKey]: null }} }}]], true, "boolean_equal", "Feature flag semantics (flag null)", true);
+    _semanticCase("{name}", (_args: unknown[]) => {call},
+      [{{ flags: {{ [_flagKey]: false }} }}], false, "bool", "Feature flag semantics (explicit false)");
   }}
 "#,
         name = func.name,
-        flag_key = flag_key,
-        fallback_call = fallback_call,
-        null_flags_call = null_flags_call,
-        null_flag_value_call = null_flag_value_call,
-        explicit_false_call = explicit_false_call,
     )
 }
 

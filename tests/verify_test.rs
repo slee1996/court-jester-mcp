@@ -2,7 +2,6 @@ use court_jester::tools::verify::{
     final_verdict, load_persisted_report, parse_findings, repair_summary, replay_report,
     report_human_summary, report_json_value, verify, VerifyOptions,
 };
-use court_jester::types::MinimizationStatus;
 use court_jester::types::{
     CandidateProvenance, ComplexityMetric, CoverageGate, CoverageSummary, DiagnosticComponent,
     DiagnosticImpact, ExecuteGate, FailureDiagnostic, FailureDomain, FailureKind, FindingCategory,
@@ -13,6 +12,7 @@ use court_jester::types::{
     VerificationStrength, VerificationVerdict, DEFAULT_BUN_DOCKER_IMAGE,
     DEFAULT_PYTHON_DOCKER_IMAGE, DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
 };
+use court_jester::types::{MinimizationStatus, ReproKind};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -2318,6 +2318,148 @@ def beta_checkout_enabled(config: dict | None) -> bool:
     assert!(execute_stage.detail.as_ref().unwrap()["findings"]
         .as_array()
         .is_some_and(Vec::is_empty));
+}
+
+#[tokio::test]
+async fn feature_flag_semantic_replay_preserves_reference_calls() {
+    for (label, body) in [
+        (
+            "flags null",
+            "return config?.flags === null ? false : true;",
+        ),
+        (
+            "flag null",
+            "return config?.flags?.betaCheckout === null ? false : true;",
+        ),
+        (
+            "explicit false",
+            "return config?.flags?.betaCheckout || true;",
+        ),
+    ] {
+        let project = tempfile::tempdir().unwrap();
+        let source = project.path().join("target.ts");
+        let code = format!("type Config = {{ flags?: {{ betaCheckout?: boolean | null }} | null }} | null;\nexport function betaCheckoutEnabled(config: Config): boolean {{ {body} }}");
+        fs::write(&source, &code).unwrap();
+        let mut opts = default_opts(None);
+        opts.source_file = source.to_str();
+        opts.project_dir = project.path().to_str();
+        let report = verify(&code, &Language::TypeScript, opts).await;
+        let repair = repair_summary(&report, &Language::TypeScript);
+        let finding = repair
+            .findings
+            .iter()
+            .find(|finding| {
+                finding.oracle.kind == OracleKind::InferredSemantic
+                    && finding
+                        .message
+                        .contains(&format!("Feature flag semantics ({label})"))
+            })
+            .expect("feature flag observation");
+        let report_path = project.path().join("repair.json");
+        fs::write(&report_path, serde_json::to_vec(&repair).unwrap()).unwrap();
+        let replay = replay_report(
+            report_path.to_str().unwrap(),
+            &finding.id,
+            None,
+            RuntimeProfile::LocalTrusted,
+            DEFAULT_PYTHON_DOCKER_IMAGE,
+            DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            replay.outcome,
+            ReplayOutcome::Reproduced,
+            "{label}: {replay:?}"
+        );
+        if label != "explicit false" {
+            assert_eq!(finding.repro.kind, ReproKind::SemanticCase);
+            assert_eq!(finding.repro.arguments.len(), 2);
+        }
+        // The default changes too: replay must compare the new related values,
+        // not freeze the original true fallback as an application requirement.
+        fs::write(
+            &source,
+            "export function betaCheckoutEnabled(config: unknown): boolean { return false; }",
+        )
+        .unwrap();
+        let replay = replay_report(
+            report_path.to_str().unwrap(),
+            &finding.id,
+            None,
+            RuntimeProfile::LocalTrusted,
+            DEFAULT_PYTHON_DOCKER_IMAGE,
+            DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            replay.outcome,
+            ReplayOutcome::NotReproduced,
+            "{label}: {replay:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn semantic_sequence_replay_requires_the_same_failing_call() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("target.ts");
+    let prefix = "type Config = { flags?: { betaCheckout?: boolean | null } | null } | null;\nexport function betaCheckoutEnabled(config: Config): boolean";
+    let code = format!("{prefix} {{ if (config && Object.keys(config).length === 0) throw new Error('same failure'); return false; }}");
+    fs::write(&source, &code).unwrap();
+    let mut opts = default_opts(None);
+    opts.source_file = source.to_str();
+    opts.project_dir = project.path().to_str();
+    let report = verify(&code, &Language::TypeScript, opts).await;
+    let repair = repair_summary(&report, &Language::TypeScript);
+    let finding = repair
+        .findings
+        .iter()
+        .find(|finding| {
+            finding.oracle.kind == OracleKind::InferredSemantic
+                && finding.repro.case_label.as_deref()
+                    == Some("Feature flag semantics (flags null)")
+        })
+        .unwrap();
+    assert_eq!(finding.repro.kind, ReproKind::SemanticCase);
+    assert_eq!(
+        finding.repro.arguments[0].json_value,
+        Some(serde_json::json!([{}]))
+    );
+    assert_eq!(
+        finding.repro.arguments[1].json_value,
+        Some(serde_json::json!([{ "flags": null }]))
+    );
+    let report_path = project.path().join("repair.json");
+    fs::write(&report_path, serde_json::to_vec(&repair).unwrap()).unwrap();
+    let replay = replay_report(
+        report_path.to_str().unwrap(),
+        &finding.id,
+        None,
+        RuntimeProfile::LocalTrusted,
+        DEFAULT_PYTHON_DOCKER_IMAGE,
+        DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay.outcome, ReplayOutcome::Reproduced, "{replay:?}");
+    fs::write(&source, format!("{prefix} {{ if (config?.flags === null) throw new Error('same failure'); return false; }}")).unwrap();
+    let replay = replay_report(
+        report_path.to_str().unwrap(),
+        &finding.id,
+        None,
+        RuntimeProfile::LocalTrusted,
+        DEFAULT_PYTHON_DOCKER_IMAGE,
+        DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        replay.outcome,
+        ReplayOutcome::NotReproduced,
+        "moving the exception to another call is not the recorded observation: {replay:?}"
+    );
 }
 
 #[tokio::test]

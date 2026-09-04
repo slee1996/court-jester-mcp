@@ -1631,11 +1631,12 @@ fn typescript_feature_flag_resolver_gets_explicit_false_semantics() {
     assert_advisory_contract(&plan, "betaCheckoutEnabled", "feature_flag_override");
     assert_advisory_semantic_probe(&code, "betaCheckoutEnabled");
     assert!(
-        code.contains("const _explicitFalse = Boolean((betaCheckoutEnabled as Function)({ flags: { [_flagKey]: false } }))"),
+        code.contains("(betaCheckoutEnabled as Function)(_args[0])")
+            && code.contains("[{ flags: { [_flagKey]: false } }], false, \"bool\""),
         "feature-flag probe must preserve an explicit false override, got: {code}"
     );
     assert!(
-        code.contains("const _nullFlagValue = Boolean((betaCheckoutEnabled as Function)({ flags: { [_flagKey]: null } }))"),
+        code.contains("[[{}], [{ flags: { [_flagKey]: null } }]], true, \"boolean_equal\""),
         "feature-flag probe must compare a nested null with fallback behavior, got: {code}"
     );
 }
