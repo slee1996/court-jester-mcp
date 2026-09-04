@@ -1727,15 +1727,16 @@ export function defaults<T>(
         "defaults must retain runtime checking with object-shaped generated input, got: {code}"
     );
     assert!(
-        code.contains("(defaults as Function)({ a: null }, { a: 1 })"),
+        code.contains("(defaults as Function)(_args[0], _args[1])")
+            && code.contains("() => [{ a: null }, { a: 1 }], null"),
         "defaults probe must preserve null target values, got: {code}"
     );
     assert!(
-        code.contains("(defaults as Function)({ a: undefined }, { a: 1 })"),
+        code.contains("() => [{ a: undefined }, { a: 1 }], 1"),
         "defaults probe must fill undefined target values, got: {code}"
     );
     assert!(
-        code.contains("Object.create(_defaultsProto)"),
+        code.contains("globalThis.Object.create({ inherited: 7 })"),
         "defaults probe must exercise inherited enumerable keys, got: {code}"
     );
 }

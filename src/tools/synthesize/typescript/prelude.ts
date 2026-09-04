@@ -534,7 +534,7 @@ function _minimizeFailure(original: unknown[], reproduce: (candidate: unknown[])
   }
   return [reproduce(current) ? "preserved" : "failed", attempts, current];
 }
-function _emitFinding(name: string, args: unknown[], error: unknown, severity = "crash", oracleKind = "runtime_contract", provenance = "language_runtime", confidence = "high", category = "exception", minimize: [string, number, unknown[]] | null = null, invocationPath: unknown = "direct", caseLabel: string | null = null, sourceLine = 0, replaySnippet: string | null = null, inputClassification = "valid", expected: string | null = null, reproKind = "function_call"): void {
+function _emitFinding(name: string, args: unknown[], error: unknown, severity = "crash", oracleKind = "runtime_contract", provenance = "language_runtime", confidence = "high", category = "exception", minimize: [string, number, unknown[]] | null = null, invocationPath: unknown = "direct", caseLabel: string | null = null, sourceLine = 0, replaySnippet: string | null = null, inputClassification = "valid", expected: string | null = null, reproKind = "function_call", originalCase: Record<string, unknown> | null = null): void {
   const status = minimize?.[0] ?? "not_needed"; const attempts = minimize?.[1] ?? 0; const minimized = status === "not_needed" || status === "failed" ? null : _reproCase(minimize![2], caseLabel); const reproArgs = minimized ? minimize![2] : args;
   const expectation = { severity, oracle_kind: oracleKind, category }; const message = error instanceof Error ? error.message : String(error);
   const errorType = error instanceof Error ? error.constructor.name : "unknown";
@@ -543,11 +543,13 @@ function _emitFinding(name: string, args: unknown[], error: unknown, severity = 
     ? `_replayError instanceof Error && _replayError.constructor.name === ${JSON.stringify(errorType)}`
     : primitiveException ? `Object.is(_replayError, ${_reproExpression(error)})` : null;
   const snippet = replaySnippet ?? (replayMatch === null ? `throw new Error("Court Jester cannot replay this runtime-only thrown value");` : `// Court Jester replay snippet\nlet _reproduced = false;\ntry { (${name} as Function)(${reproArgs.map((value) => _reproExpression(value)).join(", ")}); } catch (_replayError) { _reproduced = ${replayMatch}; }\nconsole.log("__COURT_JESTER_REPLAY_JSON__");\nconsole.log(JSON.stringify({reproduced:_reproduced,severity:${JSON.stringify(severity)},oracle_kind:${JSON.stringify(oracleKind)},category:${JSON.stringify(category)}}));`);
-  const record: Record<string, unknown> = { id: _findingId(name), severity, confidence, category, location: { source_file: "", function: name, line: sourceLine, invocation_path: invocationPath }, oracle: { id: `${oracleKind}:${_sanitizeSymbol(name)}`, kind: oracleKind, provenance, confidence, expected, actual: message }, input_classification: inputClassification, repro: { kind: reproKind, function: name, arguments: _reproCase(args, caseLabel).arguments, case_label: caseLabel, snippet, command: null, expectation }, minimization: { status, attempts, original: _reproCase(args, caseLabel), minimized }, error_type: errorType, message, suppressed: false };
+  const recordedCase = originalCase ?? _reproCase(args, caseLabel);
+  const record: Record<string, unknown> = { id: _findingId(name), severity, confidence, category, location: { source_file: "", function: name, line: sourceLine, invocation_path: invocationPath }, oracle: { id: `${oracleKind}:${_sanitizeSymbol(name)}`, kind: oracleKind, provenance, confidence, expected, actual: message }, input_classification: inputClassification, repro: { kind: reproKind, function: name, arguments: recordedCase.arguments, case_label: caseLabel, snippet, command: null, expectation }, minimization: { status, attempts, original: recordedCase, minimized }, error_type: errorType, message, suppressed: false };
   _fuzzResults.push(record);
   _cjEvent("finding", { finding: record });
 }
-function _semanticProject(value: unknown, projection: string): unknown {
+function _semanticProject(value: unknown, projection: string | { property: string }): unknown {
+  if (typeof projection !== "string") return (value as Record<string, unknown>)[projection.property];
   switch (projection) {
     case "sign": return _cmpSign(value);
     case "bool": return Boolean(value);
@@ -560,7 +562,7 @@ function _semanticProject(value: unknown, projection: string): unknown {
     default: throw new Error(`Unknown semantic projection: ${projection}`);
   }
 }
-function _observeSemantic(invoke: (args: unknown[]) => unknown, args: unknown[], expected: unknown, projection: string, sequence: boolean) {
+function _observeSemantic(invoke: (args: unknown[]) => unknown, args: unknown[], expected: unknown, projection: string | { property: string }, sequence: boolean) {
   let actual: unknown;
   let error: unknown;
   let threw = false;
@@ -585,19 +587,22 @@ function _observeSemantic(invoke: (args: unknown[]) => unknown, args: unknown[],
   } catch (caught) { threw = true; error = caught; }
   return { actual, error, threw, phase, matched };
 }
-function _semanticCase(name: string, invoke: (args: unknown[]) => unknown, args: unknown[], expected: unknown, projection: string, label: string, sequence = false): void {
+function _semanticCase(name: string, invoke: (args: unknown[]) => unknown, args: unknown[] | (() => unknown[]), expected: unknown, projection: string | { property: string }, label: string, sequence = false): void {
   if (projection === "sign") expected = _cmpSign(expected);
-  const original = _cloneSeed(args);
-  const { actual, error, threw, phase, matched } = _observeSemantic(invoke, _cloneSeed(original), expected, projection, sequence);
+  const recipe = typeof args === "function" ? args : null;
+  const original = recipe ? recipe() : _cloneSeed(args as unknown[]);
+  const createSource = recipe ? recipe.toString() : `() => (${_reproExpression(original)})`;
+  const recordedCase = recipe ? { arguments: original.map((_, index) => ({ expression: `(${createSource})()[${index}]` })), input_text: label } : null;
+  const { actual, error, threw, phase, matched } = _observeSemantic(invoke, recipe ? recipe() : _cloneSeed(original), expected, projection, sequence);
   if (!threw && matched) return;
   const primitiveException = error === null || ["undefined", "string", "number", "boolean", "bigint"].includes(typeof error);
   const replayMatch = error instanceof Error
     ? `_error instanceof Error && _error.constructor.name === ${JSON.stringify(error.constructor.name)} && _error.message === ${JSON.stringify(error.message)}`
     : primitiveException ? `Object.is(_error, ${_reproExpression(error)})` : null;
   const snippet = replayMatch === null ? `throw new Error("Court Jester cannot replay this runtime-only thrown value");`
-    : `((_semanticInvoke) => {\n${_PropertyFailure.toString()}\n${_cmpSign.toString()}\n${_nanSafeEq.toString()}\n${_semanticProject.toString()}\n${_observeSemantic.toString()}\nconst _observation = _observeSemantic(_semanticInvoke, ${_reproExpression(original)}, ${_reproExpression(expected)}, ${JSON.stringify(projection)}, ${sequence});\nconst _error = _observation.error;\nconst _reproduced = ${threw ? `_observation.threw && _observation.phase === ${JSON.stringify(phase)} && (${replayMatch})` : "!_observation.threw && !_observation.matched"};\nconsole.log("__COURT_JESTER_REPLAY_JSON__");\nconsole.log(JSON.stringify({reproduced: _reproduced, severity: "property_violation", oracle_kind: "inferred_semantic", category: "property"}));\n})(${invoke.toString()});`;
+    : `((_semanticInvoke, _semanticArguments) => {\n${_PropertyFailure.toString()}\n${_cmpSign.toString()}\n${_nanSafeEq.toString()}\n${_semanticProject.toString()}\n${_observeSemantic.toString()}\nconst _observation = _observeSemantic(_semanticInvoke, _semanticArguments(), ${_reproExpression(expected)}, ${JSON.stringify(projection)}, ${sequence});\nconst _error = _observation.error;\nconst _reproduced = ${threw ? `_observation.threw && _observation.phase === ${JSON.stringify(phase)} && (${replayMatch})` : "!_observation.threw && !_observation.matched"};\nconsole.log("__COURT_JESTER_REPLAY_JSON__");\nconsole.log(JSON.stringify({reproduced: _reproduced, severity: "property_violation", oracle_kind: "inferred_semantic", category: "property"}));\n})(${invoke.toString()}, ${createSource});`;
   const failure = threw ? error : new Error(`${label}: ${JSON.stringify(actual)} !== ${JSON.stringify(expected)}`);
-  _emitFinding(name, original, failure, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", null, "direct", label, 0, snippet, "valid", JSON.stringify(expected), sequence ? "semantic_case" : "function_call");
+  _emitFinding(name, original, failure, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", null, "direct", label, 0, snippet, "valid", JSON.stringify(expected), sequence ? "semantic_case" : "function_call", recordedCase);
   console.log(`  CRASH ${name}(${label}): ${_clipText(failure instanceof Error ? failure.message : String(failure))}`);
   _fuzzTotalFailures++;
 }

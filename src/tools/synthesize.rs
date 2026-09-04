@@ -3370,41 +3370,18 @@ fn ts_defaults_semantic_check(
     if !is_ts_defaults_semantic_target(func, param_types, ret_type, type_defs) {
         return String::new();
     }
-    let null_target_call = ts_call_with_args(func, &["{ a: null }", "{ a: 1 }"]);
-    let undefined_target_call = ts_call_with_args(func, &["{ a: undefined }", "{ a: 1 }"]);
-    let inherited_target_call = ts_call_with_args(func, &["{}", "_defaultsSource"]);
-
+    let call = ts_call_with_args(func, &["_args[0]", "_args[1]"]);
     format!(
         r#"  {{
-    let _defaultsLabel = "null target preserves value";
-    try {{
-      const _nullTarget = {null_target_call} as Record<string, unknown>;
-      if (_nullTarget.a !== null) {{
-        throw new Error(`Defaults semantics (${{_defaultsLabel}}): ${{JSON.stringify(_nullTarget.a)}} !== null`);
-      }}
-      _defaultsLabel = "undefined target accepts source";
-      const _undefinedTarget = {undefined_target_call} as Record<string, unknown>;
-      if (_undefinedTarget.a !== 1) {{
-        throw new Error(`Defaults semantics (${{_defaultsLabel}}): ${{JSON.stringify(_undefinedTarget.a)}} !== 1`);
-      }}
-      _defaultsLabel = "inherited source keys";
-      const _defaultsProto = {{ inherited: 7 }};
-      const _defaultsSource = Object.create(_defaultsProto) as Record<string, unknown>;
-      const _inheritedTarget = {inherited_target_call} as Record<string, unknown>;
-      if (_inheritedTarget.inherited !== 7) {{
-        throw new Error(`Defaults semantics (${{_defaultsLabel}}): ${{JSON.stringify(_inheritedTarget.inherited)}} !== 7`);
-      }}
-    }} catch (_e: unknown) {{
-      _emitFinding("{name}", [], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", null, "direct", _defaultsLabel);
-      console.log(`  CRASH {name}(defaults semantics): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
-      _fuzzTotalFailures++;
-    }}
+    _semanticCase("{name}", (_args: unknown[]) => {call},
+      () => [{{ a: null }}, {{ a: 1 }}], null, {{ property: "a" }}, "Defaults semantics (null target preserves value)");
+    _semanticCase("{name}", (_args: unknown[]) => {call},
+      () => [{{ a: undefined }}, {{ a: 1 }}], 1, {{ property: "a" }}, "Defaults semantics (undefined target accepts source)");
+    _semanticCase("{name}", (_args: unknown[]) => {call},
+      () => [{{}}, globalThis.Object.create({{ inherited: 7 }})], 7, {{ property: "inherited" }}, "Defaults semantics (inherited source keys)");
   }}
 "#,
         name = func.name,
-        null_target_call = null_target_call,
-        undefined_target_call = undefined_target_call,
-        inherited_target_call = inherited_target_call,
     )
 }
 

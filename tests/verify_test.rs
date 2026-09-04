@@ -2837,6 +2837,150 @@ export function matchesCaret(version: string, range: string): boolean {
 }
 
 #[tokio::test]
+async fn defaults_semantic_replay_retains_inherited_input_behavior() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("target.ts");
+    let code = "export function defaults(target: Record<string, unknown>, source: Record<string, unknown>): Record<string, unknown> { for (const key of Object.keys(source)) if (target[key] === undefined) target[key] = source[key]; return target; }";
+    fs::write(&source, code).unwrap();
+    let mut opts = default_opts(None);
+    opts.source_file = source.to_str();
+    opts.project_dir = project.path().to_str();
+    let report = verify(code, &Language::TypeScript, opts).await;
+    let repair = repair_summary(&report, &Language::TypeScript);
+    let finding = repair
+        .findings
+        .iter()
+        .find(|finding| {
+            finding.oracle.kind == OracleKind::InferredSemantic
+                && finding.message.contains("inherited source keys")
+        })
+        .expect("inherited-property observation");
+    let report_path = project.path().join("repair.json");
+    fs::write(&report_path, serde_json::to_vec(&repair).unwrap()).unwrap();
+    let replay = replay_report(
+        report_path.to_str().unwrap(),
+        &finding.id,
+        None,
+        RuntimeProfile::LocalTrusted,
+        DEFAULT_PYTHON_DOCKER_IMAGE,
+        DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay.outcome, ReplayOutcome::Reproduced, "{replay:?}");
+    fs::write(
+        &source,
+        code.replace("Object.keys(source)", "Reflect.ownKeys(source)"),
+    )
+    .unwrap();
+    let replay = replay_report(
+        report_path.to_str().unwrap(),
+        &finding.id,
+        None,
+        RuntimeProfile::LocalTrusted,
+        DEFAULT_PYTHON_DOCKER_IMAGE,
+        DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        replay.outcome,
+        ReplayOutcome::Reproduced,
+        "another own-key implementation must still fail: {replay:?}"
+    );
+    fs::write(&source, "export function defaults(target: Record<string, unknown>, source: Record<string, unknown>): Record<string, unknown> { for (const key in source) if (target[key] === undefined) target[key] = source[key]; return target; }").unwrap();
+    let replay = replay_report(
+        report_path.to_str().unwrap(),
+        &finding.id,
+        None,
+        RuntimeProfile::LocalTrusted,
+        DEFAULT_PYTHON_DOCKER_IMAGE,
+        DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay.outcome, ReplayOutcome::NotReproduced, "{replay:?}");
+}
+
+#[tokio::test]
+async fn defaults_recipe_replay_preserves_null_undefined_and_prototype_mutation() {
+    for (label, body) in [
+        (
+            "null target preserves value",
+            "return Object.assign(target, source);",
+        ),
+        ("undefined target accepts source", "return target;"),
+        (
+            "inherited source keys",
+            "delete Object.getPrototypeOf(source).inherited; return target;",
+        ),
+    ] {
+        let project = tempfile::tempdir().unwrap();
+        let source = project.path().join("target.ts");
+        let signature = "export function defaults(target: Record<string, unknown>, source: Record<string, unknown>): Record<string, unknown>";
+        let code = format!("{signature} {{ {body} }}");
+        fs::write(&source, &code).unwrap();
+        let mut opts = default_opts(None);
+        opts.source_file = source.to_str();
+        opts.project_dir = project.path().to_str();
+        let report = verify(&code, &Language::TypeScript, opts).await;
+        let repair = repair_summary(&report, &Language::TypeScript);
+        let finding = repair
+            .findings
+            .iter()
+            .find(|finding| {
+                finding.oracle.kind == OracleKind::InferredSemantic
+                    && finding.repro.case_label.as_deref()
+                        == Some(&format!("Defaults semantics ({label})"))
+            })
+            .unwrap();
+        assert_eq!(finding.confidence, FindingConfidence::Low);
+        assert_eq!(finding.repro.arguments.len(), 2);
+        assert!(
+            finding
+                .repro
+                .arguments
+                .iter()
+                .all(|argument| argument.json_value.is_none()),
+            "runtime recipes must not supply lossy JSON seed data"
+        );
+        let report_path = project.path().join("repair.json");
+        fs::write(&report_path, serde_json::to_vec(&repair).unwrap()).unwrap();
+        let replay = replay_report(
+            report_path.to_str().unwrap(),
+            &finding.id,
+            None,
+            RuntimeProfile::LocalTrusted,
+            DEFAULT_PYTHON_DOCKER_IMAGE,
+            DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            replay.outcome,
+            ReplayOutcome::Reproduced,
+            "{label}: {replay:?}"
+        );
+        fs::write(&source, format!("{signature} {{ for (const key in source) if (target[key] === undefined) target[key] = source[key]; return target; }}")).unwrap();
+        let replay = replay_report(
+            report_path.to_str().unwrap(),
+            &finding.id,
+            None,
+            RuntimeProfile::LocalTrusted,
+            DEFAULT_PYTHON_DOCKER_IMAGE,
+            DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            replay.outcome,
+            ReplayOutcome::NotReproduced,
+            "{label}: {replay:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn typescript_defaults_null_override_and_inherited_keys_fail_verify() {
     let code = r#"
 const objectProto = Object.prototype;
