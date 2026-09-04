@@ -56,6 +56,183 @@ fn assert_log_contains_path(log: &str, prefix: &str, expected: &Path) {
 }
 
 #[tokio::test]
+async fn typescript_nullish_domains_do_not_discard_allowed_undefined_exceptions() {
+    for parameter in ["flag: boolean | undefined", "flag?: boolean"] {
+        let code = format!("export function choose({parameter}): boolean {{ if (flag === undefined) throw new Error('missing undefined branch'); return flag === true; }}");
+        let report = verify(&code, &Language::TypeScript, default_opts(None)).await;
+        assert_eq!(
+            report.verdict,
+            VerificationVerdict::Fail,
+            "{}",
+            report_human_summary(&report)
+        );
+        assert!(repair_summary(&report, &Language::TypeScript)
+            .findings
+            .iter()
+            .any(
+                |finding| finding.message.contains("missing undefined branch")
+                    && finding.input_classification == InputClassification::Valid
+            ));
+        let clean = format!("export function choose({parameter}): boolean {{ if (flag === null) throw new Error('null is outside this contract'); return flag === true; }}");
+        let clean_report = verify(&clean, &Language::TypeScript, default_opts(None)).await;
+        assert_eq!(
+            clean_report.verdict,
+            VerificationVerdict::Pass,
+            "{}",
+            report_human_summary(&clean_report)
+        );
+        assert_eq!(clean_report.summary.findings.total, 0);
+    }
+}
+
+#[tokio::test]
+async fn primitive_typescript_exception_observations_replay_exactly() {
+    for (thrown, different) in [
+        ("'plain failure'", "'different failure'"),
+        ("null", "undefined"),
+        ("undefined", "null"),
+        ("NaN", "Infinity"),
+        ("-0", "0"),
+        ("17", "18"),
+        ("17n", "18n"),
+        ("true", "false"),
+    ] {
+        let project = tempfile::tempdir().unwrap();
+        let source = project.path().join("target.ts");
+        let code = format!("export function inspect(value: string): string {{ throw {thrown}; }}");
+        fs::write(&source, &code).unwrap();
+        let mut opts = default_opts(None);
+        opts.source_file = source.to_str();
+        opts.project_dir = project.path().to_str();
+        let report = verify(&code, &Language::TypeScript, opts).await;
+        assert_eq!(report.verdict, VerificationVerdict::Inconclusive);
+        let repair = repair_summary(&report, &Language::TypeScript);
+        let finding = repair.findings.first().expect("retained exception");
+        let path = project.path().join("repair.json");
+        fs::write(&path, serde_json::to_vec(&repair).unwrap()).unwrap();
+        for expected in [ReplayOutcome::Reproduced, ReplayOutcome::NotReproduced] {
+            if expected == ReplayOutcome::NotReproduced {
+                fs::write(
+                    &source,
+                    format!(
+                        "export function inspect(value: string): string {{ throw {different}; }}"
+                    ),
+                )
+                .unwrap();
+            }
+            let replay = replay_report(
+                path.to_str().unwrap(),
+                &finding.id,
+                None,
+                RuntimeProfile::LocalTrusted,
+                DEFAULT_PYTHON_DOCKER_IMAGE,
+                DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+            )
+            .await
+            .unwrap();
+            assert_eq!(replay.outcome, expected, "{thrown}: {replay:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn runtime_only_typescript_thrown_values_abstain_from_replay() {
+    for thrown in [
+        "({reason: 'opaque'})",
+        "Symbol('opaque')",
+        "(() => undefined)",
+    ] {
+        let project = tempfile::tempdir().unwrap();
+        let source = project.path().join("target.ts");
+        let code = format!("export function inspect(value: string): string {{ throw {thrown}; }}");
+        fs::write(&source, &code).unwrap();
+        let mut opts = default_opts(None);
+        opts.source_file = source.to_str();
+        opts.project_dir = project.path().to_str();
+        let report = verify(&code, &Language::TypeScript, opts).await;
+        let repair = repair_summary(&report, &Language::TypeScript);
+        let finding = repair.findings.first().expect("retained exception");
+        assert_eq!(finding.input_classification, InputClassification::Unknown);
+        let path = project.path().join("repair.json");
+        fs::write(&path, serde_json::to_vec(&repair).unwrap()).unwrap();
+        let replay = replay_report(
+            path.to_str().unwrap(),
+            &finding.id,
+            None,
+            RuntimeProfile::LocalTrusted,
+            DEFAULT_PYTHON_DOCKER_IMAGE,
+            DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            replay.outcome,
+            ReplayOutcome::Inconclusive,
+            "{thrown}: {replay:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn target_errors_during_property_evaluation_do_not_impersonate_checks() {
+    let code = "let calls = 0;\n// court-jester-properties idempotent\nexport function echo(value: string): string { if (++calls % 2 === 0) throw new Error('Not idempotent: copied diagnostic'); return value; }";
+    let report = verify(code, &Language::TypeScript, default_opts(None)).await;
+    assert_eq!(
+        report.verdict,
+        VerificationVerdict::Inconclusive,
+        "{}",
+        report_human_summary(&report)
+    );
+    let repair = repair_summary(&report, &Language::TypeScript);
+    assert!(!repair.findings.is_empty());
+    assert!(repair
+        .findings
+        .iter()
+        .all(
+            |finding| finding.input_classification == InputClassification::Unknown
+                && finding.category == FindingCategory::Exception
+        ));
+    assert_eq!(report.summary.findings.gating, 0);
+}
+
+#[tokio::test]
+async fn unclassified_typescript_exceptions_remain_observations_under_strict_gating() {
+    for exception in [
+        "new Error('unspecified contract')",
+        "new RangeError('unspecified contract')",
+        "'plain thrown value'",
+        "new Error('Return type mismatch: copied diagnostic')",
+    ] {
+        let code =
+            format!("export function inspect(value: string): string {{ throw {exception}; }}");
+        let mut opts = default_opts(None);
+        opts.inferred_oracle_gate = InferredOracleGate::Fail;
+        let report = verify(&code, &Language::TypeScript, opts).await;
+        assert_eq!(
+            report.verdict,
+            VerificationVerdict::Inconclusive,
+            "{}",
+            report_human_summary(&report)
+        );
+        let repair = repair_summary(&report, &Language::TypeScript);
+        assert_eq!(repair.recommended_action, "add_contract_or_test");
+        assert!(
+            !repair.findings.is_empty(),
+            "exception observation was discarded: {exception}"
+        );
+        assert!(repair
+            .findings
+            .iter()
+            .all(|finding| finding.input_classification == InputClassification::Unknown));
+        assert_eq!(report.summary.findings.gating, 0);
+        assert!(report
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.kind != FailureKind::NonzeroExit));
+    }
+}
+
+#[tokio::test]
 async fn closed_keyword_domain_uses_bound_slot_after_variadic_arguments() {
     let code = "def label(value: int, *values: int, mode: bool) -> str:\n    if values:\n        raise ValueError('valid keyword, unknown state contract')\n    return str(mode)\n";
     let report = verify(code, &Language::Python, default_opts(None)).await;
@@ -257,6 +434,11 @@ async fn typescript_property_replay_repeats_the_recorded_check() {
         let replay = replay_report(path.to_str().unwrap(), &finding.id, None,
             RuntimeProfile::LocalTrusted, DEFAULT_PYTHON_DOCKER_IMAGE, DEFAULT_TYPESCRIPT_DOCKER_IMAGE).await.unwrap();
         assert_eq!(replay.outcome, ReplayOutcome::NotReproduced, "initial target exception must not impersonate the property: {replay:?}");
+        if directive.is_empty() {
+            fs::write(&source, format!("let calls = 0; class CopiedFailure extends Error {{}} Object.defineProperty(CopiedFailure, 'name', {{value: '_PropertyFailure'}}); export function {signature} {{ if (++calls % 2 === 0) throw new CopiedFailure({}); return value; }}", serde_json::to_string(&finding.message).unwrap())).unwrap();
+            let replay = replay_report(path.to_str().unwrap(), &finding.id, None, RuntimeProfile::LocalTrusted, DEFAULT_PYTHON_DOCKER_IMAGE, DEFAULT_TYPESCRIPT_DOCKER_IMAGE).await.unwrap();
+            assert_eq!(replay.outcome, ReplayOutcome::NotReproduced, "repeat-call exception with copied class name and wording is not a check: {replay:?}");
+        }
     }
 }
 
@@ -599,6 +781,19 @@ fn assert_advisory_inferred_finding(
         .find(|stage| stage.name == "execute")
         .expect("execute stage should be present");
     assert_eq!(execute_stage.status, StageStatus::Passed);
+    assert_inferred_finding_metadata(report, function, message_fragment);
+}
+
+fn assert_inferred_finding_metadata(
+    report: &VerificationReport,
+    function: &str,
+    message_fragment: &str,
+) {
+    let execute_stage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("execute stage");
     let detail = execute_stage
         .detail
         .as_ref()
@@ -608,7 +803,12 @@ fn assert_advisory_inferred_finding(
         .expect("typed findings should be present");
     let finding = findings
         .iter()
-        .find(|finding| finding["location"]["function"].as_str() == Some(function))
+        .find(|finding| {
+            finding["location"]["function"].as_str() == Some(function)
+                && finding["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains(message_fragment))
+        })
         .unwrap_or_else(|| panic!("expected advisory finding for {function}: {findings:#?}"));
     assert_eq!(finding["severity"].as_str(), Some("property_violation"));
     assert_eq!(finding["category"].as_str(), Some("property"));
@@ -2245,7 +2445,12 @@ export function parseQueryString(input: string, setting: QueryParserSetting): un
     opts.project_dir = Some(project_dir_string.as_str());
     let report = verify(code, &Language::TypeScript, opts).await;
 
-    assert_advisory_inferred_finding(
+    assert_eq!(report.verdict, VerificationVerdict::Inconclusive);
+    assert!(repair_summary(&report, &Language::TypeScript)
+        .findings
+        .iter()
+        .any(|finding| finding.input_classification == InputClassification::Unknown));
+    assert_inferred_finding_metadata(
         &report,
         "parseQueryString",
         "Query parse semantics (repeated scalar)",
@@ -4023,7 +4228,7 @@ export const useReorderer = create(() => ({
 }
 
 #[tokio::test]
-async fn typescript_malformed_uri_is_treated_as_reject_not_crash() {
+async fn typescript_malformed_uri_is_uncertain_without_an_input_contract() {
     let code = r#"
 export function decodeSegment(value: string): string {
     return decodeURIComponent(value);
@@ -4032,8 +4237,8 @@ export function decodeSegment(value: string): string {
     let report = verify(code, &Language::TypeScript, default_opts(None)).await;
 
     assert!(
-        report.verdict == VerificationVerdict::Pass,
-        "malformed URI inputs should be rejected, not fail verify: {:#?}",
+        report.verdict == VerificationVerdict::Inconclusive,
+        "the exception alone cannot establish whether the API promises to accept malformed input: {:#?}",
         report.stages
     );
 
@@ -4044,8 +4249,8 @@ export function decodeSegment(value: string): string {
         .expect("execute stage should be present");
     assert_eq!(
         exec_stage.status,
-        StageStatus::Passed,
-        "malformed URI rejection should leave execute passed: {:?}",
+        StageStatus::Inconclusive,
+        "unspecified URI admission should remain inconclusive: {:?}",
         exec_stage.message
     );
 
@@ -4056,9 +4261,13 @@ export function decodeSegment(value: string): string {
         .and_then(|findings| findings.as_array())
         .expect("schema-v3 execute detail should contain typed findings");
     assert!(
-        failures.is_empty(),
-        "malformed URI rejections should not be recorded as crashes: {failures:?}"
+        !failures.is_empty()
+            && failures
+                .iter()
+                .all(|finding| finding["input_classification"] == "unknown"),
+        "URI exceptions must be retained without claiming an admitted crash: {failures:?}"
     );
+    assert_eq!(report.summary.findings.gating, 0);
 }
 
 #[tokio::test]
@@ -8537,7 +8746,7 @@ export function dispatch(input: { kind: string; attempts: number }): string {
 }
 
 #[tokio::test]
-async fn generated_application_overflow_range_error_is_rejected() {
+async fn generated_application_overflow_range_error_is_uncertain() {
     let code = r#"
 export function reserve(quantity: number): number {
   if (!Number.isFinite(quantity)) {
@@ -8555,20 +8764,21 @@ export function reserve(quantity: number): number {
         .expect("execute stage");
     assert_eq!(
         execute.status,
-        StageStatus::Passed,
-        "an application validation RangeError on arbitrary generated rows must be rejected: {report:#?}"
+        StageStatus::Inconclusive,
+        "an application RangeError on arbitrary generated rows has no admission evidence: {report:#?}"
     );
     assert!(
         execute
             .detail
             .as_ref()
             .and_then(|detail| detail["findings"].as_array())
-            .is_none_or(|findings| findings.iter().all(|finding| {
-                finding["location"]["function"] != "reserve"
-                    || finding["message"] != "quantity overflow"
-            })),
-        "the validation RangeError must not become a finding: {report:#?}"
+            .is_some_and(|findings| !findings.is_empty()
+                && findings
+                    .iter()
+                    .all(|finding| { finding["input_classification"] == "unknown" })),
+        "the RangeError must remain an uncertain observation: {report:#?}"
     );
+    assert_eq!(report.summary.findings.gating, 0);
 }
 
 fn parse_cli_json(output: &std::process::Output, context: &str) -> serde_json::Value {

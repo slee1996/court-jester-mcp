@@ -63,6 +63,7 @@ pub fn synthesize_calls_for(
 struct PlannedSeedInput {
     arguments: PlannedArguments,
     contract_valid: bool,
+    supports_type_fallback: bool,
 }
 
 type PlannedSeedInputs = HashMap<String, Vec<PlannedSeedInput>>;
@@ -178,6 +179,18 @@ pub fn synthesize_plan_for_verification(
             .push(PlannedSeedInput {
                 arguments: input.arguments.clone(),
                 contract_valid,
+                supports_type_fallback: input.sources.iter().any(|source| {
+                    matches!(
+                        source.kind,
+                        DomainSourceKind::ObservedCall
+                            | DomainSourceKind::JsonFixture
+                            | DomainSourceKind::ValidationGuard
+                            | DomainSourceKind::SafeDependencySubstitute
+                            | DomainSourceKind::CoverageCorpus
+                            | DomainSourceKind::TypescriptEnum
+                            | DomainSourceKind::TypescriptConstTuple
+                    )
+                }),
             });
     }
     let safe_dependency_surfaces = safe_dependency_surfaces.into_iter().collect::<Vec<_>>();
@@ -500,7 +513,11 @@ fn factory_callable_coverage(
     coverage
 }
 
-fn python_rejection_domains(func: &FunctionInfo, analysis: &AnalysisResult) -> String {
+fn rejection_domains(
+    func: &FunctionInfo,
+    analysis: &AnalysisResult,
+    language: &Language,
+) -> String {
     let domains = func
         .params
         .iter()
@@ -515,17 +532,24 @@ fn python_rejection_domains(func: &FunctionInfo, analysis: &AnalysisResult) -> S
                 annotation.as_deref(),
                 &analysis.aliases,
                 &analysis.classes,
-                &Language::Python,
+                language,
             );
-            let values = finite_declared_literals(&domain, &Language::Python)?;
-            Some(format!(
-                "({index}, [{}])",
-                values
-                    .iter()
-                    .map(|value| value.expression.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ))
+            let mut values = finite_declared_literals(&domain, language)?;
+            if matches!(language, Language::TypeScript) && param.optional {
+                values.push(DomainLiteral {
+                    expression: "undefined".into(),
+                    json_value: None,
+                });
+            }
+            let values = values
+                .iter()
+                .map(|value| value.expression.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(match language {
+                Language::Python => format!("({index}, [{values}])"),
+                Language::TypeScript => format!("[{index}, [{values}]]"),
+            })
         })
         .collect::<Vec<_>>()
         .join(", ");
@@ -1089,7 +1113,7 @@ else:
             edge_case_setup = edge_case_setup,
             seed_rows = python_seed_rows_expr(func, seed_inputs, false),
             contract_rows = python_seed_rows_expr(func, seed_inputs, true),
-            rejection_domains = python_rejection_domains(func, analysis),
+            rejection_domains = rejection_domains(func, analysis, &Language::Python),
             type_check = python_type_check(ret_type, type_defs),
             line = func.line,
             idempotency_check = python_idempotency_check(func, &callable_params, type_defs),
@@ -2244,6 +2268,11 @@ fn synthesize_typescript(
         let has_seed_rows = seed_inputs
             .get(&func.name)
             .is_some_and(|rows| !rows.is_empty());
+        // Automatic domain/omission rows do not implement an unsupported type's
+        // generator. Only independently supplied seed evidence permits fallback.
+        let has_fallback_seeds = seed_inputs
+            .get(&func.name)
+            .is_some_and(|rows| rows.iter().any(|row| row.supports_type_fallback));
         if callable_params.is_empty()
             && positional_variadic.is_none()
             && !has_nested
@@ -2289,7 +2318,7 @@ fn synthesize_typescript(
             continue;
         }
 
-        if !has_seed_rows && !ts_params_are_fuzzable(func, &callable_params, type_defs) {
+        if !has_fallback_seeds && !ts_params_are_fuzzable(func, &callable_params, type_defs) {
             coverage.push(coverage_entry(
                 func,
                 FuzzFunctionStatus::SkippedUnsupportedType,
@@ -2326,7 +2355,7 @@ fn synthesize_typescript(
             .enumerate()
             .map(|(idx, p)| {
                 ts_generator_for_param(contract, p.type_annotation.as_deref(), type_defs, idx, func)
-                    .or_else(|| has_seed_rows.then(|| "_fuzzAny()".to_string()))
+                    .or_else(|| has_fallback_seeds.then(|| "_fuzzAny()".to_string()))
             })
             .collect::<Option<Vec<_>>>()
         else {
@@ -2553,7 +2582,7 @@ fn synthesize_typescript(
         code.push_str(&format!(
             r#"
 {{
-  const _fuzzOk = _fuzzOne("{name}", {iters}, () => [{gen_list}], (args: unknown[]) => {call_expr}, {typecheck}, [{param_type_list}], [{properties_list}], [{seed_rows}], [{default_omission_rows}], [{declared_properties_list}], {source_line});
+  _fuzzOne("{name}", {iters}, () => [{gen_list}], (args: unknown[]) => {call_expr}, {typecheck}, [{param_type_list}], [{properties_list}], [{seed_rows}], [{default_omission_rows}], [{declared_properties_list}], {source_line}, {rejection_domains});
 {query_string_semantic_check}
 {query_string_parser_semantic_check}
 {defaults_semantic_check}
@@ -2584,6 +2613,7 @@ fn synthesize_typescript(
             static_file_semantic_check = static_file_semantic_check,
             declared_properties_list = declared_properties_list,
             source_line = func.line,
+            rejection_domains = rejection_domains(func, analysis, &Language::TypeScript),
         ));
 
         any_synthesized = true;
@@ -3329,7 +3359,7 @@ fn ts_query_string_semantic_check(
     };
 
     format!(
-        r#"  if (_fuzzOk) {{
+        r#"  {{
     let _queryLabel = "{initial_label}";
     try {{
       const _queryCases: Array<[string, Record<string, unknown>, Array<[string, string]>]> = [
@@ -3377,7 +3407,7 @@ fn ts_query_string_parser_semantic_check(
     let query_call = ts_call_with_args(func, &query_args);
 
     format!(
-        r#"  if (_fuzzOk) {{
+        r#"  {{
     let _queryParseLabel = "repeated scalar";
     try {{
       const _queryParseCases: Array<[string, string, Record<string, unknown>]> = [
@@ -3417,7 +3447,7 @@ fn ts_defaults_semantic_check(
     let inherited_target_call = ts_call_with_args(func, &["{}", "_defaultsSource"]);
 
     format!(
-        r#"  if (_fuzzOk) {{
+        r#"  {{
     let _defaultsLabel = "null target preserves value";
     try {{
       const _nullTarget = {null_target_call} as Record<string, unknown>;
@@ -3480,7 +3510,7 @@ fn ts_feature_flag_override_check(
     let explicit_false_call = ts_call_with_args(func, &["{ flags: { [_flagKey]: false } }"]);
 
     format!(
-        r#"  if (_fuzzOk) {{
+        r#"  {{
     let _flagLabel = "explicit false override";
     try {{
       const _flagKey = "{flag_key}";
@@ -3535,7 +3565,7 @@ fn ts_semver_compare_semantic_check(
     let reverse_compare_call = ts_call_with_args(func, &["_right", "_left"]);
 
     format!(
-        r#"  if (_fuzzOk) {{
+        r#"  {{
     let _semverLabel = "prerelease ordering";
     try {{
       const _semverCases: Array<[string, string, number]> = [
@@ -3586,7 +3616,7 @@ fn ts_semver_caret_semantic_check(
     let caret_call = ts_call_with_args(func, &["_version", "_range"]);
 
     format!(
-        r#"  if (_fuzzOk) {{
+        r#"  {{
     let _caretLabel = "prerelease exclusion";
     try {{
       const _caretCases: Array<[string, string, boolean]> = [
@@ -3628,7 +3658,7 @@ fn ts_same_value_zero_semantic_check(
     let reverse_call = ts_call_with_args(func, &["_right", "_left"]);
 
     format!(
-        r#"  if (_fuzzOk) {{
+        r#"  {{
     let _sameValueLabel = "NaN equals NaN";
     try {{
       const _sameValueCases: Array<[string, unknown, unknown, boolean]> = [
@@ -3672,7 +3702,7 @@ fn ts_http_request_metadata_semantic_check(func: &FunctionInfo, param_types: &[S
     let request_call = ts_call_with_args(func, &["_request"]);
 
     format!(
-        r#"  if (_fuzzOk) {{
+        r#"  {{
     let _requestMetaLabel = "header lookup";
     try {{
       const _request: any = {{
@@ -3730,7 +3760,7 @@ fn ts_http_response_helpers_semantic_check(func: &FunctionInfo, param_types: &[S
     let response_call = ts_call_with_args(func, &args);
 
     format!(
-        r#"  if (_fuzzOk) {{
+        r#"  {{
     let _responseHelperLabel = "location encodes spaces";
     try {{
       const _request: any = {{
@@ -3779,7 +3809,7 @@ fn ts_http_static_file_semantic_check(func: &FunctionInfo, param_types: &[String
     let factory_call = ts_call_with_args(func, &["_staticRoot"]);
 
     format!(
-        r#"  if (_fuzzOk) {{
+        r#"  {{
     let _staticLabel = "serve known file";
     try {{
       const _staticRoot = `${{process.cwd()}}/static`;

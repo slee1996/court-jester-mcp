@@ -124,7 +124,8 @@ fn literal(raw: &str, language: &Language) -> Option<DomainLiteral> {
                     .map(serde_json::Value::Number)
             }),
     };
-    if json_value.is_none() && !bytes_literal {
+    let undefined_literal = matches!(language, Language::TypeScript) && text == "undefined";
+    if json_value.is_none() && !bytes_literal && !undefined_literal {
         return None;
     }
     let expression = if json_value.as_ref().is_some_and(serde_json::Value::is_null) {
@@ -160,10 +161,10 @@ fn nullable_or_union(
 ) -> DomainNode {
     let has_none = parts
         .iter()
-        .any(|part| matches!(part.trim(), "None" | "null" | "undefined"));
+        .any(|part| matches!(part.trim(), "None" | "null"));
     let non_null = parts
         .into_iter()
-        .filter(|part| !matches!(part.trim(), "None" | "null" | "undefined"))
+        .filter(|part| !matches!(part.trim(), "None" | "null"))
         .collect::<Vec<_>>();
     let mut nodes = non_null
         .iter()
@@ -1140,6 +1141,28 @@ fn value_matches_domain(value: &DomainLiteral, domain: &DomainNode) -> Option<bo
     if let DomainNode::Literal(values) = domain {
         return Some(values.iter().any(|candidate| same_value(candidate, value)));
     }
+    if let DomainNode::Union(items) = domain {
+        let mut unknown = false;
+        for item in items {
+            match value_matches_domain(value, item) {
+                Some(true) => return Some(true),
+                Some(false) => {}
+                None => unknown = true,
+            }
+        }
+        return (!unknown).then_some(false);
+    }
+    if let DomainNode::Nullable(inner) = domain {
+        return if value
+            .json_value
+            .as_ref()
+            .is_some_and(serde_json::Value::is_null)
+        {
+            Some(true)
+        } else {
+            value_matches_domain(value, inner)
+        };
+    }
     let Some(json) = &value.json_value else {
         return None;
     };
@@ -1152,19 +1175,8 @@ fn value_matches_domain(value: &DomainLiteral, domain: &DomainNode) -> Option<bo
         DomainNode::String => Some(json.is_string()),
         DomainNode::Bytes => Some(false),
         DomainNode::Literal(_) => unreachable!("literal domains are matched by expression above"),
-        DomainNode::Nullable(inner) => {
-            Some(json.is_null() || value_matches_domain(value, inner).unwrap_or(false))
-        }
-        DomainNode::Union(items) => {
-            let mut unknown = false;
-            for item in items {
-                match value_matches_domain(value, item) {
-                    Some(true) => return Some(true),
-                    Some(false) => {}
-                    None => unknown = true,
-                }
-            }
-            (!unknown).then_some(false)
+        DomainNode::Nullable(_) | DomainNode::Union(_) => {
+            unreachable!("composite domains are matched before JSON projection")
         }
         DomainNode::Array(_) | DomainNode::Tuple(_) | DomainNode::Set(_) => Some(json.is_array()),
         DomainNode::Map(_, _) | DomainNode::Object(_) => Some(json.is_object()),
@@ -1515,6 +1527,15 @@ pub fn build_verification_plan(
                     }
                 }
                 domain = DomainNode::Union(vec![DomainNode::Literal(values), domain]);
+            }
+            if matches!(language, Language::TypeScript) && param.optional && !param.is_variadic() {
+                domain = DomainNode::Union(vec![
+                    domain,
+                    DomainNode::Literal(vec![DomainLiteral {
+                        expression: "undefined".into(),
+                        json_value: None,
+                    }]),
+                ]);
             }
             if matches!(param.variadic, Some(VariadicKind::Positional))
                 && matches!(language, Language::TypeScript)

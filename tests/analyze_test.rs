@@ -8,6 +8,59 @@ use court_jester::tools::domain::{build_verification_plan, classify_input, domai
 use court_jester::types::Language;
 
 #[test]
+fn typescript_null_and_undefined_remain_distinct_in_planned_domains() {
+    use court_jester::types::InputClassification;
+    for (parameter, expected) in [
+        ("flag: boolean | null", vec!["null", "false", "true"]),
+        (
+            "flag: boolean | undefined",
+            vec!["false", "true", "undefined"],
+        ),
+        (
+            "flag: boolean | null | undefined",
+            vec!["null", "false", "true", "undefined"],
+        ),
+        ("flag?: boolean", vec!["false", "true", "undefined"]),
+    ] {
+        let code =
+            format!("export function choose({parameter}): boolean {{ return flag === true; }}");
+        let analysis = analyze(&code, &Language::TypeScript);
+        let plan = build_verification_plan(
+            &analysis.functions,
+            &analysis.classes,
+            &analysis.aliases,
+            &Language::TypeScript,
+            &[],
+            &[],
+            &[],
+        );
+        let values = plan
+            .inputs
+            .iter()
+            .flat_map(|input| &input.arguments.positional)
+            .map(|value| value.expression.as_str())
+            .collect::<Vec<_>>();
+        for value in &expected {
+            assert!(
+                values.contains(value),
+                "{parameter}: missing {value}: {values:?}"
+            );
+        }
+        assert!(
+            values.iter().all(|value| expected.contains(value)),
+            "{parameter}: unexpected nullish value: {values:?}"
+        );
+        assert!(
+            plan.inputs
+                .iter()
+                .all(|input| input.classification == InputClassification::Valid),
+            "{parameter}: {:?}",
+            plan.inputs
+        );
+    }
+}
+
+#[test]
 fn python_bytes_literal_prefix_does_not_capture_type_names() {
     use court_jester::types::DomainNode;
     assert!(matches!(

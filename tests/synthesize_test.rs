@@ -915,6 +915,9 @@ export function increment(value = 1n): bigint {
 export function decrement(value = -1n): bigint {
     return value - 1n;
 }
+export function incrementMixed(value = 1n, enabled = true): bigint {
+    return enabled ? value + 1n : value;
+}
 export function incrementNumber(value = 1): number {
     return value + 1;
 }
@@ -922,7 +925,7 @@ export function incrementNumber(value = 1): number {
         &Language::TypeScript,
     );
 
-    for function_name in ["increment", "decrement"] {
+    for function_name in ["increment", "decrement", "incrementMixed"] {
         let function = analysis
             .functions
             .iter()
@@ -935,7 +938,7 @@ export function incrementNumber(value = 1): number {
         );
     }
     let plan = synthesize_plan(&analysis, &Language::TypeScript);
-    for function_name in ["increment", "decrement"] {
+    for function_name in ["increment", "decrement", "incrementMixed"] {
         assert!(
             !plan.code.contains(&format!("_fuzzOne(\"{function_name}\"")),
             "unsupported bigint default must not receive generated number inputs"
