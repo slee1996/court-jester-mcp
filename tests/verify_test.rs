@@ -2,6 +2,7 @@ use court_jester::tools::verify::{
     final_verdict, load_persisted_report, parse_findings, repair_summary, replay_report,
     report_human_summary, report_json_value, verify, VerifyOptions,
 };
+use court_jester::types::MinimizationStatus;
 use court_jester::types::{
     CandidateProvenance, ComplexityMetric, CoverageGate, CoverageSummary, DiagnosticComponent,
     DiagnosticImpact, ExecuteGate, FailureDiagnostic, FailureDomain, FailureKind, FindingCategory,
@@ -53,6 +54,341 @@ fn assert_log_contains_path(log: &str, prefix: &str, expected: &Path) {
         }),
         "expected log to contain {prefix}{expected}, got:\n{log}"
     );
+}
+
+#[tokio::test]
+async fn python_property_replay_handles_containers_and_abstains_on_runtime_values() {
+    for (declarations, annotation, expected) in [
+        ("", "tuple[int, ...]", ReplayOutcome::Reproduced),
+        ("", "set[int]", ReplayOutcome::Reproduced),
+        (
+            "from typing import Callable\n",
+            "Callable[[int], int]",
+            ReplayOutcome::Inconclusive,
+        ),
+    ] {
+        let project = tempfile::tempdir().unwrap();
+        let source = project.path().join("target.py");
+        let code =
+            format!("{declarations}\ndef label(value: {annotation}) -> str:\n    return 42\n");
+        fs::write(&source, &code).unwrap();
+        let mut opts = default_opts(None);
+        opts.source_file = source.to_str();
+        opts.project_dir = project.path().to_str();
+        let report = verify(&code, &Language::Python, opts).await;
+        let repair = repair_summary(&report, &Language::Python);
+        let finding = repair
+            .findings
+            .iter()
+            .find(|finding| finding.severity == FindingSeverity::PropertyViolation)
+            .unwrap_or_else(|| panic!("{annotation}: {}", report_human_summary(&report)));
+        let path = project.path().join("repair.json");
+        fs::write(&path, serde_json::to_vec(&repair).unwrap()).unwrap();
+        let replay = replay_report(
+            path.to_str().unwrap(),
+            &finding.id,
+            None,
+            RuntimeProfile::LocalTrusted,
+            DEFAULT_PYTHON_DOCKER_IMAGE,
+            DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay.outcome, expected, "{annotation}: {replay:?}");
+        if expected == ReplayOutcome::Reproduced {
+            fs::write(
+                &source,
+                format!("def label(value: {annotation}) -> str:\n    return 'fixed'\n"),
+            )
+            .unwrap();
+            let replay = replay_report(
+                path.to_str().unwrap(),
+                &finding.id,
+                None,
+                RuntimeProfile::LocalTrusted,
+                DEFAULT_PYTHON_DOCKER_IMAGE,
+                DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                replay.outcome,
+                ReplayOutcome::NotReproduced,
+                "{annotation}: {replay:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn python_exception_replay_does_not_match_an_unrelated_same_class_error() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("target.py");
+    let code = "def inspect(*, value: str) -> str:\n    raise ValueError('original rejection')\n";
+    fs::write(&source, code).unwrap();
+    let mut opts = default_opts(None);
+    opts.source_file = source.to_str();
+    opts.project_dir = project.path().to_str();
+    let report = verify(code, &Language::Python, opts).await;
+    let repair = repair_summary(&report, &Language::Python);
+    let finding = repair.findings.first().expect("exception observation");
+    let path = project.path().join("repair.json");
+    fs::write(&path, serde_json::to_vec(&repair).unwrap()).unwrap();
+    for expected in [ReplayOutcome::Reproduced, ReplayOutcome::NotReproduced] {
+        if expected == ReplayOutcome::NotReproduced {
+            fs::write(
+                &source,
+                "def inspect(*, value: str) -> str:\n    raise ValueError('different rejection')\n",
+            )
+            .unwrap();
+        }
+        let replay = replay_report(
+            path.to_str().unwrap(),
+            &finding.id,
+            None,
+            RuntimeProfile::LocalTrusted,
+            DEFAULT_PYTHON_DOCKER_IMAGE,
+            DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay.outcome, expected, "{replay:?}");
+    }
+}
+
+#[tokio::test]
+async fn python_property_replay_preserves_nonfinite_inputs() {
+    for predicate in [
+        "math.isnan(value)",
+        "value == float('inf')",
+        "value == float('-inf')",
+    ] {
+        let project = tempfile::tempdir().unwrap();
+        let source = project.path().join("target.py");
+        let code = format!("import math\ndef metric(value: float) -> float:\n    if {predicate}:\n        return 'wrong'\n    return value\n");
+        fs::write(&source, &code).unwrap();
+        let mut opts = default_opts(None);
+        opts.source_file = source.to_str();
+        opts.project_dir = project.path().to_str();
+        let report = verify(&code, &Language::Python, opts).await;
+        let repair = repair_summary(&report, &Language::Python);
+        let finding = repair
+            .findings
+            .iter()
+            .find(|finding| finding.severity == FindingSeverity::PropertyViolation)
+            .expect("nonfinite property finding");
+        let path = project.path().join("repair.json");
+        fs::write(&path, serde_json::to_vec(&repair).unwrap()).unwrap();
+        for expected in [ReplayOutcome::Reproduced, ReplayOutcome::NotReproduced] {
+            if expected == ReplayOutcome::NotReproduced {
+                fs::write(
+                    &source,
+                    "def metric(value: float) -> float:\n    return value\n",
+                )
+                .unwrap();
+            }
+            let replay = replay_report(
+                path.to_str().unwrap(),
+                &finding.id,
+                None,
+                RuntimeProfile::LocalTrusted,
+                DEFAULT_PYTHON_DOCKER_IMAGE,
+                DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+            )
+            .await
+            .unwrap();
+            assert_eq!(replay.outcome, expected, "{predicate}: {replay:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn python_assertions_do_not_impersonate_declared_property_checks() {
+    for body in ["raise AssertionError('Not idempotent: copied diagnostic')", "global calls\n    calls += 1\n    if calls % 2 == 0:\n        raise AssertionError('Not idempotent: copied diagnostic')\n    return value"] {
+        let code = format!("calls = 0\n# court-jester-properties idempotent\ndef echo(value: str) -> str:\n    {body}\n");
+        let report = verify(&code, &Language::Python, default_opts(None)).await;
+        assert_eq!(report.verdict, VerificationVerdict::Inconclusive, "{}", report_human_summary(&report));
+        let repair = repair_summary(&report, &Language::Python);
+        assert!(!repair.findings.is_empty());
+        assert!(repair.findings.iter().all(|finding| finding.input_classification == InputClassification::Unknown && finding.category == FindingCategory::Exception));
+        assert_eq!(report.summary.findings.gating, 0);
+    }
+    let report = verify(
+        "# court-jester-properties bounded\ndef grow(value: str) -> str:\n    return 42\n",
+        &Language::Python,
+        default_opts(None),
+    )
+    .await;
+    let repair = repair_summary(&report, &Language::Python);
+    let finding = repair.findings.first().expect("return-type finding");
+    assert_eq!(finding.oracle.kind, OracleKind::GenericProperty);
+    assert_eq!(finding.confidence, FindingConfidence::Medium);
+}
+
+#[tokio::test]
+async fn python_property_replay_repeats_the_recorded_check() {
+    for (directive, signature, buggy, repaired) in [
+        (
+            "bounded",
+            "grow(value: str) -> str",
+            "return value + '!'",
+            "return value",
+        ),
+        (
+            "idempotent",
+            "normalize(value: str) -> str",
+            "return value + '!'",
+            "return value.strip()",
+        ),
+        (
+            "involution",
+            "flip(value: str) -> str",
+            "return value + '!'",
+            "return value[::-1]",
+        ),
+        (
+            "monotonic",
+            "scale(value: int) -> int",
+            "return -value",
+            "return value",
+        ),
+        (
+            "order_invariant",
+            "summarize(values: list[int]) -> int",
+            "return values[0] if values else 0",
+            "return len(values)",
+        ),
+        (
+            "nonneg",
+            "score(value: int) -> int",
+            "return -1",
+            "return abs(value)",
+        ),
+        (
+            "permutation",
+            "keep(values: list[int]) -> list[int]",
+            "return []",
+            "return list(values)",
+        ),
+        (
+            "clamped",
+            "clamp(value: int, lo: int, hi: int) -> int",
+            "return hi + 1",
+            "return min(max(value, min(lo, hi)), max(lo, hi))",
+        ),
+        (
+            "symmetric",
+            "combine(left: int, right: int) -> int",
+            "return left - right",
+            "return left + right",
+        ),
+        (
+            "no_nullish_string",
+            "serialize(value: dict[str, str | None]) -> str",
+            "return ','.join(map(str, value.values()))",
+            "return ','.join(str(item) for item in value.values() if item is not None)",
+        ),
+        (
+            "sorted",
+            "arrange(values: list[int]) -> list[int]",
+            "return list(reversed(values))",
+            "return sorted(values)",
+        ),
+        (
+            "antisymmetric",
+            "compare_values(left: int, right: int) -> int",
+            "return 1",
+            "return (left > right) - (left < right)",
+        ),
+        (
+            "palindrome",
+            "mirror(value: str) -> str",
+            "return 'ab'",
+            "return value + value[::-1]",
+        ),
+        ("", "label(value: str) -> str", "return 42", "return value"),
+    ] {
+        for keyword_only in [false, true] {
+            let signature = if keyword_only {
+                signature.replacen('(', "(*, ", 1)
+            } else {
+                signature.to_owned()
+            };
+            let project = tempfile::tempdir().unwrap();
+            let source = project.path().join("target.py");
+            let code =
+                format!("# court-jester-properties {directive}\ndef {signature}:\n    {buggy}\n");
+            fs::write(&source, &code).unwrap();
+            let mut opts = default_opts(None);
+            opts.source_file = source.to_str();
+            opts.project_dir = project.path().to_str();
+            let report = verify(&code, &Language::Python, opts).await;
+            let repair = repair_summary(&report, &Language::Python);
+            let finding = repair
+                .findings
+                .iter()
+                .find(|finding| finding.severity == FindingSeverity::PropertyViolation)
+                .unwrap_or_else(|| {
+                    panic!("missing {directive}: {}", report_human_summary(&report))
+                });
+            assert_eq!(finding.minimization.status, MinimizationStatus::Preserved);
+            let path = project.path().join("repair.json");
+            fs::write(&path, serde_json::to_vec(&repair).unwrap()).unwrap();
+            for expected in [ReplayOutcome::Reproduced, ReplayOutcome::NotReproduced] {
+                if expected == ReplayOutcome::NotReproduced {
+                    fs::write(&source, format!("def {signature}:\n    {repaired}\n")).unwrap();
+                }
+                let replay = replay_report(
+                    path.to_str().unwrap(),
+                    &finding.id,
+                    None,
+                    RuntimeProfile::LocalTrusted,
+                    DEFAULT_PYTHON_DOCKER_IMAGE,
+                    DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+                )
+                .await
+                .unwrap();
+                assert_eq!(replay.outcome, expected, "{directive}: {replay:?}");
+            }
+            fs::write(
+                &source,
+                format!(
+                    "def {signature}:\n    raise AssertionError({})\n",
+                    serde_json::to_string(&finding.message).unwrap()
+                ),
+            )
+            .unwrap();
+            let replay = replay_report(
+                path.to_str().unwrap(),
+                &finding.id,
+                None,
+                RuntimeProfile::LocalTrusted,
+                DEFAULT_PYTHON_DOCKER_IMAGE,
+                DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                replay.outcome,
+                ReplayOutcome::NotReproduced,
+                "target assertion must not impersonate {directive}: {replay:?}"
+            );
+            if directive == "idempotent" {
+                fs::write(&source, format!("calls = 0\nclass CopiedFailure(AssertionError):\n    oracle_id = 'idempotent'\nCopiedFailure.__name__ = '_PropertyFailure'\ndef {signature}:\n    global calls\n    calls += 1\n    if calls % 2 == 0:\n        raise CopiedFailure({})\n    return value\n", serde_json::to_string(&finding.message).unwrap())).unwrap();
+                let replay = replay_report(
+                    path.to_str().unwrap(),
+                    &finding.id,
+                    None,
+                    RuntimeProfile::LocalTrusted,
+                    DEFAULT_PYTHON_DOCKER_IMAGE,
+                    DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+                )
+                .await
+                .unwrap();
+                assert_eq!(replay.outcome, ReplayOutcome::NotReproduced, "repeat-call exception must not impersonate typed property evidence: {replay:?}");
+            }
+        }
+    }
 }
 
 #[tokio::test]

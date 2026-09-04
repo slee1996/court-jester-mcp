@@ -955,50 +955,6 @@ fn synthesize_python(
             call_args.push("**_call_args[-1]".into());
         }
         let call = call_args.join(", ");
-        let mut repeat_call_args: Vec<String> = callable_params
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                if p.keyword_only {
-                    format!("{}=_repeat_args[{}]", p.name, i)
-                } else {
-                    format!("_repeat_args[{}]", i)
-                }
-            })
-            .collect();
-        if positional_variadic.is_some() {
-            if keyword_variadic.is_some() {
-                repeat_call_args.push(format!("*_repeat_args[{}:-1]", rest_start));
-            } else {
-                repeat_call_args.push(format!("*_repeat_args[{}:]", rest_start));
-            }
-        }
-        if keyword_variadic.is_some() {
-            repeat_call_args.push("**_repeat_args[-1]".into());
-        }
-        let ret_type = func.return_type.as_deref().unwrap_or("");
-        let mut candidate_call_args: Vec<String> = callable_params
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                if p.keyword_only {
-                    format!("{}=_candidate[{}]", p.name, i)
-                } else {
-                    format!("_candidate[{}]", i)
-                }
-            })
-            .collect();
-        if positional_variadic.is_some() {
-            if keyword_variadic.is_some() {
-                candidate_call_args.push(format!("*_candidate[{}:-1]", rest_start));
-            } else {
-                candidate_call_args.push(format!("*_candidate[{}:]", rest_start));
-            }
-        }
-        if keyword_variadic.is_some() {
-            candidate_call_args.push("**_candidate[-1]".into());
-        }
-        let candidate_call = candidate_call_args.join(", ");
         let declared_properties = func
             .declared_properties
             .iter()
@@ -1023,8 +979,11 @@ fn synthesize_python(
             String::new()
         };
 
+        let evaluator_source = python_evaluator_source(func, &callable_params, type_defs, &call);
         code.push_str(&format!(
             r#"
+{evaluator_source_code}
+_cj_evaluator_source = {evaluator_source}
 _all_inputs = []
 _seed_rows = {seed_rows}
 _contract_rows = {contract_rows}
@@ -1045,28 +1004,17 @@ _crash = 0
 _unknown = 0
 for _iteration, _args in enumerate(_all_inputs):
     _contract_target_exception = False
+    _checking_properties = False
     try:
-        _call_args = _copy.deepcopy(_args)
         _target_entered("{name}:{line}", _iteration)
         try:
-            _result = _materialize_if_iterator({name}({call}))
+            _result = _cj_invoke(_args)
         except Exception:
             _contract_target_exception = any(_same_input(_args, _row) for _row in _contract_rows)
             raise
+        _checking_properties = True
+        _cj_evaluate(_args, _result)
         _pass += 1
-{type_check}
-{idempotency_check}
-{consistency_check}
-{boundedness_check}
-{nonneg_check}
-{clamped_check}
-{sorted_check}
-{permutation_check}
-{palindrome_check}
-{nullish_string_leak_check}
-{comparator_check}
-{symmetry_check}
-{metamorphic_checks}
         if _retain_corpus_input(_corpus, _behavior_signatures, _behavior_signature("passed", _result), _args) and len(_all_inputs) < _max_campaign_inputs:
             _all_inputs.append(_mutate_corpus_row(_args))
         _cj_unit_completed("{name}:{line}", _iteration, "passed")
@@ -1078,7 +1026,7 @@ for _iteration, _args in enumerate(_all_inputs):
         if _target_exception:
             _crash += 1
             _cj_unit_completed("{name}:{line}", _iteration, "target_exception")
-            _emit_error("{name}", _args, _e, [{declared_properties}], lambda _candidate: (not _contract_target_exception or any(_same_input(_candidate, _row) for _row in _contract_rows)) and _reproduces_python(_candidate, _e, lambda: {name}({candidate_call})), invocation_path="direct", target_exception=_contract_target_exception)
+            _emit_error("{name}", _args, _e, [{declared_properties}], lambda _candidate: (not _contract_target_exception or any(_same_input(_candidate, _row) for _row in _contract_rows)) and _reproduces_python(_candidate, _e, lambda: _cj_run(_candidate) if _checking_properties else _cj_invoke(_candidate)), invocation_path="direct", target_exception=_contract_target_exception, replay_source=_cj_evaluator_source, evaluate=_checking_properties)
             if _crash == 1:
                 print(f"  CRASH {name}({{_short_repr(_args)}}): {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
         elif _outside_contract:
@@ -1087,7 +1035,7 @@ for _iteration, _args in enumerate(_all_inputs):
         else:
             _unknown += 1
             _cj_unit_completed("{name}:{line}", _iteration, "unclassified_exception")
-            _emit_uncertain_exception("{name}", _args, _e)
+            _emit_uncertain_exception("{name}", _args, _e, replay_source=_cj_evaluator_source, evaluate=_checking_properties)
 _CJ_CORPORA["{name}:{line}"] = _corpus[:64]
 {query_string_semantic_check}
 {pep440_version_ordering_check}
@@ -1108,23 +1056,14 @@ else:
     print(f"FUZZ {name}: {{_pass}} passed, {{_reject}} rejected (of {{_total}})")
 "#,
             name = func.name,
-            candidate_call = candidate_call,
+            evaluator_source = serde_json::to_string(&evaluator_source).expect("Python evaluator source is serializable"),
+            evaluator_source_code = evaluator_source,
             declared_properties = declared_properties,
             edge_case_setup = edge_case_setup,
             seed_rows = python_seed_rows_expr(func, seed_inputs, false),
             contract_rows = python_seed_rows_expr(func, seed_inputs, true),
             rejection_domains = rejection_domains(func, analysis, &Language::Python),
-            type_check = python_type_check(ret_type, type_defs),
             line = func.line,
-            idempotency_check = python_idempotency_check(func, &callable_params, type_defs),
-            consistency_check = python_consistency_check(func, &repeat_call_args),
-            boundedness_check = python_boundedness_check(func, &callable_params),
-            nonneg_check = python_nonneg_check(func),
-            clamped_check = python_clamped_check(func, &callable_params),
-            sorted_check = python_sorted_check(func, &callable_params),
-            permutation_check = python_permutation_check(func, &callable_params),
-            palindrome_check = python_palindrome_check(func),
-            nullish_string_leak_check = python_nullish_string_leak_check(func, &callable_params),
             query_string_semantic_check =
                 python_query_string_semantic_check(func, &callable_params),
             pep440_version_ordering_check =
@@ -1135,9 +1074,6 @@ else:
                 python_pep440_filter_prerelease_check(func, &callable_params),
             cookie_value_quote_check = python_cookie_value_quote_check(func, &callable_params),
             cookie_header_quote_check = python_cookie_header_quote_check(func, &callable_params),
-            comparator_check = python_comparator_check(func, &callable_params),
-            symmetry_check = python_symmetry_check(func, &callable_params),
-            metamorphic_checks = python_metamorphic_checks(func, &callable_params),
         ));
 
         any_synthesized = true;
@@ -1406,6 +1342,36 @@ fn python_generator(type_ann: Option<&str>, type_defs: &HashMap<&str, &ClassInfo
     }
 }
 
+fn python_evaluator_source(
+    func: &FunctionInfo,
+    params: &[&ParamInfo],
+    type_defs: &HashMap<&str, &ClassInfo>,
+    call: &str,
+) -> String {
+    let body = [
+        python_type_check(func.return_type.as_deref().unwrap_or(""), type_defs),
+        python_idempotency_check(func, params, type_defs),
+        python_consistency_check(func),
+        python_boundedness_check(func, params),
+        python_nonneg_check(func),
+        python_clamped_check(func, params),
+        python_sorted_check(func, params),
+        python_permutation_check(func, params),
+        python_palindrome_check(func),
+        python_nullish_string_leak_check(func, params),
+        python_comparator_check(func, params),
+        python_symmetry_check(func, params),
+        python_metamorphic_checks(func, params),
+    ]
+    .join("\n");
+    let body = body
+        .lines()
+        .map(|line| line.strip_prefix("    ").unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("def _cj_invoke(_args):\n    _call_args = _copy.deepcopy(_args)\n    return _materialize_if_iterator({}({call}))\ndef _cj_evaluate(_args, _result):\n    pass\n{body}\ndef _cj_run(_args):\n    _result = _cj_invoke(_args)\n    _cj_evaluate(_args, _result)\n    return _result\n", func.name)
+}
+
 fn python_type_check(ret_type: &str, _type_defs: &HashMap<&str, &ClassInfo>) -> String {
     let check = match ret_type.trim() {
         "str" => "isinstance(_result, str)",
@@ -1417,7 +1383,7 @@ fn python_type_check(ret_type: &str, _type_defs: &HashMap<&str, &ClassInfo>) -> 
         t if t.contains("None") => return String::new(), // optional return, skip
         _ => return String::new(),
     };
-    format!("        assert _cj_checked(\"return_type\", {check}), f\"Return type mismatch: got {{type(_result).__name__}}\"")
+    format!("        _cj_require(\"return_type\", {check}, lambda: f\"Return type mismatch: got {{type(_result).__name__}}\")")
 }
 
 fn is_idempotent_candidate_type(type_name: &str) -> bool {
@@ -1896,26 +1862,19 @@ fn python_idempotency_check(
         && is_idempotent_candidate_type(param_type)
         && has_declared_property(func, "idempotent")
     {
-        format!(
-            "        _result2 = {name}(_result)\n        assert _cj_checked(\"idempotent\", _nan_eq(_result, _result2)), f\"Not idempotent: {{repr(_result)}} -> {{repr(_result2)}}\"",
-            name = func.name,
-        )
+        "        _result2 = _cj_invoke(_replace_args(_args, {0: _result}))\n        _cj_require(\"idempotent\", _nan_eq(_result, _result2), lambda: f\"Not idempotent: {repr(_result)} -> {repr(_result2)}\")".into()
     } else {
         String::new()
     }
 }
 
-fn python_consistency_check(func: &FunctionInfo, call_args: &[String]) -> String {
+fn python_consistency_check(func: &FunctionInfo) -> String {
     if !supports_implicit_consistency(func) {
         return String::new();
     }
 
     // Run the same input twice, verify same output
-    let call = call_args.join(", ");
-    format!(
-        "        _repeat_args = _copy.deepcopy(_args)\n        _result_b = _materialize_if_iterator({name}({call}))\n        assert _cj_checked(\"consistent\", _consistency_eq(_result, _result_b)), f\"Inconsistent: {{repr(_result)}} != {{repr(_result_b)}}\"",
-        name = func.name,
-    )
+    "        _result_b = _cj_invoke(_args)\n        _cj_require(\"consistent\", _consistency_eq(_result, _result_b), lambda: f\"Inconsistent: {repr(_result)} != {repr(_result_b)}\")".into()
 }
 
 fn python_boundedness_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
@@ -1928,7 +1887,7 @@ fn python_boundedness_check(func: &FunctionInfo, params: &[&ParamInfo]) -> Strin
         || (starts_with_any(param_type, &["list", "List"])
             && starts_with_any(ret_type, &["list", "List"]));
     if types_match && has_declared_property(func, "bounded") {
-        "        assert _cj_checked(\"bounded\", len(_result) <= len(_args[0])), f\"Not bounded: len({repr(_result)}) > len({repr(_args[0])})\"".to_string()
+        "        _cj_require(\"bounded\", len(_result) <= len(_args[0]), lambda: f\"Not bounded: len({repr(_result)}) > len({repr(_args[0])})\")".to_string()
     } else {
         String::new()
     }
@@ -1937,7 +1896,7 @@ fn python_boundedness_check(func: &FunctionInfo, params: &[&ParamInfo]) -> Strin
 fn python_nonneg_check(func: &FunctionInfo) -> String {
     let ret_type = func.return_type.as_deref().unwrap_or("");
     if (ret_type == "int" || ret_type == "float") && has_declared_property(func, "nonneg") {
-        "        assert _cj_checked(\"nonneg\", _result >= 0), f\"Non-negative violation: {repr(_result)} < 0\"".to_string()
+        "        _cj_require(\"nonneg\", _result >= 0, lambda: f\"Non-negative violation: {repr(_result)} < 0\")".to_string()
     } else {
         String::new()
     }
@@ -1948,7 +1907,7 @@ fn python_clamped_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
         return String::new();
     }
 
-    "        if all(isinstance(_value, (int, float)) and not isinstance(_value, bool) for _value in (_args[0], _args[1], _args[2], _result)):\n            _lo = min(_args[1], _args[2])\n            _hi = max(_args[1], _args[2])\n            assert _cj_checked(\"clamped\", _lo <= _result <= _hi), f\"Clamp bounds violated: {repr(_result)} not in [{repr(_lo)}, {repr(_hi)}]\"\n            if _lo <= _args[0] <= _hi:\n                assert _cj_checked(\"clamped\", _result == _args[0]), f\"Clamp passthrough violated: {repr(_result)} != {repr(_args[0])}\"".to_string()
+    "        if all(isinstance(_value, (int, float)) and not isinstance(_value, bool) for _value in (_args[0], _args[1], _args[2], _result)):\n            _lo = min(_args[1], _args[2])\n            _hi = max(_args[1], _args[2])\n            _cj_require(\"clamped\", _lo <= _result <= _hi, lambda: f\"Clamp bounds violated: {repr(_result)} not in [{repr(_lo)}, {repr(_hi)}]\")\n            if _lo <= _args[0] <= _hi:\n                _cj_require(\"clamped\", _result == _args[0], lambda: f\"Clamp passthrough violated: {repr(_result)} != {repr(_args[0])}\")".to_string()
 }
 
 fn python_sorted_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
@@ -1956,7 +1915,7 @@ fn python_sorted_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
         return String::new();
     }
 
-    "        if isinstance(_result, (list, tuple)) and all(isinstance(_item, (int, float, str)) for _item in _result):\n            assert _cj_checked(\"sorted\", list(_result) == sorted(_result)), f\"Not sorted: {repr(_result)}\"".to_string()
+    "        if isinstance(_result, (list, tuple)) and all(isinstance(_item, (int, float, str)) for _item in _result):\n            _cj_require(\"sorted\", list(_result) == sorted(_result), lambda: f\"Not sorted: {repr(_result)}\")".to_string()
 }
 
 fn python_permutation_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
@@ -1964,7 +1923,7 @@ fn python_permutation_check(func: &FunctionInfo, params: &[&ParamInfo]) -> Strin
         return String::new();
     }
 
-    "        if isinstance(_args[0], (list, tuple)) and isinstance(_result, (list, tuple)):\n            assert _cj_checked(\"permutation\", _multiset_counts(_result) == _multiset_counts(_args[0])), f\"Permutation violated: {repr(_result)} vs {repr(_args[0])}\"".to_string()
+    "        if isinstance(_args[0], (list, tuple)) and isinstance(_result, (list, tuple)):\n            _cj_require(\"permutation\", _multiset_counts(_result) == _multiset_counts(_args[0]), lambda: f\"Permutation violated: {repr(_result)} vs {repr(_args[0])}\")".to_string()
 }
 
 fn python_palindrome_check(func: &FunctionInfo) -> String {
@@ -1972,7 +1931,7 @@ fn python_palindrome_check(func: &FunctionInfo) -> String {
         return String::new();
     }
 
-    "        if isinstance(_result, (list, tuple, str)):\n            assert _cj_checked(\"palindrome\", _is_palindrome_sequence(_result)), f\"Palindrome violated: {repr(_result)}\"".to_string()
+    "        if isinstance(_result, (list, tuple, str)):\n            _cj_require(\"palindrome\", _is_palindrome_sequence(_result), lambda: f\"Palindrome violated: {repr(_result)}\")".to_string()
 }
 
 fn python_nullish_string_leak_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
@@ -1991,7 +1950,7 @@ fn python_nullish_string_leak_check(func: &FunctionInfo, params: &[&ParamInfo]) 
                 || infer_python_contract(func, params) == Some(ContractKind::MappingSerializer))
                 && likely_nullish_string_leak(&func.name)))
     {
-        "        if _contains_nullish(_args[0]):\n            assert _cj_checked(\"no_nullish_string\", not _string_leaks_nullish(_result)), f\"Nullish string leak: {repr(_result)}\"".to_string()
+        "        if _contains_nullish(_args[0]):\n            _cj_require(\"no_nullish_string\", not _string_leaks_nullish(_result), lambda: f\"Nullish string leak: {repr(_result)}\")".to_string()
     } else {
         String::new()
     }
@@ -2159,10 +2118,7 @@ fn python_comparator_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String
     if infer_python_contract(func, params) == Some(ContractKind::Comparator)
         || has_declared_property(func, "antisymmetric")
     {
-        format!(
-            "        _self_cmp = {name}(_args[0], _args[0])\n        assert _cj_checked(\"comparator\", _cmp_sign(_self_cmp) == 0), f\"Comparator self-compare should be zero: {{repr(_self_cmp)}}\"\n        _rev_cmp = {name}(_args[1], _args[0])\n        assert _cj_checked(\"comparator\", _cmp_sign(_result) == -_cmp_sign(_rev_cmp)), f\"Comparator antisymmetry violated: {{repr(_result)}} vs {{repr(_rev_cmp)}}\"",
-            name = func.name,
-        )
+        "        _self_cmp = _cj_invoke(_replace_args(_args, {1: _args[0]}))\n        _cj_require(\"comparator\", _cmp_sign(_self_cmp) == 0, lambda: f\"Comparator self-compare should be zero: {repr(_self_cmp)}\")\n        _rev_cmp = _cj_invoke(_replace_args(_args, {0: _args[1], 1: _args[0]}))\n        _cj_require(\"comparator\", _cmp_sign(_result) == -_cmp_sign(_rev_cmp), lambda: f\"Comparator antisymmetry violated: {repr(_result)} vs {repr(_rev_cmp)}\")".into()
     } else {
         String::new()
     }
@@ -2175,10 +2131,7 @@ fn python_symmetry_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
     let t0 = params[0].type_annotation.as_deref().unwrap_or("");
     let t1 = params[1].type_annotation.as_deref().unwrap_or("");
     if t0 == t1 && !t0.is_empty() && has_declared_property(func, "symmetric") {
-        format!(
-            "        _result_sym = {name}(_args[1], _args[0])\n        assert _cj_checked(\"symmetric\", _nan_eq(_result, _result_sym)), f\"Not symmetric: {{repr(_result)}} != {{repr(_result_sym)}}\"",
-            name = func.name,
-        )
+        "        _result_sym = _cj_invoke(_replace_args(_args, {0: _args[1], 1: _args[0]}))\n        _cj_require(\"symmetric\", _nan_eq(_result, _result_sym), lambda: f\"Not symmetric: {repr(_result)} != {repr(_result_sym)}\")".into()
     } else {
         String::new()
     }
@@ -2191,13 +2144,7 @@ fn python_metamorphic_checks(func: &FunctionInfo, params: &[&ParamInfo]) -> Stri
     let param = params[0];
     let param_type = param.type_annotation.as_deref().unwrap_or("").trim();
     let return_type = func.return_type.as_deref().unwrap_or("").trim();
-    let invoke = |argument: &str| {
-        if param.keyword_only {
-            format!("{}({}={argument})", func.name, param.name)
-        } else {
-            format!("{}({argument})", func.name)
-        }
-    };
+    let invoke = |argument: &str| format!("_cj_invoke(_replace_args(_args, {{0: {argument}}}))");
     let mut checks = Vec::new();
 
     if has_declared_property(func, "involution")
@@ -2205,7 +2152,7 @@ fn python_metamorphic_checks(func: &FunctionInfo, params: &[&ParamInfo]) -> Stri
         && param_type == return_type
     {
         checks.push(format!(
-            "        _involution_result = _materialize_if_iterator({})\n        assert _cj_checked(\"metamorphic\", _nan_eq(_args[0], _involution_result)), f\"Involution violated: {{repr(_args[0])}} -> {{repr(_result)}} -> {{repr(_involution_result)}}\"",
+            "        _involution_result = _materialize_if_iterator({})\n        _cj_require(\"involution\", _nan_eq(_args[0], _involution_result), lambda: f\"Involution violated: {{repr(_args[0])}} -> {{repr(_result)}} -> {{repr(_involution_result)}}\")",
             invoke("_copy.deepcopy(_result)")
         ));
     }
@@ -2215,7 +2162,7 @@ fn python_metamorphic_checks(func: &FunctionInfo, params: &[&ParamInfo]) -> Stri
         && matches!(return_type, "int" | "float")
     {
         checks.push(format!(
-            "        _monotonic_input = _copy.deepcopy(_args[0]) + 1\n        _monotonic_result = _materialize_if_iterator({})\n        assert _cj_checked(\"metamorphic\", _monotonic_result >= _result), f\"Monotonicity violated: f({{repr(_args[0])}})={{repr(_result)}} > f({{repr(_monotonic_input)}})={{repr(_monotonic_result)}}\"",
+            "        _monotonic_input = _copy.deepcopy(_args[0]) + 1\n        _monotonic_result = _materialize_if_iterator({})\n        _cj_require(\"monotonic\", _monotonic_result >= _result, lambda: f\"Monotonicity violated: f({{repr(_args[0])}})={{repr(_result)}} > f({{repr(_monotonic_input)}})={{repr(_monotonic_result)}}\")",
             invoke("_monotonic_input")
         ));
     }
@@ -2226,7 +2173,7 @@ fn python_metamorphic_checks(func: &FunctionInfo, params: &[&ParamInfo]) -> Stri
         || param_type.starts_with("Tuple[");
     if has_declared_property(func, "order_invariant") && orderable_input {
         checks.push(format!(
-            "        _order_input = type(_args[0])(reversed(_copy.deepcopy(_args[0])))\n        _order_result = _materialize_if_iterator({})\n        assert _cj_checked(\"metamorphic\", _nan_eq(_result, _order_result)), f\"Order invariance violated: {{repr(_result)}} != {{repr(_order_result)}}\"",
+            "        _order_input = type(_args[0])(reversed(_copy.deepcopy(_args[0])))\n        _order_result = _materialize_if_iterator({})\n        _cj_require(\"order_invariant\", _nan_eq(_result, _order_result), lambda: f\"Order invariance violated: {{repr(_result)}} != {{repr(_order_result)}}\")",
             invoke("_order_input")
         ));
     }

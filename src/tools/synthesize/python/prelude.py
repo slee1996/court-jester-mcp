@@ -49,6 +49,18 @@ def _cj_checked(oracle_id, condition):
         _cj_event("oracle_evaluated", {"surface_id": surface_id, "iteration": iteration,
                                       "oracle_id": oracle_id, "passed": passed})
     return passed
+class _PropertyFailure(AssertionError):
+    def __init__(self, oracle_id, message):
+        super().__init__(message)
+        self.oracle_id = oracle_id
+def _cj_require(oracle_id, condition, message):
+    if not _cj_checked(oracle_id, condition):
+        raise _PropertyFailure(oracle_id, message())
+def _replace_args(args, replacements):
+    result = list(args)
+    for index, value in replacements.items():
+        result[index] = value
+    return result
 def _cj_complete_harness():
     global _CJ_HARNESS_COMPLETED
     if _CJ_HARNESS_COMPLETED:
@@ -83,9 +95,36 @@ def _json_value(value):
         return value
     except Exception:
         return None
+def _repro_expression(value, ancestors=None):
+    if type(value) in (type(None), bool, int, str, bytes):
+        return repr(value)
+    if type(value) is float:
+        import math
+        if math.isnan(value): return "float('nan')"
+        if math.isinf(value): return "float('inf')" if value > 0 else "float('-inf')"
+        return repr(value)
+    if type(value) not in (list, tuple, dict, set, frozenset):
+        raise ValueError("runtime-only repro value")
+    ancestors = set() if ancestors is None else ancestors
+    if id(value) in ancestors or len(ancestors) >= 64:
+        raise ValueError("cyclic or deeply nested repro value")
+    ancestors.add(id(value))
+    try:
+        if type(value) is dict:
+            return "{" + ", ".join(_repro_expression(key, ancestors) + ": " + _repro_expression(item, ancestors) for key, item in value.items()) + "}"
+        items = ", ".join(_repro_expression(item, ancestors) for item in value)
+        if type(value) is list: return "[" + items + "]"
+        if type(value) is tuple: return "(" + items + ("," if len(value) == 1 else "") + ")"
+        if type(value) is frozenset: return "frozenset([" + items + "])"
+        return "{" + items + "}" if value else "set()"
+    finally:
+        ancestors.remove(id(value))
+def _repro_value_expression(value):
+    try: return _repro_expression(value)
+    except ValueError: return repr(value)
 def _repro_case(args, input_text=None):
     values = list(args) if isinstance(args, (list, tuple)) else [args]
-    return {"arguments": [{"expression": repr(value), "json_value": _json_value(value)} for value in values], "input_text": input_text}
+    return {"arguments": [{"expression": _repro_value_expression(value), "json_value": _json_value(value)} for value in values], "input_text": input_text}
 def _shrink_candidates(value):
     seen = set()
     def add(candidate):
@@ -162,7 +201,10 @@ def _minimize_failure(original, reproduce, severity, oracle_id):
     except Exception: preserved = False
     return ("preserved" if preserved else "failed", attempts, current if preserved else original)
 def _replay_snippet(function, args, severity, oracle_kind, category, error_type):
-    rendered = ", ".join(repr(value) for value in (args if isinstance(args, (list, tuple)) else [args]))
+    try:
+        rendered = ", ".join(_repro_expression(value) for value in (args if isinstance(args, (list, tuple)) else [args]))
+    except ValueError:
+        return "raise RuntimeError('Court Jester cannot replay this runtime-only input')"
     payload = {"severity": severity, "oracle_kind": oracle_kind, "category": category}
     return ("import json as _replay_json\n_reproduced = False\ntry:\n"
             + f"    {function}({rendered})\n"
@@ -170,6 +212,25 @@ def _replay_snippet(function, args, severity, oracle_kind, category, error_type)
             + f"    _reproduced = type(_replay_error).__name__ == {error_type!r}\n"
             + "print('__COURT_JESTER_REPLAY_JSON__')\n"
             + f"print(_replay_json.dumps(dict({payload!r}, reproduced=_reproduced), ensure_ascii=False))")
+def _invocation_replay_snippet(source, args, error, severity, oracle_kind, category, evaluate):
+    try: arguments = _repro_expression(args)
+    except ValueError: return "raise RuntimeError('Court Jester cannot replay this runtime-only input')"
+    import inspect as _inspect
+    helpers = (_PropertyFailure, _python_failure_identity, _cj_checked, _cj_require, _replace_args, _materialize_if_iterator,
+               _nan_eq, _callable_consistency_key, _consistency_eq, _contains_nullish,
+               _string_leaks_nullish, _cmp_sign, _multiset_counts, _is_palindrome_sequence)
+    definitions = "\n".join(_inspect.getsource(helper) for helper in helpers)
+    payload = {"severity": severity, "oracle_kind": oracle_kind, "category": category}
+    match = f"_python_failure_identity(_error) == {_python_failure_identity(error)!r}"
+    return ("import copy as _copy\nimport json as _json\n_CJ_ACTIVE_UNITS = set()\n"
+            + definitions + "\n" + source + f"\n_args = {arguments}\n_reproduced = False\n_checking = False\ntry:\n"
+            + "    _result = _cj_invoke(_args)\n"
+            + ("    _checking = True\n    _cj_evaluate(_args, _result)\n" if evaluate else "")
+            + "except Exception as _error:\n"
+            + f"    _reproduced = {evaluate!r} == _checking and ({match})\n"
+            + "print('__COURT_JESTER_REPLAY_JSON__')\n"
+            + f"print(_json.dumps(dict({payload!r}, reproduced=_reproduced), ensure_ascii=False))")
+
 def _emit_finding(function, args, error, severity="crash", oracle_kind="runtime_contract", oracle_provenance="language_runtime", confidence="high", category="exception", expected=None, actual=None, input_classification="valid", case_label=None, minimize=None, invocation_path="direct", replay_snippet=None):
     oracle_id = f"{oracle_kind}:{_sanitize_symbol(function)}"
     status, attempts, minimized = ("not_needed", 0, args) if minimize is None else minimize
@@ -225,34 +286,42 @@ def _is_generated_collaborator_mismatch(error):
     message = str(error)
     return "object has no attribute 'execute'" in message or 'object has no attribute "execute"' in message
 
-def _emit_uncertain_exception(function, args, error, case_label=None, invocation_path="direct"):
+def _emit_uncertain_exception(function, args, error, case_label=None, invocation_path="direct", replay_source=None, evaluate=False):
+    snippet = _invocation_replay_snippet(replay_source, args, error, "crash", "runtime_contract", "exception", evaluate) if replay_source is not None else None
     _emit_finding(function, args, error, "crash", "runtime_contract", "observed_call", "low", "exception",
-                  input_classification="unknown", case_label=case_label, invocation_path=invocation_path)
+                  input_classification="unknown", case_label=case_label, invocation_path=invocation_path, replay_snippet=snippet)
 
 def _outside_closed_domain(args, domains):
     return any(index < len(args) and not any(_same_input(args[index], value) for value in values)
                for index, values in domains)
 
-def _emit_error(function, args, error, properties=(), reproduce=None, case_label=None, invocation_path="direct", target_exception=False):
+def _emit_error(function, args, error, properties=(), reproduce=None, case_label=None, invocation_path="direct", target_exception=False, replay_source=None, evaluate=False):
     if _is_generated_collaborator_mismatch(error):
         return
 
-    is_property = isinstance(error, AssertionError) and not target_exception
-    declared = any(name in properties for name in ("idempotent", "bounded", "nonneg", "sorted", "permutation", "clamped", "symmetric", "no_nullish_string", "antisymmetric", "involution", "monotonic", "order_invariant"))
+    is_property = isinstance(error, _PropertyFailure)
+    declared = is_property and (error.oracle_id in properties or (error.oracle_id == "comparator" and "antisymmetric" in properties))
     kind = "declared_property" if is_property and declared else ("generic_property" if is_property else "runtime_contract")
     provenance = "source_directive" if kind == "declared_property" else "language_runtime"
     confidence = "authoritative" if kind == "declared_property" else ("medium" if is_property else "high")
     category = "property" if is_property else "exception"
     severity = "property_violation" if is_property else "crash"
     minimized = _minimize_failure(args, reproduce, severity, f"{kind}:{function}") if reproduce is not None else None
+    replay_args = minimized[2] if minimized is not None and minimized[0] == "preserved" else args
+    snippet = _invocation_replay_snippet(replay_source, replay_args, error, severity, kind, category, evaluate) if replay_source is not None else None
     _emit_finding(function, args, error, severity, kind, provenance, confidence, category,
                   actual=_clip_text(error), case_label=case_label, minimize=minimized,
-                  invocation_path=invocation_path)
+                  invocation_path=invocation_path, replay_snippet=snippet)
+def _python_failure_identity(error):
+    prefix = str(error).split(":", 1)[0]
+    if isinstance(error, _PropertyFailure):
+        return ("property", error.oracle_id, prefix)
+    return ("exception", type(error).__name__, prefix)
 def _reproduces_python(candidate, original, invoke):
     try:
         invoke()
     except Exception as error:
-        return type(error) is type(original) and _clip_text(error).split(":", 1)[0] == _clip_text(original).split(":", 1)[0]
+        return type(error) is type(original) and _python_failure_identity(error) == _python_failure_identity(original)
     return False
 
 # Crash detection: these exception types indicate real bugs, not validation.
@@ -280,7 +349,7 @@ def _is_crash(e):
     """Distinguish intentional validation errors from real bugs."""
     if isinstance(e, _CRASH_TYPES):
         return True
-    if isinstance(e, AssertionError):
+    if isinstance(e, _PropertyFailure):
         return True  # property violation (type check, idempotency, consistency)
     return False
 
@@ -489,7 +558,7 @@ def _cmp_sign(value):
         if value > 0:
             return 1
         return 0
-    raise AssertionError(f"Comparator returned non-numeric value: {repr(value)}")
+    _cj_require("comparator", False, lambda: f"Comparator returned non-numeric value: {repr(value)}")
 
 def _multiset_counts(values):
     counts = {}

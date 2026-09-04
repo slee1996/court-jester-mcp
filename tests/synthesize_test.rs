@@ -336,7 +336,7 @@ fn python_no_idempotency_from_name_only() {
     .code;
     assert_property_is_not_gating(&plan, "idempotent");
     assert!(
-        code.contains("_result_b = _materialize_if_iterator(clean_text(_repeat_args[0]))"),
+        code.contains("_result_b = _cj_invoke(_args)"),
         "clean_text should retain the runtime consistency oracle, got: {code}"
     );
     assert!(
@@ -351,7 +351,7 @@ fn python_callable_results_do_not_use_object_identity_for_consistency() {
     let analysis = analyze(source, &Language::Python);
     let code = synthesize_calls(&analysis, &Language::Python);
     assert!(
-        code.contains("assert _cj_checked(\"consistent\", _consistency_eq(_result, _result_b))"),
+        code.contains("_cj_require(\"consistent\", _consistency_eq(_result, _result_b),"),
         "implicit consistency must ignore fresh callable identity, got: {code}"
     );
 
@@ -376,7 +376,7 @@ fn python_set_members_use_semantic_consistency_equality() {
     let analysis = analyze(source, &Language::Python);
     let code = synthesize_calls(&analysis, &Language::Python);
     assert!(
-        code.contains("assert _cj_checked(\"consistent\", _consistency_eq(_result, _result_b))"),
+        code.contains("_cj_require(\"consistent\", _consistency_eq(_result, _result_b),"),
         "set results must retain semantic consistency checking, got: {code}"
     );
 
@@ -697,7 +697,7 @@ fn python_no_idempotency_for_different_types() {
     .code;
     assert_property_is_not_gating(&plan, "idempotent");
     assert!(
-        code.contains("_result_b = _materialize_if_iterator(normalize_text(_repeat_args[0]))"),
+        code.contains("_result_b = _cj_invoke(_args)"),
         "str→int should retain runtime consistency checking, got: {code}"
     );
     assert!(
@@ -723,12 +723,12 @@ fn python_keyword_only_in_fuzz() {
         "initial invocation must bind mode by keyword, got: {code}"
     );
     assert!(
-        code.contains("process(_repeat_args[0], mode=_repeat_args[1])"),
+        code.contains("_result_b = _cj_invoke(_args)"),
         "consistency invocation must preserve keyword-only binding, got: {code}"
     );
     assert!(
-        code.contains("process(_candidate[0], mode=_candidate[1])"),
-        "minimized repro invocation must preserve keyword-only binding, got: {code}"
+        code.contains("_cj_run(_candidate) if _checking_properties else _cj_invoke(_candidate)"),
+        "minimized repro must reuse the bound invocation and evaluator, got: {code}"
     );
 }
 
@@ -2338,7 +2338,7 @@ fn python_symmetry_requires_declared_property() {
         "declared symmetric function should check symmetry, got: {code}"
     );
     assert!(
-        code.contains("_args[1], _args[0]"),
+        code.contains("_replace_args(_args, {0: _args[1], 1: _args[0]})"),
         "should swap args for symmetry check, got: {code}"
     );
 }
@@ -2461,7 +2461,7 @@ fn python_no_boundedness_for_non_matching_name() {
     .code;
     assert_property_is_not_gating(&plan, "bounded");
     assert!(
-        code.contains("_result_b = _materialize_if_iterator(transform(_repeat_args[0]))"),
+        code.contains("_result_b = _cj_invoke(_args)"),
         "transform should retain runtime consistency checking, got: {code}"
     );
     assert!(
