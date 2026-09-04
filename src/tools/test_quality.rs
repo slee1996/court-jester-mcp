@@ -344,7 +344,10 @@ fn collect_mutations(
                     if !original.trim().is_empty() {
                         let replacement = match language {
                             Language::Python => format!("not ({original})"),
-                            Language::TypeScript => format!("!({original})"),
+                            Language::TypeScript if original.trim().starts_with('(') => {
+                                format!("(!{original})")
+                            }
+                            Language::TypeScript => format!("(!({original}))"),
                         };
                         candidates.push(MutationCandidate {
                             id: String::new(),
@@ -426,6 +429,12 @@ pub fn plan_mutations(
         left.start_byte == right.start_byte
             && left.end_byte == right.end_byte
             && left.replacement == right.replacement
+    });
+    candidates.retain(|candidate| {
+        apply_mutation(code, candidate)
+            .ok()
+            .and_then(|mutated| parser.parse(&mutated, None))
+            .is_some_and(|tree| !tree.root_node().has_error())
     });
 
     let mut by_surface = BTreeMap::<String, VecDeque<MutationCandidate>>::new();
@@ -1622,6 +1631,31 @@ mod tests {
         assert_eq!(planned[0].operator, MutationOperator::BooleanLiteral);
         assert_eq!(planned[0].original, "true");
         assert!(planned[0].column > code.find("return").unwrap());
+    }
+
+    #[test]
+    fn typescript_parenthesized_condition_negation_remains_parseable() {
+        let code =
+            "export function normalize(code?: string) { if (!code) return 'unknown'; return code; }";
+        let normalize = function("normalize", 1, 1);
+        let planned = plan_mutations(
+            code,
+            Language::TypeScript,
+            SourceMode::TypeScript,
+            &[&normalize],
+            usize::MAX,
+        )
+        .unwrap();
+        let candidate = planned
+            .iter()
+            .find(|candidate| candidate.operator == MutationOperator::ConditionNegation)
+            .expect("condition-negation candidate");
+        assert_eq!(candidate.original, "(!code)");
+        assert_eq!(candidate.replacement, "(!(!code))");
+        let mutated = apply_mutation(code, candidate).unwrap();
+        let mut parser = parser_for_mode(SourceMode::TypeScript).unwrap();
+        let tree = parser.parse(&mutated, None).unwrap();
+        assert!(!tree.root_node().has_error(), "{mutated}");
     }
 
     #[test]

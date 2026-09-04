@@ -1,15 +1,16 @@
 use court_jester::tools::verify::{
-    final_verdict, load_persisted_report, parse_findings, replay_report, report_human_summary,
-    report_json_value, verify, VerifyOptions,
+    final_verdict, load_persisted_report, parse_findings, repair_summary, replay_report,
+    report_human_summary, report_json_value, verify, VerifyOptions,
 };
 use court_jester::types::{
-    ComplexityMetric, CoverageGate, CoverageSummary, DiagnosticComponent, DiagnosticImpact,
-    ExecuteGate, FailureDiagnostic, FailureDomain, FailureKind, FindingCategory, FindingConfidence,
-    FindingSeverity, FindingsSummary, FuzzFunctionCoverage, FuzzFunctionStatus, InferredOracleGate,
-    InputClassification, Language, NetworkPolicy, OracleKind, OracleProvenance, ReplayOutcome,
-    ReportLevel, ReportSummary, RuntimeProfile, StageStatus, TestRunner, VerificationEvidence,
-    VerificationReport, VerificationStage, VerificationStrength, VerificationVerdict,
-    DEFAULT_BUN_DOCKER_IMAGE, DEFAULT_PYTHON_DOCKER_IMAGE, DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+    CandidateProvenance, ComplexityMetric, CoverageGate, CoverageSummary, DiagnosticComponent,
+    DiagnosticImpact, ExecuteGate, FailureDiagnostic, FailureDomain, FailureKind, FindingCategory,
+    FindingConfidence, FindingSeverity, FindingsSummary, FuzzFunctionCoverage, FuzzFunctionStatus,
+    InferredOracleGate, InputClassification, Language, NetworkPolicy, OracleKind, OracleProvenance,
+    ReplayOutcome, ReportLevel, ReportSummary, RuntimeProfile, StageStatus, TestRunner,
+    ToolProvenance, VerificationEvidence, VerificationReport, VerificationStage,
+    VerificationStrength, VerificationVerdict, DEFAULT_BUN_DOCKER_IMAGE,
+    DEFAULT_PYTHON_DOCKER_IMAGE, DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -613,6 +614,8 @@ async fn lint_runner_failures_do_not_count_as_lint_issues_in_summary() {
 fn human_summary_highlights_offenders_and_findings() {
     let report = VerificationReport {
         schema_version: 3,
+        tool: ToolProvenance::default(),
+        candidate: CandidateProvenance::default(),
         stages: vec![
             VerificationStage {
                 name: "complexity".into(),
@@ -6139,6 +6142,14 @@ async fn persisted_and_minimal_reports_are_v3_without_legacy_ok_fields() {
     let minimal = report_json_value(&report, ReportLevel::Minimal);
     for value in [full, minimal] {
         assert_eq!(value["schema_version"].as_u64(), Some(3));
+        assert_eq!(
+            value["tool"]["version"].as_str(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            value["candidate"]["content_sha256"].as_str().map(str::len),
+            Some(64)
+        );
         assert!(value.get("verdict").is_some());
         assert!(value.get("strength").is_some());
         assert!(value.get("overall_ok").is_none());
@@ -6148,7 +6159,73 @@ async fn persisted_and_minimal_reports_are_v3_without_legacy_ok_fields() {
     let persisted: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     assert!(persisted.get("overall_ok").is_none());
+    assert_eq!(
+        persisted["tool"]["version"].as_str(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(
+        persisted["candidate"]["content_sha256"]
+            .as_str()
+            .map(str::len),
+        Some(64)
+    );
     assert!(persisted["summary"]["coverage"].is_object());
+}
+#[tokio::test]
+async fn equivalent_findings_are_coalesced_and_minimal_reports_are_bounded() {
+    let project = tempfile::tempdir().unwrap();
+    let output = tempfile::tempdir().unwrap();
+    let source = project.path().join("repeated.py");
+    let code = "def explode(value: str) -> str:\n    print('x' * 10000)\n    return value[1000]\n";
+    fs::write(&source, code).unwrap();
+
+    let mut opts = default_opts(None);
+    opts.project_dir = project.path().to_str();
+    opts.source_file = source.to_str();
+    opts.output_dir = output.path().to_str();
+    opts.report_level = ReportLevel::Minimal;
+    let report = verify(code, &Language::Python, opts).await;
+
+    let execute = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("execute detail");
+    let findings = execute["findings"].as_array().expect("findings");
+    assert_eq!(findings.len(), 1, "{findings:#?}");
+    assert!(
+        findings[0]["occurrences"].as_u64().unwrap_or(0) > 1,
+        "{findings:#?}"
+    );
+    assert!(
+        findings[0]["sample_inputs"]
+            .as_array()
+            .is_some_and(|samples| samples.len() <= 3),
+        "{findings:#?}"
+    );
+
+    let report_path = report.report_path.as_deref().expect("persisted report");
+    let bytes = fs::read(report_path).unwrap();
+    assert!(bytes.len() < 512 * 1024, "{} bytes", bytes.len());
+    let persisted: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let minimal_execute = persisted["stages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|stage| stage["name"] == "execute")
+        .expect("minimal execute stage");
+    assert!(minimal_execute["detail"].get("execution").is_none());
+
+    let full = report_json_value(&report, ReportLevel::Full);
+    let retained_stdout = full["stages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|stage| stage["name"] == "execute")
+        .and_then(|stage| stage["detail"]["execution"]["stdout"].as_str())
+        .expect("full execution stdout");
+    assert!(retained_stdout.chars().count() <= 64 * 1024 + 128);
 }
 
 #[tokio::test]
@@ -6304,6 +6381,44 @@ async fn minimal_output_dir_report_loads_and_replays() {
     )
     .await
     .expect("persisted minimal finding should be replayable");
+    assert_eq!(replay.outcome, ReplayOutcome::Reproduced, "{replay:#?}");
+}
+
+#[tokio::test]
+async fn repair_json_report_loads_and_replays() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("characters.py");
+    let code = "def first_character(value: str) -> str:\n    return value[0]";
+    fs::write(&source, code).unwrap();
+
+    let mut opts = default_opts(None);
+    opts.project_dir = project.path().to_str();
+    opts.source_file = source.to_str();
+    let report = verify(code, &Language::Python, opts).await;
+    let repair = repair_summary(&report, &Language::Python);
+    let finding_id = repair
+        .findings
+        .iter()
+        .find(|finding| finding.location.function == "first_character")
+        .expect("repair summary should retain the actionable finding")
+        .id
+        .clone();
+    let report_path = project.path().join("repair.json");
+    fs::write(&report_path, serde_json::to_vec_pretty(&repair).unwrap()).unwrap();
+
+    let loaded =
+        load_persisted_report(report_path.to_str().unwrap()).expect("repair report should load");
+    assert_eq!(loaded.meta.language, "python");
+    let replay = replay_report(
+        report_path.to_str().unwrap(),
+        &finding_id,
+        None,
+        RuntimeProfile::LocalTrusted,
+        DEFAULT_PYTHON_DOCKER_IMAGE,
+        DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+    )
+    .await
+    .expect("repair finding should be replayable");
     assert_eq!(replay.outcome, ReplayOutcome::Reproduced, "{replay:#?}");
 }
 
@@ -9584,4 +9699,266 @@ fn ci_nonzero_unjudged_equals_invalid_blocked_and_no_coverage() {
         test_quality_stage(&ci_file(&report, "target.py")["report"])["detail"]["counts"]["blocked"],
         "the single blocked campaign must aggregate without fabricating invalid mutants"
     );
+}
+
+#[tokio::test]
+async fn react_hooks_require_an_authoritative_renderer_context() {
+    let code = r#"
+import { useQuery } from "@tanstack/react-query";
+
+export function useCurrentGraph(tenantId: string) {
+  return useQuery({ queryKey: ["graph", tenantId] });
+}
+"#;
+    let mut opts = default_opts(None);
+    opts.coverage_gate = CoverageGate::None;
+    let report = verify(code, &Language::TypeScript, opts).await;
+
+    assert_ne!(report.verdict, VerificationVerdict::Fail, "{report:#?}");
+    assert_eq!(report.summary.findings.total, 0, "{report:#?}");
+    let hook = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "coverage")
+        .and_then(|stage| stage.detail.as_ref())
+        .and_then(|detail| detail["functions"].as_array())
+        .and_then(|functions| {
+            functions
+                .iter()
+                .find(|function| function["function"] == "useCurrentGraph")
+        })
+        .expect("hook coverage");
+    assert_eq!(hook["status"].as_str(), Some("skipped_no_fuzzable_surface"));
+    assert!(hook["reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("renderer")));
+}
+
+#[tokio::test]
+async fn auto_runner_prefers_exact_node_test_file_over_package_vitest() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("target.ts");
+    let test_file = project.path().join("target.test.ts");
+    let node_log = project.path().join("node.log");
+    let tool_dir = project.path().join("node_modules").join(".bin");
+    let code = "export function formatValue(value: number): number { return value; }\n";
+    let tests = "import test from \"node:test\";\nimport { formatValue } from \"./target.ts\";\ntest(\"formats\", () => { if (formatValue(1) !== 1) throw new Error(\"bad\"); });\n";
+    fs::write(&source, code).unwrap();
+    fs::write(&test_file, tests).unwrap();
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"devDependencies":{"vitest":"3.2.6"}}"#,
+    )
+    .unwrap();
+    install_fake_tool_at(
+        &tool_dir,
+        "node",
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s\\n' '{{\"event\":\"target_entered\",\"surface_id\":\"formatValue:1\"}}' >&2\nprintf '%s\\n' 'TAP version 13' 'ok 1 - formats' '1..1'\n",
+            node_log.display()
+        ),
+    );
+    install_fake_tool_at(&tool_dir, "vitest", "#!/bin/sh\nexit 97\n");
+
+    let mut opts = default_opts(Some(tests));
+    opts.project_dir = project.path().to_str();
+    opts.source_file = source.to_str();
+    opts.test_source_file = test_file.to_str();
+    opts.tests_only = true;
+    let report = verify(code, &Language::TypeScript, opts).await;
+
+    let test = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "test")
+        .expect("test stage");
+    assert_eq!(test.status, StageStatus::Passed, "{report:#?}");
+    assert_eq!(
+        test.detail.as_ref().unwrap()["test_runner_selected"].as_str(),
+        Some("node")
+    );
+    let args = fs::read_to_string(node_log).unwrap();
+    assert!(args.lines().any(|arg| arg == "--test"), "{args}");
+}
+
+#[tokio::test]
+async fn python_validation_errors_are_rejected_and_complete_the_harness() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("target.py");
+    let test_file = project.path().join("test_target.py");
+    let code = "def correlation_for_incident(identity: str) -> str:\n    if not identity.startswith('INC-'):\n        raise ValueError('invalid incident identity')\n    return identity.lower()\n";
+    let tests = "import target\nassert target.correlation_for_incident('INC-42') == 'inc-42'\n";
+    fs::write(&source, code).unwrap();
+    fs::write(&test_file, tests).unwrap();
+    let mut opts = default_opts(Some(tests));
+    opts.project_dir = project.path().to_str();
+    opts.source_file = source.to_str();
+    opts.test_source_file = test_file.to_str();
+
+    let report = verify(code, &Language::Python, opts).await;
+
+    assert_eq!(report.verdict, VerificationVerdict::Pass, "{report:#?}");
+    assert_eq!(report.summary.findings.total, 0, "{report:#?}");
+    let execute = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("execute detail");
+    assert_eq!(
+        execute["harness_events"]["harness_completed"].as_bool(),
+        Some(true)
+    );
+}
+
+#[tokio::test]
+async fn python_domain_rejections_do_not_become_process_failures() {
+    let code = r#"class PolicyError(RuntimeError):
+    pass
+
+def load_policy(path: str) -> str:
+    raise PolicyError("policy file not found")
+"#;
+    let report = verify(code, &Language::Python, default_opts(None)).await;
+
+    assert_eq!(
+        report.verdict,
+        VerificationVerdict::Inconclusive,
+        "{report:#?}"
+    );
+    assert_eq!(report.summary.findings.total, 0, "{report:#?}");
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.kind != FailureKind::NonzeroExit),
+        "{report:#?}"
+    );
+    let execute = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .expect("execute stage");
+    assert_eq!(execute.status, StageStatus::Passed);
+}
+
+#[tokio::test]
+async fn python_harness_emits_completion_during_interpreter_shutdown() {
+    let code = "def stop(value: str) -> str:\n    raise SystemExit('stop')\n";
+    let report = verify(code, &Language::Python, default_opts(None)).await;
+    let execute = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .and_then(|stage| stage.detail.as_ref())
+        .expect("execute detail");
+
+    assert_eq!(
+        execute["harness_events"]["harness_completed"].as_bool(),
+        Some(true),
+        "{report:#?}"
+    );
+    assert!(report.diagnostics.iter().all(|diagnostic| {
+        diagnostic.kind != FailureKind::HarnessProtocol
+            || !diagnostic.message.contains("harness_completed")
+    }));
+}
+
+#[tokio::test]
+async fn unresolved_python_plugin_context_is_not_fuzzed_with_primitives() {
+    let code = r#"
+from __future__ import annotations
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from hermes import PluginContext
+
+def register(context: PluginContext) -> None:
+    context.register_slack_action_handler("decision", lambda: None)
+"#;
+    let report = verify(code, &Language::Python, default_opts(None)).await;
+
+    assert_ne!(report.verdict, VerificationVerdict::Fail, "{report:#?}");
+    assert_eq!(report.summary.findings.total, 0, "{report:#?}");
+    let register = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "coverage")
+        .and_then(|stage| stage.detail.as_ref())
+        .and_then(|detail| detail["functions"].as_array())
+        .and_then(|functions| {
+            functions
+                .iter()
+                .find(|function| function["function"] == "register")
+        })
+        .expect("register coverage");
+    assert_eq!(
+        register["status"].as_str(),
+        Some("skipped_unsupported_type")
+    );
+}
+
+#[tokio::test]
+async fn deeply_nested_python_syntax_returns_structured_inconclusive_report() {
+    let depth = 2_000;
+    let code = format!(
+        "def normalize(value: {}int{}) -> int:\n    return 1\n",
+        "list[".repeat(depth),
+        "]".repeat(depth)
+    );
+    let report = verify(&code, &Language::Python, default_opts(None)).await;
+
+    assert_eq!(
+        report.verdict,
+        VerificationVerdict::Inconclusive,
+        "{report:#?}"
+    );
+    let parse = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "parse")
+        .expect("parse stage");
+    assert_eq!(parse.status, StageStatus::Inconclusive);
+    assert_eq!(
+        parse.detail.as_ref().unwrap()["parse_diagnostics"][0]["kind"].as_str(),
+        Some("unsupported")
+    );
+}
+
+#[tokio::test]
+async fn typescript_campaign_preserves_required_object_shape() {
+    let project = tempfile::tempdir().unwrap();
+    let code = r#"
+export type ResourceType = 'IMAGE' | 'DOCUMENT'
+
+export function resolveListingFeaturedImage(input: {
+  canonicalProductFeaturedImage?: string | null
+  itemFeaturedImage?: string | null
+  resources: Array<{ resourceType: ResourceType; src: string }>
+}): string | undefined {
+  const imageResource = input.resources.find(
+    (resource) => resource.resourceType === 'IMAGE'
+  )
+  return input.itemFeaturedImage ?? imageResource?.src ?? input.canonicalProductFeaturedImage ?? undefined
+}
+"#;
+
+    let source = project.path().join("repro.ts");
+    let test_file = project.path().join("repro.test.ts");
+    let tests = r#"
+import { resolveListingFeaturedImage } from './repro'
+resolveListingFeaturedImage({
+  canonicalProductFeaturedImage: 'https://example.com/product.png',
+  itemFeaturedImage: undefined,
+  resources: [{ resourceType: 'IMAGE', src: 'https://example.com/resource.png' }]
+})
+"#;
+    fs::write(&source, code).unwrap();
+    fs::write(&test_file, tests).unwrap();
+    let mut opts = default_opts(Some(tests));
+    opts.project_dir = project.path().to_str();
+    opts.source_file = source.to_str();
+    opts.test_source_file = test_file.to_str();
+    let report = verify(code, &Language::TypeScript, opts).await;
+    assert_eq!(report.summary.findings.total, 0, "{report:#?}");
+    assert_eq!(report.verdict, VerificationVerdict::Pass, "{report:#?}");
 }

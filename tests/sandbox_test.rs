@@ -2412,3 +2412,34 @@ async fn isolated_bun_test_resolves_leaf_package_pnpm_dependencies() {
         execution.process.stderr
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn external_sigxcpu_is_not_reported_as_the_wall_clock_timeout() {
+    let result = execute(
+        "import os, signal\nos.kill(os.getpid(), signal.SIGXCPU)",
+        &Language::Python,
+        sandbox_options(30.0, 128, None, None),
+    )
+    .await;
+
+    assert!(!result.timed_out, "{result:#?}");
+    assert_eq!(
+        result
+            .termination
+            .as_ref()
+            .map(|termination| termination.kind),
+        Some(ProcessTerminationKind::Signaled)
+    );
+    assert_eq!(
+        result
+            .termination
+            .as_ref()
+            .and_then(|termination| termination.signal_name.as_deref()),
+        Some("SIGXCPU")
+    );
+    assert!(result.diagnostics.iter().any(|diagnostic| {
+        diagnostic.domain == FailureDomain::Environment
+            && diagnostic.kind == court_jester::types::FailureKind::Signal
+    }));
+}

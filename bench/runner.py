@@ -10,13 +10,54 @@ import shutil
 import subprocess
 import tempfile
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from pathlib import Path
 from threading import Lock
 from typing import Any
 
 from .agent_trace import prepare_agent_trace, summarize_agent_trace
 from .cli_client import CourtJesterClient
+from .results import CommandResult, WorkspaceSetupResult
+from .reporting import (
+    report_schema_version,
+    report_verdict,
+    report_is_failed,
+    report_is_inconclusive,
+    stage_status,
+    stage_is_failed,
+    stage_message,
+    stage_findings,
+    _report_diagnostics,
+    _report_findings,
+    _is_target_finding,
+    report_terminal_cause,
+    report_has_target_failure,
+    report_metadata,
+    finding_function,
+    finding_input,
+    finding_message,
+)
+from .feedback import (
+    format_public_failure_feedback,
+    normalize_feedback_path,
+    resolve_local_import_path,
+    local_import_paths,
+    infer_tests_only_owner_paths,
+    verify_feedback_scope_lines,
+    format_verify_feedback,
+    collect_promoted_verify_repros,
+    build_first_party_repair_checklist,
+    collect_verify_haystack,
+    build_fuzz_repro_assertion,
+    extract_observed_output,
+    promoted_repro_block,
+    format_hidden_failure_feedback,
+    should_suppress_verify_evidence,
+    summarize_verify_failures,
+    extract_assertion_repro,
+    first_nonempty_text,
+    first_meaningful_line,
+)
 from .providers import ProviderResult, provider_from_manifest
 from .common import (
     ARTIFACT_SCHEMA_VERSION,
@@ -37,274 +78,7 @@ DEFAULT_AGENT_TRACE_EVENT_OVERHEAD_MS = 20.0
 _SHADOW_RECORD_LOCK = Lock()
 
 
-def report_schema_version(report: Any) -> int | None:
-    if not isinstance(report, dict):
-        return None
-    version = report.get("schema_version")
-    return version if isinstance(version, int) else None
 
-
-def report_verdict(report: Any) -> str | None:
-    """Return a verdict only from a structurally valid schema-v3 report."""
-    if report_schema_version(report) != VERIFY_SCHEMA_VERSION_REQUIRED:
-        return None
-
-    verdict = report.get("verdict")
-    strength = report.get("strength")
-    stages = report.get("stages")
-    summary = report.get("summary")
-    if not isinstance(verdict, str) or verdict not in {"pass", "fail", "inconclusive"}:
-        return None
-    if not isinstance(strength, str) or strength not in {
-        "none",
-        "parse_only",
-        "static_checked",
-        "runtime_smoke",
-        "property_checked",
-        "authoritative_tests",
-    }:
-        return None
-    if not isinstance(summary, dict):
-        return None
-    if not isinstance(stages, list) or not stages:
-        return None
-    for stage in stages:
-        if not isinstance(stage, dict):
-            return None
-        name = stage.get("name")
-        status = stage.get("status")
-        duration_ms = stage.get("duration_ms")
-        if not isinstance(name, str) or not name.strip():
-            return None
-        if not isinstance(status, str) or status not in {
-            "passed",
-            "failed",
-            "inconclusive",
-            "advisory",
-            "skipped",
-        }:
-            return None
-        if isinstance(duration_ms, bool) or not isinstance(duration_ms, int) or duration_ms < 0:
-            return None
-    return verdict
-
-
-def report_is_failed(report: Any) -> bool:
-    return report_verdict(report) == "fail"
-
-
-def report_is_inconclusive(report: Any) -> bool:
-    return report_verdict(report) == "inconclusive"
-
-
-def stage_status(stage: Any) -> str | None:
-    if not isinstance(stage, dict):
-        return None
-    status = stage.get("status")
-    if not isinstance(status, str):
-        return None
-    return status if status in {"passed", "failed", "inconclusive", "advisory", "skipped"} else None
-
-
-def stage_is_failed(stage: Any) -> bool:
-    return stage_status(stage) == "failed"
-
-
-def stage_message(stage: Any) -> str:
-    if not isinstance(stage, dict):
-        return ""
-    return str(stage.get("message") or "")
-
-
-def stage_findings(stage: Any) -> list[dict[str, Any]]:
-    if not isinstance(stage, dict):
-        return []
-    detail = stage.get("detail")
-    findings = detail.get("findings") if isinstance(detail, dict) else None
-    return [finding for finding in findings if isinstance(finding, dict)] if isinstance(findings, list) else []
-def _report_diagnostics(report: Any) -> list[dict[str, Any]]:
-    """Collect typed diagnostics without interpreting human-readable output.
-
-    Diagnostics were added additively to schema v3.  A few stage producers put
-    them in ``detail`` while the final report puts them at the top level, so
-    consume both locations and de-duplicate by their serialized content.
-    """
-    if not isinstance(report, dict):
-        return []
-    values: list[dict[str, Any]] = []
-    candidates: list[Any] = [report.get("diagnostics")]
-    for stage in report.get("stages", []):
-        if not isinstance(stage, dict):
-            continue
-        detail = stage.get("detail")
-        if isinstance(detail, dict):
-            candidates.append(detail.get("diagnostics"))
-            execution = detail.get("execution")
-            if isinstance(execution, dict):
-                candidates.append(execution.get("diagnostics"))
-    seen: set[str] = set()
-    for candidate in candidates:
-        if not isinstance(candidate, list):
-            continue
-        for diagnostic in candidate:
-            if not isinstance(diagnostic, dict):
-                continue
-            key = json.dumps(diagnostic, sort_keys=True, separators=(",", ":"))
-            if key not in seen:
-                seen.add(key)
-                values.append(diagnostic)
-    return values
-
-
-def _report_findings(report: Any) -> list[dict[str, Any]]:
-    findings: list[dict[str, Any]] = []
-    if not isinstance(report, dict):
-        return findings
-    for stage in report.get("stages", []):
-        findings.extend(stage_findings(stage))
-    return findings
-
-
-def _is_target_finding(finding: dict[str, Any]) -> bool:
-    """Return true only for an unsuppressed, non-infrastructure finding."""
-    if finding.get("suppressed") is True:
-        return False
-    severity = str(finding.get("severity") or "").lower()
-    category = str(finding.get("category") or "").lower()
-    return severity in {"crash", "property_violation", "behavioral_regression"} and category != "infrastructure"
-
-
-def report_terminal_cause(report: Any) -> dict[str, Any] | None:
-    """Resolve a report's terminal cause using typed diagnostic precedence.
-
-    ``target`` is intentionally narrower than a failed stage: verifier,
-    environment, and resource diagnostics are benchmark abstentions.  Reports
-    without typed diagnostics retain the old stage/verdict interpretation.
-    """
-    if not isinstance(report, dict):
-        return None
-    diagnostics = _report_diagnostics(report)
-    typed = bool(diagnostics) or "diagnostics" in report or "diagnostics_summary" in report
-    target = [
-        diagnostic
-        for diagnostic in diagnostics
-        if str(diagnostic.get("domain") or "").lower() == "target_code"
-        and str(diagnostic.get("impact") or "").lower() == "gating"
-    ]
-    if target:
-        cause = dict(target[0])
-        cause["classification"] = "target"
-        return cause
-    findings = [finding for finding in _report_findings(report) if _is_target_finding(finding)]
-    if findings:
-        return {"classification": "target", "finding": findings[0]}
-    blocking = [
-        diagnostic
-        for diagnostic in diagnostics
-        if str(diagnostic.get("impact") or "").lower() == "blocking"
-    ]
-    if blocking:
-        cause = dict(blocking[0])
-        cause["classification"] = "inconclusive"
-        return cause
-    if typed and report.get("verdict") == "fail":
-        # A typed report with no target evidence cannot be scored as a target
-        # defect, even if an older producer emitted a failed verdict.
-        return {"classification": "inconclusive", "kind": "harness_protocol"}
-    if report.get("verdict") == "inconclusive":
-        return {"classification": "inconclusive"}
-    if report.get("verdict") == "fail":
-        return {"classification": "legacy"}
-    return None
-
-
-def report_has_target_failure(report: Any) -> bool:
-    cause = report_terminal_cause(report)
-    return bool(cause and cause.get("classification") in {"target", "legacy"})
-
-
-def report_metadata(report: Any) -> dict[str, Any]:
-    """Extract machine-readable execution context for benchmark artifacts."""
-    metadata: dict[str, set[str]] = {
-        "source_modes": set(),
-        "network_policies": set(),
-        "runtimes": set(),
-        "input_origins": set(),
-        "provenance": set(),
-        "termination_kinds": set(),
-        "failure_domains": set(),
-        "failure_kinds": set(),
-        "diagnostic_components": set(),
-    }
-
-    def walk(value: Any, key: str = "") -> None:
-        if isinstance(value, dict):
-            for name, child in value.items():
-                normalized = str(name).lower()
-                if normalized in {"source_mode", "network_policy", "network", "runtime", "input_origin", "provenance", "termination_kind", "failure_domain", "failure_kind", "component"}:
-                    if isinstance(child, str):
-                        field = {
-                            "source_mode": "source_modes",
-                            "network_policy": "network_policies",
-                            "network": "network_policies",
-                            "runtime": "runtimes",
-                            "input_origin": "input_origins",
-                            "provenance": "provenance",
-                            "termination_kind": "termination_kinds",
-                            "failure_domain": "failure_domains",
-                            "failure_kind": "failure_kinds",
-                            "component": "diagnostic_components",
-                        }[normalized]
-                        metadata[field].add(child)
-                if normalized == "kind" and key in {"termination", "process"} and isinstance(child, str):
-                    metadata["termination_kinds"].add(child)
-                walk(child, normalized)
-        elif isinstance(value, list):
-            for child in value:
-                walk(child, key)
-
-    walk(report)
-    return {key: sorted(values) for key, values in metadata.items() if values}
-
-
-def finding_function(finding: dict[str, Any]) -> str:
-    location = finding.get("location")
-    if isinstance(location, dict) and location.get("function"):
-        return str(location["function"])
-    return str(finding.get("function") or "")
-
-
-def finding_input(finding: dict[str, Any]) -> str:
-    repro = finding.get("repro")
-    if isinstance(repro, dict):
-        if repro.get("snippet"):
-            return str(repro["snippet"])
-        arguments = repro.get("arguments")
-        if arguments:
-            return str(arguments)
-    return str(finding.get("input") or "")
-
-
-def finding_message(finding: dict[str, Any]) -> str:
-    return str(finding.get("message") or finding.get("error_type") or "")
-
-@dataclass(slots=True)
-class CommandResult:
-    argv: list[str]
-    exit_code: int
-    duration_ms: int
-    stdout_path: str
-    stderr_path: str
-
-
-@dataclass(slots=True)
-class WorkspaceSetupResult:
-    success: bool
-    cache_hit: bool
-    duration_ms: int
-    commands: list[CommandResult]
-    cache_dir: str | None = None
-    failure_reason: str | None = None
 
 
 def select_repair_trigger_source(
@@ -2073,258 +1847,6 @@ def build_critic_feedback(
         return None
 
 
-def format_public_failure_feedback(items: list[CommandResult]) -> str:
-    lines = [
-        "public checks failed. Repair the workspace using these concrete failures.",
-        "Prioritize the smallest code change that makes the public checks pass.",
-    ]
-    for item in items:
-        if item.exit_code == 0:
-            continue
-        command = " ".join(item.argv)
-        lines.append(f"- Command: {command}")
-        stderr = Path(item.stderr_path).read_text() if Path(item.stderr_path).exists() else ""
-        stdout = Path(item.stdout_path).read_text() if Path(item.stdout_path).exists() else ""
-        snippet = first_nonempty_text(stderr, stdout)
-        if snippet:
-            lines.append(f"  Evidence: {snippet}")
-    return "\n".join(lines)
-
-
-def normalize_feedback_path(path: str, workspace: Path | None) -> str:
-    candidate = Path(path)
-    if workspace is not None and candidate.is_absolute():
-        try:
-            return candidate.relative_to(workspace).as_posix()
-        except ValueError:
-            return candidate.as_posix()
-    return candidate.as_posix()
-
-
-def resolve_local_import_path(source_path: Path, import_path: str) -> Path | None:
-    if not import_path.startswith("."):
-        return None
-    target = source_path.parent / import_path
-    candidates: list[Path] = []
-    if target.suffix:
-        candidates.append(target)
-    else:
-        candidates.extend(
-            [
-                target.with_suffix(".ts"),
-                target.with_suffix(".tsx"),
-                target.with_suffix(".js"),
-                target.with_suffix(".jsx"),
-                target / "index.ts",
-                target / "index.tsx",
-                target / "index.js",
-                target / "index.jsx",
-            ]
-        )
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return None
-
-
-def local_import_paths(source_path: Path) -> list[str]:
-    if not source_path.exists():
-        return []
-    text = source_path.read_text()
-    imports: list[str] = []
-    for match in re.finditer(
-        r'^\s*(?:import|export)\s+(?:[^"\']+\s+from\s+)?["\']([^"\']+)["\']',
-        text,
-        re.MULTILINE,
-    ):
-        import_path = match.group(1)
-        if import_path.startswith("."):
-            imports.append(import_path)
-    return imports
-
-
-def infer_tests_only_owner_paths(
-    *,
-    workspace: Path,
-    task: TaskManifest,
-    failed_path: str,
-) -> list[str]:
-    source_path = workspace / failed_path
-    verify_paths = {Path(path).as_posix() for path in task.verify_paths}
-    owners: list[str] = []
-    for import_path in local_import_paths(source_path):
-        resolved = resolve_local_import_path(source_path, import_path)
-        if resolved is None:
-            continue
-        relative = normalize_feedback_path(str(resolved), workspace)
-        if relative != failed_path and relative in verify_paths and relative not in owners:
-            owners.append(relative)
-    return owners
-
-
-def verify_feedback_scope_lines(
-    item: dict[str, Any],
-    *,
-    workspace: Path | None,
-    task: TaskManifest | None,
-) -> list[str]:
-    path = item.get("path")
-    if not isinstance(path, str) or not path:
-        return []
-    normalized_path = normalize_feedback_path(path, workspace)
-    if task is None or not task.verify_tests_only or workspace is None:
-        return [f"File: {normalized_path}"]
-    owner_paths = infer_tests_only_owner_paths(
-        workspace=workspace,
-        task=task,
-        failed_path=normalized_path,
-    )
-    if owner_paths:
-        lines = [f"Likely owner files: {', '.join(owner_paths)}"]
-        if normalized_path not in owner_paths:
-            lines.append(f"Related call site: {normalized_path}")
-        return lines
-    return [f"Related source file: {normalized_path}"]
-
-
-def format_verify_feedback(
-    items: list[dict[str, Any]],
-    *,
-    workspace: Path | None = None,
-    promoted_repros: list[str] | None = None,
-    task: TaskManifest | None = None,
-    include_first_party_checklist: bool = False,
-) -> str:
-    lines = [
-        "court-jester verify failed. Repair the workspace using these concrete failures.",
-        "Prioritize the smallest code change that eliminates the failing repros.",
-    ]
-    if promoted_repros:
-        lines.append("Required repros to fix on the next attempt:")
-        for repro in promoted_repros:
-            lines.append(f"- {repro}")
-    checklist = (
-        build_first_party_repair_checklist(task, items)
-        if include_first_party_checklist
-        else []
-    )
-    if checklist:
-        lines.append("Court Jester repair checklist:")
-        for item in checklist:
-            lines.append(f"- {item}")
-    for item in items:
-        response = item.get("response")
-        if not isinstance(response, dict) or report_verdict(response) not in {"fail", "inconclusive"}:
-            continue
-        for scope_line in verify_feedback_scope_lines(
-            item,
-            workspace=workspace,
-            task=task,
-        ):
-            lines.append(f"- {scope_line}")
-        for summary_line in summarize_verify_failures(response, task=task):
-            lines.append(f"  {summary_line}")
-    return "\n".join(lines)
-
-
-def collect_promoted_verify_repros(language: str, items: list[dict[str, Any]]) -> list[str]:
-    repros: list[str] = []
-    seen: set[str] = set()
-    for item in items:
-        response = item.get("response")
-        if not isinstance(response, dict) or report_verdict(response) != "fail":
-            continue
-        for stage in response.get("stages", []):
-            if not stage_is_failed(stage):
-                continue
-            detail = stage.get("detail") if isinstance(stage.get("detail"), dict) else {}
-            message = stage_message(stage).strip()
-            assertion_repro = extract_assertion_repro(message, detail)
-            if assertion_repro and assertion_repro not in seen:
-                seen.add(assertion_repro)
-                repros.append(assertion_repro)
-            for finding in stage_findings(stage)[:3]:
-                assertion = build_fuzz_repro_assertion(language, finding)
-                if assertion and assertion not in seen:
-                    seen.add(assertion)
-                    repros.append(assertion)
-            if len(repros) >= 3:
-                return repros[:3]
-    return repros[:3]
-
-
-def build_first_party_repair_checklist(
-    task: TaskManifest | None,
-    items: list[dict[str, Any]],
-) -> list[str]:
-    checklist: list[str] = []
-    seen: set[str] = set()
-
-    def add(line: str) -> None:
-        if line not in seen:
-            seen.add(line)
-            checklist.append(line)
-
-    haystack = collect_verify_haystack(items).lower()
-    if "nullish string leak" in haystack:
-        add("Do not leak nullish values into output strings.")
-        add("Drop dict/list/object inputs instead of converting them to strings.")
-        add("Preserve the original order of any remaining valid scalar list items.")
-    if "normalize" in haystack or "accent" in haystack or "non-ascii" in haystack:
-        add("Normalize accepted text values before encoding them into the final output.")
-    if "not defined" in haystack or "cannot find name" in haystack:
-        add("Resolve the missing symbol by fixing both the definition/export and every import or call site that uses it.")
-    if "referenceerror" in haystack:
-        add("Do not add a new helper call unless the target symbol is also wired into the current file correctly.")
-    if "assert.equal" in haystack or "assert " in haystack:
-        add("Change behavior on the exact cited repro before making broader refactors.")
-    if "property_violation" in haystack:
-        add("Avoid cosmetic edits that leave the cited failing property unchanged.")
-
-    return checklist[:5]
-
-
-def collect_verify_haystack(items: list[dict[str, Any]]) -> str:
-    chunks: list[str] = []
-    for item in items:
-        response = item.get("response")
-        if not isinstance(response, dict):
-            continue
-        for stage in response.get("stages", []):
-            if not isinstance(stage, dict):
-                continue
-            detail = stage.get("detail") if isinstance(stage.get("detail"), dict) else {}
-            chunks.append(stage_message(stage))
-            chunks.append(str(detail.get("stderr") or ""))
-            chunks.append(str(detail.get("stdout") or ""))
-            for finding in stage_findings(stage):
-                chunks.append(str(finding))
-    return "\n".join(chunk for chunk in chunks if chunk)
-
-
-def build_fuzz_repro_assertion(language: str, failure: Any) -> str | None:
-    if not isinstance(failure, dict):
-        return None
-    function = finding_function(failure).strip()
-    input_value = finding_input(failure).strip()
-    message = finding_message(failure).strip()
-    if not function or not input_value:
-        return None
-    observed_output = extract_observed_output(message)
-    if observed_output is None:
-        return None
-    if language == "python":
-        return f"assert {function}(*{input_value}) != {json.dumps(observed_output)}"
-    if language == "typescript":
-        return f"expect({function}(...{input_value})).not.toBe({json.dumps(observed_output)});"
-    return None
-
-
-def extract_observed_output(message: str) -> str | None:
-    match = re.search(r": '([^']*)'$", message)
-    if not match:
-        return None
-    return match.group(1)
 
 
 def write_promoted_verify_test(
@@ -2355,131 +1877,6 @@ def write_promoted_verify_test(
     return generated
 
 
-def promoted_repro_block(language: str, promoted_repros: list[str]) -> str:
-    if language == "python":
-        header = [
-            "# Court Jester promoted repros",
-            "# These cases were harvested from the previous failed verify attempt.",
-        ]
-        return "\n".join(header + promoted_repros)
-    if language == "typescript":
-        header = [
-            "// Court Jester promoted repros",
-            "// These cases were harvested from the previous failed verify attempt.",
-        ]
-        return "\n".join(header + promoted_repros)
-    return "\n".join(promoted_repros)
-
-
-def format_hidden_failure_feedback(items: list[CommandResult]) -> str:
-    lines = [
-        "hidden evaluation failed. Repair the workspace using these concrete failures.",
-        "Prioritize the smallest code change that satisfies the failing hidden cases.",
-    ]
-    for item in items:
-        if item.exit_code == 0:
-            continue
-        command = " ".join(item.argv)
-        lines.append(f"- Command: {command}")
-        stderr = Path(item.stderr_path).read_text() if Path(item.stderr_path).exists() else ""
-        stdout = Path(item.stdout_path).read_text() if Path(item.stdout_path).exists() else ""
-        snippet = first_nonempty_text(stderr, stdout)
-        if snippet:
-            lines.append(f"  Evidence: {snippet}")
-    return "\n".join(lines)
-
-
-def should_suppress_verify_evidence(
-    *,
-    task: TaskManifest | None,
-    stage_name: str,
-    snippet: str,
-) -> bool:
-    if task is None or not task.verify_tests_only:
-        return False
-    return stage_name == "test" and snippet.strip().lower() == "process timed out"
-
-
-def summarize_verify_failures(
-    response: dict[str, Any],
-    *,
-    task: TaskManifest | None = None,
-) -> list[str]:
-    lines: list[str] = []
-    for stage in response.get("stages", []):
-        if stage_status(stage) not in {"failed", "inconclusive"}:
-            continue
-        stage_name = stage.get("name", "unknown")
-        detail = stage.get("detail") if isinstance(stage.get("detail"), dict) else {}
-        message = stage_message(stage).strip()
-        lines.append(f"Stage: {stage_name}")
-
-        assertion_repro = extract_assertion_repro(message, detail)
-        if assertion_repro:
-            lines.append(f"Counterexample: {assertion_repro}")
-
-        findings = stage_findings(stage)
-        for finding in findings[:3]:
-            function = finding_function(finding) or "<unknown>"
-            severity = finding.get("severity", "failure")
-            input_value = finding_input(finding) or "<unknown>"
-            finding_text = finding_message(finding).strip()
-            lines.append(f"Repro: {function}{input_value} -> {severity}")
-            if finding_text:
-                lines.append(f"Message: {finding_text}")
-
-        snippet = first_nonempty_text(
-            message,
-            str(detail.get("stderr") or ""),
-            str(detail.get("stdout") or ""),
-        )
-        if snippet and not should_suppress_verify_evidence(
-            task=task,
-            stage_name=stage_name,
-            snippet=snippet,
-        ):
-            lines.append(f"Evidence: {snippet}")
-    if not lines:
-        lines.append("No structured verify failure details were available.")
-    return lines
-
-
-def extract_assertion_repro(error: str, detail: dict[str, Any]) -> str | None:
-    candidates = [
-        error,
-        str(detail.get("stderr") or ""),
-        str(detail.get("stdout") or ""),
-    ]
-    for value in candidates:
-        for raw_line in value.splitlines():
-            line = raw_line.strip()
-            if not line.startswith("assert "):
-                continue
-            repro = line[len("assert ") :].strip()
-            if repro:
-                return repro[:300]
-    return None
-
-
-def first_nonempty_text(*values: str) -> str | None:
-    for value in values:
-        snippet = first_meaningful_line(value)
-        if snippet:
-            return snippet
-    return None
-
-
-def first_meaningful_line(value: str) -> str | None:
-    for raw_line in value.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        if line.startswith("__COURT_JESTER_FUZZ_JSON__"):
-            continue
-        if line.startswith("[") and line.endswith("]"):
-            continue
-        return line[:240]
-    return None
 
 
 def should_sample_hidden_on_public_failure(hidden_seed: str) -> bool:

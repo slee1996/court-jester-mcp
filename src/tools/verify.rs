@@ -10,6 +10,33 @@ use tree_sitter::Parser;
 use crate::tools::{analyze, diff, domain, lint, sandbox, synthesize, test_quality};
 use crate::types::*;
 
+mod corpus;
+mod decisions;
+use decisions::{
+    build_report, has_non_target_blocking_diagnostic, is_typescript_module_load_error,
+    is_typescript_portability_error,
+};
+pub use decisions::{final_verdict, stage_diagnostics};
+mod provenance;
+mod replay;
+mod report_text;
+mod reporting;
+use provenance::{stable_digest, tree_digest};
+pub use replay::{
+    load_persisted_report, replay_launch_context, replay_report, replay_report_with_options,
+};
+
+use reporting::write_report;
+pub use reporting::{
+    report_human_summary, report_json_value, test_quality_summary, TestQualitySummary,
+};
+
+use corpus::{
+    corpus_inputs, parse_corpus, persist_corpus, persistent_corpus_path, read_persistent_corpus,
+    PersistentCorpus,
+};
+use report_text::{clipped_test_failure, sanitize_report_text, sanitize_report_value};
+
 pub struct VerifyOptions<'a> {
     pub test_code: Option<&'a str>,
     pub test_source_file: Option<&'a str>,
@@ -166,6 +193,81 @@ fn typescript_code_imports_vitest(code: &str) -> bool {
                 || statement == "import \"vitest\";"
                 || statement == "import 'vitest';")
     })
+}
+fn typescript_code_imports_node_test(code: &str) -> bool {
+    code.lines().any(|line| {
+        let statement = line.split_once("//").map_or(line, |(code, _)| code).trim();
+        let is_import_statement = statement.starts_with("import ")
+            || statement.starts_with("export ")
+            || statement.starts_with("} from ");
+        is_import_statement
+            && (statement.contains("from \"node:test\"")
+                || statement.contains("from 'node:test'")
+                || statement == "import \"node:test\";"
+                || statement == "import 'node:test';")
+    })
+}
+
+fn typescript_code_imports_react_runtime(code: &str) -> bool {
+    code.lines().any(|line| {
+        let statement = line.split_once("//").map_or(line, |(code, _)| code).trim();
+        let is_import_statement = statement.starts_with("import ")
+            || statement.starts_with("export ")
+            || statement.starts_with("} from ");
+        is_import_statement
+            && [
+                "from \"react\"",
+                "from 'react'",
+                "\"react/",
+                "'react/",
+                "react-query",
+            ]
+            .iter()
+            .any(|module| statement.contains(module))
+    })
+}
+
+fn react_hook_surface_ids(code: &str, functions: &[FunctionInfo]) -> HashSet<String> {
+    if !typescript_code_imports_react_runtime(code) {
+        return HashSet::new();
+    }
+    functions
+        .iter()
+        .filter(|function| {
+            function
+                .name
+                .strip_prefix("use")
+                .and_then(|tail| tail.chars().next())
+                .is_some_and(char::is_uppercase)
+        })
+        .map(|function| format!("{}:{}", function.name, function.line))
+        .collect()
+}
+
+fn exclude_context_dependent_surfaces(plan: &mut VerificationPlan, surface_ids: &HashSet<String>) {
+    for surface in &mut plan.surfaces {
+        if surface_ids.contains(&surface.id) {
+            surface.invocable = false;
+        }
+    }
+    plan.inputs
+        .retain(|input| !surface_ids.contains(&input.surface_id));
+    plan.execution_units
+        .retain(|unit| !surface_ids.contains(&unit.surface_id));
+}
+
+fn apply_context_dependent_coverage(
+    coverage: &mut [FuzzFunctionCoverage],
+    surface_ids: &HashSet<String>,
+) {
+    for entry in coverage {
+        let surface_id = format!("{}:{}", entry.function, entry.line);
+        if surface_ids.contains(&surface_id) {
+            entry.status = FuzzFunctionStatus::SkippedNoFuzzableSurface;
+            entry.reason =
+                Some("React hooks require an authoritative renderer and provider context".into());
+        }
+    }
 }
 
 const VITEST_CONFIG_FILENAMES: &[&str] = &[
@@ -1380,82 +1482,6 @@ fn function_key(func: &FunctionInfo) -> (String, usize) {
     (func.name.clone(), func.line)
 }
 
-fn stable_digest(value: &str) -> String {
-    const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-        0xc67178f2,
-    ];
-    let bytes = value.as_bytes();
-    let bit_len = (bytes.len() as u64).wrapping_mul(8);
-    let padded_len = (bytes.len() + 9).div_ceil(64) * 64;
-    let mut padded = Vec::with_capacity(padded_len);
-    padded.extend_from_slice(bytes);
-    padded.push(0x80);
-    padded.resize(padded_len - 8, 0);
-    padded.extend_from_slice(&bit_len.to_be_bytes());
-    let mut state = [
-        0x6a09e667u32,
-        0xbb67ae85,
-        0x3c6ef372,
-        0xa54ff53a,
-        0x510e527f,
-        0x9b05688c,
-        0x1f83d9ab,
-        0x5be0cd19,
-    ];
-    for chunk in padded.chunks_exact(64) {
-        let mut words = [0u32; 64];
-        for (index, word) in words[..16].iter_mut().enumerate() {
-            *word = u32::from_be_bytes(chunk[index * 4..index * 4 + 4].try_into().unwrap());
-        }
-        for index in 16..64 {
-            let s0 = words[index - 15].rotate_right(7)
-                ^ words[index - 15].rotate_right(18)
-                ^ (words[index - 15] >> 3);
-            let s1 = words[index - 2].rotate_right(17)
-                ^ words[index - 2].rotate_right(19)
-                ^ (words[index - 2] >> 10);
-            words[index] = words[index - 16]
-                .wrapping_add(s0)
-                .wrapping_add(words[index - 7])
-                .wrapping_add(s1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
-        for index in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let choice = (e & f) ^ ((!e) & g);
-            let temp1 = h
-                .wrapping_add(s1)
-                .wrapping_add(choice)
-                .wrapping_add(K[index])
-                .wrapping_add(words[index]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let majority = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = s0.wrapping_add(majority);
-            h = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-        for (slot, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
-            *slot = slot.wrapping_add(value);
-        }
-    }
-    state.iter().map(|word| format!("{word:08x}")).collect()
-}
-
 fn differential_argument(param: &ParamInfo, language: &Language) -> Option<&'static str> {
     let annotation = param.type_annotation.as_deref()?.trim();
     match language {
@@ -1768,18 +1794,6 @@ fn differential_binding_failure(snapshot: &BehaviorSnapshot, language: &Language
     .any(|fragment| message.contains(fragment))
 }
 
-fn tree_digest(files: &[EmbeddedSource]) -> String {
-    if files.len() == 1 {
-        return stable_digest(&files[0].content);
-    }
-    let mut entries = files
-        .iter()
-        .map(|source| format!("{}\n{}", source.relative_path, source.content))
-        .collect::<Vec<_>>();
-    entries.sort();
-    stable_digest(&entries.join("\n"))
-}
-
 fn embedded_project_sources(
     project_dir: Option<&str>,
     source_file: Option<&str>,
@@ -1939,6 +1953,11 @@ fn differential_finding(
                 .replace(|c: char| !c.is_ascii_alphanumeric(), "_")
         ),
         severity: FindingSeverity::BehavioralRegression,
+        occurrences: 1,
+        sample_inputs: vec![ReproCase {
+            arguments: arguments.clone(),
+            input_text: None,
+        }],
         confidence: FindingConfidence::Low,
         category: FindingCategory::Differential,
         error_type: Some("behavioral_regression".into()),
@@ -2102,89 +2121,6 @@ fn coverage_entry_for_verify(
         is_exported: func.is_exported,
         reason,
     }
-}
-fn coverage_has_gap(coverage: &CoverageSummary, gate: CoverageGate) -> bool {
-    gate == CoverageGate::ChangedExports && coverage.required > coverage.behaviorally_checked
-}
-
-/// Compute the schema-v3 verdict and evidence strength from typed stage/evidence data.
-pub fn final_verdict(
-    stages: &[VerificationStage],
-    coverage: &CoverageSummary,
-    gate: CoverageGate,
-    evidence: &VerificationEvidence,
-) -> (VerificationVerdict, VerificationStrength) {
-    let parse_failed = stages
-        .iter()
-        .any(|stage| stage.name == "parse" && stage.status == StageStatus::Failed);
-    let strength = if parse_failed {
-        VerificationStrength::ParseOnly
-    } else if evidence.authoritative_test_completed {
-        VerificationStrength::AuthoritativeTests
-    } else if evidence.evaluated_oracles > 0 {
-        VerificationStrength::PropertyChecked
-    } else if evidence.valid_invocations > 0 {
-        VerificationStrength::RuntimeSmoke
-    } else if evidence.static_checks_completed {
-        VerificationStrength::StaticChecked
-    } else if evidence.parsed {
-        VerificationStrength::ParseOnly
-    } else {
-        VerificationStrength::None
-    };
-    // Typed causes outrank the lossy stage status: a gating target cause
-    // remains a failure even when the process also reported a resource or
-    // harness termination, while a blocking non-target cause is inconclusive.
-    let diagnostics = diagnostics_from_relevant_stages(stages, coverage, evidence);
-    if diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.impact == DiagnosticImpact::Gating)
-    {
-        return (VerificationVerdict::Fail, strength);
-    }
-    if diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.impact == DiagnosticImpact::Blocking)
-    {
-        return (VerificationVerdict::Inconclusive, strength);
-    }
-    if stages.iter().any(|stage| {
-        !generated_execution_is_superseded(stage, coverage, evidence)
-            && stage.status == StageStatus::Failed
-    }) {
-        return (VerificationVerdict::Fail, strength);
-    }
-    if coverage_has_gap(coverage, gate)
-        || (!evidence.authoritative_test_completed
-            && evidence.valid_invocations == 0
-            && evidence.evaluated_oracles == 0)
-        || stages.iter().any(|stage| {
-            !generated_execution_is_superseded(stage, coverage, evidence)
-                && (stage.status == StageStatus::Inconclusive
-                    || (stage.name == "execute"
-                        && stage.status == StageStatus::Skipped
-                        && !evidence.authoritative_test_completed))
-        })
-    {
-        return (VerificationVerdict::Inconclusive, strength);
-    }
-    (VerificationVerdict::Pass, strength)
-}
-
-fn is_typescript_portability_error(stderr: &str) -> bool {
-    stderr.contains("ERR_MODULE_NOT_FOUND")
-        || stderr.contains("ERR_IMPORT_ATTRIBUTE_MISSING")
-        || stderr.contains("Cannot find module 'bun'")
-        || stderr.contains("Cannot find package 'bun'")
-        || stderr.contains("Bun is not defined")
-        || stderr.contains("needs an import attribute of \"type: json\"")
-}
-
-fn is_typescript_module_load_error(stderr: &str) -> bool {
-    is_typescript_portability_error(stderr)
-        || stderr.contains("Cannot find module")
-        || stderr.contains("Cannot find package")
-        || stderr.contains("The requested module")
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -4019,16 +3955,77 @@ fn parse_fuzz_outcomes(stdout: &str) -> Vec<FuzzOutcome> {
 
     outcomes
 }
+const MAX_FINDING_INPUT_SAMPLES: usize = 3;
+
+fn finding_repro_case(finding: &VerificationFinding) -> &ReproCase {
+    finding
+        .minimization
+        .minimized
+        .as_ref()
+        .unwrap_or(&finding.minimization.original)
+}
+
+fn coalesce_equivalent_findings(findings: Vec<VerificationFinding>) -> Vec<VerificationFinding> {
+    let mut coalesced = Vec::<VerificationFinding>::new();
+    let mut fingerprints = HashMap::<String, usize>::new();
+    for mut finding in findings {
+        let fingerprint = serde_json::json!({
+            "source_file": finding.location.source_file,
+            "function": finding.location.function,
+            "line": finding.location.line,
+            "invocation_path": finding.location.invocation_path,
+            "severity": finding.severity,
+            "confidence": finding.confidence,
+            "category": finding.category,
+            "oracle_id": finding.oracle.id,
+            "oracle_kind": finding.oracle.kind,
+            "oracle_provenance": finding.oracle.provenance,
+            "input_classification": finding.input_classification,
+            "error_type": finding.error_type,
+            "message": finding.message,
+            "classification": finding.classification,
+        })
+        .to_string();
+        let sample = finding_repro_case(&finding).clone();
+        if let Some(index) = fingerprints.get(&fingerprint).copied() {
+            let existing = &mut coalesced[index];
+            existing.occurrences = existing
+                .occurrences
+                .saturating_add(finding.occurrences.max(1));
+            if existing.sample_inputs.len() < MAX_FINDING_INPUT_SAMPLES
+                && !existing.sample_inputs.contains(&sample)
+            {
+                existing.sample_inputs.push(sample);
+            }
+            continue;
+        }
+        finding.occurrences = finding.occurrences.max(1);
+        if finding.sample_inputs.is_empty() {
+            finding.sample_inputs.push(sample);
+        } else {
+            finding.sample_inputs.truncate(MAX_FINDING_INPUT_SAMPLES);
+        }
+        fingerprints.insert(fingerprint, coalesced.len());
+        coalesced.push(finding);
+    }
+    coalesced
+}
+
 fn findings_summary(
     findings: &[VerificationFinding],
-    suppressed: usize,
+    suppressed: &[VerificationFinding],
     inferred_gate: InferredOracleGate,
 ) -> FindingsSummary {
     let mut summary = FindingsSummary {
-        total: findings.len() + suppressed,
+        total: findings.len() + suppressed.len(),
+        occurrences: findings
+            .iter()
+            .chain(suppressed)
+            .map(|finding| finding.occurrences.max(1))
+            .sum(),
         gating: 0,
-        advisory: suppressed,
-        suppressed,
+        advisory: suppressed.len(),
+        suppressed: suppressed.len(),
         by_severity: BTreeMap::new(),
         by_oracle_kind: BTreeMap::new(),
     };
@@ -4439,7 +4436,7 @@ fn authoritative_harness_runtime(
         Language::TypeScript => match runner {
             TestRunner::Bun => (HarnessRuntime::BunTest, Some(TestAdapter::BunJunit)),
             TestRunner::RepoNative => (HarnessRuntime::RepoTest, Some(TestAdapter::Opaque)),
-            TestRunner::Node => (HarnessRuntime::NodeScript, Some(TestAdapter::NodeTap)),
+            TestRunner::Node => (HarnessRuntime::NodeTest, Some(TestAdapter::NodeTap)),
             TestRunner::Auto
                 if typescript_code_imports_vitest(test_code)
                     || context_declares_vitest(context) =>
@@ -4621,6 +4618,12 @@ async fn run_authoritative_test(
         format!("{code}\n\n{tests}")
     };
     let selected_test_runner = match language {
+        Language::TypeScript
+            if opts.test_runner == TestRunner::Auto
+                && typescript_code_imports_node_test(&runner_probe) =>
+        {
+            TestRunner::Node
+        }
         Language::TypeScript => match opts.test_runner {
             TestRunner::Auto if sandbox::typescript_code_requires_bun_runtime(&runner_probe) => {
                 TestRunner::Bun
@@ -4772,231 +4775,6 @@ async fn run_authoritative_test(
         duration_ms,
         selected_test_runner,
     }
-}
-
-fn report_secret_value_end(bytes: &[u8], mut index: usize) -> usize {
-    while index < bytes.len()
-        && !bytes[index].is_ascii_whitespace()
-        && !matches!(
-            bytes[index],
-            b',' | b';' | b')' | b']' | b'}' | b'\'' | b'"' | b'&'
-        )
-    {
-        index += 1;
-    }
-    index
-}
-
-fn report_key_tokens(key: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut previous_was_lowercase = false;
-    for character in key.chars() {
-        if !character.is_ascii_alphanumeric() {
-            if !current.is_empty() {
-                tokens.push(std::mem::take(&mut current));
-            }
-            previous_was_lowercase = false;
-            continue;
-        }
-        if character.is_ascii_uppercase() && previous_was_lowercase && !current.is_empty() {
-            tokens.push(std::mem::take(&mut current));
-        }
-        current.push(character.to_ascii_lowercase());
-        previous_was_lowercase = character.is_ascii_lowercase();
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
-}
-
-fn is_sensitive_report_key(key: &str) -> bool {
-    let tokens = report_key_tokens(key);
-    tokens.iter().any(|token| {
-        matches!(
-            token.as_str(),
-            "apikey" | "token" | "secret" | "password" | "authorization" | "cookie"
-        )
-    }) || tokens
-        .windows(2)
-        .any(|pair| pair[0] == "api" && pair[1] == "key")
-}
-
-fn report_text_secret_ranges(text: &str) -> Vec<(usize, usize)> {
-    let bytes = text.as_bytes();
-    let lower = text.to_ascii_lowercase();
-    let mut ranges = Vec::new();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index].is_ascii_alphanumeric() || matches!(bytes[index], b'_' | b'-') {
-            let key_start = index;
-            while index < bytes.len()
-                && (bytes[index].is_ascii_alphanumeric() || matches!(bytes[index], b'_' | b'-'))
-            {
-                index += 1;
-            }
-            let key = &text[key_start..index];
-            if is_sensitive_report_key(key) {
-                let mut separator = index;
-                if separator < bytes.len() && matches!(bytes[separator], b'\'' | b'"') {
-                    separator += 1;
-                }
-                while separator < bytes.len() && bytes[separator].is_ascii_whitespace() {
-                    separator += 1;
-                }
-                if separator < bytes.len() && matches!(bytes[separator], b'=' | b':') {
-                    let mut value_start = separator + 1;
-                    while value_start < bytes.len() && bytes[value_start].is_ascii_whitespace() {
-                        value_start += 1;
-                    }
-                    let (redact_start, redact_end) = if value_start < bytes.len()
-                        && matches!(bytes[value_start], b'\'' | b'"')
-                    {
-                        let quote = bytes[value_start];
-                        let content_start = value_start + 1;
-                        let content_end = bytes[content_start..]
-                            .iter()
-                            .position(|byte| *byte == quote)
-                            .map(|offset| content_start + offset)
-                            .unwrap_or(bytes.len());
-                        (content_start, content_end)
-                    } else if key.eq_ignore_ascii_case("authorization")
-                        && lower[value_start..].starts_with("bearer")
-                    {
-                        let mut credential_start = value_start + "bearer".len();
-                        while credential_start < bytes.len()
-                            && bytes[credential_start].is_ascii_whitespace()
-                        {
-                            credential_start += 1;
-                        }
-                        (
-                            credential_start,
-                            report_secret_value_end(bytes, credential_start),
-                        )
-                    } else {
-                        (value_start, report_secret_value_end(bytes, value_start))
-                    };
-                    if redact_start < redact_end {
-                        ranges.push((redact_start, redact_end));
-                    }
-                }
-            }
-            continue;
-        }
-        index += 1;
-    }
-
-    for (pattern, preserve_prefix) in [
-        ("bearer ", true),
-        ("ghp_", false),
-        ("github_pat_", false),
-        ("sk-", false),
-    ] {
-        let mut offset = 0;
-        while let Some(relative) = lower[offset..].find(pattern) {
-            let start = offset + relative;
-            if start > 0
-                && (bytes[start - 1].is_ascii_alphanumeric()
-                    || matches!(bytes[start - 1], b'_' | b'-'))
-            {
-                offset = start + pattern.len();
-                continue;
-            }
-            let value_start = if preserve_prefix {
-                let mut value_start = start + pattern.len();
-                while value_start < bytes.len() && bytes[value_start].is_ascii_whitespace() {
-                    value_start += 1;
-                }
-                value_start
-            } else {
-                start
-            };
-            let value_end = report_secret_value_end(bytes, value_start);
-            if value_start < value_end {
-                ranges.push((value_start, value_end));
-            }
-            offset = (start + pattern.len()).min(lower.len());
-            if offset == lower.len() {
-                break;
-            }
-        }
-    }
-    ranges.sort_unstable();
-    ranges
-}
-
-fn sanitize_report_text(text: &str) -> String {
-    let mut ranges = report_text_secret_ranges(text).into_iter();
-    let Some((mut range_start, mut range_end)) = ranges.next() else {
-        return text.to_string();
-    };
-    let mut merged = Vec::new();
-    for (start, end) in ranges {
-        if start <= range_end {
-            range_end = range_end.max(end);
-        } else {
-            merged.push((range_start, range_end));
-            range_start = start;
-            range_end = end;
-        }
-    }
-    merged.push((range_start, range_end));
-
-    let mut sanitized = String::with_capacity(text.len());
-    let mut copied_until = 0;
-    for (start, end) in merged {
-        sanitized.push_str(&text[copied_until..start]);
-        sanitized.push_str("[REDACTED]");
-        copied_until = end;
-    }
-    sanitized.push_str(&text[copied_until..]);
-    sanitized
-}
-
-fn sanitize_report_value(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::String(text) => *text = sanitize_report_text(text),
-        serde_json::Value::Array(items) => {
-            for item in items {
-                sanitize_report_value(item);
-            }
-        }
-        serde_json::Value::Object(fields) => {
-            for (key, value) in fields {
-                if is_sensitive_report_key(key) && value.is_string() {
-                    *value = serde_json::Value::String("[REDACTED]".into());
-                } else {
-                    sanitize_report_value(value);
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn clipped_test_failure(result: &ExecutionResult) -> String {
-    let diagnostic = result
-        .stderr
-        .lines()
-        .filter(|line| {
-            serde_json::from_str::<serde_json::Value>(line)
-                .ok()
-                .and_then(|value| {
-                    value
-                        .get("event")
-                        .and_then(|event| event.as_str())
-                        .map(str::to_owned)
-                })
-                .as_deref()
-                != Some("target_entered")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    sanitize_report_text(diagnostic.trim())
-        .chars()
-        .take(1_000)
-        .collect()
 }
 
 fn test_quality_functions(
@@ -5504,7 +5282,7 @@ pub async fn verify(
                 "Mutation campaign skipped because verification context was unavailable",
             );
             return finalize_report(
-                build_report(stages, opts.coverage_gate),
+                build_report(stages, opts.coverage_gate, code, opts.source_file),
                 opts.output_dir,
                 opts.source_file,
                 language,
@@ -5579,6 +5357,10 @@ pub async fn verify(
     let parse_ms = start.elapsed().as_millis() as u64;
 
     if analysis.parse_error {
+        let unsupported = analysis
+            .parse_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == "unsupported");
         let message = analysis
             .parse_diagnostics
             .first()
@@ -5591,15 +5373,27 @@ pub async fn verify(
             .unwrap_or_else(|| "Code contains syntax errors".into());
         stages.push(VerificationStage {
             name: "parse".into(),
-            status: StageStatus::Failed,
+            status: if unsupported {
+                StageStatus::Inconclusive
+            } else {
+                StageStatus::Failed
+            },
             duration_ms: parse_ms,
             detail: Some(serde_json::to_value(&analysis).unwrap()),
             message: Some(message),
         });
         if !opts.tests_only {
             stages.push(skipped_execute_stage(
-                "parse_failed",
-                "Execution skipped because the source did not parse",
+                if unsupported {
+                    "analysis_depth_unsupported"
+                } else {
+                    "parse_failed"
+                },
+                if unsupported {
+                    "Execution skipped because source nesting exceeds the analysis safety limit"
+                } else {
+                    "Execution skipped because the source did not parse"
+                },
             ));
         }
         ensure_test_quality_stage(
@@ -5608,7 +5402,7 @@ pub async fn verify(
             "Mutation campaign skipped because the source did not parse",
         );
         return finalize_report(
-            build_report(stages, opts.coverage_gate),
+            build_report(stages, opts.coverage_gate, code, opts.source_file),
             opts.output_dir,
             opts.source_file,
             language,
@@ -5737,7 +5531,7 @@ pub async fn verify(
             "Mutation campaign skipped because no authoritative test was available",
         );
         return finalize_report(
-            build_report(stages, opts.coverage_gate),
+            build_report(stages, opts.coverage_gate, code, opts.source_file),
             opts.output_dir,
             opts.source_file,
             language,
@@ -5928,6 +5722,12 @@ pub async fn verify(
             &fixture_examples,
             &inferred_properties,
         );
+        let context_dependent_surfaces = if matches!(language, Language::TypeScript) {
+            react_hook_surface_ids(code, &functions_to_fuzz)
+        } else {
+            HashSet::new()
+        };
+        exclude_context_dependent_surfaces(&mut verification_plan, &context_dependent_surfaces);
         let corpus_path = persistent_corpus_path(
             opts.output_dir,
             candidate_source_file_owned.as_deref(),
@@ -6006,6 +5806,7 @@ pub async fn verify(
                 &fuzz_plan.coverage,
                 false,
             );
+            apply_context_dependent_coverage(&mut coverage, &context_dependent_surfaces);
             for function in &mut coverage {
                 if matches!(
                     function.status,
@@ -6154,6 +5955,7 @@ pub async fn verify(
                 &fuzz_plan.coverage,
                 module_load_blocked,
             );
+            apply_context_dependent_coverage(&mut coverage, &context_dependent_surfaces);
             apply_runtime_coverage_proof(&mut coverage, &exec_result.stderr);
             if let Some(blocker) = &nuxt_runtime_blocker {
                 apply_nuxt_runtime_coverage(&mut coverage, blocker);
@@ -6696,23 +6498,7 @@ pub async fn verify(
                     }
                 }
             }
-            let mut seen_findings = HashSet::new();
-            failures.retain(|finding| {
-                let replay_case = finding
-                    .minimization
-                    .minimized
-                    .as_ref()
-                    .unwrap_or(&finding.minimization.original);
-                let key = serde_json::json!({
-                    "function": finding.location.function,
-                    "severity": finding.severity,
-                    "category": finding.category,
-                    "oracle": finding.oracle.id,
-                    "case": replay_case,
-                })
-                .to_string();
-                seen_findings.insert(key)
-            });
+            let mut failures = coalesce_equivalent_findings(failures);
             let mut finding_ordinals: HashMap<String, usize> = HashMap::new();
             for finding in &mut failures {
                 let symbol: String = finding
@@ -6736,11 +6522,8 @@ pub async fn verify(
                 &suppressions,
                 candidate_source_file_owned.as_deref(),
             );
-            let summary = findings_summary(
-                &failures,
-                suppressed_failures.len(),
-                opts.inferred_oracle_gate,
-            );
+            let summary =
+                findings_summary(&failures, &suppressed_failures, opts.inferred_oracle_gate);
             let fuzz_outcomes = parse_fuzz_outcomes(&exec_result.stdout);
             let valid_invocations = fuzz_outcomes
                 .iter()
@@ -7006,12 +6789,13 @@ pub async fn verify(
                 },
             });
         } else {
-            let coverage = finalize_fuzz_coverage(
+            let mut coverage = finalize_fuzz_coverage(
                 &analysis.functions,
                 &functions_to_fuzz,
                 &fuzz_plan.coverage,
                 module_load_blocked,
             );
+            apply_context_dependent_coverage(&mut coverage, &context_dependent_surfaces);
             stages.push(VerificationStage {
                 name: "coverage".into(),
                 status: StageStatus::Passed,
@@ -7277,715 +7061,12 @@ pub async fn verify(
         "Mutation campaign skipped because no explicit authoritative test entrypoint was available",
     );
     finalize_report(
-        build_report(stages, opts.coverage_gate),
+        build_report(stages, opts.coverage_gate, code, opts.source_file),
         opts.output_dir,
         opts.source_file,
         language,
         opts.report_level,
     )
-}
-
-fn diagnostic_from_termination(
-    termination: &ProcessTermination,
-    message: String,
-) -> FailureDiagnostic {
-    let (domain, kind) = match termination.kind {
-        ProcessTerminationKind::TimedOut => (FailureDomain::Resource, FailureKind::Timeout),
-        ProcessTerminationKind::MemoryLimit => (FailureDomain::Resource, FailureKind::MemoryLimit),
-        ProcessTerminationKind::Signaled => (FailureDomain::Environment, FailureKind::Signal),
-        ProcessTerminationKind::LaunchFailed => {
-            (FailureDomain::Environment, FailureKind::LauncherFailure)
-        }
-        ProcessTerminationKind::WaitFailed => {
-            (FailureDomain::Environment, FailureKind::ToolFailure)
-        }
-        ProcessTerminationKind::Exited => (FailureDomain::Environment, FailureKind::NonzeroExit),
-    };
-    FailureDiagnostic {
-        domain,
-        kind,
-        component: DiagnosticComponent::Sandbox,
-        impact: DiagnosticImpact::Blocking,
-        message,
-        process: Some(termination.clone()),
-        limits: None,
-    }
-}
-
-fn is_non_target_blocker(diagnostic: &FailureDiagnostic) -> bool {
-    diagnostic.impact == DiagnosticImpact::Blocking
-        && diagnostic.domain != FailureDomain::TargetCode
-        && diagnostic.kind != FailureKind::NonzeroExit
-}
-
-fn has_non_target_blocking_diagnostic(diagnostics: &[FailureDiagnostic]) -> bool {
-    diagnostics.iter().any(is_non_target_blocker)
-}
-
-fn detail_has_non_target_blocker(detail: Option<&serde_json::Value>) -> bool {
-    let Some(detail) = detail else {
-        return false;
-    };
-    if detail
-        .get("non_target_blocking")
-        .and_then(|value| value.as_bool())
-        == Some(true)
-    {
-        return true;
-    }
-    let has_blocker = |value: &serde_json::Value| {
-        ["diagnostics", "failure_diagnostics"]
-            .iter()
-            .filter_map(|key| value.get(key).and_then(|entries| entries.as_array()))
-            .flatten()
-            .filter_map(|entry| serde_json::from_value::<FailureDiagnostic>(entry.clone()).ok())
-            .any(|d| is_non_target_blocker(&d))
-    };
-    has_blocker(detail) || detail.get("execution").is_some_and(has_blocker)
-}
-
-fn detail_has_target_finding(detail: Option<&serde_json::Value>) -> bool {
-    let Some(detail) = detail else {
-        return false;
-    };
-    detail
-        .get("findings")
-        .and_then(|value| value.as_array())
-        .is_some_and(|findings| !findings.is_empty())
-        || detail
-            .get("suppressed_findings")
-            .and_then(|value| value.as_array())
-            .is_some_and(|findings| !findings.is_empty())
-        || detail
-            .get("finding_count")
-            .and_then(|value| value.as_u64())
-            .is_some_and(|count| count > 0)
-}
-
-fn diagnostic_from_stage(
-    stage: &VerificationStage,
-    coverage_gate: CoverageGate,
-) -> Option<FailureDiagnostic> {
-    let detail = stage.detail.as_ref();
-    let message = stage
-        .message
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| format!("{} stage did not complete successfully", stage.name));
-
-    let simple = |domain, kind, component, impact| FailureDiagnostic {
-        domain,
-        kind,
-        component,
-        impact,
-        message: message.clone(),
-        process: None,
-        limits: None,
-    };
-
-    match stage.name.as_str() {
-        "context" => Some(simple(
-            FailureDomain::Environment,
-            FailureKind::ContextResolution,
-            DiagnosticComponent::ModuleLoader,
-            DiagnosticImpact::Blocking,
-        )),
-        "parse" => {
-            let parse_message = detail
-                .and_then(|value| value.get("parse_diagnostics"))
-                .and_then(|value| value.as_array())
-                .and_then(|values| values.first())
-                .and_then(|value| value.get("message"))
-                .and_then(|value| value.as_str())
-                .map(|value| format!("{value} ({}).", message))
-                .unwrap_or(message);
-            Some(FailureDiagnostic {
-                domain: FailureDomain::TargetCode,
-                kind: FailureKind::SyntaxError,
-                component: DiagnosticComponent::Target,
-                impact: DiagnosticImpact::Gating,
-                message: parse_message,
-                process: None,
-                limits: None,
-            })
-        }
-        "complexity" => Some(simple(
-            FailureDomain::TargetCode,
-            FailureKind::ComplexityThreshold,
-            DiagnosticComponent::Target,
-            DiagnosticImpact::Gating,
-        )),
-        "lint" => {
-            let runner_failed = detail
-                .and_then(|value| value.get("runner_failed"))
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false);
-            if runner_failed || stage.status != StageStatus::Advisory {
-                Some(simple(
-                    FailureDomain::Environment,
-                    if runner_failed {
-                        FailureKind::ToolFailure
-                    } else {
-                        FailureKind::LauncherFailure
-                    },
-                    DiagnosticComponent::LintRunner,
-                    DiagnosticImpact::Advisory,
-                ))
-            } else {
-                None
-            }
-        }
-        "coverage" => {
-            let required_functions = detail
-                .and_then(|value| value.get("functions"))
-                .and_then(|value| value.as_array())
-                .into_iter()
-                .flatten()
-                .filter(|function| {
-                    function
-                        .get("required")
-                        .and_then(|value| value.as_bool())
-                        .unwrap_or(false)
-                })
-                .collect::<Vec<_>>();
-            let every_required_surface_accounted_for = !required_functions.is_empty()
-                && required_functions.iter().all(|function| {
-                    matches!(
-                        function.get("status").and_then(|value| value.as_str()),
-                        Some(
-                            "checked_direct"
-                                | "checked_via_factory"
-                                | "checked_via_caller"
-                                | "checked_via_authoritative_test"
-                                | "reached_via_factory"
-                                | "reached_via_authoritative_test"
-                        )
-                    )
-                });
-            (!every_required_surface_accounted_for).then(|| {
-                simple(
-                    FailureDomain::VerifierHarness,
-                    FailureKind::ContractViolation,
-                    DiagnosticComponent::FuzzHarness,
-                    if coverage_gate == CoverageGate::ChangedExports {
-                        DiagnosticImpact::Blocking
-                    } else {
-                        DiagnosticImpact::Advisory
-                    },
-                )
-            })
-        }
-        "portability" => Some(simple(
-            FailureDomain::Environment,
-            FailureKind::ToolFailure,
-            DiagnosticComponent::Sandbox,
-            DiagnosticImpact::Blocking,
-        )),
-        "differential" => Some(simple(
-            FailureDomain::VerifierHarness,
-            FailureKind::AmbiguousGeneratedInput,
-            DiagnosticComponent::DifferentialRunner,
-            DiagnosticImpact::Advisory,
-        )),
-        "llm_plateau_escape" => Some(if detail_has_target_finding(detail) {
-            simple(
-                FailureDomain::TargetCode,
-                FailureKind::TargetException,
-                DiagnosticComponent::Target,
-                DiagnosticImpact::Gating,
-            )
-        } else {
-            simple(
-                FailureDomain::Environment,
-                FailureKind::ToolFailure,
-                DiagnosticComponent::Sandbox,
-                DiagnosticImpact::Blocking,
-            )
-        }),
-        "execute" | "test" => {
-            let is_test = stage.name == "test";
-            let non_target_blocked = detail_has_non_target_blocker(detail);
-            let assertion_failure = is_test
-                && !non_target_blocked
-                && (message.contains("Assertion failed")
-                    || message.contains("AssertionError")
-                    || detail
-                        .and_then(|value| value.get("assertion_failure"))
-                        .and_then(|value| value.as_bool())
-                        == Some(true));
-            let has_target_finding = detail_has_target_finding(detail);
-            let execution = detail.and_then(|value| value.get("execution")).or(detail);
-            let module_load_blocked = detail
-                .and_then(|value| value.get("module_load_blocked"))
-                .and_then(|value| value.as_bool())
-                == Some(true)
-                || execution
-                    .and_then(|value| value.get("stderr"))
-                    .and_then(|value| value.as_str())
-                    .is_some_and(is_typescript_module_load_error);
-            if module_load_blocked {
-                return Some(simple(
-                    FailureDomain::Environment,
-                    FailureKind::ModuleLoad,
-                    DiagnosticComponent::ModuleLoader,
-                    DiagnosticImpact::Blocking,
-                ));
-            }
-            if non_target_blocked {
-                return None;
-            }
-            if let Some(termination) = execution
-                .and_then(|value| value.get("termination"))
-                .and_then(|value| serde_json::from_value::<ProcessTermination>(value.clone()).ok())
-            {
-                // A target finding is authoritative and must not be replaced by
-                // a generic nonzero-exit diagnostic. Resource/process causes are
-                // retained alongside that finding.
-                if !(assertion_failure
-                    || has_target_finding
-                        && termination.kind == ProcessTerminationKind::Exited
-                        && termination.exit_code != Some(0))
-                {
-                    return Some(diagnostic_from_termination(&termination, message));
-                }
-            }
-
-            let overlay_unsupported = detail
-                .and_then(|value| value.get("instrumentation_overlay"))
-                .and_then(|value| value.get("supported"))
-                .and_then(|value| value.as_bool())
-                == Some(false);
-            if overlay_unsupported {
-                return Some(simple(
-                    FailureDomain::VerifierHarness,
-                    FailureKind::Instrumentation,
-                    DiagnosticComponent::Instrumentation,
-                    DiagnosticImpact::Blocking,
-                ));
-            }
-
-            if assertion_failure {
-                return Some(simple(
-                    FailureDomain::TargetCode,
-                    FailureKind::AssertionFailure,
-                    DiagnosticComponent::AuthoritativeTestRunner,
-                    DiagnosticImpact::Gating,
-                ));
-            }
-            if has_target_finding {
-                return Some(simple(
-                    FailureDomain::TargetCode,
-                    if is_test {
-                        FailureKind::AssertionFailure
-                    } else {
-                        FailureKind::TargetException
-                    },
-                    if is_test {
-                        DiagnosticComponent::AuthoritativeTestRunner
-                    } else {
-                        DiagnosticComponent::Target
-                    },
-                    DiagnosticImpact::Gating,
-                ));
-            }
-            if !has_target_finding {
-                return Some(simple(
-                    if is_test {
-                        FailureDomain::Environment
-                    } else {
-                        FailureDomain::VerifierHarness
-                    },
-                    if is_test {
-                        FailureKind::ToolFailure
-                    } else {
-                        FailureKind::HarnessProtocol
-                    },
-                    if is_test {
-                        DiagnosticComponent::AuthoritativeTestRunner
-                    } else {
-                        DiagnosticComponent::FuzzHarness
-                    },
-                    DiagnosticImpact::Blocking,
-                ));
-            }
-            None
-        }
-        _ => Some(simple(
-            FailureDomain::Environment,
-            FailureKind::ToolFailure,
-            DiagnosticComponent::Sandbox,
-            DiagnosticImpact::Blocking,
-        )),
-    }
-}
-
-fn append_unique_diagnostic(
-    diagnostics: &mut Vec<FailureDiagnostic>,
-    diagnostic: FailureDiagnostic,
-) {
-    let key = serde_json::to_string(&diagnostic).unwrap_or_else(|_| diagnostic.message.clone());
-    if !diagnostics.iter().any(|existing| {
-        serde_json::to_string(existing)
-            .map(|value| value == key)
-            .unwrap_or(false)
-    }) {
-        diagnostics.push(diagnostic);
-    }
-}
-
-fn diagnostics_from_stage_detail(detail: Option<&serde_json::Value>) -> Vec<FailureDiagnostic> {
-    let mut diagnostics = Vec::new();
-    let Some(detail) = detail else {
-        return diagnostics;
-    };
-    let target_cause = detail_has_target_finding(Some(detail))
-        || detail
-            .get("assertion_failure")
-            .and_then(|value| value.as_bool())
-            == Some(true);
-    let non_target_blocked = detail_has_non_target_blocker(Some(detail));
-    for key in ["diagnostics", "failure_diagnostics"] {
-        if let Some(values) = detail.get(key).and_then(|value| value.as_array()) {
-            for value in values {
-                if let Ok(diagnostic) = serde_json::from_value::<FailureDiagnostic>(value.clone()) {
-                    if (target_cause || non_target_blocked)
-                        && diagnostic.kind == FailureKind::NonzeroExit
-                    {
-                        continue;
-                    }
-                    append_unique_diagnostic(&mut diagnostics, diagnostic);
-                }
-            }
-        }
-    }
-    if let Some(value) = detail.get("diagnostic") {
-        if let Ok(diagnostic) = serde_json::from_value::<FailureDiagnostic>(value.clone()) {
-            append_unique_diagnostic(&mut diagnostics, diagnostic);
-        }
-    }
-    // ExecutionResult is deliberately kept as a nested legacy-compatible
-    // object. Promote its typed diagnostics and authoritative termination to
-    if let Some(execution) = detail.get("execution") {
-        if let Some(values) = execution
-            .get("diagnostics")
-            .and_then(|value| value.as_array())
-        {
-            for value in values {
-                if let Ok(diagnostic) = serde_json::from_value::<FailureDiagnostic>(value.clone()) {
-                    let target_cause = detail_has_target_finding(Some(detail))
-                        || detail
-                            .get("assertion_failure")
-                            .and_then(|value| value.as_bool())
-                            == Some(true);
-                    if (target_cause || non_target_blocked)
-                        && diagnostic.kind == FailureKind::NonzeroExit
-                    {
-                        continue;
-                    }
-                    append_unique_diagnostic(&mut diagnostics, diagnostic);
-                }
-            }
-        }
-    }
-    diagnostics
-}
-pub fn stage_diagnostics(stage: &VerificationStage) -> Vec<FailureDiagnostic> {
-    diagnostics_from_stage_detail(stage.detail.as_ref())
-}
-
-fn annotate_stage_diagnostics(stages: &mut [VerificationStage], coverage_gate: CoverageGate) {
-    for stage in stages {
-        let mut diagnostics = diagnostics_from_stage_detail(stage.detail.as_ref());
-        let should_infer = matches!(
-            stage.status,
-            StageStatus::Failed | StageStatus::Inconclusive
-        ) || (stage.name == "lint"
-            && stage
-                .detail
-                .as_ref()
-                .and_then(|value| value.get("runner_failed"))
-                .and_then(|value| value.as_bool())
-                == Some(true));
-
-        if stage.name == "execute" || stage.name == "test" {
-            let execution = stage
-                .detail
-                .as_ref()
-                .and_then(|value| value.get("execution"))
-                .or(stage.detail.as_ref());
-            if let Some(execution) = execution {
-                if let Some(termination) = execution.get("termination").and_then(|value| {
-                    serde_json::from_value::<ProcessTermination>(value.clone()).ok()
-                }) {
-                    let non_target_blocked = detail_has_non_target_blocker(stage.detail.as_ref());
-                    let assertion_failure = stage.name == "test"
-                        && !non_target_blocked
-                        && (stage.message.as_deref().is_some_and(|message| {
-                            message.contains("Assertion failed")
-                                || message.contains("AssertionError")
-                        }) || stage
-                            .detail
-                            .as_ref()
-                            .and_then(|value| value.get("assertion_failure"))
-                            .and_then(|value| value.as_bool())
-                            == Some(true));
-                    let has_target_finding = detail_has_target_finding(stage.detail.as_ref());
-                    let module_load_blocked = stage
-                        .detail
-                        .as_ref()
-                        .and_then(|value| value.get("module_load_blocked"))
-                        .and_then(|value| value.as_bool())
-                        == Some(true)
-                        || execution
-                            .get("stderr")
-                            .and_then(|value| value.as_str())
-                            .is_some_and(is_typescript_module_load_error);
-                    let should_record_exit = !module_load_blocked
-                        && !non_target_blocked
-                        && !assertion_failure
-                        && (termination.kind != ProcessTerminationKind::Exited
-                            || (termination.exit_code != Some(0) && !has_target_finding));
-                    if should_record_exit {
-                        append_unique_diagnostic(
-                            &mut diagnostics,
-                            diagnostic_from_termination(
-                                &termination,
-                                stage.message.clone().unwrap_or_else(|| {
-                                    format!("{} process did not exit successfully", stage.name)
-                                }),
-                            ),
-                        );
-                    }
-                }
-            }
-        }
-
-        if should_infer {
-            if let Some(diagnostic) = diagnostic_from_stage(stage, coverage_gate) {
-                // Preserve typed target/resource causes already emitted by the
-                // harness, while still guaranteeing one cause for this stage.
-                let same_kind = diagnostics
-                    .iter()
-                    .any(|existing| existing.kind == diagnostic.kind);
-                if !same_kind {
-                    append_unique_diagnostic(&mut diagnostics, diagnostic);
-                }
-            }
-        }
-
-        if !diagnostics.is_empty() {
-            let detail = stage.detail.get_or_insert_with(|| serde_json::json!({}));
-            if let Some(object) = detail.as_object_mut() {
-                if object
-                    .get("diagnostic")
-                    .and_then(|value| {
-                        serde_json::from_value::<FailureDiagnostic>(value.clone()).ok()
-                    })
-                    .is_none()
-                {
-                    let diagnostics_key = if stage.name == "lint" {
-                        "failure_diagnostics"
-                    } else {
-                        "diagnostics"
-                    };
-                    object.insert(
-                        diagnostics_key.into(),
-                        serde_json::to_value(&diagnostics)
-                            .unwrap_or_else(|_| serde_json::json!([])),
-                    );
-                }
-            }
-        }
-    }
-}
-
-fn generated_execution_is_superseded(
-    stage: &VerificationStage,
-    coverage: &CoverageSummary,
-    evidence: &VerificationEvidence,
-) -> bool {
-    if stage.name != "execute"
-        || !evidence.authoritative_test_completed
-        || coverage.required == 0
-        || coverage.behaviorally_checked < coverage.required
-    {
-        return false;
-    }
-    let diagnostics = diagnostics_from_stage_detail(stage.detail.as_ref());
-    !diagnostics.is_empty()
-        && diagnostics
-            .iter()
-            .all(|diagnostic| diagnostic.domain != FailureDomain::TargetCode)
-}
-
-fn diagnostics_from_relevant_stages(
-    stages: &[VerificationStage],
-    coverage: &CoverageSummary,
-    evidence: &VerificationEvidence,
-) -> Vec<FailureDiagnostic> {
-    let mut diagnostics = Vec::new();
-    for stage in stages {
-        if generated_execution_is_superseded(stage, coverage, evidence) {
-            continue;
-        }
-        for diagnostic in diagnostics_from_stage_detail(stage.detail.as_ref()) {
-            append_unique_diagnostic(&mut diagnostics, diagnostic);
-        }
-    }
-    diagnostics
-}
-fn orthogonal_outcome(stages: &[VerificationStage], names: &[&str]) -> OrthogonalOutcome {
-    let matching = stages
-        .iter()
-        .filter(|stage| names.contains(&stage.name.as_str()))
-        .collect::<Vec<_>>();
-    if matching.is_empty()
-        || matching
-            .iter()
-            .all(|stage| stage.status == StageStatus::Skipped)
-    {
-        return OrthogonalOutcome::NotRun;
-    }
-    if matching
-        .iter()
-        .any(|stage| stage.status == StageStatus::Failed)
-    {
-        return OrthogonalOutcome::Failed;
-    }
-    if matching
-        .iter()
-        .any(|stage| stage.status == StageStatus::Inconclusive)
-    {
-        return OrthogonalOutcome::Blocked;
-    }
-    OrthogonalOutcome::Passed
-}
-
-fn verification_outcome_matrix(stages: &[VerificationStage]) -> VerificationOutcomeMatrix {
-    VerificationOutcomeMatrix {
-        static_analysis: orthogonal_outcome(stages, &["parse", "complexity", "lint"]),
-        generated_execution: orthogonal_outcome(stages, &["execute"]),
-        authoritative_tests: orthogonal_outcome(stages, &["test"]),
-        portability: orthogonal_outcome(stages, &["portability"]),
-    }
-}
-
-fn build_report(mut stages: Vec<VerificationStage>, gate: CoverageGate) -> VerificationReport {
-    // Normalize stage-local causes before computing the report-level verdict.
-    // This keeps old stage JSON readable while ensuring every failed or
-    // inconclusive stage has a typed, deduplicated provenance record.
-    annotate_stage_diagnostics(&mut stages, gate);
-    let mut summary = compute_report_summary(&stages);
-    let evidence = evidence_from_stages(&stages);
-    let diagnostics = diagnostics_from_relevant_stages(&stages, &summary.coverage, &evidence);
-    summary.diagnostics = DiagnosticsSummary::from_diagnostics(&diagnostics);
-    let (verdict, strength) = final_verdict(&stages, &summary.coverage, gate, &evidence);
-    let outcome_matrix = verification_outcome_matrix(&stages);
-    stages.push(VerificationStage {
-        name: "outcome_matrix".into(),
-        status: StageStatus::Passed,
-        duration_ms: 0,
-        detail: Some(
-            serde_json::to_value(outcome_matrix).unwrap_or_else(|_| serde_json::json!({})),
-        ),
-        message: None,
-    });
-    VerificationReport {
-        schema_version: REPORT_SCHEMA_VERSION,
-        stages,
-        verdict,
-        strength,
-        summary,
-        diagnostics_summary: (!diagnostics.is_empty())
-            .then(|| DiagnosticsSummary::from_diagnostics(&diagnostics)),
-        diagnostics,
-        report_path: None,
-    }
-}
-
-fn evidence_from_stages(stages: &[VerificationStage]) -> VerificationEvidence {
-    let parsed = stages
-        .iter()
-        .any(|stage| stage.name == "parse" && stage.status != StageStatus::Failed);
-    let static_checks_completed = parsed
-        && stages
-            .iter()
-            .any(|stage| matches!(stage.name.as_str(), "lint" | "complexity"));
-    let mut evidence = VerificationEvidence {
-        parsed,
-        static_checks_completed,
-        ..Default::default()
-    };
-    for stage in stages {
-        if stage.name == "execute" {
-            if let Some(detail) = &stage.detail {
-                evidence.valid_invocations += detail
-                    .get("valid_invocations")
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(0) as usize;
-                evidence.evaluated_oracles += detail
-                    .get("evaluated_oracles")
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(0) as usize;
-            }
-        }
-        if stage.name == "test" && stage.status == StageStatus::Passed {
-            evidence.authoritative_test_completed = true;
-        }
-    }
-    evidence
-}
-
-fn coverage_summary_from_stages(stages: &[VerificationStage]) -> CoverageSummary {
-    let mut summary = CoverageSummary::default();
-    for stage in stages.iter().filter(|stage| stage.name == "coverage") {
-        let Some(functions) = stage
-            .detail
-            .as_ref()
-            .and_then(|d| d.get("functions"))
-            .and_then(|v| v.as_array())
-        else {
-            continue;
-        };
-        for function in functions {
-            let required = function
-                .get("required")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false);
-            if required {
-                summary.required += 1;
-            }
-            match function.get("status").and_then(|v| v.as_str()) {
-                Some(
-                    "checked_direct"
-                    | "checked_via_factory"
-                    | "checked_via_caller"
-                    | "checked_via_authoritative_test",
-                ) if required => summary.behaviorally_checked += 1,
-                Some("reached_via_factory" | "reached_via_authoritative_test") if required => {
-                    summary.reached_only += 1
-                }
-                Some("blocked_module_load") => summary.blocked += 1,
-                Some(
-                    "skipped_no_fuzzable_surface"
-                    | "skipped_unsupported_type"
-                    | "skipped_internal_helper"
-                    | "skipped_method"
-                    | "skipped_nested"
-                    | "skipped_private_name"
-                    | "skipped_diff_filtered",
-                ) => summary.skipped += 1,
-                _ => {}
-            }
-        }
-        summary.no_inputs_reached += stage
-            .detail
-            .as_ref()
-            .and_then(|d| d.get("no_inputs_reached"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
-    }
-    summary
 }
 
 fn finalize_report(
@@ -7999,817 +7080,6 @@ fn finalize_report(
         report.report_path = write_report(dir, &report, source_file, language, report_level);
     }
     report
-}
-
-fn minimal_plan_counts(detail: &serde_json::Value) -> serde_json::Value {
-    let plan = detail
-        .get("verification_plan")
-        .unwrap_or(&serde_json::Value::Null);
-    let parameter_domains = plan
-        .get("parameter_domains")
-        .and_then(|value| value.as_array())
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
-    let inputs = plan
-        .get("inputs")
-        .and_then(|value| value.as_array())
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
-    let mut source_kind_counts = serde_json::Map::new();
-    for parameter in parameter_domains {
-        for source in parameter
-            .get("sources")
-            .and_then(|value| value.as_array())
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
-        {
-            if let Some(kind) = source.get("kind").and_then(|value| value.as_str()) {
-                let count = source_kind_counts
-                    .get(kind)
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(0);
-                source_kind_counts.insert(kind.to_string(), serde_json::Value::from(count + 1));
-            }
-        }
-    }
-    serde_json::json!({
-        "domain_param_count": parameter_domains.len(),
-        "closed_domain_param_count": parameter_domains.iter().filter(|parameter| parameter.get("closed").and_then(|value| value.as_bool()).unwrap_or(false)).count(),
-        "valid_case_count": inputs.iter().filter(|input| input.get("classification").and_then(|value| value.as_str()) == Some("valid")).count(),
-        "invalid_case_count": inputs.iter().filter(|input| input.get("classification").and_then(|value| value.as_str()) == Some("invalid")).count(),
-        "source_kind_counts": source_kind_counts,
-    })
-}
-
-fn minimal_stage_view(stage: &VerificationStage) -> serde_json::Value {
-    let mut value = serde_json::json!({
-        "name": stage.name,
-        "status": stage.status,
-        "duration_ms": stage.duration_ms,
-    });
-    if let Some(message) = &stage.message {
-        value["message"] = serde_json::Value::String(message.clone());
-    }
-    if let Some(detail) = &stage.detail {
-        let trimmed = match stage.name.as_str() {
-            "complexity" => Some(serde_json::json!({
-                "threshold": detail.get("threshold").cloned().unwrap_or(serde_json::Value::Null),
-                "metric": detail.get("metric").cloned().unwrap_or(serde_json::Value::Null),
-                "checked_functions": detail.get("checked_functions").cloned().unwrap_or(serde_json::Value::Null),
-                "diff_scoped": detail.get("diff_scoped").cloned().unwrap_or(serde_json::Value::Null),
-                "violations": detail.get("violations").cloned().unwrap_or_else(|| serde_json::json!([])),
-                "suppressed_violations": detail.get("suppressed_violations").cloned().unwrap_or_else(|| serde_json::json!([])),
-                "source_directive_functions": detail.get("source_directive_functions").cloned().unwrap_or_else(|| serde_json::json!([])),
-                "source_directive_suppression_count": detail.get("source_directive_suppression_count").cloned().unwrap_or_else(|| serde_json::Value::from(0)),
-            })),
-            "coverage" => Some(serde_json::json!({
-                "counts": detail.get("counts").cloned().unwrap_or(serde_json::json!({})),
-                "diff_scoped": detail.get("diff_scoped").cloned().unwrap_or(serde_json::Value::Null),
-                "seed_input_count": detail.get("seed_input_count").cloned().unwrap_or_else(|| serde_json::Value::from(0)),
-                "seeded_functions": detail.get("seeded_functions").cloned().unwrap_or_else(|| serde_json::Value::from(0)),
-                "seed_sources": detail.get("seed_sources").cloned().unwrap_or_else(|| serde_json::json!([])),
-                "inferred_context_properties": detail.get("inferred_context_properties").cloned().unwrap_or_else(|| serde_json::json!({})),
-                "plan": minimal_plan_counts(detail),
-            })),
-            "execute" => Some(serde_json::json!({
-                "runtime": detail.get("runtime").cloned().unwrap_or(serde_json::Value::Null),
-                "skipped": detail.get("skipped").cloned().unwrap_or(serde_json::Value::Bool(false)),
-                "reason": detail.get("reason").cloned().unwrap_or(serde_json::Value::Null),
-                "generated_cases": detail.get("generated_cases").cloned().unwrap_or(serde_json::Value::Null),
-                "valid_invocations": detail.get("valid_invocations").cloned().unwrap_or_else(|| serde_json::Value::from(0)),
-                "evaluated_oracles": detail.get("evaluated_oracles").cloned().unwrap_or_else(|| serde_json::Value::from(0)),
-                "no_inputs_reached": detail.get("no_inputs_reached").cloned().unwrap_or_else(|| serde_json::Value::from(0)),
-                "findings": detail.get("findings").cloned().unwrap_or_else(|| serde_json::json!([])),
-                "suppressed_findings": detail.get("suppressed_findings").cloned().unwrap_or_else(|| serde_json::json!([])),
-                "findings_summary": detail.get("findings_summary").cloned().unwrap_or_else(|| serde_json::json!({})),
-                "plan": minimal_plan_counts(detail),
-            })),
-            "test_quality" => Some(serde_json::json!({
-                "experimental": false,
-                "mode": "advisory",
-                "max_mutants": detail.get("max_mutants").cloned().unwrap_or_else(|| serde_json::Value::from(0)),
-                "baseline_eligible": detail.get("baseline_eligible").cloned().unwrap_or(serde_json::Value::Bool(false)),
-                "counts": detail.get("counts").cloned().unwrap_or_else(|| serde_json::json!({})),
-                "mutants": detail.get("mutants").cloned().unwrap_or_else(|| serde_json::json!([])),
-                "coupling_findings": detail.get("coupling_findings").cloned().unwrap_or_else(|| serde_json::json!([])),
-                "planning_error": detail.get("planning_error").cloned().unwrap_or(serde_json::Value::Null),
-                "coupling_error": detail.get("coupling_error").cloned().unwrap_or(serde_json::Value::Null),
-            })),
-            "lint" => Some(serde_json::json!({
-                "diagnostics": detail.get("diagnostics").cloned().unwrap_or_else(|| serde_json::json!([])),
-                "runner_diagnostics": detail.get("runner_diagnostics").cloned().unwrap_or_else(|| serde_json::json!([])),
-                "runner_failed": detail.get("runner_failed").cloned().unwrap_or(serde_json::Value::Bool(false)),
-                "unavailable": detail.get("unavailable").cloned().unwrap_or(serde_json::Value::Bool(false)),
-            })),
-            "portability" => Some(serde_json::json!({
-                "reason": detail.get("reason").cloned().unwrap_or(serde_json::Value::Null),
-                "failing_imports": detail.get("failing_imports").cloned().unwrap_or_else(|| serde_json::json!([])),
-                "fix_hint": detail.get("fix_hint").cloned().unwrap_or(serde_json::Value::Null),
-                "suppressed": detail.get("suppressed").cloned().unwrap_or(serde_json::Value::Bool(false)),
-                "repo_runtime": detail.get("repo_runtime").cloned().unwrap_or(serde_json::Value::Null),
-                "node_result": serde_json::json!({
-                    "stderr": detail
-                        .get("node_result")
-                        .and_then(|node| node.get("stderr"))
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null),
-                }),
-            })),
-            _ => None,
-        };
-        if let Some(trimmed) = trimmed {
-            value["detail"] = trimmed;
-        }
-    }
-    value
-}
-
-pub fn report_json_value(
-    report: &VerificationReport,
-    report_level: ReportLevel,
-) -> serde_json::Value {
-    let mut value = match report_level {
-        ReportLevel::Minimal => serde_json::json!({
-            "schema_version": report.schema_version,
-            "verdict": report.verdict,
-            "strength": report.strength,
-            "summary": report.summary,
-            "diagnostics": report.diagnostics,
-            "diagnostics_summary": report.diagnostics_summary,
-            "report_path": report.report_path,
-            "stages": report
-                .stages
-                .iter()
-                .map(minimal_stage_view)
-                .collect::<Vec<_>>(),
-        }),
-        ReportLevel::Full => serde_json::to_value(report).unwrap_or_else(|_| serde_json::json!({})),
-    };
-    sanitize_report_value(&mut value);
-    value
-}
-
-fn clip_human(text: &str, limit: usize) -> String {
-    let sanitized = sanitize_report_text(text);
-    let trimmed = sanitized.trim();
-    if trimmed.chars().count() <= limit {
-        return trimmed.to_string();
-    }
-    let clipped: String = trimmed.chars().take(limit).collect();
-    format!("{clipped}...")
-}
-
-fn human_number(detail: &serde_json::Value, key: &str) -> usize {
-    detail
-        .get(key)
-        .and_then(|value| value.as_u64())
-        .unwrap_or(0) as usize
-}
-
-#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
-pub struct TestQualitySummary {
-    pub planned: usize,
-    pub killed: usize,
-    pub survived: usize,
-    pub invalid: usize,
-    pub blocked: usize,
-    pub no_coverage: usize,
-    pub unjudged: usize,
-    pub coupling: usize,
-}
-
-impl TestQualitySummary {
-    pub fn add(&mut self, other: Self) {
-        self.planned += other.planned;
-        self.killed += other.killed;
-        self.survived += other.survived;
-        self.invalid += other.invalid;
-        self.blocked += other.blocked;
-        self.no_coverage += other.no_coverage;
-        self.unjudged = self.invalid + self.blocked + self.no_coverage;
-        self.coupling += other.coupling;
-    }
-}
-
-pub fn test_quality_summary(report: &VerificationReport) -> Option<TestQualitySummary> {
-    let detail = report
-        .stages
-        .iter()
-        .find(|stage| stage.name == "test_quality")?
-        .detail
-        .as_ref()?;
-    let counts = detail.get("counts");
-    let count = |key: &str| {
-        counts
-            .and_then(|counts| counts.get(key))
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok())
-            .unwrap_or(0)
-    };
-    let invalid = count("invalid");
-    let blocked = count("blocked");
-    let no_coverage = count("no_coverage");
-    Some(TestQualitySummary {
-        planned: count("planned"),
-        killed: count("killed"),
-        survived: count("survived"),
-        invalid,
-        blocked,
-        no_coverage,
-        unjudged: invalid + blocked + no_coverage,
-        coupling: detail
-            .get("coupling_findings")
-            .and_then(serde_json::Value::as_array)
-            .map(Vec::len)
-            .unwrap_or(0),
-    })
-}
-fn stage_status_text(status: StageStatus) -> &'static str {
-    match status {
-        StageStatus::Passed => "PASS",
-        StageStatus::Failed => "FAIL",
-        StageStatus::Inconclusive => "INCONCLUSIVE",
-        StageStatus::Advisory => "ADVISORY",
-        StageStatus::Skipped => "SKIPPED",
-    }
-}
-
-pub fn report_human_summary(report: &VerificationReport) -> String {
-    let mut out = String::new();
-    let _ = writeln!(out, "Overall: {:?} ({:?})", report.verdict, report.strength);
-    if let Some(path) = &report.report_path {
-        let _ = writeln!(out, "Report Path: {path}");
-    }
-
-    let summary = &report.summary;
-    let _ = writeln!(
-        out,
-        "Coverage: {} analyzed, {} fuzzed, {} skipped, {} module-load blocked",
-        summary.functions_analyzed,
-        summary.functions_fuzzed,
-        summary.functions_skipped,
-        summary.functions_blocked_module_load
-    );
-    let _ = writeln!(
-        out,
-        "Execute: {} findings ({} gating, {} advisory, {} suppressed)",
-        summary.findings.total,
-        summary.findings.gating,
-        summary.findings.advisory,
-        summary.findings.suppressed
-    );
-    let _ = writeln!(
-        out,
-        "Lint: {} issues, {} runner failures",
-        summary.lint_issues, summary.lint_runner_failures
-    );
-    let _ = writeln!(
-        out,
-        "Complexity: {} violations, {} suppressed",
-        summary.complexity_violations, summary.suppressed_complexity_violations
-    );
-    if !report.diagnostics.is_empty() {
-        let _ = writeln!(out, "Diagnostics: {}", report.diagnostics.len());
-        for diagnostic in &report.diagnostics {
-            let _ = writeln!(
-                out,
-                "  {:?}/{:?} ({:?}, {:?}): {}",
-                diagnostic.domain,
-                diagnostic.kind,
-                diagnostic.component,
-                diagnostic.impact,
-                clip_human(&diagnostic.message, 160)
-            );
-        }
-    }
-
-    let _ = writeln!(out);
-    let _ = writeln!(out, "Stages:");
-    for stage in &report.stages {
-        let mut extra = String::new();
-        if let Some(detail) = &stage.detail {
-            match stage.name.as_str() {
-                "execute" => {
-                    let crash = detail
-                        .get("finding_counts")
-                        .and_then(|counts| counts.get("crash"))
-                        .and_then(|value| value.as_u64())
-                        .unwrap_or(0);
-                    let property = detail
-                        .get("finding_counts")
-                        .and_then(|counts| counts.get("property_violation"))
-                        .and_then(|value| value.as_u64())
-                        .unwrap_or(0);
-                    let no_inputs = human_number(detail, "no_inputs_reached");
-                    extra = format!("crash={crash}, property={property}, no_inputs={no_inputs}");
-                }
-                "coverage" => {
-                    let counts = detail.get("counts").cloned().unwrap_or_default();
-                    let checked = [
-                        "checked_direct",
-                        "checked_via_factory",
-                        "checked_via_caller",
-                        "checked_via_authoritative_test",
-                    ]
-                    .iter()
-                    .map(|key| {
-                        counts
-                            .get(*key)
-                            .and_then(|value| value.as_u64())
-                            .unwrap_or(0)
-                    })
-                    .sum::<u64>();
-                    let factory = counts
-                        .get("checked_via_factory")
-                        .and_then(|value| value.as_u64())
-                        .unwrap_or(0);
-                    let reached = counts
-                        .get("reached_via_factory")
-                        .and_then(|value| value.as_u64())
-                        .unwrap_or(0);
-                    let skipped = counts
-                        .as_object()
-                        .map(|obj| {
-                            obj.iter()
-                                .filter(|(key, _)| {
-                                    !key.starts_with("checked_") && *key != "reached_via_factory"
-                                })
-                                .map(|(_, value)| value.as_u64().unwrap_or(0))
-                                .sum()
-                        })
-                        .unwrap_or(0);
-                    extra = format!("checked={checked}, factory={factory}, reached={reached}, skipped={skipped}");
-                }
-                "test_quality" => {
-                    let quality = test_quality_summary(report).unwrap_or_default();
-                    extra = format!(
-                        "planned={}, killed={}, survived={}, unjudged={}, coupling={}",
-                        quality.planned,
-                        quality.killed,
-                        quality.survived,
-                        quality.unjudged,
-                        quality.coupling
-                    );
-                }
-                "lint" => {
-                    let issues = detail
-                        .get("diagnostics")
-                        .and_then(|value| value.as_array())
-                        .map(|arr| arr.len())
-                        .unwrap_or(0);
-                    let runner_failures = detail
-                        .get("runner_diagnostics")
-                        .and_then(|value| value.as_array())
-                        .map(|arr| arr.len())
-                        .unwrap_or(0);
-                    let unavailable = detail
-                        .get("unavailable")
-                        .and_then(|value| value.as_bool())
-                        .unwrap_or(false);
-                    extra = format!(
-                        "issues={issues}, runner_failures={runner_failures}, unavailable={unavailable}"
-                    );
-                }
-                "complexity" => {
-                    let violations = detail
-                        .get("violations")
-                        .and_then(|value| value.as_array())
-                        .map(|arr| arr.len())
-                        .unwrap_or(0);
-                    let threshold = human_number(detail, "threshold");
-                    extra = format!("violations={violations}, threshold={threshold}");
-                }
-                _ => {}
-            }
-        }
-        let _ = if extra.is_empty() {
-            writeln!(
-                out,
-                "  {:<12} {:<4} {:>5} ms",
-                stage.name,
-                stage_status_text(stage.status),
-                stage.duration_ms
-            )
-        } else {
-            writeln!(
-                out,
-                "  {:<12} {:<4} {:>5} ms  {}",
-                stage.name,
-                stage_status_text(stage.status),
-                stage.duration_ms,
-                extra
-            )
-        };
-        if let Some(message) = &stage.message {
-            let _ = writeln!(out, "    {}", clip_human(message, 160));
-        }
-    }
-
-    if let Some(complexity_stage) = report
-        .stages
-        .iter()
-        .find(|stage| stage.name == "complexity")
-    {
-        if let Some(violations) = complexity_stage
-            .detail
-            .as_ref()
-            .and_then(|detail| detail.get("violations"))
-            .and_then(|value| value.as_array())
-        {
-            if !violations.is_empty() {
-                let _ = writeln!(out);
-                let _ = writeln!(out, "Top Complexity Offenders:");
-                for (idx, violation) in violations.iter().take(5).enumerate() {
-                    let function = violation
-                        .get("function")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("<unknown>");
-                    let line = violation
-                        .get("line")
-                        .and_then(|value| value.as_u64())
-                        .unwrap_or(0);
-                    let cyclomatic = violation
-                        .get("complexity")
-                        .and_then(|value| value.as_u64())
-                        .unwrap_or(0);
-                    let cognitive = violation
-                        .get("cognitive_complexity")
-                        .and_then(|value| value.as_u64())
-                        .unwrap_or(0);
-                    let _ = writeln!(
-                        out,
-                        "  {}. {} (line {}) cyclomatic={} cognitive={}",
-                        idx + 1,
-                        function,
-                        line,
-                        cyclomatic,
-                        cognitive
-                    );
-                }
-            }
-        }
-    }
-
-    if let Some(execute_stage) = report.stages.iter().find(|stage| stage.name == "execute") {
-        if let Some(failures) = execute_stage
-            .detail
-            .as_ref()
-            .and_then(|detail| detail.get("findings"))
-            .and_then(|value| value.as_array())
-        {
-            if !failures.is_empty() {
-                let _ = writeln!(out);
-                let _ = writeln!(out, "Top Execute Findings:");
-                for (idx, failure) in failures.iter().take(5).enumerate() {
-                    let function = failure
-                        .get("function")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("<unknown>");
-                    let severity = failure
-                        .get("severity")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("unknown");
-                    let message = failure
-                        .get("message")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("");
-                    let _ = writeln!(
-                        out,
-                        "  {}. {} [{}] {}",
-                        idx + 1,
-                        function,
-                        severity,
-                        clip_human(message, 140)
-                    );
-                }
-            }
-        }
-    }
-
-    out.trim_end().to_string()
-}
-
-fn compute_report_summary(stages: &[VerificationStage]) -> ReportSummary {
-    let mut summary = ReportSummary {
-        functions_analyzed: 0,
-        functions_fuzzed: 0,
-        functions_skipped: 0,
-        functions_blocked_module_load: 0,
-        fuzz_pass: 0,
-        fuzz_no_inputs_reached: 0,
-        findings: FindingsSummary::default(),
-        suppressed_complexity_violations: 0,
-        suppressed_portability_warnings: 0,
-        lint_issues: 0,
-        lint_runner_failures: 0,
-        complexity_violations: 0,
-        coverage: CoverageSummary::default(),
-        diagnostics: DiagnosticsSummary::default(),
-    };
-    summary.coverage = coverage_summary_from_stages(stages);
-    for stage in stages {
-        let Some(detail) = &stage.detail else {
-            continue;
-        };
-        match stage.name.as_str() {
-            "parse" => {
-                summary.functions_analyzed = detail
-                    .get("functions")
-                    .and_then(|v| v.as_array())
-                    .map(|v| v.len())
-                    .unwrap_or(0)
-            }
-            "coverage" => {
-                if let Some(funcs) = detail.get("functions").and_then(|v| v.as_array()) {
-                    for func in funcs {
-                        match func.get("status").and_then(|v| v.as_str()) {
-                            Some(
-                                "checked_direct"
-                                | "checked_via_factory"
-                                | "checked_via_caller"
-                                | "checked_via_authoritative_test",
-                            ) => summary.functions_fuzzed += 1,
-                            Some("blocked_module_load") => {
-                                summary.functions_blocked_module_load += 1
-                            }
-                            Some(_) => summary.functions_skipped += 1,
-                            None => {}
-                        }
-                    }
-                }
-            }
-            "execute" => {
-                summary.findings = detail
-                    .get("findings_summary")
-                    .and_then(|value| serde_json::from_value(value.clone()).ok())
-                    .unwrap_or_default();
-                summary.fuzz_pass = detail
-                    .get("valid_invocations")
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(0) as usize;
-                summary.fuzz_no_inputs_reached = detail
-                    .get("no_inputs_reached")
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(0) as usize;
-            }
-            "lint" => {
-                let runner_failed = detail
-                    .get("runner_failed")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                summary.lint_issues = if runner_failed {
-                    0
-                } else {
-                    detail
-                        .get("diagnostics")
-                        .and_then(|v| v.as_array())
-                        .map(|v| v.len())
-                        .unwrap_or(0)
-                };
-                if runner_failed {
-                    summary.lint_runner_failures += 1;
-                }
-            }
-            "complexity" => {
-                summary.complexity_violations = detail
-                    .get("violations")
-                    .and_then(|v| v.as_array())
-                    .map(|v| v.len())
-                    .unwrap_or(0);
-                summary.suppressed_complexity_violations = detail
-                    .get("suppressed_violations")
-                    .and_then(|v| v.as_array())
-                    .map(|v| v.len())
-                    .unwrap_or(0);
-            }
-            "portability"
-                if detail
-                    .get("suppressed")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false) =>
-            {
-                summary.suppressed_portability_warnings += 1
-            }
-            _ => {}
-        }
-    }
-    summary.coverage.no_inputs_reached = summary.fuzz_no_inputs_reached;
-    summary
-}
-
-fn set_repro_commands(value: &mut serde_json::Value, report_path: &str) {
-    match value {
-        serde_json::Value::Object(map) => {
-            let finding_id = map
-                .get("id")
-                .and_then(|value| value.as_str())
-                .map(ToOwned::to_owned);
-            if let (Some(finding_id), Some(repro)) = (
-                finding_id,
-                map.get_mut("repro").and_then(|value| value.as_object_mut()),
-            ) {
-                repro.insert(
-                    "command".into(),
-                    serde_json::Value::String(format!(
-                        "court-jester replay --report {report_path} --finding {finding_id}"
-                    )),
-                );
-            }
-            for child in map.values_mut() {
-                set_repro_commands(child, report_path);
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for child in items {
-                set_repro_commands(child, report_path);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn write_report(
-    output_dir: &str,
-    report: &VerificationReport,
-    source_file: Option<&str>,
-    language: &Language,
-    _report_level: ReportLevel,
-) -> Option<String> {
-    use chrono::Utc;
-
-    let _ = std::fs::create_dir_all(output_dir);
-    let total_duration = report
-        .stages
-        .iter()
-        .map(|stage| stage.duration_ms)
-        .sum::<u64>();
-
-    let now = Utc::now();
-    let timestamp = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    let file_timestamp = now.format("%Y%m%dT%H%M%SZ").to_string();
-
-    let persisted = PersistedReport {
-        schema_version: REPORT_SCHEMA_VERSION,
-        meta: ReportMeta {
-            source_file: source_file.map(|s| s.to_string()),
-            language: format!("{:?}", language).to_lowercase(),
-            timestamp,
-            duration_ms: total_duration,
-        },
-        stages: report.stages.clone(),
-        verdict: report.verdict,
-        strength: report.strength,
-        summary: report.summary.clone(),
-        diagnostics: report.diagnostics.clone(),
-        diagnostics_summary: report.diagnostics_summary.clone(),
-    };
-    let basename = source_file
-        .map(|s| {
-            std::path::Path::new(s)
-                .file_stem()
-                .and_then(|os| os.to_str())
-                .unwrap_or("inline")
-                .to_string()
-        })
-        .unwrap_or_else(|| "inline".to_string());
-
-    let filename = format!("{file_timestamp}-{basename}.json");
-    let path = std::path::Path::new(output_dir).join(&filename);
-
-    let mut json_value = serde_json::to_value(&persisted).ok()?;
-    set_repro_commands(&mut json_value, path.to_string_lossy().as_ref());
-    sanitize_report_value(&mut json_value);
-
-    match serde_json::to_string_pretty(&json_value) {
-        Ok(json) => {
-            if std::fs::write(&path, &json).is_ok() {
-                Some(path.to_string_lossy().to_string())
-            } else {
-                None
-            }
-        }
-        Err(_) => None,
-    }
-}
-
-/// Parse schema-v3 findings emitted by the generated harness.
-///
-/// Prefer the bounded event stream: the trailing aggregate can be truncated
-/// when a target produces many detailed failures, while each event remains an
-type PersistentCorpus = BTreeMap<String, Vec<Vec<serde_json::Value>>>;
-
-const CORPUS_MARKER: &str = "__COURT_JESTER_CORPUS_JSON__";
-
-fn stable_corpus_key(source_file: Option<&str>, language: &Language) -> String {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in format!("{language:?}:{}", source_file.unwrap_or("<inline>")).bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
-}
-
-fn persistent_corpus_path(
-    output_dir: Option<&str>,
-    source_file: Option<&str>,
-    language: &Language,
-) -> Option<PathBuf> {
-    output_dir.map(|directory| {
-        Path::new(directory).join(format!(
-            ".court-jester-corpus-{}.json",
-            stable_corpus_key(source_file, language)
-        ))
-    })
-}
-
-fn read_persistent_corpus(path: &Path) -> PersistentCorpus {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|content| serde_json::from_str(&content).ok())
-        .unwrap_or_default()
-}
-
-fn parse_corpus(stdout: &str) -> PersistentCorpus {
-    stdout
-        .lines()
-        .rev()
-        .find_map(|line| line.strip_prefix(CORPUS_MARKER))
-        .and_then(|payload| serde_json::from_str(payload).ok())
-        .unwrap_or_default()
-}
-
-fn corpus_inputs(
-    corpus: &PersistentCorpus,
-    functions: &[FunctionInfo],
-    language: &Language,
-    source_file: Option<&str>,
-) -> Vec<PlannedInput> {
-    let mut inputs = Vec::new();
-    for function in functions.iter().filter(|function| !function.is_nested) {
-        let surface_id = format!("{}:{}", function.name, function.line);
-        let Some(rows) = corpus.get(&surface_id) else {
-            continue;
-        };
-        let params = function
-            .params
-            .iter()
-            .filter(|param| !param.is_variadic())
-            .collect::<Vec<_>>();
-        for row in rows.iter().take(64) {
-            if row.len() != params.len() {
-                continue;
-            }
-            let mut positional = Vec::new();
-            let mut named = BTreeMap::new();
-            for (param, value) in params.iter().zip(row) {
-                let literal = domain::literal_from_json_value(value.clone(), language);
-                if matches!(language, Language::Python) && param.keyword_only {
-                    named.insert(param.name.clone(), literal);
-                } else {
-                    positional.push(literal);
-                }
-            }
-            inputs.push(PlannedInput {
-                surface_id: surface_id.clone(),
-                arguments: PlannedArguments { positional, named },
-                classification: InputClassification::Unknown,
-                sources: vec![DomainSource {
-                    kind: DomainSourceKind::CoverageCorpus,
-                    symbol: Some(function.name.clone()),
-                    source_file: source_file.map(str::to_string),
-                    line: None,
-                }],
-            });
-        }
-    }
-    inputs
-}
-
-fn persist_corpus(path: Option<&Path>, update: &PersistentCorpus) -> usize {
-    let Some(path) = path else {
-        return update.values().map(Vec::len).sum();
-    };
-    let mut corpus = read_persistent_corpus(path);
-    for (surface, rows) in update {
-        let retained = corpus.entry(surface.clone()).or_default();
-        for row in rows {
-            let duplicate = retained.iter().any(|existing| existing == row);
-            if !duplicate && retained.len() < 64 {
-                retained.push(row.clone());
-            }
-        }
-    }
-    let retained_count = corpus.values().map(Vec::len).sum();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(content) = serde_json::to_vec_pretty(&corpus) {
-        let temporary = path.with_extension("json.tmp");
-        if std::fs::write(&temporary, content).is_ok() {
-            let _ = std::fs::rename(temporary, path);
-        }
-    }
-    retained_count
 }
 
 const NATIVE_FINDING_MARKER: &str = "__COURT_JESTER_NATIVE_FINDING__";
@@ -8856,6 +7126,8 @@ fn parse_native_findings(output: &str) -> Vec<VerificationFinding> {
                 severity: FindingSeverity::Crash,
                 confidence: FindingConfidence::High,
                 category: FindingCategory::Exception,
+                occurrences: 1,
+                sample_inputs: vec![original.clone()],
                 location: FindingLocation {
                     source_file: String::new(),
                     function: record.function.clone(),
@@ -8975,7 +7247,7 @@ fn repair_priority(finding: &VerificationFinding) -> u8 {
 }
 
 /// Build the stable, agent-facing repair view from a verification report.
-pub fn repair_summary(report: &VerificationReport) -> RepairSummary {
+pub fn repair_summary(report: &VerificationReport, language: &Language) -> RepairSummary {
     let findings = findings_from_stages(&report.stages);
     let primary_finding = findings
         .iter()
@@ -9023,8 +7295,21 @@ pub fn repair_summary(report: &VerificationReport) -> RepairSummary {
     .to_string();
     RepairSummary {
         schema_version: report.schema_version,
+        tool: report.tool.clone(),
+        candidate: report.candidate.clone(),
+        meta: ReportMeta {
+            source_file: report.candidate.source_file.clone(),
+            language: match language {
+                Language::Python => "python",
+                Language::TypeScript => "typescript",
+            }
+            .into(),
+            timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            duration_ms: report.stages.iter().map(|stage| stage.duration_ms).sum(),
+        },
         verdict: report.verdict,
         strength: report.strength,
+        summary: report.summary.clone(),
         recommended_action,
         primary_finding,
         findings,
@@ -9034,654 +7319,9 @@ pub fn repair_summary(report: &VerificationReport) -> RepairSummary {
     }
 }
 
-fn persisted_findings(report: &PersistedReport) -> Vec<VerificationFinding> {
-    findings_from_stages(&report.stages)
-}
-
-pub fn load_persisted_report(path: &str) -> Result<PersistedReport, String> {
-    let bytes = std::fs::read_to_string(path)
-        .map_err(|error| format!("failed to read report '{path}': {error}"))?;
-    let report: PersistedReport = serde_json::from_str(&bytes)
-        .map_err(|error| format!("invalid persisted report: {error}"))?;
-    if report.schema_version != REPORT_SCHEMA_VERSION {
-        return Err(format!(
-            "unsupported report schema {}; expected {}",
-            report.schema_version, REPORT_SCHEMA_VERSION
-        ));
-    }
-    Ok(report)
-}
-pub fn replay_launch_context(
-    report_path: &str,
-    finding_id: &str,
-) -> Result<Option<ReproLaunchContext>, String> {
-    let report = load_persisted_report(report_path)?;
-    let mut matches = persisted_findings(&report)
-        .into_iter()
-        .filter(|finding| finding.id == finding_id);
-    let finding = matches
-        .next()
-        .ok_or_else(|| format!("finding '{finding_id}' was not found in report"))?;
-    if matches.next().is_some() {
-        return Err(format!("finding id '{finding_id}' is duplicated"));
-    }
-    Ok(finding.launch_context)
-}
-
-fn replay_payload(stdout: &str) -> Result<serde_json::Value, String> {
-    const MARKER: &str = "__COURT_JESTER_REPLAY_JSON__";
-    if stdout.matches(MARKER).count() != 1 {
-        return Err("replay sentinel must occur exactly once".into());
-    }
-    let after = stdout
-        .split_once(MARKER)
-        .map(|(_, value)| value.trim())
-        .unwrap_or_default();
-    let line = after.lines().next().unwrap_or_default().trim();
-    if line.is_empty() {
-        return Err("replay sentinel has no JSON payload".into());
-    }
-    serde_json::from_str(line).map_err(|error| format!("invalid replay sentinel JSON: {error}"))
-}
-
-fn validate_differential_repro(
-    differential: &DifferentialRepro,
-    dependency_project_dir: Option<&str>,
-) -> Result<(), String> {
-    for source in differential
-        .base_files
-        .iter()
-        .chain(differential.candidate_files.iter())
-    {
-        if stable_digest(&source.content) != source.sha256 {
-            return Err(format!(
-                "embedded source digest mismatch for {}",
-                source.relative_path
-            ));
-        }
-    }
-    let tree_digest = |files: &[EmbeddedSource]| {
-        if files.len() == 1 {
-            return stable_digest(&files[0].content);
-        }
-        let mut entries = files
-            .iter()
-            .map(|source| format!("{}\n{}", source.relative_path, source.content))
-            .collect::<Vec<_>>();
-        entries.sort();
-        stable_digest(&entries.join("\n"))
-    };
-    if tree_digest(&differential.base_files) != differential.base_tree_sha256 {
-        return Err("embedded base tree digest mismatch".into());
-    }
-    if tree_digest(&differential.candidate_files) != differential.candidate_tree_sha256 {
-        return Err("embedded candidate tree digest mismatch".into());
-    }
-    if !differential
-        .dependency_contract
-        .third_party_modules
-        .is_empty()
-        && dependency_project_dir.is_none()
-    {
-        return Err("replay requires --dependency-project-dir for third-party modules".into());
-    }
-    if let Some(root) = dependency_project_dir {
-        for lockfile in &differential.dependency_contract.lockfiles {
-            let path = Path::new(root).join(&lockfile.relative_path);
-            let content = std::fs::read_to_string(&path)
-                .map_err(|error| format!("dependency lockfile unavailable: {error}"))?;
-            if stable_digest(&content) != lockfile.sha256 {
-                return Err(format!(
-                    "dependency lockfile digest mismatch for {}",
-                    lockfile.relative_path
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-fn materialize_embedded_tree(
-    files: &[EmbeddedSource],
-    relative_entry: &str,
-    label: &str,
-) -> Result<(tempfile::TempDir, String, String), String> {
-    let root = tempfile::tempdir()
-        .map_err(|error| format!("failed to create {label} replay root: {error}"))?;
-    let mut entry_content = None;
-    let mut entry_path = None;
-    for embedded in files {
-        let relative = Path::new(&embedded.relative_path);
-        if relative.is_absolute()
-            || relative
-                .components()
-                .any(|component| matches!(component, std::path::Component::ParentDir))
-        {
-            return Err(format!(
-                "invalid embedded source path '{}'",
-                embedded.relative_path
-            ));
-        }
-        let destination = root.path().join(relative);
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| format!("failed to materialize {label} replay source: {error}"))?;
-        }
-        std::fs::write(&destination, &embedded.content)
-            .map_err(|error| format!("failed to materialize {label} replay source: {error}"))?;
-        if embedded.relative_path == relative_entry {
-            entry_content = Some(embedded.content.clone());
-            entry_path = Some(destination.to_string_lossy().to_string());
-        }
-    }
-    match (entry_content, entry_path) {
-        (Some(content), Some(path)) => Ok((root, content, path)),
-        _ => Err(format!(
-            "differential entry '{relative_entry}' is absent from embedded {label} sources"
-        )),
-    }
-}
-
-pub async fn replay_report(
-    report_path: &str,
-    finding_id: &str,
-    dependency_project_dir: Option<&str>,
-    runtime_profile: RuntimeProfile,
-    python_docker_image: &str,
-    typescript_docker_image: &str,
-) -> Result<ReplayReport, String> {
-    replay_report_with_options(
-        report_path,
-        finding_id,
-        dependency_project_dir,
-        runtime_profile,
-        python_docker_image,
-        typescript_docker_image,
-        None,
-        None,
-        None,
-        None,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn replay_report_with_options(
-    report_path: &str,
-    finding_id: &str,
-    dependency_project_dir: Option<&str>,
-    runtime_profile: RuntimeProfile,
-    python_docker_image: &str,
-    typescript_docker_image: &str,
-    timeout_seconds: Option<f64>,
-    memory_mb: Option<u64>,
-    network: Option<NetworkPolicy>,
-    harness_args: Option<&[HarnessArg]>,
-) -> Result<ReplayReport, String> {
-    let report = load_persisted_report(report_path)?;
-    let mut matches = persisted_findings(&report)
-        .into_iter()
-        .filter(|finding| finding.id == finding_id);
-    let finding = matches
-        .next()
-        .ok_or_else(|| format!("finding '{finding_id}' was not found in report"))?;
-    if matches.next().is_some() {
-        return Err(format!("finding id '{finding_id}' is duplicated"));
-    }
-    let language = Language::parse(&report.meta.language).ok_or_else(|| {
-        format!(
-            "unsupported report language '{}'; expected python or typescript",
-            report.meta.language
-        )
-    })?;
-
-    let launch_context = finding.launch_context.as_ref();
-    let docker_image = match language {
-        Language::Python => python_docker_image,
-        Language::TypeScript => typescript_docker_image,
-    };
-    let replay_timeout = timeout_seconds
-        .or_else(|| launch_context.map(|context| context.limits.timeout_seconds))
-        .unwrap_or(10.0);
-    let replay_memory = memory_mb
-        .or_else(|| launch_context.map(|context| context.limits.memory_mb))
-        .unwrap_or(128);
-    let replay_network = network
-        .or_else(|| launch_context.map(|context| context.limits.network_policy))
-        .unwrap_or(NetworkPolicy::Deny);
-    let replay_harness_args = harness_args.unwrap_or_else(|| {
-        launch_context
-            .map(|context| context.harness_args.as_slice())
-            .unwrap_or(&[])
-    });
-    if let Some(differential) = finding.repro.differential.as_ref() {
-        if let Err(reason) = validate_differential_repro(differential, dependency_project_dir) {
-            return Ok(ReplayReport {
-                schema_version: REPORT_SCHEMA_VERSION,
-                finding_id: finding.id,
-                outcome: ReplayOutcome::Inconclusive,
-                execution: err_execution_result(&reason),
-            });
-        }
-        let (base_root, base_source, base_entry) = match materialize_embedded_tree(
-            &differential.base_files,
-            &differential.relative_entry,
-            "base",
-        ) {
-            Ok(materialized) => materialized,
-            Err(reason) => {
-                return Ok(ReplayReport {
-                    schema_version: REPORT_SCHEMA_VERSION,
-                    finding_id: finding.id,
-                    outcome: ReplayOutcome::Inconclusive,
-                    execution: err_execution_result(&reason),
-                })
-            }
-        };
-        let (candidate_root, candidate_source, candidate_entry) = match materialize_embedded_tree(
-            &differential.candidate_files,
-            &differential.relative_entry,
-            "candidate",
-        ) {
-            Ok(materialized) => materialized,
-            Err(reason) => {
-                return Ok(ReplayReport {
-                    schema_version: REPORT_SCHEMA_VERSION,
-                    finding_id: finding.id,
-                    outcome: ReplayOutcome::Inconclusive,
-                    execution: err_execution_result(&reason),
-                })
-            }
-        };
-        let Some(symbol) = finding.repro.function.as_deref() else {
-            return Ok(ReplayReport {
-                schema_version: REPORT_SCHEMA_VERSION,
-                finding_id: finding.id,
-                outcome: ReplayOutcome::Inconclusive,
-                execution: err_execution_result("differential repro has no function symbol"),
-            });
-        };
-        let base_context = match crate::resolve_execution_context(ContextRequest {
-            invocation_dir: base_root.path(),
-            explicit_project_dir: Some(base_root.path()),
-            target_file: Some(Path::new(&base_entry)),
-            test_file: None,
-            language,
-            virtual_file_path: None,
-        }) {
-            Ok(context) => context,
-            Err(error) => {
-                return Ok(ReplayReport {
-                    schema_version: REPORT_SCHEMA_VERSION,
-                    finding_id: finding.id,
-                    outcome: ReplayOutcome::Inconclusive,
-                    execution: err_execution_result(&format!(
-                        "differential replay base context unavailable: {error}"
-                    )),
-                })
-            }
-        };
-        let candidate_context = match crate::resolve_execution_context(ContextRequest {
-            invocation_dir: candidate_root.path(),
-            explicit_project_dir: Some(candidate_root.path()),
-            target_file: Some(Path::new(&candidate_entry)),
-            test_file: None,
-            language,
-            virtual_file_path: None,
-        }) {
-            Ok(context) => context,
-            Err(error) => {
-                return Ok(ReplayReport {
-                    schema_version: REPORT_SCHEMA_VERSION,
-                    finding_id: finding.id,
-                    outcome: ReplayOutcome::Inconclusive,
-                    execution: err_execution_result(&format!(
-                        "differential replay candidate context unavailable: {error}"
-                    )),
-                })
-            }
-        };
-        let base_analysis =
-            analyze::analyze_with_context(&base_source, &base_context.target_source);
-        let candidate_analysis =
-            analyze::analyze_with_context(&candidate_source, &candidate_context.target_source);
-        let base_function = base_analysis
-            .functions
-            .iter()
-            .find(|function| function.name == symbol);
-        let candidate_function = candidate_analysis
-            .functions
-            .iter()
-            .find(|function| function.name == symbol);
-        let (Some(base_function), Some(candidate_function)) = (base_function, candidate_function)
-        else {
-            return Ok(ReplayReport {
-                schema_version: REPORT_SCHEMA_VERSION,
-                finding_id: finding.id,
-                outcome: ReplayOutcome::Inconclusive,
-                execution: err_execution_result(
-                    "differential replay surface is absent from an embedded tree",
-                ),
-            });
-        };
-        if !compatible_surface(candidate_function, base_function) {
-            return Ok(ReplayReport {
-                schema_version: REPORT_SCHEMA_VERSION,
-                finding_id: finding.id,
-                outcome: ReplayOutcome::Inconclusive,
-                execution: err_execution_result(
-                    "embedded differential surface signatures are incompatible",
-                ),
-            });
-        }
-        let Some(differential_case) = differential_case_from_arguments(
-            candidate_function,
-            &finding.repro.arguments,
-            &language,
-        ) else {
-            return Ok(ReplayReport {
-                schema_version: REPORT_SCHEMA_VERSION,
-                finding_id: finding.id,
-                outcome: ReplayOutcome::Inconclusive,
-                execution: err_execution_result(
-                    "differential replay arguments do not match the stored surface bindings",
-                ),
-            });
-        };
-        let base_probe =
-            differential_probe(&base_source, base_function, &differential_case, &language);
-        let candidate_probe = differential_probe(
-            &candidate_source,
-            candidate_function,
-            &differential_case,
-            &language,
-        );
-        let base_options = SandboxOptions {
-            timeout_seconds: replay_timeout,
-            memory_mb: replay_memory,
-            runtime_profile,
-            network_policy: replay_network,
-            harness_args: replay_harness_args,
-            docker_image: (runtime_profile == RuntimeProfile::Isolated).then_some(docker_image),
-            project_dir: base_root.path().to_str(),
-            source_file: Some(&base_entry),
-            instrumentation_target: None,
-            instrumented_source: None,
-        };
-        let candidate_options = SandboxOptions {
-            timeout_seconds: replay_timeout,
-            memory_mb: replay_memory,
-            runtime_profile,
-            network_policy: replay_network,
-            harness_args: replay_harness_args,
-            docker_image: (runtime_profile == RuntimeProfile::Isolated).then_some(docker_image),
-            project_dir: candidate_root.path().to_str(),
-            source_file: Some(&candidate_entry),
-            instrumentation_target: None,
-            instrumented_source: None,
-        };
-        base_options.validate()?;
-        candidate_options.validate()?;
-        let base_execution = sandbox::execute(&base_probe, &language, base_options).await;
-        let candidate_execution =
-            sandbox::execute(&candidate_probe, &language, candidate_options).await;
-        let base_snapshot = match differential_snapshot(&base_execution) {
-            Ok(snapshot) => snapshot,
-            Err(reason) => {
-                return Ok(ReplayReport {
-                    schema_version: REPORT_SCHEMA_VERSION,
-                    finding_id: finding.id,
-                    outcome: ReplayOutcome::Inconclusive,
-                    execution: err_execution_result(&format!(
-                        "differential replay baseline snapshot unsupported: {reason}"
-                    )),
-                })
-            }
-        };
-        let candidate_snapshot = match differential_snapshot(&candidate_execution) {
-            Ok(snapshot) => snapshot,
-            Err(reason) => {
-                return Ok(ReplayReport {
-                    schema_version: REPORT_SCHEMA_VERSION,
-                    finding_id: finding.id,
-                    outcome: ReplayOutcome::Inconclusive,
-                    execution: err_execution_result(&format!(
-                        "differential replay candidate snapshot unsupported: {reason}"
-                    )),
-                })
-            }
-        };
-        if differential_binding_failure(&base_snapshot, &language)
-            || differential_binding_failure(&candidate_snapshot, &language)
-            || (base_snapshot == candidate_snapshot && base_snapshot.exception_type.is_some())
-        {
-            return Ok(ReplayReport {
-                schema_version: REPORT_SCHEMA_VERSION,
-                finding_id: finding.id,
-                outcome: ReplayOutcome::Inconclusive,
-                execution: err_execution_result(
-                    "differential replay case is an invalid generated invocation",
-                ),
-            });
-        }
-        let reproduced = base_snapshot != candidate_snapshot;
-        let payload = serde_json::json!({
-            "reproduced": reproduced,
-            "severity": finding.repro.expectation.severity,
-            "oracle_kind": finding.repro.expectation.oracle_kind,
-            "category": finding.repro.expectation.category,
-        });
-        let execution = ExecutionResult {
-            stdout: format!(
-                "__COURT_JESTER_REPLAY_JSON__{}\n",
-                serde_json::to_string(&payload).unwrap_or_default()
-            ),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration_ms: base_execution
-                .duration_ms
-                .saturating_add(candidate_execution.duration_ms),
-            timed_out: false,
-            memory_error: false,
-            termination: Some(ProcessTermination {
-                kind: ProcessTerminationKind::Exited,
-                exit_code: Some(0),
-                signal: None,
-                signal_name: None,
-            }),
-            diagnostics: vec![],
-        };
-        return Ok(ReplayReport {
-            schema_version: REPORT_SCHEMA_VERSION,
-            finding_id: finding.id,
-            outcome: if reproduced {
-                ReplayOutcome::Reproduced
-            } else {
-                ReplayOutcome::NotReproduced
-            },
-            execution,
-        });
-    }
-
-    let mut source_file_owned = None;
-    let mut source = String::new();
-    if let Some(path) = report.meta.source_file.as_deref() {
-        let source_path = if Path::new(path).is_file() {
-            PathBuf::from(path)
-        } else if let Some(root) = dependency_project_dir {
-            Path::new(root).join(path)
-        } else {
-            return Ok(ReplayReport {
-                schema_version: REPORT_SCHEMA_VERSION,
-                finding_id: finding.id,
-                outcome: ReplayOutcome::Inconclusive,
-                execution: err_execution_result(
-                    "relative replay source requires --dependency-project-dir",
-                ),
-            });
-        };
-        source = std::fs::read_to_string(&source_path)
-            .map_err(|error| format!("source context unavailable for replay: {error}"))?;
-        source_file_owned = Some(source_path.to_string_lossy().to_string());
-    }
-    let code = if source.is_empty() {
-        finding.repro.snippet.clone()
-    } else {
-        let mut code = generated_target_source(&source, &language);
-        code.push('\n');
-        code.push_str(&finding.repro.snippet);
-        code
-    };
-    let source_file = source_file_owned.as_deref();
-    let project_dir_owned = dependency_project_dir.map(ToOwned::to_owned).or_else(|| {
-        source_file.and_then(|path| {
-            Path::new(path)
-                .parent()
-                .and_then(|parent| parent.to_str())
-                .map(ToOwned::to_owned)
-        })
-    });
-    let project_dir = project_dir_owned.as_deref();
-    let options = SandboxOptions {
-        timeout_seconds: replay_timeout,
-        memory_mb: replay_memory,
-        runtime_profile,
-        network_policy: replay_network,
-        harness_args: replay_harness_args,
-        docker_image: (runtime_profile == RuntimeProfile::Isolated).then_some(docker_image),
-        project_dir,
-        source_file,
-        instrumentation_target: None,
-        instrumented_source: None,
-    };
-    options.validate()?;
-    let execution = sandbox::execute(&code, &language, options).await;
-    let outcome = match replay_payload(&execution.stdout) {
-        Ok(payload) => {
-            let reproduced = payload
-                .get("reproduced")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false);
-            let expected = |value: serde_json::Value| value.as_str().map(ToOwned::to_owned);
-            let matches_expectation = payload.get("severity").and_then(|value| value.as_str())
-                == expected(
-                    serde_json::to_value(finding.repro.expectation.severity).unwrap_or_default(),
-                )
-                .as_deref()
-                && payload.get("oracle_kind").and_then(|value| value.as_str())
-                    == expected(
-                        serde_json::to_value(finding.repro.expectation.oracle_kind)
-                            .unwrap_or_default(),
-                    )
-                    .as_deref()
-                && payload.get("category").and_then(|value| value.as_str())
-                    == expected(
-                        serde_json::to_value(finding.repro.expectation.category)
-                            .unwrap_or_default(),
-                    )
-                    .as_deref();
-            if matches_expectation {
-                if reproduced {
-                    ReplayOutcome::Reproduced
-                } else {
-                    ReplayOutcome::NotReproduced
-                }
-            } else {
-                ReplayOutcome::Inconclusive
-            }
-        }
-        Err(_) => ReplayOutcome::Inconclusive,
-    };
-    Ok(ReplayReport {
-        schema_version: REPORT_SCHEMA_VERSION,
-        finding_id: finding.id,
-        outcome,
-        execution,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn report_text_sanitizer_redacts_credentials_without_erasing_diagnostics() {
-        let input = "request failed: API_KEY=alpha123 password: hunter2\nDATABASE_PASSWORD=dbopaque OPENAI_API_KEY=aiopaque ACCESS_TOKEN=accessopaque CLIENT_SECRET=clientopaque GITHUB_TOKEN=githubopaque monkey=visible\n{\"token\":\"json-token\",\"cookie\":\"session=abc\"}\nAuthorization: Bearer bearer-token\nghp_deadbeef github_pat_123 sk-live-key";
-        let sanitized = sanitize_report_text(input);
-        assert!(sanitized.contains("request failed:"), "{sanitized}");
-        assert!(
-            sanitized.contains("\"token\":\"[REDACTED]\""),
-            "{sanitized}"
-        );
-        assert!(sanitized.contains("Bearer [REDACTED]"), "{sanitized}");
-        assert!(sanitized.contains("monkey=visible"), "{sanitized}");
-        for secret in [
-            "alpha123",
-            "hunter2",
-            "json-token",
-            "session=abc",
-            "bearer-token",
-            "ghp_deadbeef",
-            "github_pat_123",
-            "sk-live-key",
-            "dbopaque",
-            "aiopaque",
-            "accessopaque",
-            "clientopaque",
-            "githubopaque",
-        ] {
-            assert!(
-                !sanitized.contains(secret),
-                "{secret} leaked in {sanitized}"
-            );
-        }
-    }
-
-    #[test]
-    fn structured_sensitive_report_fields_are_redacted() {
-        let mut value = serde_json::json!({
-            "diagnostic": "request failed",
-            "api_key": "structured-secret",
-            "DATABASE_PASSWORD": "database-secret",
-            "openaiApiKey": "openai-secret",
-            "ACCESS_TOKEN": "access-secret",
-            "CLIENT_SECRET": "client-secret",
-            "GITHUB_TOKEN": "github-secret",
-            "monkey": "visible",
-            "nested": { "Authorization": "Bearer nested-secret" },
-        });
-        sanitize_report_value(&mut value);
-        assert_eq!(value["diagnostic"], "request failed");
-        assert_eq!(value["api_key"], "[REDACTED]");
-        assert_eq!(value["nested"]["Authorization"], "[REDACTED]");
-        for key in [
-            "DATABASE_PASSWORD",
-            "openaiApiKey",
-            "ACCESS_TOKEN",
-            "CLIENT_SECRET",
-            "GITHUB_TOKEN",
-        ] {
-            assert_eq!(value[key], "[REDACTED]", "{key}");
-        }
-        assert_eq!(value["monkey"], "visible");
-    }
-
-    #[test]
-    fn report_failure_bound_is_applied_after_secret_redaction() {
-        let result = ExecutionResult {
-            stdout: String::new(),
-            stderr: format!("{} token=secret-beyond-bound", "x".repeat(990)),
-            exit_code: Some(1),
-            duration_ms: 1,
-            timed_out: false,
-            memory_error: false,
-            termination: None,
-            diagnostics: Vec::new(),
-        };
-        let clipped = clipped_test_failure(&result);
-        assert!(!clipped.contains("secret"), "{clipped}");
-        assert!(clipped.contains("[RE"), "{clipped}");
-        assert!(clipped.chars().count() <= 1_000);
-    }
 
     #[test]
     fn candidate_count_uses_runtime_surface_eligibility() {

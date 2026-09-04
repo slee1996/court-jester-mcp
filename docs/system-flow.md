@@ -137,6 +137,7 @@ The benchmark shells out to the Rust CLI through `bench/cli_client.py`.
 The `verify` command entrypoint is exposed from:
 
 - `src/main.rs`
+- `src/cli/mod.rs` (command dispatch and private CLI modules)
 - `src/tools/verify.rs`
 
 For each verified file, Court Jester runs a staged pipeline:
@@ -150,7 +151,7 @@ For each verified file, Court Jester runs a staged pipeline:
    - generates language-aware adversarial inputs and property checks
 
 3. Lint
-   - informational unless the lint runner itself errors
+   - advisory, including explicit lint-runner diagnostics
 
 4. Execute / fuzz
    - runs generated fuzz/property tests in the sandbox
@@ -160,10 +161,14 @@ For each verified file, Court Jester runs a staged pipeline:
 
 6. Report
    - schema-v3 JSON report per file with stage details, typed `pass|fail|inconclusive` verdict, and evidence strength
+   - `verify/decisions.rs` computes evidence and verdicts; `verify/reporting.rs` renders and persists them
+   - `verify/replay.rs` loads and reruns persisted repros
 
 ## Sandbox Flow
 
 `src/tools/sandbox.rs` is responsible for running Python/TypeScript in a controlled subprocess.
+
+`sandbox/process.rs` owns subprocess supervision and resource limits; `sandbox/events.rs` validates generated-harness lifecycle events. See [Implementation map](code-map.md) for the complete module layout, including compile-time harness assets and benchmark report/feedback modules.
 
 Current important behavior:
 

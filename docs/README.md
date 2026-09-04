@@ -4,6 +4,7 @@ This folder now has a small canonical set at the top level, with older planning 
 
 ## Start Here
 
+- [code-map.md](code-map.md): current implementation modules, ownership boundaries, and compatibility contracts
 - [court-jester-overview.md](court-jester-overview.md): what Court Jester is, why it exists, and how the benchmark is meant to answer product questions
 - [release-readiness-private-beta.md](release-readiness-private-beta.md): current release bar and honest status read
 - [releasing.md](releasing.md): GitHub-only release procedure and post-publish verification

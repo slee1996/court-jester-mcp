@@ -19,6 +19,7 @@ It is just a CLI. No MCP transport, editor plugin, or custom agent integration l
 
 Release and CI wiring docs:
 
+- [docs/code-map.md](docs/code-map.md)
 - [CHANGELOG.md](CHANGELOG.md)
 - [docs/releasing.md](docs/releasing.md)
 - [docs/report-schema.md](docs/report-schema.md)

@@ -8,6 +8,9 @@ pub const REPORT_SCHEMA_VERSION: u32 = 3;
 fn is_zero(value: &usize) -> bool {
     *value == 0
 }
+fn one() -> usize {
+    1
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -1053,6 +1056,8 @@ pub struct OracleInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct FindingsSummary {
     pub total: usize,
+    #[serde(default)]
+    pub occurrences: usize,
     pub gating: usize,
     pub advisory: usize,
     pub suppressed: usize,
@@ -1157,6 +1162,10 @@ pub struct MinimizationInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VerificationFinding {
+    #[serde(default = "one")]
+    pub occurrences: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sample_inputs: Vec<ReproCase>,
     pub id: String,
     pub severity: FindingSeverity,
     pub confidence: FindingConfidence,
@@ -1440,9 +1449,26 @@ pub struct VerificationEvidence {
     pub authoritative_test_covered_surfaces: usize,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolProvenance {
+    pub name: String,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CandidateProvenance {
+    pub content_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_file: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerificationReport {
     pub schema_version: u32,
+    #[serde(default)]
+    pub tool: ToolProvenance,
+    #[serde(default)]
+    pub candidate: CandidateProvenance,
     pub stages: Vec<VerificationStage>,
     pub verdict: VerificationVerdict,
     pub strength: VerificationStrength,
@@ -1487,6 +1513,10 @@ pub struct ReportSummary {
 pub struct PersistedReport {
     pub schema_version: u32,
     pub meta: ReportMeta,
+    #[serde(default)]
+    pub tool: ToolProvenance,
+    #[serde(default)]
+    pub candidate: CandidateProvenance,
     pub stages: Vec<VerificationStage>,
     pub verdict: VerificationVerdict,
     pub strength: VerificationStrength,
@@ -1518,8 +1548,14 @@ pub struct DoctorReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepairSummary {
     pub schema_version: u32,
+    #[serde(default)]
+    pub tool: ToolProvenance,
+    #[serde(default)]
+    pub candidate: CandidateProvenance,
+    pub meta: ReportMeta,
     pub verdict: VerificationVerdict,
     pub strength: VerificationStrength,
+    pub summary: ReportSummary,
     pub recommended_action: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub primary_finding: Option<VerificationFinding>,

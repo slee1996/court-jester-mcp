@@ -4,6 +4,8 @@ Date: 2026-07-10
 
 Court Jester is a CLI verifier for Python and TypeScript. The Rust binary owns analysis, domain planning, harness generation, runtime execution, typed reports, repair views, and replay. The Python benchmark harness is a separate consumer that measures agent-loop utility and precision.
 
+For the current file-level boundaries, see [Implementation map](code-map.md). The binary delegates to `src/cli/`; verifier decisions, report rendering, replay, and subprocess supervision have dedicated internal modules.
+
 ```mermaid
 flowchart TD
     User[User or agent loop] --> CLI[court-jester CLI]

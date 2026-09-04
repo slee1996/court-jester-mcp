@@ -1,219 +1,16 @@
 use std::collections::{BTreeMap, HashSet};
 
-use crate::types::{
-    FailureDiagnostic, FailureDomain, FailureKind, HarnessEvent, HarnessEventRecord,
-    InputClassification, ProcessTermination, ProcessTerminationKind,
+use crate::types::{FailureDiagnostic, FailureDomain, FailureKind, ProcessTerminationKind};
+
+mod events;
+mod process;
+use process::{launch_failure, run_launch_command, termination};
+
+pub use events::{
+    parse_harness_events, HarnessEventSummary, HARNESS_EVENT_MAX_LINE_BYTES,
+    HARNESS_EVENT_MAX_RECORDS, HARNESS_EVENT_PROTOCOL_VERSION, HARNESS_EVENT_SENTINEL,
 };
 
-pub const HARNESS_EVENT_SENTINEL: &str = "__COURT_JESTER_EVENT_JSON__";
-pub const HARNESS_EVENT_PROTOCOL_VERSION: u32 = 1;
-pub const HARNESS_EVENT_MAX_LINE_BYTES: usize = 262_144;
-pub const HARNESS_EVENT_MAX_RECORDS: usize = 100_000;
-
-#[derive(Debug, Clone)]
-pub struct HarnessEventSummary {
-    pub records: Vec<HarnessEventRecord>,
-    pub findings: Vec<crate::types::VerificationFinding>,
-    pub completed_units: usize,
-    pub runner_started: bool,
-    pub target_resolved: bool,
-    pub target_ready: bool,
-    pub harness_completed: bool,
-    pub open_unit: Option<(String, usize)>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EventState {
-    Start,
-    Bootstrap,
-    Resolved,
-    Ready,
-    Completed,
-    BootstrapFailed,
-}
-
-fn event_protocol_error(message: impl Into<String>) -> String {
-    format!("harness protocol error: {}", message.into())
-}
-
-pub fn parse_harness_events(output: &str) -> Result<HarnessEventSummary, String> {
-    let mut records = Vec::new();
-    let mut seen_sequences = HashSet::new();
-    let mut state = EventState::Start;
-    let mut next_sequence = 0u64;
-    let mut current_unit: Option<(String, usize)> = None;
-    let mut findings = Vec::new();
-    let mut completed_units = 0usize;
-
-    for line in output.lines() {
-        if !line
-            .as_bytes()
-            .starts_with(HARNESS_EVENT_SENTINEL.as_bytes())
-        {
-            continue;
-        }
-        if line.len() > HARNESS_EVENT_MAX_LINE_BYTES {
-            return Err(event_protocol_error("event line exceeds 262144 bytes"));
-        }
-        if records.len() >= HARNESS_EVENT_MAX_RECORDS {
-            return Err(event_protocol_error("event record limit exceeded"));
-        }
-        let payload = &line[HARNESS_EVENT_SENTINEL.len()..];
-        if payload.starts_with(HARNESS_EVENT_SENTINEL) {
-            return Err(event_protocol_error("duplicate event sentinel"));
-        }
-        let record = serde_json::from_str::<HarnessEventRecord>(payload)
-            .map_err(|error| event_protocol_error(error.to_string()))?;
-        if record.protocol_version != HARNESS_EVENT_PROTOCOL_VERSION {
-            return Err(event_protocol_error(format!(
-                "unsupported protocol version {}",
-                record.protocol_version
-            )));
-        }
-        if !seen_sequences.insert(record.sequence) {
-            return Err(event_protocol_error("duplicate event sequence"));
-        }
-        if record.sequence != next_sequence {
-            return Err(event_protocol_error(format!(
-                "expected sequence {}, got {}",
-                next_sequence, record.sequence
-            )));
-        }
-        next_sequence = next_sequence.saturating_add(1);
-        match &record.event {
-            HarnessEvent::BootstrapStarted => {
-                if state != EventState::Start {
-                    return Err(event_protocol_error("bootstrap_started is not first"));
-                }
-                state = EventState::Bootstrap;
-            }
-            HarnessEvent::TargetResolved { module } => {
-                if state != EventState::Bootstrap || module.is_empty() {
-                    return Err(event_protocol_error("target_resolved before bootstrap"));
-                }
-                state = EventState::Resolved;
-            }
-            HarnessEvent::BootstrapFailed { .. } => {
-                if !matches!(state, EventState::Bootstrap | EventState::Resolved) {
-                    return Err(event_protocol_error("bootstrap_failed in invalid state"));
-                }
-                state = EventState::BootstrapFailed;
-            }
-            HarnessEvent::TargetReady => {
-                if state != EventState::Resolved {
-                    return Err(event_protocol_error("target_ready before target_resolved"));
-                }
-                state = EventState::Ready;
-            }
-            HarnessEvent::UnitStarted {
-                surface_id,
-                iteration,
-                input_classification,
-                ..
-            } => {
-                if state != EventState::Ready || current_unit.is_some() {
-                    return Err(event_protocol_error(
-                        "unit_started overlaps or precedes target",
-                    ));
-                }
-                if *input_classification == InputClassification::Unknown {
-                    // Unknown validity remains representable, but cannot silently
-                    // become a target finding. The reducer handles its impact.
-                }
-                current_unit = Some((surface_id.clone(), *iteration));
-            }
-            HarnessEvent::Finding { finding } => {
-                if current_unit.is_none() && state != EventState::Ready {
-                    return Err(event_protocol_error(
-                        "finding must be inside a unit or follow target_ready",
-                    ));
-                }
-                findings.push(finding.clone());
-            }
-            HarnessEvent::UnitCompleted {
-                surface_id,
-                iteration,
-                ..
-            } => {
-                if current_unit.as_ref() != Some(&(surface_id.clone(), *iteration)) {
-                    return Err(event_protocol_error(
-                        "unit_completed does not match unit_started",
-                    ));
-                }
-                current_unit = None;
-                completed_units = completed_units.saturating_add(1);
-            }
-            HarnessEvent::HarnessCompleted {
-                completed_units: reported,
-            } => {
-                if state != EventState::Ready || current_unit.is_some() {
-                    return Err(event_protocol_error("harness_completed before units close"));
-                }
-                if *reported != completed_units {
-                    return Err(event_protocol_error("harness_completed count disagrees"));
-                }
-                state = EventState::Completed;
-            }
-        }
-        records.push(record);
-    }
-
-    if state == EventState::Start {
-        return Err(event_protocol_error("no bootstrap event"));
-    }
-
-    Ok(HarnessEventSummary {
-        records,
-        findings,
-        completed_units,
-        runner_started: state != EventState::Start,
-        target_resolved: matches!(
-            state,
-            EventState::Resolved | EventState::Ready | EventState::Completed
-        ),
-        target_ready: matches!(state, EventState::Ready | EventState::Completed),
-        harness_completed: state == EventState::Completed,
-        open_unit: current_unit,
-    })
-}
-
-fn termination(
-    kind: ProcessTerminationKind,
-    exit_code: Option<i32>,
-    signal: Option<i32>,
-) -> ProcessTermination {
-    ProcessTermination {
-        kind,
-        exit_code,
-        signal,
-        signal_name: signal.map(signal_name),
-    }
-}
-
-fn signal_name(signal: i32) -> String {
-    match signal {
-        libc::SIGTERM => "SIGTERM",
-        libc::SIGKILL => "SIGKILL",
-        libc::SIGXCPU => "SIGXCPU",
-        libc::SIGSEGV => "SIGSEGV",
-        libc::SIGABRT => "SIGABRT",
-        other => return format!("SIG{other}"),
-    }
-    .to_string()
-}
-
-fn status_signal(status: &std::process::ExitStatus) -> Option<i32> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        status.signal()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = status;
-        None
-    }
-}
 /// Describe the in-memory instrumentation overlay used for authoritative tests.
 /// The original source is never rewritten; unsupported runner/import modes are
 /// explicit and must be treated as inconclusive by verification.
@@ -245,147 +42,6 @@ use std::time::Instant;
 use tokio::process::Command;
 
 use crate::types::*;
-
-#[cfg(target_os = "macos")]
-fn get_rss_bytes(pid: u32) -> u64 {
-    use std::mem;
-    const PROC_PIDTASKINFO: i32 = 4;
-
-    #[repr(C)]
-    struct ProcTaskInfo {
-        pti_virtual_size: u64,
-        pti_resident_size: u64,
-        pti_total_user: u64,
-        pti_total_system: u64,
-        pti_threads_user: u64,
-        pti_threads_system: u64,
-        pti_policy: i32,
-        pti_faults: i32,
-        pti_pageins: i32,
-        pti_cow_faults: i32,
-        pti_messages_sent: i32,
-        pti_messages_received: i32,
-        pti_syscalls_mach: i32,
-        pti_syscalls_unix: i32,
-        pti_csw: i32,
-        pti_threadnum: i32,
-        pti_numrunning: i32,
-        pti_priority: i32,
-    }
-
-    unsafe {
-        let mut info: ProcTaskInfo = mem::zeroed();
-        let size = mem::size_of::<ProcTaskInfo>() as i32;
-        unsafe extern "C" {
-            fn proc_pidinfo(
-                pid: i32,
-                flavor: i32,
-                arg: u64,
-                buffer: *mut libc::c_void,
-                buffersize: i32,
-            ) -> i32;
-        }
-        let ret = proc_pidinfo(
-            pid as i32,
-            PROC_PIDTASKINFO,
-            0,
-            &mut info as *mut _ as *mut libc::c_void,
-            size,
-        );
-        if ret > 0 {
-            info.pti_resident_size
-        } else {
-            0
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn get_process_group_rss_bytes(pgid: u32) -> u64 {
-    unsafe {
-        unsafe extern "C" {
-            fn proc_listpgrppids(
-                pgrpid: libc::pid_t,
-                buffer: *mut libc::c_void,
-                buffersize: i32,
-            ) -> i32;
-        }
-
-        let mut pids = vec![0i32; 256];
-        let bytes = (pids.len() * std::mem::size_of::<i32>()) as i32;
-        let filled = proc_listpgrppids(pgid as i32, pids.as_mut_ptr() as *mut libc::c_void, bytes);
-        if filled <= 0 {
-            return 0;
-        }
-
-        let pid_count = (filled as usize).min(pids.len());
-        pids[..pid_count]
-            .iter()
-            .filter_map(|pid| (*pid > 0).then_some(*pid as u32))
-            .map(get_rss_bytes)
-            .sum()
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn get_rss_bytes(pid: u32) -> u64 {
-    let status = match std::fs::read_to_string(format!("/proc/{pid}/status")) {
-        Ok(s) => s,
-        Err(_) => return 0,
-    };
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("VmRSS:") {
-            let kb = rest
-                .split_whitespace()
-                .next()
-                .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(0);
-            return kb * 1024;
-        }
-    }
-    0
-}
-
-#[cfg(target_os = "linux")]
-fn get_process_group_rss_bytes(pgid: u32) -> u64 {
-    let mut total = 0;
-    let entries = match std::fs::read_dir("/proc") {
-        Ok(entries) => entries,
-        Err(_) => return 0,
-    };
-
-    for entry in entries.flatten() {
-        let pid = match entry.file_name().to_string_lossy().parse::<u32>() {
-            Ok(pid) => pid,
-            Err(_) => continue,
-        };
-        let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Ok(stat) => stat,
-            Err(_) => continue,
-        };
-        let (_, rest) = match stat.split_once(") ") {
-            Some(parts) => parts,
-            None => continue,
-        };
-        let mut fields = rest.split_whitespace();
-        let _state = fields.next();
-        let _ppid = fields.next();
-        let row_pgid = match fields.next().and_then(|value| value.parse::<u32>().ok()) {
-            Some(row_pgid) => row_pgid,
-            None => continue,
-        };
-        if row_pgid == pgid {
-            total += get_rss_bytes(pid);
-        }
-    }
-
-    total
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn get_process_group_rss_bytes(_pgid: u32) -> u64 {
-    0
-}
 
 /// Find a binary on the given PATH, returning its absolute path if found.
 fn which_binary(path_env: &str, binary: &str) -> Option<String> {
@@ -3575,7 +3231,10 @@ fn harness_extension_compatible(path: &std::path::Path, mode: SourceMode) -> boo
         .map(|extension| extension.to_ascii_lowercase());
     match mode {
         SourceMode::Python => extension.as_deref() == Some("py"),
-        SourceMode::TypeScript => matches!(extension.as_deref(), Some("ts") | Some("js")),
+        SourceMode::TypeScript => matches!(
+            extension.as_deref(),
+            Some("ts") | Some("mts") | Some("cts") | Some("js") | Some("mjs") | Some("cjs")
+        ),
         SourceMode::Tsx => matches!(extension.as_deref(), Some("tsx") | Some("jsx")),
     }
 }
@@ -3613,283 +3272,6 @@ fn resolve_harness_arg(
     }
 }
 
-fn launch_failure(message: impl Into<String>) -> ExecutionResult {
-    let message = message.into();
-    let termination = termination(ProcessTerminationKind::LaunchFailed, None, None);
-    ExecutionResult {
-        stdout: String::new(),
-        stderr: message.clone(),
-        exit_code: None,
-        duration_ms: 0,
-        timed_out: false,
-        memory_error: false,
-        termination: Some(termination.clone()),
-        diagnostics: vec![FailureDiagnostic {
-            domain: FailureDomain::Environment,
-            kind: FailureKind::LauncherFailure,
-            component: DiagnosticComponent::Sandbox,
-            impact: DiagnosticImpact::Blocking,
-            message,
-            process: Some(termination),
-            limits: None,
-        }],
-    }
-}
-#[allow(clippy::too_many_arguments)]
-async fn run_command_with_limits(
-    mut command: Command,
-    timeout_seconds: f64,
-    memory_mb: u64,
-    runtime_profile: RuntimeProfile,
-    network_policy: NetworkPolicy,
-    is_typescript: bool,
-    launch_error_prefix: &str,
-) -> ExecutionResult {
-    if !timeout_seconds.is_finite() || timeout_seconds <= 0.0 {
-        return launch_failure("timeout must be finite and greater than zero");
-    }
-    let Some(memory_bytes) = memory_mb
-        .checked_mul(1024)
-        .and_then(|value| value.checked_mul(1024))
-    else {
-        return launch_failure("memory limit is too large");
-    };
-
-    let cpu_secs = timeout_seconds.ceil().max(1.0) as u64;
-    unsafe {
-        command.pre_exec(move || {
-            use nix::sys::resource::{setrlimit, Resource};
-            libc::setsid();
-            if !is_typescript {
-                let _ = setrlimit(Resource::RLIMIT_AS, memory_bytes, memory_bytes);
-                let _ = setrlimit(Resource::RLIMIT_DATA, memory_bytes, memory_bytes);
-            }
-            let _ = setrlimit(Resource::RLIMIT_CPU, cpu_secs, cpu_secs);
-            let ten_mb = 10 * 1024 * 1024;
-            let _ = setrlimit(Resource::RLIMIT_FSIZE, ten_mb, ten_mb);
-            Ok(())
-        });
-    }
-
-    let started = Instant::now();
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            return launch_failure(format!("{launch_error_prefix}: {error}"));
-        }
-    };
-    let pid = child.id().unwrap_or_default();
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
-    let stdout_task = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        if let Some(mut pipe) = stdout_pipe {
-            let _ = tokio::io::AsyncReadExt::read_to_end(&mut pipe, &mut bytes).await;
-        }
-        bytes
-    });
-    let stderr_task = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        if let Some(mut pipe) = stderr_pipe {
-            let _ = tokio::io::AsyncReadExt::read_to_end(&mut pipe, &mut bytes).await;
-        }
-        bytes
-    });
-    let memory_killed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let memory_killed_clone = memory_killed.clone();
-    let monitor = (pid > 0).then(|| {
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                if get_process_group_rss_bytes(pid) > memory_bytes {
-                    memory_killed_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-                    unsafe {
-                        libc::kill(-(pid as i32), libc::SIGKILL);
-                        libc::kill(pid as i32, libc::SIGKILL);
-                    }
-                    break;
-                }
-            }
-        })
-    });
-
-    let mut wait = Box::pin(child.wait());
-    let mut timeout = Box::pin(tokio::time::sleep(std::time::Duration::from_secs_f64(
-        timeout_seconds,
-    )));
-    let mut timed_out = false;
-    let wait_result = tokio::select! {
-        result = &mut wait => result,
-        _ = &mut timeout => {
-            timed_out = true;
-            if pid > 0 {
-                unsafe {
-                    libc::kill(-(pid as i32), libc::SIGKILL);
-                    libc::kill(pid as i32, libc::SIGKILL);
-                }
-            }
-            wait.await
-        }
-    };
-    if let Some(handle) = monitor {
-        handle.abort();
-    }
-
-    let stdout = String::from_utf8_lossy(&stdout_task.await.unwrap_or_default()).to_string();
-    let mut stderr = String::from_utf8_lossy(&stderr_task.await.unwrap_or_default()).to_string();
-    let duration_ms = started.elapsed().as_millis() as u64;
-    let (status, wait_error) = match wait_result {
-        Ok(status) => (Some(status), None),
-        Err(error) => (None, Some(error)),
-    };
-    if let Some(error) = wait_error.as_ref() {
-        if !stderr.is_empty() {
-            stderr.push('\n');
-        }
-        stderr.push_str(&format!("failed to wait for process: {error}"));
-    }
-    let signal = status.as_ref().and_then(status_signal);
-    let memory_limited = memory_killed.load(std::sync::atomic::Ordering::SeqCst);
-    let kind = if memory_limited {
-        ProcessTerminationKind::MemoryLimit
-    } else if timed_out || signal == Some(libc::SIGXCPU) {
-        ProcessTerminationKind::TimedOut
-    } else if wait_error.is_some() {
-        ProcessTerminationKind::WaitFailed
-    } else if signal.is_some() {
-        ProcessTerminationKind::Signaled
-    } else {
-        ProcessTerminationKind::Exited
-    };
-    let termination = termination(
-        kind,
-        status.as_ref().and_then(std::process::ExitStatus::code),
-        signal,
-    );
-    if memory_limited && stderr.is_empty() {
-        stderr = format!("Killed: memory limit exceeded ({memory_mb} MB)");
-    } else if matches!(kind, ProcessTerminationKind::TimedOut) && stderr.is_empty() {
-        stderr = "Process timed out".into();
-    }
-    let limits = ExecutionLimits {
-        timeout_seconds,
-        memory_mb,
-        runtime_profile,
-        network_policy,
-    };
-    let mut diagnostics = match kind {
-        ProcessTerminationKind::MemoryLimit => vec![FailureDiagnostic {
-            domain: FailureDomain::Resource,
-            kind: FailureKind::MemoryLimit,
-            component: DiagnosticComponent::Sandbox,
-            impact: DiagnosticImpact::Blocking,
-            message: stderr.clone(),
-            process: Some(termination.clone()),
-            limits: Some(limits.clone()),
-        }],
-        ProcessTerminationKind::TimedOut => vec![FailureDiagnostic {
-            domain: FailureDomain::Resource,
-            kind: FailureKind::Timeout,
-            component: DiagnosticComponent::Sandbox,
-            impact: DiagnosticImpact::Blocking,
-            message: stderr.clone(),
-            process: Some(termination.clone()),
-            limits: Some(limits.clone()),
-        }],
-        ProcessTerminationKind::LaunchFailed | ProcessTerminationKind::WaitFailed => {
-            vec![FailureDiagnostic {
-                domain: FailureDomain::Environment,
-                kind: if matches!(kind, ProcessTerminationKind::LaunchFailed) {
-                    FailureKind::LauncherFailure
-                } else {
-                    FailureKind::ToolFailure
-                },
-                component: DiagnosticComponent::Sandbox,
-                impact: DiagnosticImpact::Blocking,
-                message: stderr.clone(),
-                process: Some(termination.clone()),
-                limits: Some(limits.clone()),
-            }]
-        }
-        _ => Vec::new(),
-    };
-    if network_policy == NetworkPolicy::Deny
-        && stderr.contains("court-jester network access denied")
-    {
-        diagnostics.push(FailureDiagnostic {
-            domain: FailureDomain::Environment,
-            kind: FailureKind::NetworkDenied,
-            component: DiagnosticComponent::Sandbox,
-            impact: DiagnosticImpact::Blocking,
-            message: "network access was denied by the sandbox".into(),
-            process: Some(termination.clone()),
-            limits: Some(limits.clone()),
-        });
-    }
-    if network_policy == NetworkPolicy::Deny && stderr.contains("court-jester process spawn denied")
-    {
-        diagnostics.push(FailureDiagnostic {
-            domain: FailureDomain::Environment,
-            kind: FailureKind::ProcessSpawnDenied,
-            component: DiagnosticComponent::Sandbox,
-            impact: DiagnosticImpact::Blocking,
-            message: "process spawning was denied by the sandbox".into(),
-            process: Some(termination.clone()),
-            limits: Some(limits),
-        });
-    }
-    ExecutionResult {
-        stdout,
-        stderr,
-        exit_code: status.as_ref().and_then(std::process::ExitStatus::code),
-        duration_ms,
-        timed_out: matches!(kind, ProcessTerminationKind::TimedOut),
-        memory_error: matches!(kind, ProcessTerminationKind::MemoryLimit),
-        termination: Some(termination),
-        diagnostics,
-    }
-}
-
-async fn run_launch_command(
-    plan: &LaunchPlan,
-    timeout_seconds: f64,
-    memory_mb: u64,
-    runtime_profile: RuntimeProfile,
-    network_policy: NetworkPolicy,
-    is_typescript: bool,
-) -> ExecutionResult {
-    let configured_path = plan
-        .env
-        .iter()
-        .find(|(name, _)| name == std::ffi::OsStr::new("PATH"))
-        .map(|(_, value)| value.clone())
-        .unwrap_or_else(|| std::env::var_os("PATH").unwrap_or_default());
-    let mut command = Command::new(&plan.executable);
-    command
-        .args(&plan.args)
-        .current_dir(&plan.cwd)
-        .env_clear()
-        .env("PATH", configured_path)
-        .env("HOME", plan.cwd.to_string_lossy().as_ref())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true);
-    for (key, value) in &plan.env {
-        command.env(key, value);
-    }
-    run_command_with_limits(
-        command,
-        timeout_seconds,
-        memory_mb,
-        runtime_profile,
-        network_policy,
-        is_typescript,
-        "failed to launch harness",
-    )
-    .await
-}
-
 #[derive(Debug, PartialEq, Eq)]
 enum StructuredTestFailure {
     Assertion,
@@ -3899,7 +3281,7 @@ enum StructuredTestFailure {
 
 fn structured_test_failure(
     output: &str,
-    recognize_missing_vitest_globals: bool,
+    _recognize_missing_vitest_globals: bool,
 ) -> Option<StructuredTestFailure> {
     const MAX_SCAN_BYTES: usize = 16 * 1024 * 1024;
     const MAX_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
@@ -3933,33 +3315,7 @@ fn structured_test_failure(
         }
     }
 
-    fn runner_initialization_message(
-        message: &str,
-        recognize_missing_vitest_globals: bool,
-    ) -> bool {
-        [
-            "Vitest failed to access its internal state",
-            "Vitest was initialized with native Node instead of Vite Node",
-            "customEqualityTesters",
-            "workerState.config",
-            "matching @vitest/runner",
-            "matching package runner",
-            "does not export startTests",
-        ]
-        .iter()
-        .any(|fragment| message.contains(fragment))
-            || (recognize_missing_vitest_globals
-                && message.lines().any(|line| {
-                    let line = line.trim();
-                    line == "describe is not defined"
-                        || line.starts_with("ReferenceError: describe is not defined")
-                }))
-    }
-
-    fn reporter_failure(
-        value: &serde_json::Value,
-        recognize_missing_vitest_globals: bool,
-    ) -> Option<StructuredTestFailure> {
+    fn reporter_failure(value: &serde_json::Value) -> Option<StructuredTestFailure> {
         let fields = value.as_object()?;
         let has_test_results = fields
             .get("testResults")
@@ -3993,10 +3349,11 @@ fn structured_test_failure(
             return Some(StructuredTestFailure::ProcessSpawnDenied);
         }
 
-        if fields
-            .get("numTotalTests")
-            .and_then(serde_json::Value::as_u64)
-            == Some(0)
+        if reported_failure
+            && fields
+                .get("numTotalTests")
+                .and_then(serde_json::Value::as_u64)
+                == Some(0)
         {
             let initialization_message = fields
                 .get("testResults")
@@ -4016,12 +3373,11 @@ fn structured_test_failure(
                         .and_then(serde_json::Value::as_str)
                         .map(str::trim)
                         .filter(|message| !message.is_empty())
-                });
-            if let Some(message) = initialization_message.filter(|message| {
-                runner_initialization_message(message, recognize_missing_vitest_globals)
-            }) {
-                return Some(StructuredTestFailure::Initialization(message.to_string()));
-            }
+                })
+                .unwrap_or("test runner failed before collecting any tests");
+            return Some(StructuredTestFailure::Initialization(
+                initialization_message.to_string(),
+            ));
         }
 
         reported_failure.then_some(StructuredTestFailure::Assertion)
@@ -4094,9 +3450,7 @@ fn structured_test_failure(
                 let candidate = &output[start..=index];
                 reporter_candidates += 1;
                 if let Ok(value) = serde_json::from_str(candidate) {
-                    if let Some(failure) =
-                        reporter_failure(&value, recognize_missing_vitest_globals)
-                    {
+                    if let Some(failure) = reporter_failure(&value) {
                         return Some(failure);
                     }
                 }
@@ -4527,21 +3881,25 @@ fn docker_project_module_path(
         let Ok(canonical_root) = std::fs::canonicalize(root) else {
             continue;
         };
-        let Ok(relative_root) = canonical_root.strip_prefix(&workspace_root) else {
+        if canonical_root.strip_prefix(&workspace_root).is_err() {
             continue;
-        };
+        }
         for package_relative_path in package_relative_paths {
-            let host_path = canonical_root
+            let logical_path = canonical_root
                 .join("node_modules")
                 .join(package_relative_path);
-            if !host_path.is_file() {
+            let Ok(resolved_path) = std::fs::canonicalize(&logical_path) else {
+                continue;
+            };
+            if !resolved_path.is_file() {
                 continue;
             }
+            let Ok(resolved_relative) = resolved_path.strip_prefix(&workspace_root) else {
+                continue;
+            };
             return Some(
                 std::path::Path::new(DOCKER_DEPENDENCY_WORKSPACE)
-                    .join(relative_root)
-                    .join("node_modules")
-                    .join(package_relative_path)
+                    .join(resolved_relative)
                     .to_string_lossy()
                     .into_owned(),
             );
@@ -5234,6 +4592,48 @@ fn virtual_env_bin(virtual_env: Option<&std::ffi::OsStr>) -> Option<std::path::P
     })
 }
 
+fn project_python_available(context: &ExecutionContext) -> bool {
+    context.dependency_roots.iter().any(|root| {
+        [".venv", "venv"].iter().any(|directory| {
+            let bin = root
+                .join(directory)
+                .join(if cfg!(windows) { "Scripts" } else { "bin" });
+            let executable = if cfg!(windows) {
+                bin.join("python.exe")
+            } else {
+                bin.join("python3")
+            };
+            executable.is_file()
+        })
+    })
+}
+
+fn uv_python_runtime(
+    path_env: &str,
+    context: &ExecutionContext,
+    active_virtual_env: bool,
+) -> Option<(std::path::PathBuf, Vec<std::ffi::OsString>)> {
+    if active_virtual_env || project_python_available(context) {
+        return None;
+    }
+    let project_root = std::iter::once(&context.target_package_root)
+        .chain(context.dependency_roots.iter())
+        .find(|root| root.join("pyproject.toml").is_file() && root.join("uv.lock").is_file())?;
+    let uv = which_binary(path_env, "uv")?;
+    Some((
+        uv.into(),
+        vec![
+            "run".into(),
+            "--isolated".into(),
+            "--frozen".into(),
+            "--offline".into(),
+            "--project".into(),
+            project_root.as_os_str().to_owned(),
+            "python3".into(),
+        ],
+    ))
+}
+
 pub async fn execute_harness(
     context: &ExecutionContext,
     harness: HarnessSpec,
@@ -5498,7 +4898,20 @@ pub async fn execute_harness(
             }
         }
     };
-    let mut args = Vec::<std::ffi::OsString>::new();
+    let mut runtime_prefix_args = Vec::new();
+    if limits.runtime_profile == RuntimeProfile::LocalTrusted
+        && harness.runtime == HarnessRuntime::Python
+    {
+        if let Some((uv, prefix_args)) = uv_python_runtime(
+            &path_env,
+            context,
+            std::env::var_os("VIRTUAL_ENV").is_some(),
+        ) {
+            executable = uv;
+            runtime_prefix_args = prefix_args;
+        }
+    }
+    let mut args = runtime_prefix_args;
     match harness.runtime {
         HarnessRuntime::Python => {}
         HarnessRuntime::NodeScript | HarnessRuntime::TsxScript => {
@@ -5960,9 +5373,10 @@ mod tests {
         configure_docker_node_loader, configure_docker_typescript_loader,
         copy_materialization_tree, create_network_guard, create_node_package_resolver,
         docker_dependency_mapping, docker_image_for_harness, docker_path_mapping,
-        docker_project_module_path, harness_diagnostics, has_typescript_type_only_relative_imports,
-        insert_docker_environment, isolated_typescript_barrel_redirects,
-        resolve_typescript_runtime_reexport, typescript_virtual_type_imports, virtual_env_bin,
+        docker_project_module_path, harness_diagnostics, harness_extension_compatible,
+        has_typescript_type_only_relative_imports, insert_docker_environment,
+        isolated_typescript_barrel_redirects, resolve_typescript_runtime_reexport,
+        typescript_virtual_type_imports, uv_python_runtime, virtual_env_bin,
         vitest_project_entrypoint, which_binary,
     };
     use crate::types::{
@@ -6394,13 +5808,13 @@ mod tests {
 
         let non_vitest = harness_diagnostics(Some(TestAdapter::JestJson), &process, &limits);
         assert_eq!(non_vitest.len(), 1, "{non_vitest:#?}");
-        assert_eq!(non_vitest[0].domain, FailureDomain::TargetCode);
-        assert_eq!(non_vitest[0].kind, FailureKind::AssertionFailure);
-        assert_eq!(non_vitest[0].impact, DiagnosticImpact::Gating);
+        assert_eq!(non_vitest[0].domain, FailureDomain::Environment);
+        assert_eq!(non_vitest[0].kind, FailureKind::ModuleLoad);
+        assert_eq!(non_vitest[0].impact, DiagnosticImpact::Blocking);
     }
 
     #[test]
-    fn vitest_target_syntax_error_without_collected_tests_is_an_assertion() {
+    fn zero_test_transform_failure_is_environmental() {
         let process = ExecutionResult {
             stdout: r#"{
   "numTotalTestSuites": 1,
@@ -6411,7 +5825,7 @@ mod tests {
   "testResults": [{
     "assertionResults": [],
     "status": "failed",
-    "message": "SyntaxError: Unexpected identifier 'ManyToOneOptions'",
+    "message": "failed to resolve \"extends\":\"./.nuxt/tsconfig.json\" in /workspace/apps/client-app/tsconfig.json",
     "name": "/workspace/packages/db-entities/src/ProductConfiguration.test.ts"
   }]
 }"#
@@ -6434,9 +5848,9 @@ mod tests {
         let diagnostics = harness_diagnostics(Some(TestAdapter::VitestJson), &process, &limits);
 
         assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
-        assert_eq!(diagnostics[0].domain, FailureDomain::TargetCode);
-        assert_eq!(diagnostics[0].kind, FailureKind::AssertionFailure);
-        assert_eq!(diagnostics[0].impact, DiagnosticImpact::Gating);
+        assert_eq!(diagnostics[0].domain, FailureDomain::Environment);
+        assert_eq!(diagnostics[0].kind, FailureKind::ModuleLoad);
+        assert_eq!(diagnostics[0].impact, DiagnosticImpact::Blocking);
     }
 
     #[test]
@@ -6809,6 +6223,26 @@ export async function load(url, context, nextLoad) {
             ]
         );
     }
+    #[test]
+    fn typescript_source_mode_accepts_module_extensions() {
+        for path in [
+            "target.ts",
+            "target.mts",
+            "target.cts",
+            "target.js",
+            "target.mjs",
+            "target.cjs",
+        ] {
+            assert!(
+                harness_extension_compatible(std::path::Path::new(path), SourceMode::TypeScript),
+                "{path}"
+            );
+        }
+        assert!(!harness_extension_compatible(
+            std::path::Path::new("target.py"),
+            SourceMode::TypeScript
+        ));
+    }
 
     #[test]
     fn docker_project_module_path_prefers_package_local_dependency() {
@@ -6832,6 +6266,45 @@ export async function load(url, context, nextLoad) {
         assert_eq!(
             module_path.as_deref(),
             Some("/court-jester/dependencies/packages/app/node_modules/vitest/dist/node.mjs")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn docker_project_module_path_resolves_pnpm_symlink_targets() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let package = workspace.join("packages/app");
+        let store_package =
+            workspace.join("node_modules/.pnpm/typescript@5.1.6/node_modules/typescript");
+        std::fs::create_dir_all(store_package.join("lib")).unwrap();
+        std::fs::create_dir_all(workspace.join("node_modules")).unwrap();
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            store_package.join("lib/typescript.js"),
+            "export const version = '5.1.6';\n",
+        )
+        .unwrap();
+        symlink(
+            ".pnpm/typescript@5.1.6/node_modules/typescript",
+            workspace.join("node_modules/typescript"),
+        )
+        .unwrap();
+
+        let module_path = docker_project_module_path(
+            &workspace,
+            &package,
+            &[workspace.clone()],
+            &[std::path::Path::new("typescript/lib/typescript.js")],
+        );
+
+        assert_eq!(
+            module_path.as_deref(),
+            Some(
+                "/court-jester/dependencies/node_modules/.pnpm/typescript@5.1.6/node_modules/typescript/lib/typescript.js"
+            )
         );
     }
     #[test]
@@ -7878,5 +7351,64 @@ export default {
             Some(root.join(if cfg!(windows) { "Scripts" } else { "bin" }))
         );
         assert_eq!(virtual_env_bin(None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locked_uv_project_uses_isolated_offline_python_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let project = tempfile::tempdir().unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("pyproject.toml"),
+            "[project]\nname='demo'\n",
+        )
+        .unwrap();
+        std::fs::write(project.path().join("uv.lock"), "version = 1\n").unwrap();
+        let uv = tools.path().join("uv");
+        std::fs::write(&uv, "#!/bin/sh\n").unwrap();
+        let mut permissions = std::fs::metadata(&uv).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&uv, permissions).unwrap();
+        let context = ExecutionContext {
+            invocation_dir: project.path().to_path_buf(),
+            workspace_root: project.path().to_path_buf(),
+            materialization_source_root: None,
+            target_package_root: project.path().to_path_buf(),
+            test_package_root: None,
+            dependency_roots: vec![project.path().to_path_buf()],
+            target_source: SourceContext {
+                language: crate::types::Language::Python,
+                mode: SourceMode::Python,
+                source_file: Some(project.path().join("target.py")),
+                virtual_file_path: None,
+            },
+            test_source: None,
+        };
+
+        let (executable, args) =
+            uv_python_runtime(tools.path().to_str().unwrap(), &context, false).unwrap();
+        assert_eq!(executable, uv);
+        assert_eq!(
+            args,
+            vec![
+                "run",
+                "--isolated",
+                "--frozen",
+                "--offline",
+                "--project",
+                project.path().to_str().unwrap(),
+                "python3",
+            ]
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>()
+        );
+
+        std::fs::create_dir_all(project.path().join(".venv/bin")).unwrap();
+        std::fs::write(project.path().join(".venv/bin/python3"), "").unwrap();
+        assert!(uv_python_runtime(tools.path().to_str().unwrap(), &context, false).is_none());
+        assert!(uv_python_runtime(tools.path().to_str().unwrap(), &context, true).is_none());
     }
 }

@@ -3,6 +3,22 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use tree_sitter::Parser;
 
 use crate::types::*;
+const MAX_ANALYSIS_SYNTAX_DEPTH: usize = 512;
+
+fn syntax_depth_violation(root: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    let mut pending = vec![(root, 0usize)];
+    while let Some((node, depth)) = pending.pop() {
+        if depth > MAX_ANALYSIS_SYNTAX_DEPTH {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        pending.extend(
+            node.named_children(&mut cursor)
+                .map(|child| (child, depth + 1)),
+        );
+    }
+    None
+}
 
 pub fn analyze(code: &str, language: &Language) -> AnalysisResult {
     let context = SourceContext {
@@ -70,6 +86,39 @@ pub fn analyze_with_context(code: &str, context: &SourceContext) -> AnalysisResu
 
     let root = tree.root_node();
     let bytes = code.as_bytes();
+    if let Some(node) = syntax_depth_violation(root) {
+        let start = node.start_position();
+        let end = node.end_position();
+        return AnalysisResult {
+            functions: vec![],
+            classes: vec![],
+            aliases: vec![],
+            imports: vec![],
+            complexity: 1,
+            cognitive_complexity: 0,
+            max_nesting_depth: MAX_ANALYSIS_SYNTAX_DEPTH,
+            complexity_breakdown: BTreeMap::new(),
+            parse_error: true,
+            source_mode: grammar_mode,
+            parse_diagnostics: vec![ParseDiagnostic {
+                kind: "unsupported".into(),
+                message: format!(
+                    "Syntax nesting exceeds supported analysis depth of {MAX_ANALYSIS_SYNTAX_DEPTH}"
+                ),
+                start_line: start.row + 1,
+                start_column: start.column + 1,
+                end_line: end.row + 1,
+                end_column: end.column + 1,
+                excerpt: code
+                    .lines()
+                    .nth(start.row)
+                    .unwrap_or("")
+                    .chars()
+                    .take(160)
+                    .collect(),
+            }],
+        };
+    }
     let parse_diagnostics = parse_diagnostics(&root, code);
     let semantic_language = context.language;
     let file_complexity = program_complexity(&root, &semantic_language, bytes);
