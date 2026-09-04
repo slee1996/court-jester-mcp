@@ -3290,55 +3290,36 @@ fn ts_query_string_semantic_check(
         return String::new();
     }
     let query_args: Vec<&str> = if param_types.len() > 1 {
-        vec!["_queryInput", "\"extended\""]
+        vec!["_args[0]", "_args[1]"]
     } else {
-        vec!["_queryInput"]
+        vec!["_args[0]"]
     };
-    let query_call = ts_call_with_args(func, &query_args);
-    let (initial_label, query_cases) = if has_query_nested_brackets_contract(func) {
-        (
-            "top-level repeated array",
-            r#"        ["top-level repeated array", { page: 2, tag: ["pro", "beta"] }, [["page", "2"], ["tag", "pro"], ["tag", "beta"]]],
-        ["deep object array", { filter: { city: "Paris", tags: ["pro", "beta"] } }, [["filter[city]", "Paris"], ["filter[tags][]", "pro"], ["filter[tags][]", "beta"]]],
-        ["empty string and nullish", { filter: { city: "", zip: null } }, [["filter[city]", ""]]],
-"#,
-        )
+    let call = ts_call_with_args(func, &query_args);
+    let args = if param_types.len() > 1 {
+        "[_queryInput, \"extended\"]"
     } else {
-        (
-            "tag/nullish",
-            r#"        ["tag/nullish", { tag: ["pro", null, " beta "] }, [["tag", "pro"], ["tag", "beta"]]],
-        ["blank scalar", { q: "  ", page: 2 }, [["page", "2"]]],
-        ["accent fold", { q: "naïve café" }, [["q", _asciiFold("naïve café")]]],
-"#,
-        )
+        "[_queryInput]"
     };
-
+    let query_cases = if has_query_nested_brackets_contract(func) {
+        r#"      ["top-level repeated array", { page: 2, tag: ["pro", "beta"] }, [["page", "2"], ["tag", "pro"], ["tag", "beta"]]],
+      ["deep object array", { filter: { city: "Paris", tags: ["pro", "beta"] } }, [["filter[city]", "Paris"], ["filter[tags][]", "pro"], ["filter[tags][]", "beta"]]],
+      ["empty string and nullish", { filter: { city: "", zip: null } }, [["filter[city]", ""]]],"#
+    } else {
+        r#"      ["tag/nullish", { tag: ["pro", null, " beta "] }, [["tag", "pro"], ["tag", "beta"]]],
+      ["blank scalar", { q: "  ", page: 2 }, [["page", "2"]]],
+      ["accent fold", { q: "naïve café" }, [["q", _asciiFold("naïve café")]]],"#
+    };
     format!(
         r#"  {{
-    let _queryLabel = "{initial_label}";
-    try {{
-      const _queryCases: Array<[string, Record<string, unknown>, Array<[string, string]>]> = [
+    const _cases: Array<[string, Record<string, unknown>, Array<[string, string]>]> = [
 {query_cases}
-      ];
-      for (const [_label, _queryInput, _expectedPairs] of _queryCases) {{
-        _queryLabel = _label;
-        const _queryResult = String({query_call});
-        const _queryPairs = Array.from(new URLSearchParams(_queryResult).entries());
-        if (!_nanSafeEq(_queryPairs, _expectedPairs)) {{
-          throw new Error(`Query semantics (${{_label}}): ${{JSON.stringify(_queryPairs)}} !== ${{JSON.stringify(_expectedPairs)}} from ${{_queryResult}}`);
-        }}
-      }}
-    }} catch (_e: unknown) {{
-      _emitFinding("{name}", [], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", null, "direct", _queryLabel);
-      console.log(`  CRASH {name}(query semantics): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
-      _fuzzTotalFailures++;
+    ];
+    for (const [_label, _queryInput, _expectedPairs] of _cases) {{
+      _semanticCase("{name}", (_args: unknown[]) => {call}, {args}, _expectedPairs, "query_pairs", "Query semantics (" + _label + ")");
     }}
   }}
 "#,
         name = func.name,
-        query_call = query_call,
-        initial_label = initial_label,
-        query_cases = query_cases,
     )
 }
 
@@ -3355,36 +3336,28 @@ fn ts_query_string_parser_semantic_check(
         return String::new();
     }
     let query_args: Vec<&str> = if param_types.len() > 1 {
-        vec!["_queryInput", "\"extended\""]
+        vec!["_args[0]", "_args[1]"]
     } else {
-        vec!["_queryInput"]
+        vec!["_args[0]"]
     };
-    let query_call = ts_call_with_args(func, &query_args);
-
+    let call = ts_call_with_args(func, &query_args);
+    let args = if param_types.len() > 1 {
+        "[_queryInput, \"extended\"]"
+    } else {
+        "[_queryInput]"
+    };
     format!(
         r#"  {{
-    let _queryParseLabel = "repeated scalar";
-    try {{
-      const _queryParseCases: Array<[string, string, Record<string, unknown>]> = [
-        ["repeated scalar", "tag=pro&tag=beta", {{ tag: ["pro", "beta"] }}],
-        ["deep object array", "filter[city]=Paris&filter[tags][]=pro&filter[tags][]=beta", {{ filter: {{ city: "Paris", tags: ["pro", "beta"] }} }}],
-      ];
-      for (const [_label, _queryInput, _expectedObject] of _queryParseCases) {{
-        _queryParseLabel = _label;
-        const _queryParsed = {query_call};
-        if (!_nanSafeEq(_queryParsed, _expectedObject)) {{
-          throw new Error(`Query parse semantics (${{_label}}): ${{JSON.stringify(_queryParsed)}} !== ${{JSON.stringify(_expectedObject)}}`);
-        }}
-      }}
-    }} catch (_e: unknown) {{
-      _emitFinding("{name}", [], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", null, "direct", _queryParseLabel);
-      console.log(`  CRASH {name}(query parse semantics): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
-      _fuzzTotalFailures++;
+    const _cases: Array<[string, string, Record<string, unknown>]> = [
+      ["repeated scalar", "tag=pro&tag=beta", {{ tag: ["pro", "beta"] }}],
+      ["deep object array", "filter[city]=Paris&filter[tags][]=pro&filter[tags][]=beta", {{ filter: {{ city: "Paris", tags: ["pro", "beta"] }} }}],
+    ];
+    for (const [_label, _queryInput, _expectedObject] of _cases) {{
+      _semanticCase("{name}", (_args: unknown[]) => {call}, {args}, _expectedObject, "identity", "Query parse semantics (" + _label + ")");
     }}
   }}
 "#,
         name = func.name,
-        query_call = query_call,
     )
 }
 
@@ -3516,40 +3489,22 @@ fn ts_semver_compare_semantic_check(
     {
         return String::new();
     }
-    let compare_call = ts_call_with_args(func, &["_left", "_right"]);
-    let reverse_compare_call = ts_call_with_args(func, &["_right", "_left"]);
-
+    let call = ts_call_with_args(func, &["_args[0]", "_args[1]"]);
     format!(
         r#"  {{
-    let _semverLabel = "prerelease ordering";
-    try {{
-      const _semverCases: Array<[string, string, number]> = [
-        ["1.0.0-beta.1", "1.0.0", -1],
-        ["1.0.0-alpha", "1.0.0-alpha.1", -1],
-        ["1.0.0-beta.11", "1.0.0-beta.2", 1],
-        ["1.0.0+build.1", "1.0.0+build.9", 0],
-      ];
-      for (const [_left, _right, _expected] of _semverCases) {{
-        _semverLabel = `${{_left}} vs ${{_right}}`;
-        const _cmp = {compare_call};
-        if (_cmpSign(_cmp) !== _cmpSign(_expected)) {{
-          throw new Error(`Semver compare semantics (${{_semverLabel}}): ${{JSON.stringify(_cmp)}} !== ${{_expected}}`);
-        }}
-        const _rev = {reverse_compare_call};
-        if (_cmpSign(_rev) !== -_cmpSign(_expected)) {{
-          throw new Error(`Semver compare antisymmetry (${{_semverLabel}}): ${{JSON.stringify(_rev)}} !== ${{-_cmpSign(_expected)}}`);
-        }}
-      }}
-    }} catch (_e: unknown) {{
-      _emitFinding("{name}", [], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", null, "direct", _semverLabel);
-      console.log(`  CRASH {name}(semver compare semantics): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
-      _fuzzTotalFailures++;
+    const _cases: Array<[string, string, number]> = [
+      ["1.0.0-beta.1", "1.0.0", -1],
+      ["1.0.0-alpha", "1.0.0-alpha.1", -1],
+      ["1.0.0-beta.11", "1.0.0-beta.2", 1],
+      ["1.0.0+build.1", "1.0.0+build.9", 0],
+    ];
+    for (const [_left, _right, _expected] of _cases) {{
+      _semanticCase("{name}", (_args: unknown[]) => {call}, [_left, _right], _expected, "sign", "Semver compare semantics");
+      _semanticCase("{name}", (_args: unknown[]) => {call}, [_right, _left], -_expected, "sign", "Semver compare antisymmetry");
     }}
   }}
 "#,
         name = func.name,
-        compare_call = compare_call,
-        reverse_compare_call = reverse_compare_call,
     )
 }
 
@@ -3568,35 +3523,22 @@ fn ts_semver_caret_semantic_check(
     {
         return String::new();
     }
-    let caret_call = ts_call_with_args(func, &["_version", "_range"]);
-
+    let call = ts_call_with_args(func, &["_args[0]", "_args[1]"]);
     format!(
         r#"  {{
-    let _caretLabel = "prerelease exclusion";
-    try {{
-      const _caretCases: Array<[string, string, boolean]> = [
-        ["1.3.0-beta.1", "^1.2.3", false],
-        ["1.0.2-beta.3", "^1.0.2", false],
-        ["0.3.0", "^0.2.3", false],
-        ["0.2.9", "^0.2.3", true],
-        ["0.0.4", "^0.0.3", false],
-      ];
-      for (const [_version, _range, _expected] of _caretCases) {{
-        _caretLabel = `${{_version}} in ${{_range}}`;
-        const _actual = Boolean({caret_call});
-        if (_actual !== _expected) {{
-          throw new Error(`Semver caret semantics (${{_caretLabel}}): ${{JSON.stringify(_actual)}} !== ${{JSON.stringify(_expected)}}`);
-        }}
-      }}
-    }} catch (_e: unknown) {{
-      _emitFinding("{name}", [], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", null, "direct", _caretLabel);
-      console.log(`  CRASH {name}(semver caret semantics): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
-      _fuzzTotalFailures++;
+    const _cases: Array<[string, string, boolean]> = [
+      ["1.3.0-beta.1", "^1.2.3", false],
+      ["1.0.2-beta.3", "^1.0.2", false],
+      ["0.3.0", "^0.2.3", false],
+      ["0.2.9", "^0.2.3", true],
+      ["0.0.4", "^0.0.3", false],
+    ];
+    for (const [_version, _range, _expected] of _cases) {{
+      _semanticCase("{name}", (_args: unknown[]) => {call}, [_version, _range], _expected, "bool", "Semver caret semantics");
     }}
   }}
 "#,
         name = func.name,
-        caret_call = caret_call,
     )
 }
 
@@ -3609,40 +3551,22 @@ fn ts_same_value_zero_semantic_check(
     {
         return String::new();
     }
-    let same_value_call = ts_call_with_args(func, &["_left", "_right"]);
-    let reverse_call = ts_call_with_args(func, &["_right", "_left"]);
-
+    let call = ts_call_with_args(func, &["_args[0]", "_args[1]"]);
     format!(
         r#"  {{
-    let _sameValueLabel = "NaN equals NaN";
-    try {{
-      const _sameValueCases: Array<[string, unknown, unknown, boolean]> = [
-        ["NaN equals NaN", NaN, NaN, true],
-        ["zero sign ignored", 0, -0, true],
-        ["same scalar", "a", "a", true],
-        ["different scalar", "a", "b", false],
-      ];
-      for (const [_label, _left, _right, _expected] of _sameValueCases) {{
-        _sameValueLabel = _label;
-        const _actual = Boolean({same_value_call});
-        if (_actual !== _expected) {{
-          throw new Error(`SameValueZero semantics (${{_label}}): ${{JSON.stringify(_actual)}} !== ${{JSON.stringify(_expected)}}`);
-        }}
-        const _reverse = Boolean({reverse_call});
-        if (_reverse !== _actual) {{
-          throw new Error(`SameValueZero symmetry (${{_label}}): ${{JSON.stringify(_reverse)}} !== ${{JSON.stringify(_actual)}}`);
-        }}
-      }}
-    }} catch (_e: unknown) {{
-      _emitFinding("{name}", [], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", null, "direct", _sameValueLabel);
-      console.log(`  CRASH {name}(sameValueZero semantics): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
-      _fuzzTotalFailures++;
+    const _cases: Array<[string, unknown, unknown, boolean]> = [
+      ["NaN equals NaN", NaN, NaN, true],
+      ["zero sign ignored", 0, -0, true],
+      ["same scalar", "a", "a", true],
+      ["different scalar", "a", "b", false],
+    ];
+    for (const [_label, _left, _right, _expected] of _cases) {{
+      _semanticCase("{name}", (_args: unknown[]) => {call}, [_left, _right], _expected, "bool", "SameValueZero semantics (" + _label + ")");
+      _semanticCase("{name}", (_args: unknown[]) => {call}, [_right, _left], _expected, "bool", "SameValueZero symmetry (" + _label + ")");
     }}
   }}
 "#,
         name = func.name,
-        same_value_call = same_value_call,
-        reverse_call = reverse_call,
     )
 }
 

@@ -161,6 +161,7 @@ fn assert_advisory_contract(plan: &VerificationPlan, function_name: &str, contra
 
 fn assert_advisory_semantic_probe(code: &str, function_name: &str) {
     let shared_python = code.contains(&format!("_semantic_check(\"{function_name}\""));
+    let shared_typescript = code.contains(&format!("_semanticCase(\"{function_name}\""));
     let python_prefix = format!("_emit_finding(\"{function_name}\"");
     let typescript_prefix = format!("_emitFinding(\"{function_name}\"");
     let emission = code
@@ -169,6 +170,7 @@ fn assert_advisory_semantic_probe(code: &str, function_name: &str) {
             line.contains(&python_prefix)
                 || line.contains(&typescript_prefix)
                 || (shared_python && line.contains("_emit_finding(name, original, error"))
+                || (shared_typescript && line.contains("_emitFinding(name, original, failure"))
         })
         .unwrap_or_else(|| panic!("missing semantic finding emission for {function_name}"));
     assert!(
@@ -1370,7 +1372,7 @@ fn typescript_query_string_serializer_gets_semantic_examples() {
     assert_advisory_contract(&plan, "stringifyQuery", "query_nested_brackets");
     assert_advisory_semantic_probe(&code, "stringifyQuery");
     assert!(
-        code.contains("Array.from(new URLSearchParams(_queryResult).entries())"),
+        code.contains("Array.from(new URLSearchParams(String(value)).entries())"),
         "query-string probe must decode the serialized output, got: {code}"
     );
     assert!(
@@ -1445,7 +1447,8 @@ fn typescript_query_string_parser_setting_param_uses_extended_mode() {
     let a = make_analysis(vec![parse], vec![]);
     let code = synthesize_calls(&a, &Language::TypeScript);
     assert!(
-        code.contains("(parseQueryString as Function)(_queryInput, \"extended\")"),
+        code.contains("(parseQueryString as Function)(_args[0], _args[1])")
+            && code.contains("[_queryInput, \"extended\"]"),
         "two-argument query parser semantics should exercise extended mode, got: {code}"
     );
     assert!(

@@ -534,7 +534,7 @@ function _minimizeFailure(original: unknown[], reproduce: (candidate: unknown[])
   }
   return [reproduce(current) ? "preserved" : "failed", attempts, current];
 }
-function _emitFinding(name: string, args: unknown[], error: unknown, severity = "crash", oracleKind = "runtime_contract", provenance = "language_runtime", confidence = "high", category = "exception", minimize: [string, number, unknown[]] | null = null, invocationPath: unknown = "direct", caseLabel: string | null = null, sourceLine = 0, replaySnippet: string | null = null, inputClassification = "valid"): void {
+function _emitFinding(name: string, args: unknown[], error: unknown, severity = "crash", oracleKind = "runtime_contract", provenance = "language_runtime", confidence = "high", category = "exception", minimize: [string, number, unknown[]] | null = null, invocationPath: unknown = "direct", caseLabel: string | null = null, sourceLine = 0, replaySnippet: string | null = null, inputClassification = "valid", expected: string | null = null): void {
   const status = minimize?.[0] ?? "not_needed"; const attempts = minimize?.[1] ?? 0; const minimized = status === "not_needed" || status === "failed" ? null : _reproCase(minimize![2], caseLabel); const reproArgs = minimized ? minimize![2] : args;
   const expectation = { severity, oracle_kind: oracleKind, category }; const message = error instanceof Error ? error.message : String(error);
   const errorType = error instanceof Error ? error.constructor.name : "unknown";
@@ -543,9 +543,40 @@ function _emitFinding(name: string, args: unknown[], error: unknown, severity = 
     ? `_replayError instanceof Error && _replayError.constructor.name === ${JSON.stringify(errorType)}`
     : primitiveException ? `Object.is(_replayError, ${_reproExpression(error)})` : null;
   const snippet = replaySnippet ?? (replayMatch === null ? `throw new Error("Court Jester cannot replay this runtime-only thrown value");` : `// Court Jester replay snippet\nlet _reproduced = false;\ntry { (${name} as Function)(${reproArgs.map((value) => _reproExpression(value)).join(", ")}); } catch (_replayError) { _reproduced = ${replayMatch}; }\nconsole.log("__COURT_JESTER_REPLAY_JSON__");\nconsole.log(JSON.stringify({reproduced:_reproduced,severity:${JSON.stringify(severity)},oracle_kind:${JSON.stringify(oracleKind)},category:${JSON.stringify(category)}}));`);
-  const record: Record<string, unknown> = { id: _findingId(name), severity, confidence, category, location: { source_file: "", function: name, line: sourceLine, invocation_path: invocationPath }, oracle: { id: `${oracleKind}:${_sanitizeSymbol(name)}`, kind: oracleKind, provenance, confidence, actual: message }, input_classification: inputClassification, repro: { kind: "function_call", function: name, arguments: _reproCase(args, caseLabel).arguments, case_label: caseLabel, snippet, command: null, expectation }, minimization: { status, attempts, original: _reproCase(args, caseLabel), minimized }, error_type: errorType, message, suppressed: false };
+  const record: Record<string, unknown> = { id: _findingId(name), severity, confidence, category, location: { source_file: "", function: name, line: sourceLine, invocation_path: invocationPath }, oracle: { id: `${oracleKind}:${_sanitizeSymbol(name)}`, kind: oracleKind, provenance, confidence, expected, actual: message }, input_classification: inputClassification, repro: { kind: "function_call", function: name, arguments: _reproCase(args, caseLabel).arguments, case_label: caseLabel, snippet, command: null, expectation }, minimization: { status, attempts, original: _reproCase(args, caseLabel), minimized }, error_type: errorType, message, suppressed: false };
   _fuzzResults.push(record);
   _cjEvent("finding", { finding: record });
+}
+function _semanticProject(value: unknown, projection: string): unknown {
+  switch (projection) {
+    case "sign": return _cmpSign(value);
+    case "bool": return Boolean(value);
+    case "query_pairs": return Array.from(new URLSearchParams(String(value)).entries());
+    case "identity": return value;
+    default: throw new Error(`Unknown semantic projection: ${projection}`);
+  }
+}
+function _semanticCase(name: string, invoke: (args: unknown[]) => unknown, args: unknown[], expected: unknown, projection: string, label: string): void {
+  if (projection === "sign") expected = _cmpSign(expected);
+  const original = _cloneSeed(args);
+  let actual: unknown;
+  let error: unknown;
+  let threw = false;
+  let phase = "invoke";
+  let matched = false;
+  try { const value = invoke(_cloneSeed(original)); phase = "project"; actual = _semanticProject(value, projection); phase = "compare"; matched = _nanSafeEq(actual, expected); }
+  catch (caught) { threw = true; error = caught; }
+  if (!threw && matched) return;
+  const primitiveException = error === null || ["undefined", "string", "number", "boolean", "bigint"].includes(typeof error);
+  const replayMatch = error instanceof Error
+    ? `_error instanceof Error && _error.constructor.name === ${JSON.stringify(error.constructor.name)} && _error.message === ${JSON.stringify(error.message)}`
+    : primitiveException ? `Object.is(_error, ${_reproExpression(error)})` : null;
+  const snippet = replayMatch === null ? `throw new Error("Court Jester cannot replay this runtime-only thrown value");`
+    : `((_semanticInvoke) => {\n${_PropertyFailure.toString()}\n${_cmpSign.toString()}\n${_nanSafeEq.toString()}\n${_semanticProject.toString()}\nlet _reproduced = false;\nlet _replayPhase = "invoke";\ntry { const _value = _semanticInvoke(${_reproExpression(original)}); _replayPhase = "project"; const _actual = _semanticProject(_value, ${JSON.stringify(projection)}); _replayPhase = "compare"; const _matches = _nanSafeEq(_actual, ${_reproExpression(expected)}); ${threw ? "" : "_reproduced = !_matches;"} } catch (_error) { ${threw ? `_reproduced = _replayPhase === ${JSON.stringify(phase)} && (${replayMatch});` : ""} }\nconsole.log("__COURT_JESTER_REPLAY_JSON__");\nconsole.log(JSON.stringify({reproduced: _reproduced, severity: "property_violation", oracle_kind: "inferred_semantic", category: "property"}));\n})(${invoke.toString()});`;
+  const failure = threw ? error : new Error(`${label}: ${JSON.stringify(actual)} !== ${JSON.stringify(expected)}`);
+  _emitFinding(name, original, failure, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", null, "direct", label, 0, snippet, "valid", JSON.stringify(expected));
+  console.log(`  CRASH ${name}(${label}): ${_clipText(failure instanceof Error ? failure.message : String(failure))}`);
+  _fuzzTotalFailures++;
 }
 function _declaredPropertyForFailure(error: unknown): string | null {
   if (!(error instanceof _PropertyFailure)) return null;

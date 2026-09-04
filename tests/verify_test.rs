@@ -882,6 +882,214 @@ async fn closed_input_contract_clean_controls_stay_clean() {
 }
 
 #[tokio::test]
+async fn typescript_semantic_replay_repeats_the_observation() {
+    for (property, name, signature, return_type, broken, query, arity) in [
+        (
+            "",
+            "compareVersions",
+            "left: string, right: string",
+            "number",
+            "return 0;",
+            false,
+            2,
+        ),
+        (
+            "",
+            "satisfiesCaret",
+            "version: string, range: string",
+            "boolean",
+            "return true;",
+            false,
+            2,
+        ),
+        (
+            "same_value_zero",
+            "sameValueZero",
+            "left: unknown, right: unknown",
+            "boolean",
+            "return left === right;",
+            false,
+            2,
+        ),
+        (
+            "query_string_serializer",
+            "canonicalQuery",
+            "params: Record<string, unknown>",
+            "string",
+            "for (const key of Object.keys(params)) delete params[key]; return '';",
+            true,
+            1,
+        ),
+        (
+            "query_nested_brackets",
+            "parseQuery",
+            "input: string, mode: string",
+            "Record<string, unknown>",
+            "return {};",
+            false,
+            2,
+        ),
+    ] {
+        for body in [
+            broken,
+            "throw new Error('semantic target unavailable');",
+            "return null as any;",
+            "const value: any = {}; value.self = value; return value;",
+        ] {
+            let project = tempfile::tempdir().unwrap();
+            let source = project.path().join("target.ts");
+            let code = format!("// court-jester-properties {property}\nexport function {name}({signature}): {return_type} {{ {body} }}");
+            fs::write(&source, &code).unwrap();
+            let mut opts = default_opts(None);
+            opts.source_file = source.to_str();
+            opts.project_dir = project.path().to_str();
+            let report = verify(&code, &Language::TypeScript, opts).await;
+            let repair = repair_summary(&report, &Language::TypeScript);
+            let finding = repair
+                .findings
+                .iter()
+                .find(|finding| finding.oracle.kind == OracleKind::InferredSemantic)
+                .unwrap_or_else(|| panic!("{name}: {body}: {}", report_human_summary(&report)));
+            assert_eq!(finding.confidence, FindingConfidence::Low);
+            assert_eq!(finding.repro.arguments.len(), arity);
+            if query {
+                assert!(
+                    !finding.repro.arguments[0]
+                        .json_value
+                        .as_ref()
+                        .unwrap()
+                        .as_object()
+                        .unwrap()
+                        .is_empty(),
+                    "target mutation must not alter the original case"
+                );
+            }
+            let id = finding.id.clone();
+            let report_path = project.path().join("repair.json");
+            fs::write(&report_path, serde_json::to_vec(&repair).unwrap()).unwrap();
+            let replay = replay_report(
+                report_path.to_str().unwrap(),
+                &id,
+                None,
+                RuntimeProfile::LocalTrusted,
+                DEFAULT_PYTHON_DOCKER_IMAGE,
+                DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                replay.outcome,
+                ReplayOutcome::Reproduced,
+                "{name}: {body}: {replay:?}"
+            );
+            let expected = finding
+                .oracle
+                .expected
+                .as_ref()
+                .expect("recorded expectation");
+            let value = if query {
+                format!("new URLSearchParams({expected}).toString()")
+            } else {
+                expected.clone()
+            };
+            // Satisfy the recorded observation, not the entire application contract.
+            fs::write(
+                &source,
+                format!("export function {name}(...args: unknown[]) {{ return {value}; }}"),
+            )
+            .unwrap();
+            let replay = replay_report(
+                report_path.to_str().unwrap(),
+                &id,
+                None,
+                RuntimeProfile::LocalTrusted,
+                DEFAULT_PYTHON_DOCKER_IMAGE,
+                DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                replay.outcome,
+                ReplayOutcome::NotReproduced,
+                "{name}: {body}: {replay:?}"
+            );
+            fs::write(&source, format!("export function {name}(...args: unknown[]) {{ throw new Error('different target failure'); }}")).unwrap();
+            let replay = replay_report(
+                report_path.to_str().unwrap(),
+                &id,
+                None,
+                RuntimeProfile::LocalTrusted,
+                DEFAULT_PYTHON_DOCKER_IMAGE,
+                DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                replay.outcome,
+                ReplayOutcome::NotReproduced,
+                "{name}: unrelated exception must not reproduce: {replay:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn typescript_semantic_replay_preserves_projection_phase_and_runtime_limits() {
+    for (body, expected) in [
+        ("return null as any;", ReplayOutcome::Reproduced),
+        ("throw Symbol('runtime-only');", ReplayOutcome::Inconclusive),
+    ] {
+        let project = tempfile::tempdir().unwrap();
+        let source = project.path().join("target.ts");
+        let code = format!(
+            "export function compareVersions(left: string, right: string): number {{ {body} }}"
+        );
+        fs::write(&source, &code).unwrap();
+        let mut opts = default_opts(None);
+        opts.source_file = source.to_str();
+        opts.project_dir = project.path().to_str();
+        let report = verify(&code, &Language::TypeScript, opts).await;
+        let repair = repair_summary(&report, &Language::TypeScript);
+        let finding = repair
+            .findings
+            .iter()
+            .find(|finding| finding.oracle.kind == OracleKind::InferredSemantic)
+            .unwrap();
+        let report_path = project.path().join("repair.json");
+        fs::write(&report_path, serde_json::to_vec(&repair).unwrap()).unwrap();
+        let replay = replay_report(
+            report_path.to_str().unwrap(),
+            &finding.id,
+            None,
+            RuntimeProfile::LocalTrusted,
+            DEFAULT_PYTHON_DOCKER_IMAGE,
+            DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay.outcome, expected, "{replay:?}");
+        if expected == ReplayOutcome::Reproduced {
+            fs::write(&source, "class _PropertyFailure extends Error {}\nexport function compareVersions(...args: unknown[]): number { throw new _PropertyFailure('Comparator returned non-numeric value: null'); }").unwrap();
+            let replay = replay_report(
+                report_path.to_str().unwrap(),
+                &finding.id,
+                None,
+                RuntimeProfile::LocalTrusted,
+                DEFAULT_PYTHON_DOCKER_IMAGE,
+                DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                replay.outcome,
+                ReplayOutcome::NotReproduced,
+                "copied projection error must not count as projection execution: {replay:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn semantic_observation_replays_and_stops_when_recorded_expectation_is_met() {
     let cases = [
         (
