@@ -209,15 +209,21 @@ def _invocation_replay_snippet(source, args, error, severity, oracle_kind, categ
                _string_leaks_nullish, _cmp_sign, _multiset_counts, _is_palindrome_sequence)
     definitions = "\n".join(_inspect.getsource(helper) for helper in helpers)
     payload = {"severity": severity, "oracle_kind": oracle_kind, "category": category}
+    required_oracle = error.oracle_id if isinstance(error, _PropertyFailure) else None
+    observer = ("_cj_passed_oracles = set()\n_cj_original_checked = _cj_checked\n"
+                "def _cj_checked(oracle_id, condition):\n"
+                "    passed = _cj_original_checked(oracle_id, condition)\n"
+                "    if passed: _cj_passed_oracles.add(oracle_id)\n"
+                "    return passed\n")
     match = f"_python_failure_identity(_error) == {_python_failure_identity(error)!r}"
     return ("import copy as _copy\nimport json as _json\n_CJ_ACTIVE_UNITS = set()\n"
-            + definitions + "\n" + source + f"\n_args = {arguments}\n_reproduced = False\n_check_passed = False\n_checking = False\ntry:\n"
+            + definitions + "\n" + observer + source + f"\n_args = {arguments}\n_reproduced = False\n_check_passed = False\n_checking = False\ntry:\n"
             + "    _result = _cj_invoke(_args)\n"
             + ("    _checking = True\n    _cj_evaluate(_args, _result)\n" if evaluate else "")
-            + "    _check_passed = True\nexcept Exception as _error:\n"
+            + f"    _check_passed = {required_oracle!r} is None or {required_oracle!r} in _cj_passed_oracles\nexcept Exception as _error:\n"
             + f"    _reproduced = {evaluate!r} == _checking and ({match})\n"
             + "print('__COURT_JESTER_REPLAY_JSON__')\n"
-            + f"print(_json.dumps(dict({payload!r}, reproduced=_reproduced, check_passed=_check_passed), ensure_ascii=False))")
+            + f"print(_json.dumps(dict({payload!r}, reproduced=_reproduced, check_passed=_check_passed, required_oracle={required_oracle!r}, passed_oracles=sorted(_cj_passed_oracles)), ensure_ascii=False))")
 
 def _resolve_factory_action(result, action, single):
     if callable(result) and single: return result

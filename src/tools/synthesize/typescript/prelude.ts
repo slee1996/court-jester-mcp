@@ -664,6 +664,16 @@ function _declaredPropertyForFailure(error: unknown): string | null {
 }
 function _evaluateProperties(fn: (args: unknown[]) => unknown, args: unknown[], result: unknown, expectedType: string | null, properties: string[], onCheck: (oracleId: string, passed: boolean) => void = () => {}): void {
   const violates = (oracleId: string, condition: boolean): boolean => { onCheck(oracleId, !condition); return condition; };
+  const compareSign = (value: unknown): number => {
+    try {
+      const sign = _cmpSign(value);
+      onCheck("comparator:type", true);
+      return sign;
+    } catch (error) {
+      if (error instanceof _PropertyFailure) onCheck("comparator:type", false);
+      throw error;
+    }
+  };
   // Type check
   if (expectedType !== null && violates("return_type", typeof result !== expectedType)) {
     throw new _PropertyFailure(`Return type mismatch: expected ${expectedType}, got ${typeof result}`);
@@ -757,16 +767,16 @@ function _evaluateProperties(fn: (args: unknown[]) => unknown, args: unknown[], 
   // Comparator contract: compare(a,a) == 0 and sign(compare(a,b)) == -sign(compare(b,a))
   if (properties.includes("comparator") && args.length === 2) {
     const selfCmp = fn([args[0], args[0]]);
-    if (violates("comparator:self", _cmpSign(selfCmp) !== 0)) {
+    if (violates("comparator:self", compareSign(selfCmp) !== 0)) {
       throw new _PropertyFailure(`Comparator self-compare should be zero: ${JSON.stringify(selfCmp)}`);
     }
     const resultRev = fn([args[1], args[0]]);
-    if (violates("comparator:reverse", _cmpSign(result) !== -_cmpSign(resultRev))) {
+    if (violates("comparator:reverse", compareSign(result) !== -compareSign(resultRev))) {
       throw new _PropertyFailure(`Comparator antisymmetry violated: ${JSON.stringify(result)} vs ${JSON.stringify(resultRev)}`);
     }
   }
 }
-function _propertyReplaySnippet(name: string, args: unknown[], expectedType: string | null, properties: string[], failureIdentity: string | null, severity: string, oracleKind: string, category: string): string {
+function _propertyReplaySnippet(name: string, args: unknown[], expectedType: string | null, properties: string[], failureIdentity: string | null, severity: string, oracleKind: string, category: string, requiredOracle: string | null = null): string {
   if (failureIdentity === null) return 'throw new Error("Court Jester cannot replay this runtime-only thrown value");';
   // Persist the actual evaluator and its pure dependencies. Replay neither
   // regenerates inputs nor guesses an oracle from a diagnostic message.
@@ -774,7 +784,7 @@ function _propertyReplaySnippet(name: string, args: unknown[], expectedType: str
     _stringLeaksNullish, _cmpSign, _isPrimitiveSortableArray, _samePrimitiveMultiset,
     _declaredPropertyForFailure, _failureIdentity, _evaluateProperties]
     .map((helper) => helper.toString()).join("\n");
-  return `${helpers}\nconst _args = ${_reproExpression(args)};\nlet _reproduced = false, _checkPassed = false;\nlet _checking = false;\ntry {\n  const _invoke = (args: unknown[]) => (${name} as Function)(...args);\n  const _result = _invoke(_cloneSeed(_args));\n  _checking = true;\n  _evaluateProperties(_invoke, _args, _result, ${JSON.stringify(expectedType)}, ${JSON.stringify(properties)});\n  _checkPassed = true;\n} catch (_error) { _reproduced = _checking && (${severity !== "property_violation"} || _error instanceof _PropertyFailure) && _failureIdentity(_error) === ${JSON.stringify(failureIdentity)}; }\nconsole.log("__COURT_JESTER_REPLAY_JSON__");\nconsole.log(JSON.stringify({ reproduced: _reproduced, check_passed: _checkPassed, severity: ${JSON.stringify(severity)}, oracle_kind: ${JSON.stringify(oracleKind)}, category: ${JSON.stringify(category)} }));`;
+  return `${helpers}\nconst _passedOracles = new Set<string>();\nconst _requiredOracle = ${JSON.stringify(requiredOracle)};\nconst _args = ${_reproExpression(args)};\nlet _reproduced = false, _checkPassed = false;\nlet _checking = false;\ntry {\n  const _invoke = (args: unknown[]) => (${name} as Function)(...args);\n  const _result = _invoke(_cloneSeed(_args));\n  _checking = true;\n  _evaluateProperties(_invoke, _args, _result, ${JSON.stringify(expectedType)}, ${JSON.stringify(properties)}, (oracleId, passed) => { if (passed) _passedOracles.add(oracleId); });\n  _checkPassed = _requiredOracle === null || _passedOracles.has(_requiredOracle);\n} catch (_error) { _reproduced = _checking && (${severity !== "property_violation"} || _error instanceof _PropertyFailure) && _failureIdentity(_error) === ${JSON.stringify(failureIdentity)}; }\nconsole.log("__COURT_JESTER_REPLAY_JSON__");\nconsole.log(JSON.stringify({ reproduced: _reproduced, check_passed: _checkPassed, required_oracle: _requiredOracle, passed_oracles: [..._passedOracles], severity: ${JSON.stringify(severity)}, oracle_kind: ${JSON.stringify(oracleKind)}, category: ${JSON.stringify(category)} }));`;
 }
 function _fuzzOne(
   name: string,
@@ -837,6 +847,7 @@ function _fuzzOne(
     const { args, contractValid } = allInputs[i];
     let contractTargetException = false;
     let checkingProperties = false;
+    let failedOracle: string | null = null;
     try {
       _targetEntered(`${name}:${sourceLine}`, i);
       let result: unknown;
@@ -848,6 +859,7 @@ function _fuzzOne(
       }
       checkingProperties = true;
       _evaluateProperties(fn, args, result, expectedType, properties, (oracleId, passed) => {
+        if (!passed) failedOracle = oracleId;
         _cjEvent("oracle_evaluated", { surface_id: `${name}:${sourceLine}`, iteration: i, oracle_id: oracleId, passed });
       });
       if (_retainCorpusInput(corpus, behaviorSignatures, _behaviorSignature("passed", result), args)
@@ -879,18 +891,19 @@ function _fuzzOne(
           // different value. Restrict contract exceptions to admitted seed rows.
           if (contractTargetException && !seedRows.some((seed) => seed.contractValid && _sameInput(candidate, seed.args))) return false;
           let candidateChecking = false;
+          let candidateFailedOracle: string | null = null;
           try {
             const candidateResult = fn(_cloneSeed(candidate));
             candidateChecking = true;
-            if (checkingProperties) _evaluateProperties(fn, candidate, candidateResult, expectedType, properties);
+            if (checkingProperties) _evaluateProperties(fn, candidate, candidateResult, expectedType, properties, (oracleId, passed) => { if (!passed) candidateFailedOracle = oracleId; });
             return false;
           } catch (candidateError) {
-            return failureIdentity !== null && (!checkingProperties || candidateChecking) && (contractTargetException || _isCrash(candidateError)) && _failureIdentity(candidateError) === failureIdentity;
+            return failureIdentity !== null && (!propertyFailure || (failedOracle !== null && candidateFailedOracle === failedOracle)) && (!checkingProperties || candidateChecking) && (contractTargetException || _isCrash(candidateError)) && _failureIdentity(candidateError) === failureIdentity;
           }
         });
         const replayArgs = minimized[0] === "preserved" ? minimized[2] : args;
         const category = propertyFailure ? "property" : "exception";
-        const replaySnippet = checkingProperties ? _propertyReplaySnippet(name, replayArgs, expectedType, properties, failureIdentity, severity, oracleKind, category) : null;
+        const replaySnippet = checkingProperties ? _propertyReplaySnippet(name, replayArgs, expectedType, properties, failureIdentity, severity, oracleKind, category, propertyFailure ? failedOracle : null) : null;
         _emitFinding(name, args, e, severity, oracleKind, provenance, confidence, category, minimized, "direct", null, sourceLine, replaySnippet);
         if (crash === 1) firstCrash = `  CRASH ${name}(${_shortJson(args)}): ${_clipText(e)}`;
       } else if (outsideContract) {

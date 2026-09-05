@@ -319,6 +319,9 @@ fn export_preserves_effective_replay_limits_and_refuses_unknown_inputs() {
 #[test]
 fn property_pair_and_factory_exports_fail_before_and_pass_after_repair() {
     for (language, oracle, bug, fixed) in [
+        ("typescript", "declared_property", "// court-jester-properties clamped\nexport function clampValue(value: number, low: number, high: number): number { const lo = Math.min(low, high), hi = Math.max(low, high); return value >= lo && value <= hi ? lo : hi + 1; }\nclampValue(5, 0, 10);", "export function clampValue(value: number, low: number, high: number): number { return Math.max(Math.min(low, high), Math.min(Math.max(low, high), value)); }"),
+        ("python", "declared_property", "# court-jester-properties antisymmetric\ndef compare(left: int, right: int):\n    return None\n", "def compare(left: int, right: int):\n    return left - right\n"),
+        ("typescript", "declared_property", "// court-jester-properties antisymmetric\nexport function compare(left: number, right: number): any { return null; }", "export function compare(left: number, right: number): any { return left - right; }"),
         ("python", "declared_property", "# court-jester-properties bounded\ndef grow(value: str) -> str:\n    return value + '!'\n", "def grow(value: str) -> str:\n    return value\n"),
         ("typescript", "declared_property", "// court-jester-properties bounded\nexport function grow(value: string): string { return value + '!'; }", "export function grow(value: string): string { return value; }"),
         ("python", "inferred_semantic", "def encode(value: str) -> str:\n    return value\ndef decode(value: str) -> str:\n    return value + 'x'\n", "def encode(value: str) -> str:\n    return value\ndef decode(value: str) -> str:\n    return value\n"),
@@ -331,6 +334,13 @@ fn property_pair_and_factory_exports_fail_before_and_pass_after_repair() {
         let bundle = root.path().join("regression");
         let result = export(root.path(), &report, &id, &bundle, true);
         assert!(result.status.success(), "{language}/{oracle}: {}", String::from_utf8_lossy(&result.stderr));
+        if bug.contains("clampValue(5, 0, 10)") {
+            let replay: Value = serde_json::from_slice(&result.stdout).unwrap();
+            let stdout = replay["execution"]["stdout"].as_str().unwrap();
+            let payload = stdout.split_once("__COURT_JESTER_REPLAY_JSON__").unwrap().1.trim();
+            let payload: Value = serde_json::from_str(payload.lines().next().unwrap()).unwrap();
+            assert_eq!(payload["required_oracle"], "clamped:passthrough", "minimization must retain the seeded failing subcheck");
+        }
         assert!(!run_test(&bundle, language, env!("CARGO_BIN_EXE_court-jester")).status.success());
         if oracle == "runtime_contract" {
             let missing = if language == "python" { "def create_counter():\n    return {}\n" }
@@ -373,4 +383,77 @@ fn relative_replay_source_belongs_to_explicit_project_not_callers_directory() {
     let replay: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(replay["outcome"], "reproduced", "{replay}");
     assert_eq!(replay["check_passed"], false);
+}
+
+#[test]
+fn exported_property_requires_the_recorded_oracle_to_run() {
+    for (language, bug, skipped, fixed) in [
+        ("python", "# court-jester-properties sorted\ndef reorder(values: list[int]):\n    return [2, 1]\n", "def reorder(values: list[int]):\n    return {}\n", "def reorder(values: list[int]):\n    return [1, 2]\n"),
+        ("typescript", "// court-jester-properties sorted\nexport function reorder(values: number[]): any { return [2, 1]; }", "export function reorder(values: number[]): any { return {}; }", "export function reorder(values: number[]): any { return [1, 2]; }"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let (source, report, id) = fixture(root.path(), language, bug, Some("declared_property"));
+        let bundle = root.path().join("regression");
+        let result = export(root.path(), &report, &id, &bundle, false);
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        std::fs::write(&source, skipped).unwrap();
+        let skipped = run_test(&bundle, language, env!("CARGO_BIN_EXE_court-jester"));
+        assert!(!skipped.status.success(), "{language}: returning an object skipped the recorded sorted check but passed the regression");
+        std::fs::write(&source, fixed).unwrap();
+        let fixed = run_test(&bundle, language, env!("CARGO_BIN_EXE_court-jester"));
+        assert!(fixed.status.success(), "{}{}", String::from_utf8_lossy(&fixed.stdout), String::from_utf8_lossy(&fixed.stderr));
+    }
+}
+
+#[test]
+fn legacy_or_unrelated_property_evidence_cannot_authorize_a_regression_pass() {
+    let root = tempfile::tempdir().unwrap();
+    let (_, report, id) = fixture(
+        root.path(),
+        "python",
+        "# court-jester-properties sorted\ndef reorder(values: list[int]):\n    return [2, 1]\n",
+        Some("declared_property"),
+    );
+    let original: Value = serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+    for witness in [
+        None,
+        Some(serde_json::json!(["consistent"])),
+        Some(serde_json::json!(["sorted", false])),
+    ] {
+        let mut data = original.clone();
+        let mut payload = data["findings"][0]["repro"]["expectation"].clone();
+        payload["reproduced"] = Value::Bool(false);
+        payload["check_passed"] = Value::Bool(true);
+        if let Some(passed) = &witness {
+            payload["required_oracle"] = Value::String("sorted".into());
+            payload["passed_oracles"] = passed.clone();
+        }
+        let literal = serde_json::to_string(&payload.to_string()).unwrap();
+        data["findings"][0]["repro"]["snippet"] = Value::String(format!(
+            "print('__COURT_JESTER_REPLAY_JSON__')\nprint({literal})\n"
+        ));
+        std::fs::write(&report, serde_json::to_vec(&data).unwrap()).unwrap();
+        let output = cli(&[
+            "replay",
+            "--report",
+            report.to_str().unwrap(),
+            "--finding",
+            &id,
+        ]);
+        let replay: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            replay["outcome"],
+            if witness.is_none() {
+                "not_reproduced"
+            } else {
+                "inconclusive"
+            }
+        );
+        assert!(replay.get("check_passed").is_none(), "{replay}");
+        let bundle = root.path().join("regression");
+        assert!(!export(root.path(), &report, &id, &bundle, false)
+            .status
+            .success());
+        assert!(!bundle.exists());
+    }
 }

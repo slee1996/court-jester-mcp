@@ -7,10 +7,11 @@ use super::{
 };
 use crate::tools::{analyze, sandbox};
 use crate::types::{
-    ContextRequest, DifferentialRepro, EmbeddedSource, ExecutionResult, HarnessArg, Language,
-    NetworkPolicy, PersistedReport, ProcessTermination, ProcessTerminationKind, RepairSummary,
-    ReplayOutcome, ReplayReport, ReproLaunchContext, RuntimeProfile, SandboxOptions, StageStatus,
-    VerificationFinding, VerificationStage, VerificationVerdict, REPORT_SCHEMA_VERSION,
+    ContextRequest, DifferentialRepro, EmbeddedSource, ExecutionResult, FindingSeverity,
+    HarnessArg, Language, NetworkPolicy, OracleKind, PersistedReport, ProcessTermination,
+    ProcessTerminationKind, RepairSummary, ReplayOutcome, ReplayReport, ReproLaunchContext,
+    RuntimeProfile, SandboxOptions, StageStatus, VerificationFinding, VerificationStage,
+    VerificationVerdict, REPORT_SCHEMA_VERSION,
 };
 use std::path::{Path, PathBuf};
 
@@ -605,12 +606,48 @@ pub async fn replay_report_with_options(
             let positive = payload
                 .get("check_passed")
                 .and_then(|value| value.as_bool());
+            let requires_oracle = finding.repro.expectation.severity
+                == FindingSeverity::PropertyViolation
+                && matches!(
+                    finding.repro.expectation.oracle_kind,
+                    OracleKind::DeclaredProperty
+                        | OracleKind::GenericProperty
+                        | OracleKind::TypeContract
+                );
+            let required_oracle = payload
+                .get("required_oracle")
+                .and_then(|value| value.as_str())
+                .filter(|id| !id.is_empty());
+            let passed_oracles = payload
+                .get("passed_oracles")
+                .and_then(|value| value.as_array())
+                .filter(|values| {
+                    values
+                        .iter()
+                        .all(|value| value.as_str().is_some_and(|id| !id.is_empty()))
+                });
+            let witnessed = required_oracle
+                .zip(passed_oracles)
+                .map(|(required, passed)| {
+                    passed.iter().any(|value| value.as_str() == Some(required))
+                });
+            let declares_witness =
+                payload.get("required_oracle").is_some() || payload.get("passed_oracles").is_some();
             if matches_expectation
                 && reproduced.is_some()
                 && !(reproduced == Some(true) && positive == Some(true))
                 && (payload.get("check_passed").is_none() || positive.is_some())
+                && !(requires_oracle && positive == Some(true) && witnessed == Some(false))
+                && !(requires_oracle && declares_witness && witnessed.is_none())
             {
-                check_passed = positive;
+                // Older property snippets claimed normal evaluator return, not
+                // execution of the recorded oracle. Preserve replay compatibility
+                // without treating that claim as a passing regression contract.
+                check_passed = if requires_oracle && witnessed.is_none() {
+                    None
+                } else {
+                    positive
+                };
                 if reproduced == Some(true) {
                     ReplayOutcome::Reproduced
                 } else {

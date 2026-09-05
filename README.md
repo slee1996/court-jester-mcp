@@ -314,6 +314,8 @@ Run `python3 tests/first-character-regression/test_regression.py` for Python, or
 
 The test checks the current source using the saved runtime profile, limits, and harness arguments. It passes only when the recorded check positively completes—not merely when the original exception disappears. A different exception, incomplete action sequence, missing source/runtime, or inconclusive replay fails. A successful export exits `0`, even if its recorded check currently fails; ordinary replay exit codes are unchanged. Never run untrusted report snippets in `local-trusted` mode.
 
+Property regressions also require the specific recorded oracle to run successfully. Returning a different shape that skips a property check is not a repair. Older property bundles without per-oracle evidence fail closed with a current CLI; regenerate the finding from the failing revision and export a fresh bundle.
+
 Sandbox flags for `execute`:
 
 - `--timeout-seconds <F>`
