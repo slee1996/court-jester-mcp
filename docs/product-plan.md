@@ -364,6 +364,13 @@ This is a single-owner Plan-mode execution record. The completed historical rele
 - The rename stall subsequently cleared without cancellation or a machine restart. Both scratch probes completed, and the focused CLI validation-order test passed in both the original build (after 6m40s compilation) and the independent non-incremental build. The original full-suite session has advanced into tests and remains the full verification run to observe. The filesystem delay was not a test failure.
 - Final-source verification is now terminal: 675 Rust tests passed and only the two known filesystem-restricted temporary-directory tests failed; both passed in the exact unrestricted rerun. All 227 verifier tests pass, including the revised CI validation-order regression; doctor has 11 passes and configuration nine. Final-source strict Clippy, formatting/whitespace checks, release build, sample/extended smoke, four-case repair contract, all 13 effectiveness cases, 83 benchmark unit tests, six repair-contract unit tests, and two release tests pass. The final rebuilt binary's repair evidence SHA-256 is `0bc77542de05df5df1454e25696f648e4ac7fbc28390bad21ddf27e1826ee36f`. This supersedes the pre-validation-order failure, not the outstanding product requirements.
 
+### Increment 34: honor CI suppression configuration
+
+- Reproduced CI returning pass with a configured but missing suppression file, including a zero-source diff. CI previously discarded both suppression contents and provenance when constructing verifier options.
+- Direct verification and CI now share suppression-file loading and JSON syntax validation. CI passes the loaded rules and source path through the existing verifier suppression boundary rather than implementing separate matching behavior.
+- Regression coverage checks missing and malformed files, an actual configured complexity suppression with retained suppressed evidence/provenance, and the unsuppressed failing control with config disabled. Ten repository-configuration tests, six existing CI verifier tests, three existing suppression tests, strict Clippy, formatting, and whitespace checks pass. This increment has targeted verification, not a new full-suite/release evidence claim.
+- Push of preceding commit `79a05f3` remains blocked by the active GitHub account's repository permissions; account switching awaits user direction. Local work continues. Committed-versus-working-tree selection and all remaining P1–P9 outcomes remain unfinished.
+
 ## Completion audit
 
 All P1–P9 remain required. Local gates do not substitute for actual design-partner results or current-build paired repair evidence. Record missing authority/data explicitly; do not call the full product objective complete on implementation alone.

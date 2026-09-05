@@ -2,6 +2,56 @@ use serde_json::{json, Value};
 use std::fs;
 use std::process::{Command, Output};
 
+#[test]
+fn ci_validates_configured_suppressions_even_without_changed_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for args in [
+        vec!["init", "--quiet"],
+        vec![
+            "-c",
+            "user.name=Tests",
+            "-c",
+            "user.email=tests@example.com",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "base",
+        ],
+    ] {
+        assert!(Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    }
+    fs::write(
+        root.join(".court-jester.json"),
+        json!({"schema_version": 1, "defaults": {"suppressions_file": "suppression.json"}})
+            .to_string(),
+    )
+    .unwrap();
+    for contents in [None, Some("not json")] {
+        if let Some(contents) = contents {
+            fs::write(root.join("suppression.json"), contents).unwrap();
+        }
+        let output = Command::new(env!("CARGO_BIN_EXE_court-jester"))
+            .current_dir(root)
+            .args(["ci", "--base", "HEAD", "--report", "json"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("suppression.json"));
+    }
+}
+
 fn run(root: &std::path::Path, extra: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_court-jester"))
         .current_dir(root)
@@ -150,6 +200,65 @@ fn ci_uses_configured_authoritative_tests_without_requiring_mutation_testing() {
     let test = stages.iter().find(|stage| stage["name"] == "test").unwrap();
     assert_eq!(test["status"], "passed", "{test:#?}");
     assert!(stages.iter().all(|stage| stage["name"] != "test_quality"));
+
+    fs::write(
+        root.join("target.py"),
+        "def inspect(value: bool):\n    if value:\n        return True\n    return False\n",
+    )
+    .unwrap();
+    git(&["add", "target.py"]);
+    git(&["commit", "--quiet", "-m", "branching candidate"]);
+    fs::write(
+        root.join("suppression.json"),
+        json!({"rules": [{"path": "target.py", "stage": "complexity", "function": "inspect"}]})
+            .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        root.join(".court-jester.json"),
+        json!({"schema_version": 1, "defaults": {"suppressions_file": "suppression.json"}})
+            .to_string(),
+    )
+    .unwrap();
+    for (extra, expected) in [(vec![], "passed"), (vec!["--no-repo-config"], "failed")] {
+        let output = Command::new(env!("CARGO_BIN_EXE_court-jester"))
+            .current_dir(root)
+            .args([
+                "ci",
+                "--base",
+                &base,
+                "--report",
+                "json",
+                "--gate",
+                "complexity",
+                "--complexity-threshold",
+                "1",
+            ])
+            .args(extra)
+            .output()
+            .unwrap();
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let stage = report["files"][0]["report"]["stages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|stage| stage["name"] == "complexity")
+            .unwrap();
+        assert_eq!(stage["status"], expected, "{stage:#}");
+        if expected == "passed" {
+            assert_eq!(
+                stage["detail"]["suppressed_violations"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert!(stage["detail"]["suppression_source"]
+                .as_str()
+                .unwrap()
+                .ends_with("suppression.json"));
+        }
+    }
 }
 
 #[test]

@@ -398,16 +398,7 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
             let project_dir_owned = context.workspace_root.to_string_lossy().into_owned();
             let complexity_threshold = resolve_complexity_threshold(&args)?;
             let test_code = read_optional_file(test_file)?;
-            let suppressions = read_optional_file(args.suppressions_file.as_deref())?;
-            if let Some(raw) = suppressions.as_deref() {
-                serde_json::from_str::<serde_json::Value>(raw).map_err(|e| {
-                    format!(
-                        "invalid suppressions file '{}': {}",
-                        args.suppressions_file.as_deref().unwrap_or("<inline>"),
-                        e
-                    )
-                })?;
-            }
+            let suppressions = args::read_suppressions(args.suppressions_file.as_deref())?;
             let diff = read_optional_file(args.diff_file.as_deref())?;
             let base_pair = validate_base_pair(&args, &file, &language)?;
             let base_code = base_pair

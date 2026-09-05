@@ -45,6 +45,8 @@ Configured test and suppression paths are relative to the configuration file's d
 
 Configuration is currently read from the working tree, even when CI uses `--head` to select a revision's diff. Committed-configuration selection remains unfinished; do not interpret a revision label as proof that configuration was loaded from that commit.
 
+CI and direct verification both load the selected suppression file, reject missing files or invalid JSON, and pass its rules and source path to verification. CI validates the file even when no changed sources are selected. Suppression matching and retained suppressed evidence use the same verifier rules in both commands.
+
 Discovery starts at `--project-dir` when supplied and checks only that directory. Otherwise `verify` and doctor with `--file` start at the target file's directory; CI and doctor without a target start at the invocation directory. Within a Git repository, discovery walks up to the nearest Git root, inclusively, and chooses the nearest configuration without merging parent files. Without a Git root, it checks only the starting directory. It never searches above the Git root. Git worktree `.git` files are also boundaries.
 
 Use `--no-repo-config` to bypass discovery, including a malformed discovered config. It conflicts with `--repo-config`. Invalid discovered files produce errors rather than silently falling back to another config.

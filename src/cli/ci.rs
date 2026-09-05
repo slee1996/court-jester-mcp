@@ -428,6 +428,7 @@ pub(super) async fn run_ci_for_repo(
     }
     let base = require_base(args)?.to_string();
     let head = args.head.clone().unwrap_or_else(|| "HEAD".into());
+    let suppressions = super::args::read_suppressions(args.suppressions_file.as_deref())?;
     let test_entrypoints = ci_test_entrypoints(repo_dir, &args.test_files)?;
     let baseline_temp = archive_baseline_tree(repo_dir, &base)?;
     let gates = parse_ci_gates(args.gate.as_deref())?;
@@ -534,8 +535,8 @@ pub(super) async fn run_ci_for_repo(
                 lint_config_path: args.config_path.as_deref(),
                 lint_virtual_file_path: None,
                 diff: diff.as_deref(),
-                suppressions: None,
-                suppression_source: None,
+                suppressions: suppressions.as_deref(),
+                suppression_source: args.suppressions_file.as_deref(),
                 auto_seed: !args.no_auto_seed,
                 base_code: baseline_code.as_deref(),
                 base_source_file: baseline_path.to_str(),
