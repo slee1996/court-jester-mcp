@@ -54,6 +54,8 @@ pub(super) struct CliArgs {
     pub(super) typescript_docker_image: Option<String>,
     pub(super) report_path: Option<String>,
     pub(super) finding_id: Option<String>,
+    pub(super) regression_output: Option<String>,
+    pub(super) accept_inferred: bool,
     pub(super) dependency_project_dir: Option<String>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -376,6 +378,8 @@ pub(super) fn parse_replay_flags(rest: &[String]) -> Result<CliArgs, String> {
         match flag {
             "--report" => out.report_path = Some(value(&mut i)?),
             "--finding" => out.finding_id = Some(value(&mut i)?),
+            "--export-regression" => out.regression_output = Some(value(&mut i)?),
+            "--accept-inferred" => out.accept_inferred = true,
             "--dependency-project-dir" => out.dependency_project_dir = Some(value(&mut i)?),
             "--runtime-profile" => {
                 out.runtime_profile = RuntimeProfile::parse(&value(&mut i)?).ok_or_else(|| {

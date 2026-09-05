@@ -1588,6 +1588,10 @@ pub struct ReplayReport {
     pub schema_version: u32,
     pub finding_id: String,
     pub outcome: ReplayOutcome,
+    /// Positive completion of the recorded check, not merely absence of the old failure.
+    /// Older repros and unsupported observations have no such evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_passed: Option<bool>,
     pub execution: ExecutionResult,
 }
 // Repository-derived domain and verification-plan IR.

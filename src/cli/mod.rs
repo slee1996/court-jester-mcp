@@ -94,6 +94,8 @@ EXECUTE OPTIONS:
 REPLAY OPTIONS:
   --report <PATH>            Persisted schema-v3 report to replay
   --finding <ID>             Finding id to replay (must be unique)
+  --export-regression <DIR>  Write new CLI-backed test bundle inside dependency project
+  --accept-inferred          Explicitly accept an inferred expectation for export
   --dependency-project-dir <PATH>  Dependency project root for replay
   --timeout-seconds <F>      Replay timeout override
   --memory-mb <N>            Replay memory cap override
@@ -174,6 +176,9 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
     validate_runtime_flags(cmd, &args)?;
     validate_policy_flags(cmd, &args)?;
     if cmd == "replay" {
+        if args.accept_inferred && args.regression_output.is_none() {
+            return Err("--accept-inferred requires --export-regression".into());
+        }
         let report_path = args
             .report_path
             .as_deref()
@@ -183,6 +188,23 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
             .as_deref()
             .ok_or_else(|| "--finding is required for `court-jester replay`".to_string())?;
         let persisted_context = tools::verify::replay_launch_context(report_path, finding_id)?;
+        let export_plan = args
+            .regression_output
+            .as_deref()
+            .map(|output| {
+                let project = args
+                    .dependency_project_dir
+                    .as_deref()
+                    .ok_or("--export-regression requires --dependency-project-dir")?;
+                tools::verify::prepare_regression_export(
+                    report_path,
+                    finding_id,
+                    project,
+                    output,
+                    args.accept_inferred,
+                )
+            })
+            .transpose()?;
         let persisted_report = tools::verify::load_persisted_report(report_path)?;
         let replay_language = parse_language(&persisted_report.meta.language).map_err(|_| {
             format!(
@@ -233,6 +255,37 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
                 .then_some(args.harness_args.as_slice()),
         )
         .await?;
+        if let Some(plan) = export_plan {
+            let mut launch = persisted_context
+                .clone()
+                .ok_or("regression export requires launch context")?;
+            launch.limits.runtime_profile = runtime_profile;
+            if let Some(timeout) = args.timeout_seconds {
+                launch.limits.timeout_seconds = timeout;
+            }
+            if let Some(memory) = args.memory_mb {
+                launch.limits.memory_mb = memory;
+            }
+            if args.network_explicit {
+                launch.limits.network_policy = args.network;
+            }
+            if args.harness_args_explicit {
+                launch.harness_args = args.harness_args.clone();
+            }
+            launch.docker_image =
+                (runtime_profile == RuntimeProfile::Isolated).then(|| match replay_language {
+                    Language::Python => python_docker_image.to_string(),
+                    Language::TypeScript => typescript_docker_image.to_string(),
+                });
+            let exported = tools::verify::write_regression_export(plan, &report, launch)?;
+            let mut value = serde_json::to_value(&report).map_err(|error| error.to_string())?;
+            value["regression_export"] = exported;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?
+            );
+            return Ok(());
+        }
         println!(
             "{}",
             serde_json::to_string_pretty(&report)

@@ -258,6 +258,7 @@ pub async fn replay_report_with_options(
     if let Some(differential) = finding.repro.differential.as_ref() {
         if let Err(reason) = validate_differential_repro(differential, dependency_project_dir) {
             return Ok(ReplayReport {
+                check_passed: None,
                 schema_version: REPORT_SCHEMA_VERSION,
                 finding_id: finding.id,
                 outcome: ReplayOutcome::Inconclusive,
@@ -272,6 +273,7 @@ pub async fn replay_report_with_options(
             Ok(materialized) => materialized,
             Err(reason) => {
                 return Ok(ReplayReport {
+                    check_passed: None,
                     schema_version: REPORT_SCHEMA_VERSION,
                     finding_id: finding.id,
                     outcome: ReplayOutcome::Inconclusive,
@@ -287,6 +289,7 @@ pub async fn replay_report_with_options(
             Ok(materialized) => materialized,
             Err(reason) => {
                 return Ok(ReplayReport {
+                    check_passed: None,
                     schema_version: REPORT_SCHEMA_VERSION,
                     finding_id: finding.id,
                     outcome: ReplayOutcome::Inconclusive,
@@ -296,6 +299,7 @@ pub async fn replay_report_with_options(
         };
         let Some(symbol) = finding.repro.function.as_deref() else {
             return Ok(ReplayReport {
+                check_passed: None,
                 schema_version: REPORT_SCHEMA_VERSION,
                 finding_id: finding.id,
                 outcome: ReplayOutcome::Inconclusive,
@@ -313,6 +317,7 @@ pub async fn replay_report_with_options(
             Ok(context) => context,
             Err(error) => {
                 return Ok(ReplayReport {
+                    check_passed: None,
                     schema_version: REPORT_SCHEMA_VERSION,
                     finding_id: finding.id,
                     outcome: ReplayOutcome::Inconclusive,
@@ -333,6 +338,7 @@ pub async fn replay_report_with_options(
             Ok(context) => context,
             Err(error) => {
                 return Ok(ReplayReport {
+                    check_passed: None,
                     schema_version: REPORT_SCHEMA_VERSION,
                     finding_id: finding.id,
                     outcome: ReplayOutcome::Inconclusive,
@@ -357,6 +363,7 @@ pub async fn replay_report_with_options(
         let (Some(base_function), Some(candidate_function)) = (base_function, candidate_function)
         else {
             return Ok(ReplayReport {
+                check_passed: None,
                 schema_version: REPORT_SCHEMA_VERSION,
                 finding_id: finding.id,
                 outcome: ReplayOutcome::Inconclusive,
@@ -367,6 +374,7 @@ pub async fn replay_report_with_options(
         };
         if !compatible_surface(candidate_function, base_function) {
             return Ok(ReplayReport {
+                check_passed: None,
                 schema_version: REPORT_SCHEMA_VERSION,
                 finding_id: finding.id,
                 outcome: ReplayOutcome::Inconclusive,
@@ -381,6 +389,7 @@ pub async fn replay_report_with_options(
             &language,
         ) else {
             return Ok(ReplayReport {
+                check_passed: None,
                 schema_version: REPORT_SCHEMA_VERSION,
                 finding_id: finding.id,
                 outcome: ReplayOutcome::Inconclusive,
@@ -430,6 +439,7 @@ pub async fn replay_report_with_options(
             Ok(snapshot) => snapshot,
             Err(reason) => {
                 return Ok(ReplayReport {
+                    check_passed: None,
                     schema_version: REPORT_SCHEMA_VERSION,
                     finding_id: finding.id,
                     outcome: ReplayOutcome::Inconclusive,
@@ -443,6 +453,7 @@ pub async fn replay_report_with_options(
             Ok(snapshot) => snapshot,
             Err(reason) => {
                 return Ok(ReplayReport {
+                    check_passed: None,
                     schema_version: REPORT_SCHEMA_VERSION,
                     finding_id: finding.id,
                     outcome: ReplayOutcome::Inconclusive,
@@ -457,6 +468,7 @@ pub async fn replay_report_with_options(
             || (base_snapshot == candidate_snapshot && base_snapshot.exception_type.is_some())
         {
             return Ok(ReplayReport {
+                check_passed: None,
                 schema_version: REPORT_SCHEMA_VERSION,
                 finding_id: finding.id,
                 outcome: ReplayOutcome::Inconclusive,
@@ -493,6 +505,7 @@ pub async fn replay_report_with_options(
             diagnostics: vec![],
         };
         return Ok(ReplayReport {
+            check_passed: None,
             schema_version: REPORT_SCHEMA_VERSION,
             finding_id: finding.id,
             outcome: if reproduced {
@@ -507,20 +520,24 @@ pub async fn replay_report_with_options(
     let mut source_file_owned = None;
     let mut source = String::new();
     if let Some(path) = report.meta.source_file.as_deref() {
-        let source_path = if Path::new(path).is_file() {
-            PathBuf::from(path)
-        } else if let Some(root) = dependency_project_dir {
-            Path::new(root).join(path)
-        } else {
-            return Ok(ReplayReport {
-                schema_version: REPORT_SCHEMA_VERSION,
-                finding_id: finding.id,
-                outcome: ReplayOutcome::Inconclusive,
-                execution: err_execution_result(
-                    "relative replay source requires --dependency-project-dir",
-                ),
-            });
-        };
+        let source_path =
+            if let Some(root) = dependency_project_dir.filter(|_| !Path::new(path).is_absolute()) {
+                Path::new(root).join(path)
+            } else if Path::new(path).is_file() {
+                PathBuf::from(path)
+            } else if let Some(root) = dependency_project_dir {
+                Path::new(root).join(path)
+            } else {
+                return Ok(ReplayReport {
+                    check_passed: None,
+                    schema_version: REPORT_SCHEMA_VERSION,
+                    finding_id: finding.id,
+                    outcome: ReplayOutcome::Inconclusive,
+                    execution: err_execution_result(
+                        "relative replay source requires --dependency-project-dir",
+                    ),
+                });
+            };
         source = std::fs::read_to_string(&source_path)
             .map_err(|error| format!("source context unavailable for replay: {error}"))?;
         source_file_owned = Some(source_path.to_string_lossy().to_string());
@@ -557,12 +574,16 @@ pub async fn replay_report_with_options(
     };
     options.validate()?;
     let execution = sandbox::execute(&code, &language, options).await;
-    let outcome = match replay_payload(&execution.stdout) {
+    let mut check_passed = None;
+    let payload =
+        if execution.exit_code == Some(0) && !execution.timed_out && !execution.memory_error {
+            replay_payload(&execution.stdout)
+        } else {
+            Err("replay process did not complete successfully".into())
+        };
+    let outcome = match payload {
         Ok(payload) => {
-            let reproduced = payload
-                .get("reproduced")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false);
+            let reproduced = payload.get("reproduced").and_then(|value| value.as_bool());
             let expected = |value: serde_json::Value| value.as_str().map(ToOwned::to_owned);
             let matches_expectation = payload.get("severity").and_then(|value| value.as_str())
                 == expected(
@@ -581,8 +602,16 @@ pub async fn replay_report_with_options(
                             .unwrap_or_default(),
                     )
                     .as_deref();
-            if matches_expectation {
-                if reproduced {
+            let positive = payload
+                .get("check_passed")
+                .and_then(|value| value.as_bool());
+            if matches_expectation
+                && reproduced.is_some()
+                && !(reproduced == Some(true) && positive == Some(true))
+                && (payload.get("check_passed").is_none() || positive.is_some())
+            {
+                check_passed = positive;
+                if reproduced == Some(true) {
                     ReplayOutcome::Reproduced
                 } else {
                     ReplayOutcome::NotReproduced
@@ -594,6 +623,7 @@ pub async fn replay_report_with_options(
         Err(_) => ReplayOutcome::Inconclusive,
     };
     Ok(ReplayReport {
+        check_passed,
         schema_version: REPORT_SCHEMA_VERSION,
         finding_id: finding.id,
         outcome,

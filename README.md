@@ -298,6 +298,22 @@ Runtime and evidence controls:
 - `court-jester replay --report <PATH> --finding <ID>` reruns a persisted structured repro and returns a typed replay outcome.
 - `just bench-fuzz-effectiveness` runs the seeded mutation/control lane and reports mutation recall plus clean-control specificity. The command exits nonzero on any expected-finding, stage, verdict, or specificity mismatch.
 
+### Keep a finding as a regression test
+
+After reviewing a persisted finding, export a CLI-backed test into a **new directory inside the project** (its parent must already exist):
+
+```bash
+court-jester replay --report <report.json> --finding <finding-id> \
+  --dependency-project-dir . \
+  --export-regression tests/first-character-regression
+```
+
+This command replays the finding before writing. Inferred expectations require explicit `--accept-inferred`; acceptance is recorded without changing the finding's confidence. Export rejects unknown/invalid inputs, suppressed findings, differential snapshots, and older or unsupported repros without positive-check evidence. Reverify older findings with the current binary first.
+
+Run `python3 tests/first-character-regression/test_regression.py` for Python, or `node --test tests/first-character-regression/regression.test.mjs` for TypeScript. These standard-library test wrappers **require Court Jester** on PATH; `COURT_JESTER_BINARY` can select its executable. They are not standalone translations of the check. Keep the bundle at the same relative location when moving the checkout.
+
+The test checks the current source using the saved runtime profile, limits, and harness arguments. It passes only when the recorded check positively completes—not merely when the original exception disappears. A different exception, incomplete action sequence, missing source/runtime, or inconclusive replay fails. A successful export exits `0`, even if its recorded check currently fails; ordinary replay exit codes are unchanged. Never run untrusted report snippets in `local-trusted` mode.
+
 Sandbox flags for `execute`:
 
 - `--timeout-seconds <F>`

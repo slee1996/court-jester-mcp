@@ -28,6 +28,9 @@ Shared source/workspace resolution remains in `src/lib.rs`; all commands use the
 | `corpus.rs` | Saved fuzz inputs, bounded merging, and conversion into planned arguments |
 | `provenance.rs` | SHA-256 source and embedded-tree hashes shared by verification and replay |
 | `replay.rs` | Loading reports, validating embedded evidence, and executing persisted repros |
+| `regression.rs` | Opt-in regression export, acceptance checks, portable source binding, and no-overwrite bundle creation |
+
+`verify/regression/python.py` and `verify/regression/node.mjs` are compile-time test-wrapper assets. Exported tests invoke Court Jester and require positive replay-check completion; they are not independent reimplementations of the recorded oracle. Keep protocol, CLI exit codes, and wrapper assertions in sync.
 
 Public functions and types remain available through `court_jester::tools::verify`, using explicit re-exports. Callers should not depend on the internal file layout. Replay uses the same differential invocation helpers as initial verification; changing those helpers requires testing both paths.
 

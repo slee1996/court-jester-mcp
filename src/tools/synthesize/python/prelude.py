@@ -211,13 +211,13 @@ def _invocation_replay_snippet(source, args, error, severity, oracle_kind, categ
     payload = {"severity": severity, "oracle_kind": oracle_kind, "category": category}
     match = f"_python_failure_identity(_error) == {_python_failure_identity(error)!r}"
     return ("import copy as _copy\nimport json as _json\n_CJ_ACTIVE_UNITS = set()\n"
-            + definitions + "\n" + source + f"\n_args = {arguments}\n_reproduced = False\n_checking = False\ntry:\n"
+            + definitions + "\n" + source + f"\n_args = {arguments}\n_reproduced = False\n_check_passed = False\n_checking = False\ntry:\n"
             + "    _result = _cj_invoke(_args)\n"
             + ("    _checking = True\n    _cj_evaluate(_args, _result)\n" if evaluate else "")
-            + "except Exception as _error:\n"
+            + "    _check_passed = True\nexcept Exception as _error:\n"
             + f"    _reproduced = {evaluate!r} == _checking and ({match})\n"
             + "print('__COURT_JESTER_REPLAY_JSON__')\n"
-            + f"print(_json.dumps(dict({payload!r}, reproduced=_reproduced), ensure_ascii=False))")
+            + f"print(_json.dumps(dict({payload!r}, reproduced=_reproduced, check_passed=_check_passed), ensure_ascii=False))")
 
 def _resolve_factory_action(result, action, single):
     if callable(result) and single: return result
@@ -235,7 +235,7 @@ def _factory_replay_snippet(factory, setup, trace, single, phase, error):
     resolver = _inspect.getsource(_resolve_factory_action)
     identity = (type(error).__name__, str(error))
     return ("import copy as _copy\nimport json as _json\n" + resolver
-            + f"\n_setup, _trace = {inputs}\n_phase = 'factory'\n_reproduced = False\ntry:\n"
+            + f"\n_setup, _trace = {inputs}\n_phase = 'factory'\n_reproduced = False\n_check_passed = False\ntry:\n"
             + f"    _result = {factory}(*_copy.deepcopy(_setup['args']), **_copy.deepcopy(_setup['kwargs']))\n"
             + "    for _index, _entry in enumerate(_trace):\n"
             + "        _phase = 'resolve:' + str(_index)\n"
@@ -244,10 +244,10 @@ def _factory_replay_snippet(factory, setup, trace, single, phase, error):
             + "        if not callable(_candidate): continue\n"
             + "        _phase = 'action:' + str(_index)\n"
             + "        _candidate(*_copy.deepcopy(_entry['args']), **_copy.deepcopy(_entry['kwargs']))\n"
-            + "except Exception as _error:\n"
+            + "    else:\n        _check_passed = True\nexcept Exception as _error:\n"
             + f"    _reproduced = _phase == {phase!r} and (type(_error).__name__, str(_error)) == {identity!r}\n"
             + "print('__COURT_JESTER_REPLAY_JSON__')\n"
-            + "print(_json.dumps(dict(reproduced=_reproduced, severity='crash', oracle_kind='runtime_contract', category='exception')))\n")
+            + "print(_json.dumps(dict(reproduced=_reproduced, check_passed=_check_passed, severity='crash', oracle_kind='runtime_contract', category='exception')))\n")
 
 def _emit_finding(function, args, error, severity="crash", oracle_kind="runtime_contract", oracle_provenance="language_runtime", confidence="high", category="exception", expected=None, actual=None, input_classification="valid", case_label=None, minimize=None, invocation_path="direct", replay_snippet=None, repro_kind="function_call"):
     oracle_id = f"{oracle_kind}:{_sanitize_symbol(function)}"
@@ -299,7 +299,7 @@ def _semantic_check(name, target_source, args, expected, projection, label):
                 + definitions
                 + f"\n_matched, _actual, _error, _phase = _observe_semantic(_target, {arguments}, {expectation}, {projection!r})\n"
                 + "print('__COURT_JESTER_REPLAY_JSON__')\n"
-                + f"print(_json.dumps(dict(reproduced=bool({match}), severity='property_violation', oracle_kind='inferred_semantic', category='property')))\n")
+                + f"print(_json.dumps(dict(reproduced=bool({match}), check_passed=bool(_matched and _error is None), severity='property_violation', oracle_kind='inferred_semantic', category='property')))\n")
         snippet = "def _cj_semantic_replay(_target):\n" + "\n".join("    " + line for line in body.splitlines()) + f"\n_cj_semantic_replay({target_source})\n"
     except ValueError:
         snippet = "raise RuntimeError('Court Jester cannot replay this runtime-only semantic input')"
@@ -335,7 +335,7 @@ def _roundtrip_case(name, source, value):
         body = ("import copy as _copy\nimport json as _json\n" + definitions
                 + f"\n_matched, _error, _phase, _actual = _observe_roundtrip(_encode, _decode, {argument})\n"
                 + "print('__COURT_JESTER_REPLAY_JSON__')\n"
-                + f"print(_json.dumps(dict(reproduced=bool({match}), severity='property_violation', oracle_kind='inferred_semantic', category='property')))\n")
+                + f"print(_json.dumps(dict(reproduced=bool({match}), check_passed=bool(_matched and _error is None), severity='property_violation', oracle_kind='inferred_semantic', category='property')))\n")
         snippet = "def _cj_roundtrip_replay(_encode, _decode):\n" + "\n".join("    " + line for line in body.splitlines()) + f"\n_cj_roundtrip_replay(*{source})\n"
     except ValueError:
         snippet = "raise RuntimeError('Court Jester cannot replay this runtime-only roundtrip input')"
