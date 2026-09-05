@@ -23,6 +23,99 @@ fn run_bundle(bundle: &Path, language: &str) -> Output {
 }
 
 #[test]
+fn differential_arguments_preserve_typescript_runtime_value_kinds() {
+    for (annotation, guard, baseline, candidate, expression) in [
+        (
+            "bigint",
+            "if (typeof value !== 'bigint') throw new Error('wrong runtime kind');",
+            "return value === 0n ? 'base' : 'other';",
+            "return value === 0n ? 'candidate' : 'other';",
+            "0n",
+        ),
+        (
+            "Map<string, number>",
+            "if (!(value instanceof Map)) throw new Error('wrong runtime kind');",
+            "return String(value.size);",
+            "return String(value.size + 1);",
+            "new Map()",
+        ),
+        (
+            "Count",
+            "if (typeof value !== 'bigint') throw new Error('wrong runtime kind');",
+            "return String(value);",
+            "return String(value + 1n);",
+            "0n",
+        ),
+        (
+            "Index",
+            "if (!(value instanceof Map)) throw new Error('wrong runtime kind');",
+            "return String(value.size);",
+            "return String(value.size + 1);",
+            "new Map()",
+        ),
+        (
+            "{ amount: bigint }",
+            "if (typeof value.amount !== 'bigint') throw new Error('wrong runtime kind');",
+            "return String(value.amount);",
+            "return String(value.amount + 1n);",
+            "{\"amount\": 0n}",
+        ),
+        (
+            "[bigint]",
+            "if (typeof value[0] !== 'bigint') throw new Error('wrong runtime kind');",
+            "return String(value[0]);",
+            "return String(value[0] + 1n);",
+            "[0n]",
+        ),
+        (
+            "Set<number>",
+            "if (!(value instanceof Set)) throw new Error('wrong runtime kind');",
+            "return String(value.size);",
+            "return String(value.size + 1);",
+            "new Set()",
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let target = |body: &str| {
+            format!("type Count = bigint; type Index = Map<string, number>; export function inspect(value: {annotation}): string {{ {guard} {body} }}")
+        };
+        std::fs::write(root.path().join("target.ts"), target(candidate)).unwrap();
+        std::fs::write(base.path().join("target.ts"), target(baseline)).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_court-jester"))
+            .args(["verify", "--language", "typescript", "--file"])
+            .arg(root.path().join("target.ts"))
+            .arg("--project-dir")
+            .arg(root.path())
+            .arg("--base-file")
+            .arg(base.path().join("target.ts"))
+            .arg("--base-project-dir")
+            .arg(base.path())
+            .args(["--summary", "repair-json"])
+            .output()
+            .unwrap();
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let finding = report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|finding| finding["category"] == "differential")
+            .unwrap_or_else(|| panic!("no real comparison for {annotation}: {report}"));
+        assert_eq!(finding["repro"]["arguments"][0]["expression"], expression);
+        assert!(finding["repro"]["arguments"][0].get("json_value").is_none());
+        for observation in ["expected", "actual"] {
+            let snapshot: Value =
+                serde_json::from_str(finding["oracle"][observation].as_str().unwrap()).unwrap();
+            assert!(snapshot["exception_type"].is_null(), "{snapshot}");
+        }
+        assert_eq!(
+            finding["input_classification"], "unknown",
+            "runtime type preservation is not a closed-domain contract"
+        );
+    }
+}
+
+#[test]
 fn differential_exploration_does_not_invent_input_admission() {
     for (language, extension, baseline, candidate) in [
         ("python", "py", "def inspect(value: str) -> str:\n    if not value: raise ValueError('reserved input')\n    return value\n",

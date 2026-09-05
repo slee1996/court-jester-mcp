@@ -8,6 +8,97 @@ use court_jester::tools::domain::{build_verification_plan, classify_input, domai
 use court_jester::types::Language;
 
 #[test]
+fn typescript_nominal_value_domains_reject_json_substitutes() {
+    use court_jester::types::{DomainLiteral, DomainNode, InputClassification, PlannedArguments};
+    assert_eq!(
+        domain_for_annotation(Some("bigint"), &[], &[], &Language::TypeScript),
+        DomainNode::BigInt
+    );
+    assert!(matches!(
+        domain_for_annotation(Some("Map<string, number>"), &[], &[], &Language::TypeScript),
+        DomainNode::NativeMap(_, _)
+    ));
+    assert_eq!(
+        domain_for_annotation(
+            Some("Map<string, number[]>"),
+            &[],
+            &[],
+            &Language::TypeScript
+        ),
+        DomainNode::NativeMap(
+            Box::new(DomainNode::String),
+            Box::new(DomainNode::Array(Box::new(DomainNode::Float)))
+        )
+    );
+    assert_eq!(
+        domain_for_annotation(
+            Some("Record<string, number[]>"),
+            &[],
+            &[],
+            &Language::TypeScript
+        ),
+        DomainNode::Map(
+            Box::new(DomainNode::String),
+            Box::new(DomainNode::Array(Box::new(DomainNode::Float)))
+        )
+    );
+    for (annotation, value, expected) in [
+        ("bigint", serde_json::json!(0), InputClassification::Invalid),
+        ("Count", serde_json::json!(0), InputClassification::Invalid),
+        (
+            "Map<string, number>",
+            serde_json::json!({}),
+            InputClassification::Invalid,
+        ),
+        ("Index", serde_json::json!({}), InputClassification::Invalid),
+        (
+            "Set<number>",
+            serde_json::json!([]),
+            InputClassification::Invalid,
+        ),
+        (
+            "{ amount: bigint }",
+            serde_json::json!({"amount": 0}),
+            InputClassification::Invalid,
+        ),
+        (
+            "Map<string, number>[]",
+            serde_json::json!([{}]),
+            InputClassification::Invalid,
+        ),
+        ("number", serde_json::json!(0), InputClassification::Valid),
+        (
+            "Record<string, number>",
+            serde_json::json!({}),
+            InputClassification::Valid,
+        ),
+    ] {
+        let analysis = analyze(&format!("type Count = bigint; type Index = Map<string, number>; export function inspect(value: {annotation}): void {{}}"), &Language::TypeScript);
+        let plan = build_verification_plan(
+            &analysis.functions,
+            &analysis.classes,
+            &analysis.aliases,
+            &Language::TypeScript,
+            &[],
+            &[],
+            &[],
+        );
+        let arguments = PlannedArguments {
+            positional: vec![DomainLiteral {
+                expression: value.to_string(),
+                json_value: Some(value),
+            }],
+            named: Default::default(),
+        };
+        assert_eq!(
+            classify_input(&arguments, &plan.parameter_domains),
+            expected,
+            "{annotation}"
+        );
+    }
+}
+
+#[test]
 fn python_class_annotations_do_not_imply_defaults() {
     let analysis = analyze(
         "class Payload:\n    required: int\n    optional: str = 'x'\n    token: Literal['x=y']\n",

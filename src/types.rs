@@ -1604,6 +1604,7 @@ pub enum DomainNode {
     Boolean,
     Integer,
     Float,
+    BigInt,
     String,
     Bytes,
     Literal(Vec<DomainLiteral>),
@@ -1613,6 +1614,7 @@ pub enum DomainNode {
     Tuple(Vec<DomainNode>),
     Set(Box<DomainNode>),
     Map(Box<DomainNode>, Box<DomainNode>),
+    NativeMap(Box<DomainNode>, Box<DomainNode>),
     Object(Vec<DomainField>),
     Instance {
         name: String,

@@ -304,6 +304,7 @@ fn domain_inner(
         ("List[", 0),
         ("Array<", 0),
         ("Set[", 1),
+        ("Set<", 1),
         ("set[", 1),
         ("Tuple[", 2),
         ("tuple[", 2),
@@ -352,30 +353,37 @@ fn domain_inner(
         || text.starts_with("Record<")
         || text.starts_with("Map<")
     {
+        let (open, close) = if text.starts_with("dict[") || text.starts_with("Dict[") {
+            ('[', ']')
+        } else {
+            ('<', '>')
+        };
         let inner = text
-            .split_once('[')
-            .or_else(|| text.split_once('<'))
-            .and_then(|(_, rest)| rest.strip_suffix(if text.contains('[') { ']' } else { '>' }))
+            .split_once(open)
+            .and_then(|(_, rest)| rest.strip_suffix(close))
             .unwrap_or("");
         let items = split_top_level(inner, ',');
-        return DomainNode::Map(
-            Box::new(domain_inner(
-                items.first().map(String::as_str).unwrap_or("String"),
-                aliases,
-                classes,
-                language,
-                stack,
-                depth,
-            )),
-            Box::new(domain_inner(
-                items.get(1).map(String::as_str).unwrap_or("Any"),
-                aliases,
-                classes,
-                language,
-                stack,
-                depth,
-            )),
-        );
+        let key = Box::new(domain_inner(
+            items.first().map(String::as_str).unwrap_or("String"),
+            aliases,
+            classes,
+            language,
+            stack,
+            depth,
+        ));
+        let value = Box::new(domain_inner(
+            items.get(1).map(String::as_str).unwrap_or("Any"),
+            aliases,
+            classes,
+            language,
+            stack,
+            depth,
+        ));
+        return if text.starts_with("Map<") && matches!(language, Language::TypeScript) {
+            DomainNode::NativeMap(key, value)
+        } else {
+            DomainNode::Map(key, value)
+        };
     }
     if text.starts_with('{') && text.ends_with('}') {
         let body = &text[1..text.len() - 1];
@@ -421,8 +429,9 @@ fn domain_inner(
     match text.trim_matches(&[' ', '"', '\'', '`'][..]) {
         "Any" | "any" | "unknown" => DomainNode::Any,
         "bool" | "boolean" => DomainNode::Boolean,
-        "int" | "number" | "bigint" => {
-            if text == "number" || text == "bigint" {
+        "bigint" if matches!(language, Language::TypeScript) => DomainNode::BigInt,
+        "int" | "number" => {
+            if text == "number" {
                 DomainNode::Float
             } else {
                 DomainNode::Integer
@@ -1109,8 +1118,8 @@ fn representative_domain_json(
         DomainNode::Boolean => Some(serde_json::Value::Bool(false)),
         DomainNode::Integer => Some(serde_json::json!(0)),
         DomainNode::Float => Some(serde_json::json!(0.0)),
-        DomainNode::String | DomainNode::Bytes => Some(serde_json::Value::String(String::new())),
-        DomainNode::Array(_) | DomainNode::Set(_) => Some(serde_json::json!([])),
+        DomainNode::String => Some(serde_json::Value::String(String::new())),
+        DomainNode::Array(_) => Some(serde_json::json!([])),
         DomainNode::Tuple(items) => items
             .iter()
             .map(|item| representative_domain_json(item, language))
@@ -1135,13 +1144,106 @@ fn representative_domain_json(
             .and_then(|literal| literal.json_value.clone()),
         DomainNode::Opaque(_) => None,
         DomainNode::Instance { .. } => None,
+        DomainNode::BigInt
+        | DomainNode::NativeMap(_, _)
+        | DomainNode::Set(_)
+        | DomainNode::Bytes => None,
     }
 }
 
-fn representative_domain_literal(
+pub(crate) fn representative_domain_literal(
     domain: &DomainNode,
     language: &Language,
 ) -> Option<DomainLiteral> {
+    match domain {
+        DomainNode::BigInt if matches!(language, Language::TypeScript) => {
+            return Some(DomainLiteral {
+                expression: "0n".into(),
+                json_value: None,
+            })
+        }
+        DomainNode::NativeMap(_, _) if matches!(language, Language::TypeScript) => {
+            return Some(DomainLiteral {
+                expression: "new Map()".into(),
+                json_value: None,
+            })
+        }
+        DomainNode::Literal(values) => return values.first().cloned(),
+        DomainNode::Set(_) => {
+            return Some(DomainLiteral {
+                expression: if matches!(language, Language::Python) {
+                    "set()"
+                } else {
+                    "new Set()"
+                }
+                .into(),
+                json_value: None,
+            })
+        }
+        DomainNode::Bytes => {
+            return matches!(language, Language::Python).then(|| DomainLiteral {
+                expression: "b''".into(),
+                json_value: None,
+            })
+        }
+        DomainNode::Tuple(items) => {
+            let items = items
+                .iter()
+                .map(|item| representative_domain_literal(item, language))
+                .collect::<Option<Vec<_>>>()?;
+            let expressions = items
+                .iter()
+                .map(|item| item.expression.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let (expression, json_value) = if matches!(language, Language::Python) {
+                (
+                    format!("({expressions}{})", if items.len() == 1 { "," } else { "" }),
+                    None,
+                )
+            } else {
+                (
+                    format!("[{expressions}]"),
+                    items
+                        .iter()
+                        .map(|item| item.json_value.clone())
+                        .collect::<Option<Vec<_>>>()
+                        .map(serde_json::Value::Array),
+                )
+            };
+            return Some(DomainLiteral {
+                expression,
+                json_value,
+            });
+        }
+        DomainNode::Object(fields) => {
+            let mut expressions = Vec::new();
+            let mut json = Some(serde_json::Map::new());
+            for field in fields.iter().filter(|field| !field.optional) {
+                let value = representative_domain_literal(&field.domain, language)?;
+                expressions.push(format!(
+                    "{}: {}",
+                    serde_json::to_string(&field.name).ok()?,
+                    value.expression
+                ));
+                if let (Some(object), Some(value)) = (&mut json, value.json_value) {
+                    object.insert(field.name.clone(), value);
+                } else {
+                    json = None;
+                }
+            }
+            return Some(DomainLiteral {
+                expression: format!("{{{}}}", expressions.join(", ")),
+                json_value: json.map(serde_json::Value::Object),
+            });
+        }
+        DomainNode::Union(items) => {
+            return items
+                .iter()
+                .find_map(|item| representative_domain_literal(item, language))
+        }
+        _ => {}
+    }
     let json = representative_domain_json(domain, language)?;
     Some(DomainLiteral {
         expression: render_json_literal(&json, language),
@@ -1209,11 +1311,12 @@ fn value_matches_domain(value: &DomainLiteral, domain: &DomainNode) -> Option<bo
         DomainNode::String => Some(json.is_string()),
         DomainNode::Bytes => Some(false),
         DomainNode::Instance { .. } => Some(false),
+        DomainNode::BigInt | DomainNode::NativeMap(_, _) | DomainNode::Set(_) => Some(false),
         DomainNode::Literal(_) => unreachable!("literal domains are matched by expression above"),
         DomainNode::Nullable(_) | DomainNode::Union(_) => {
             unreachable!("composite domains are matched before JSON projection")
         }
-        DomainNode::Array(inner) | DomainNode::Set(inner) => match json.as_array() {
+        DomainNode::Array(inner) => match json.as_array() {
             Some(values) => {
                 all_domain_matches(values.iter().map(|value| matches_json_domain(value, inner)))
             }
@@ -2010,5 +2113,41 @@ pub fn build_verification_plan(
         contracts,
         inputs,
         execution_units,
+    }
+}
+
+#[cfg(test)]
+mod representative_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_only_representatives_do_not_claim_json_equivalence() {
+        for (annotation, language, expression) in [
+            ("tuple[bool]", Language::Python, "(False,)"),
+            ("set[int]", Language::Python, "set()"),
+            ("bytes", Language::Python, "b''"),
+            ("Set<number>", Language::TypeScript, "new Set()"),
+            ("Map<string, number>", Language::TypeScript, "new Map()"),
+            ("bigint", Language::TypeScript, "0n"),
+        ] {
+            let domain = domain_for_annotation(Some(annotation), &[], &[], &language);
+            let literal = representative_domain_literal(&domain, &language).unwrap();
+            assert_eq!(literal.expression, expression);
+            assert_eq!(literal.json_value, None);
+        }
+        // The current bytes domain does not distinguish Buffer from Uint8Array.
+        assert!(representative_domain_literal(&DomainNode::Bytes, &Language::TypeScript).is_none());
+        for (annotation, value) in [
+            ("number", serde_json::json!(0.0)),
+            ("Record<string, number>", serde_json::json!({})),
+        ] {
+            let domain = domain_for_annotation(Some(annotation), &[], &[], &Language::TypeScript);
+            assert_eq!(
+                representative_domain_literal(&domain, &Language::TypeScript)
+                    .unwrap()
+                    .json_value,
+                Some(value)
+            );
+        }
     }
 }

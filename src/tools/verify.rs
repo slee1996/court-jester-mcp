@@ -1536,29 +1536,6 @@ fn function_key(func: &FunctionInfo) -> (String, usize) {
     (func.name.clone(), func.line)
 }
 
-fn differential_argument(param: &ParamInfo, language: &Language) -> Option<&'static str> {
-    let annotation = param.type_annotation.as_deref()?.trim();
-    match language {
-        Language::Python => match annotation {
-            "int" => Some("0"),
-            "float" => Some("0.0"),
-            "str" => Some("''"),
-            "bool" => Some("False"),
-            value if value.starts_with("list") || value.starts_with("List") => Some("[]"),
-            value if value.starts_with("dict") || value.starts_with("Dict") => Some("{}"),
-            _ => None,
-        },
-        Language::TypeScript => match annotation {
-            "number" | "bigint" => Some("0"),
-            "string" => Some("''"),
-            "boolean" => Some("false"),
-            value if value.ends_with("[]") || value.starts_with("Array<") => Some("[]"),
-            value if value.starts_with("Record<") || value.starts_with("Map<") => Some("{}"),
-            _ => None,
-        },
-    }
-}
-
 fn compatible_surface(candidate: &FunctionInfo, baseline: &FunctionInfo) -> bool {
     candidate.name == baseline.name
         && candidate.is_exported
@@ -1635,21 +1612,29 @@ fn differential_case_from_arguments(
     })
 }
 
-fn differential_case(function: &FunctionInfo, language: &Language) -> Option<DifferentialCase> {
+fn differential_case(
+    function: &FunctionInfo,
+    language: &Language,
+    plan: &VerificationPlan,
+) -> Option<DifferentialCase> {
+    if function.params.iter().any(ParamInfo::is_variadic) {
+        return None;
+    }
+    let surface_id = format!("{}:{}", function.name, function.line);
     let arguments = function
         .params
         .iter()
-        .filter(|param| !param.is_variadic())
-        .map(|param| {
-            differential_argument(param, language).map(|expression| ReproValue {
-                expression: expression.to_string(),
-                // These deterministic expressions are generated above, not arbitrary
-                // report text. Preserve their JSON representation for shared admission.
-                json_value: match expression {
-                    "False" | "false" => Some(serde_json::Value::Bool(false)),
-                    "''" => Some(serde_json::Value::String(String::new())),
-                    value => serde_json::from_str(value).ok(),
-                },
+        .enumerate()
+        .map(|(index, param)| {
+            let domain = plan.parameter_domains.iter().find(|domain| {
+                domain.surface_id == surface_id
+                    && domain.index == index
+                    && domain.parameter == param.name
+            })?;
+            let literal = domain::representative_domain_literal(&domain.domain, language)?;
+            Some(ReproValue {
+                expression: literal.expression,
+                json_value: literal.json_value,
             })
         })
         .collect::<Option<Vec<_>>>()?;
@@ -6142,7 +6127,10 @@ pub async fn verify(
                 "project_runner_selected",
                 "Generated execution skipped because the Nuxt project runner owns this surface",
             ));
-        } else if !fuzz_plan.code.is_empty() || native_config.engine != NativeFuzzEngine::Off {
+        } else if !fuzz_plan.code.is_empty()
+            || native_config.engine != NativeFuzzEngine::Off
+            || opts.base_code.is_some()
+        {
             let full_code = generated_verifier_source(
                 &verification_context.candidate,
                 code,
@@ -6159,9 +6147,9 @@ pub async fn verify(
                 generated_harness_runtime(verification_context.candidate.target_source.mode);
             let mut exec_runtime = Some(runtime_name.to_string());
             let harness_execution = if fuzz_plan.code.is_empty() {
-                // Native engines own their input decoders. A missing ordinary
-                // campaign must not prevent an independently requested engine
-                // from running, nor count as a successful generated invocation.
+                // Native and differential campaigns own their cases. A missing
+                // ordinary campaign must not suppress an independently requested
+                // campaign or count as a successful generated invocation.
                 exec_runtime = None;
                 HarnessExecution {
                     process: ExecutionResult {
@@ -6367,7 +6355,7 @@ pub async fn verify(
                                 continue;
                             }
                             let Some(differential_case) =
-                                differential_case(candidate_function, language)
+                                differential_case(candidate_function, language, &verification_plan)
                             else {
                                 units.push(serde_json::json!({ "surface": format!("{}:{}", candidate_function.name, candidate_function.line), "status": "disabled", "reason": "no_deterministic_valid_case" }));
                                 continue;
