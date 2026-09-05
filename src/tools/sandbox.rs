@@ -2963,26 +2963,68 @@ fn module_run_for_python_source(
 }
 
 pub async fn docker_daemon_ready() -> Result<(), String> {
-    let output = docker_output(&["info"]).await?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-    }
+    docker_daemon_ready_with_limits(10.0, 128).await
+}
+
+pub async fn docker_daemon_ready_with_limits(timeout: f64, memory_mb: u64) -> Result<(), String> {
+    docker_readiness_output(&["info"], timeout, memory_mb)
+        .await
+        .map(|_| ())
 }
 
 pub async fn docker_image_id(image: &str) -> Result<String, String> {
+    docker_image_id_with_limits(image, 10.0, 128).await
+}
+
+pub async fn docker_image_id_with_limits(
+    image: &str,
+    timeout: f64,
+    memory_mb: u64,
+) -> Result<String, String> {
     if image.trim().is_empty() || image.starts_with('-') {
         return Err("docker image must be non-empty and must not begin with '-'".into());
     }
-    let output = docker_output(&["image", "inspect", image]).await?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
-    }
-    serde_json::from_slice::<serde_json::Value>(&output.stdout)
+    let output = docker_readiness_output(&["image", "inspect", image], timeout, memory_mb).await?;
+    serde_json::from_str::<serde_json::Value>(&output)
         .ok()
         .and_then(|v| v.get(0)?.get("Id")?.as_str().map(str::to_owned))
         .ok_or_else(|| "docker image inspect returned no image id".into())
+}
+
+async fn docker_readiness_output(
+    args: &[&str],
+    timeout: f64,
+    memory_mb: u64,
+) -> Result<String, String> {
+    if !timeout.is_finite() || timeout <= 0.0 || memory_mb == 0 {
+        return Err("Docker readiness requires finite positive timeout and memory limits".into());
+    }
+    let mut command = Command::new("docker");
+    command
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let result = run_command_with_limits(
+        command,
+        timeout,
+        memory_mb,
+        RuntimeProfile::LocalTrusted,
+        NetworkPolicy::Deny,
+        true,
+        "docker unavailable",
+    )
+    .await;
+    if result.exit_code != Some(0) || result.timed_out || result.memory_error {
+        return Err(format!(
+            "Docker {} readiness probe failed (exit {:?}): {}",
+            args.join(" "),
+            result.exit_code,
+            result.stderr.trim()
+        ));
+    }
+    Ok(result.stdout)
 }
 
 async fn docker_output(args: &[&str]) -> Result<std::process::Output, String> {

@@ -106,6 +106,8 @@ Timeout defaults to doctor's 10 seconds per probe. Entrypoint memory defaults to
 
 Both runtime profiles require successful smoke execution plus exactly one structured version/executable record, with Python 3 or Node.js >=24. A zero exit code or unstructured output alone is not readiness. Missing, malformed, or duplicate records fail the check. Isolated `runtime_smoke` retains the structured execution result and detected runtime details alongside raw stdout/stderr; image inspection alone does not prove the runtime executed.
 
+Docker daemon and image readiness commands use the configured per-probe timeout and memory budget (10 seconds/128 MB by default), with process-group cleanup on timeout. Failed daemon/image readiness skips dependent runtime checks; failed isolated readiness also skips a requested entrypoint instead of trying it anyway. These are per-probe budgets, not a total wall-clock deadline for all Docker container lifecycle operations.
+
 `just onboarding-check` runs a temporary Python-project acceptance sequence: inspect settings, check default readiness without entrypoint execution, detect a missing import, repair it, then detect a failing test. It installs nothing and records binary-bound evidence; it is not participant research or proof that every framework is supported. The quality/release gate runs the same script and preserves its artifact.
 
 Replay does not read repository configuration: persisted replay context remains authoritative, with the existing explicit replay overrides. There is no configuration inheritance or executable configuration hook.

@@ -38,6 +38,77 @@ fn isolated_doctor_rejects_successful_process_without_runtime_evidence() {
     }
 }
 
+#[test]
+fn isolated_doctor_bounds_metadata_probes_and_cleans_descendants() {
+    for (operation, probe_entrypoint) in [
+        ("info", false),
+        ("image", false),
+        ("info", true),
+        ("image", true),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("leaked-descendant");
+        executable(&root.path().join("docker"), &format!(
+            "#!/bin/sh\nif [ \"$1\" = '{operation}' ]; then\n(/bin/sleep 1.5; echo leaked > '{}') &\nwait\nexit 0\nfi\nif [ \"$1\" = info ]; then exit 0; fi\nexit 1\n", marker.display()));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_court-jester"));
+        command
+            .args([
+                "doctor",
+                "--language",
+                "python",
+                "--runtime-profile",
+                "isolated",
+                "--timeout-seconds",
+                "0.5",
+            ])
+            .env("PATH", root.path());
+        if probe_entrypoint {
+            std::fs::write(root.path().join("target.py"), "def value(): return True\n").unwrap();
+            std::fs::write(
+                root.path().join("checks.py"),
+                "import target\nassert target.value()\n",
+            )
+            .unwrap();
+            command
+                .arg("--file")
+                .arg(root.path().join("target.py"))
+                .arg("--test-file")
+                .arg(root.path().join("checks.py"))
+                .arg("--probe-entrypoint");
+        }
+        let output = command.output().unwrap();
+        let report: Value =
+            serde_json::from_slice(&output.stdout).unwrap_or_else(|_| panic!("{output:?}"));
+        let probe = check(
+            &report,
+            if operation == "info" {
+                "docker_daemon"
+            } else {
+                "docker_image"
+            },
+        );
+        assert_eq!(probe["status"], "failed", "{report:#}");
+        assert!(
+            probe["message"]
+                .as_str()
+                .unwrap()
+                .to_lowercase()
+                .contains("timed out"),
+            "{report:#}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1600));
+        assert!(!marker.exists(), "metadata probe left a descendant running");
+        assert_eq!(check(&report, "runtime_smoke")["status"], "skipped");
+        if probe_entrypoint {
+            assert_eq!(check(&report, "entrypoint_probe")["status"], "skipped");
+            assert_eq!(
+                check(&report, "entrypoint_probe")["detail"]["executed"],
+                false
+            );
+        }
+    }
+}
+
 fn doctor(root: &Path, extra: &[&str]) -> (std::process::Output, Value) {
     let output = Command::new(env!("CARGO_BIN_EXE_court-jester"))
         .args(["doctor", "--language", "python", "--project-dir"])
@@ -57,7 +128,7 @@ fn check<'a>(report: &'a Value, name: &str) -> &'a Value {
         .unwrap()
         .iter()
         .find(|check| check["name"] == name)
-        .unwrap()
+        .unwrap_or_else(|| panic!("missing {name}: {report:#}"))
 }
 
 #[test]

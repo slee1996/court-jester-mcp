@@ -271,7 +271,12 @@ pub(super) async fn run_doctor(
             ));
         }
     } else {
-        match tools::sandbox::docker_daemon_ready().await {
+        match tools::sandbox::docker_daemon_ready_with_limits(
+            args.timeout_seconds.unwrap_or(10.0),
+            args.memory_mb.unwrap_or(128),
+        )
+        .await
+        {
             Ok(()) => checks.push(doctor_check(
                 "docker_daemon",
                 None,
@@ -287,7 +292,15 @@ pub(super) async fn run_doctor(
                 Some(error),
             )),
         }
+        let daemon_ready = checks
+            .last()
+            .is_some_and(|check| check.status == StageStatus::Passed);
         for language in &selected {
+            if !daemon_ready {
+                checks.push(doctor_check("runtime_smoke", Some(*language), StageStatus::Skipped,
+                    serde_json::json!({"executed": false}), Some("Docker daemon readiness failed; dependent image/runtime checks were not run".into())));
+                continue;
+            }
             let image = match language {
                 Language::Python => args
                     .python_docker_image
@@ -298,7 +311,13 @@ pub(super) async fn run_doctor(
                     .as_deref()
                     .unwrap_or(DEFAULT_TYPESCRIPT_DOCKER_IMAGE),
             };
-            match tools::sandbox::docker_image_id(image).await {
+            match tools::sandbox::docker_image_id_with_limits(
+                image,
+                args.timeout_seconds.unwrap_or(10.0),
+                args.memory_mb.unwrap_or(128),
+            )
+            .await
+            {
                 Ok(id) => checks.push(doctor_check(
                     "docker_image",
                     Some(*language),
@@ -313,6 +332,19 @@ pub(super) async fn run_doctor(
                     serde_json::json!({"image": image}),
                     Some(error),
                 )),
+            }
+            if checks
+                .last()
+                .is_some_and(|check| check.status != StageStatus::Passed)
+            {
+                checks.push(doctor_check(
+                    "runtime_smoke",
+                    Some(*language),
+                    StageStatus::Skipped,
+                    serde_json::json!({"executed": false}),
+                    Some("Selected image readiness failed; runtime smoke was not run".into()),
+                ));
+                continue;
             }
             let project = tools::sandbox::runtime_tempdir(RuntimeProfile::Isolated)
                 .map_err(|error| format!("failed to create doctor workspace: {error}"))?;
@@ -378,7 +410,15 @@ pub(super) async fn run_doctor(
                 (!passed).then(|| "Isolated runtime probe requires successful execution and one structured version/executable record (Python 3 or Node.js >=24); repair the selected image/runtime and rerun doctor".into())));
         }
     }
-    if args.probe_entrypoint {
+    let isolated_readiness_failed = args.runtime_profile == RuntimeProfile::Isolated
+        && checks
+            .iter()
+            .any(|check| check.status == StageStatus::Failed);
+    if args.probe_entrypoint && isolated_readiness_failed {
+        checks.push(doctor_check("entrypoint_probe", selected.first().copied(), StageStatus::Skipped,
+            serde_json::json!({"execution_opt_in": true, "executed": false}),
+            Some("Isolated readiness failed; repair the failed checks before executing the entrypoint".into())));
+    } else if args.probe_entrypoint {
         let language = selected[0];
         let source = args.file.as_deref().unwrap();
         let test = &args.test_files[0];

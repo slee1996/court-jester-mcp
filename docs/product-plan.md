@@ -448,6 +448,14 @@ This is a single-owner Plan-mode execution record. The completed historical rele
 - Added stop criteria, per-build tracking, private evidence references, and an exit-review structure. The participant workflow uses existing configuration inspection, opt-in entrypoint probing, repair-json verification, replay, and optional export; it explains profile selection and positive-check limitations. Local links and whitespace validation pass. This is documentation-only preparation, not experimental evidence or P9 completion.
 - Actual launch and collection require user coordination. Other implementation and evidence requirements in P1–P8 remain active, so this authority gap is not a whole-goal impasse.
 
+### Increment 45: bound Docker readiness metadata probes
+
+- Reproduced doctor reporting a delayed Docker daemon probe as passed after exceeding its requested timeout; metadata commands previously used unbounded subprocess output collection. Daemon and image readiness now share the existing process-group timeout/RSS monitoring and cleanup boundary, with explicit limits and bounded defaults for the public convenience functions.
+- Doctor passes configured timeout/memory budgets into those probes. Failed daemon readiness skips dependent image/runtime checks; failed image readiness skips runtime smoke. A requested isolated entrypoint is skipped when readiness has failed, rather than proceeding into dependent execution. Reports retain the failed prerequisite and explicit skipped outcomes.
+- Regression coverage delays each metadata operation, with and without an entrypoint request, and proves timed-out descendants cannot later write a marker. The fixture's initial 0.1-second budget also timed out its fast preliminary command on this host; the maintained fixture allows 0.5 seconds before a deliberately delayed 1.5-second operation and checks after the descendant deadline. Both operation/lifecycle variants pass.
+- Final-source verification: 22 CLI unit tests and 17 ordinary doctor tests pass; both Docker-dependent integration tests pass separately using installed images. Strict Clippy, formatting/whitespace checks, release build, real rebuilt isolated doctor, smoke, local onboarding, the four-case repair gate with independent examples, all 22 classification cases, three onboarding tests, nine repair tests, and two release tests pass. The full Rust suite was not rerun for this readiness-only change.
+- These are per-readiness-probe budgets. Broader Docker create/start/inspect/log/cleanup lifecycle deadlines remain a separate unresolved invariant; no total-command deadline is claimed. The full P1–P9 goal remains active, and pushing still requires account authorization.
+
 ## Completion audit
 
 All P1–P9 remain required. Local gates do not substitute for actual design-partner results or current-build paired repair evidence. Record missing authority/data explicitly; do not call the full product objective complete on implementation alone.
