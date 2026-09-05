@@ -4576,9 +4576,8 @@ def _cj_native_value(value):
     return snapshot
 
 def _cj_native_emit(function, line, arguments, error, data, call):
-    snippet = (
+    body = (
         "import json as _cj_replay_json\n"
-        + "_cj_args = [" + ', '.join(value['expression'] for value in arguments) + "]\n"
         + "_cj_reproduced = False\n_cj_passed = False\ntry:\n    " + call
         + "\n    _cj_passed = True\nexcept Exception as _cj_error:\n"
         + "    _cj_reproduced = (type(_cj_error).__qualname__ == " + repr(type(error).__qualname__)
@@ -4589,9 +4588,9 @@ def _cj_native_emit(function, line, arguments, error, data, call):
     payload = {{
         "function": function,
         "line": line,
-        "protocol_version": 2,
+        "protocol_version": 3,
         "argument_snapshots": arguments,
-        "replay_snippet": snippet,
+        "replay_body": body,
         "input": bytes(data).hex(),
         "error_type": type(error).__name__,
         "message": str(error),
@@ -4741,17 +4740,16 @@ function _cjNativeEmit(functionName: string, line: number, args: any[], error: u
   }} else if (error === null || ["undefined", "string", "boolean", "number", "bigint"].includes(typeof error)) {{
     match = "Object.is(_cj_error, " + (_cjNativeValue(error) as any).expression + ")";
   }}
-  const snippet = match === null ? null : "const _cj_args = [" + args.map(value => value.expression).join(", ") + "];\n"
-    + "let _cj_reproduced = false, _cj_passed = false;\ntry {{ await " + call
+  const body = match === null ? null : "let _cj_reproduced = false, _cj_passed = false;\ntry {{ await " + call
     + "; _cj_passed = true; }} catch (_cj_error) {{ _cj_reproduced = (" + match + "); }}\n"
     + "console.log('__COURT_JESTER_REPLAY_JSON__');\n"
     + "console.log(JSON.stringify({{reproduced:_cj_reproduced,check_passed:_cj_passed,severity:'crash',oracle_kind:'runtime_contract',category:'exception'}}));\n";
   const payload = {{
     function: functionName,
     line,
-    protocol_version: 2,
+    protocol_version: 3,
     argument_snapshots: args,
-    replay_snippet: snippet,
+    replay_body: body,
     input: Array.from(input, (byte) => byte.toString(16).padStart(2, "0")).join(""),
     error_type: error instanceof Error ? error.constructor.name : typeof error,
     message: error instanceof Error ? error.message : String(error),

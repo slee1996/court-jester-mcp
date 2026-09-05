@@ -1975,6 +1975,7 @@ fn differential_finding(
     };
     let repro = StructuredRepro {
         kind: ReproKind::Differential,
+        native_replay: None,
         function: Some(function.name.clone()),
         arguments: arguments.clone(),
         input_text: None,
@@ -7469,6 +7470,8 @@ struct NativeFindingRecord {
     argument_snapshots: Option<Vec<ReproValue>>,
     #[serde(default)]
     replay_snippet: Option<String>,
+    #[serde(default)]
+    replay_body: Option<String>,
     function: String,
     line: usize,
     #[serde(default)]
@@ -7543,7 +7546,7 @@ fn parse_native_findings_with_plan(
         })
         .filter_map(|record| {
             let arguments = match record.protocol_version {
-                Some(2) => {
+                Some(2 | 3) => {
                     let snapshots = record.argument_snapshots?;
                     if snapshots.iter().any(|value| value.expression.trim().is_empty()) {
                         return None;
@@ -7564,7 +7567,15 @@ fn parse_native_findings_with_plan(
                 arguments: arguments.clone(),
                 input_text: Some(record.input.clone()),
             };
-            let input_classification = if record.protocol_version == Some(2) {
+            let native_replay = (record.protocol_version == Some(3)).then(|| record.replay_body.clone())
+                .flatten().filter(|body| !body.trim().is_empty())
+                .map(|body| NativeReplayContract { schema_version: 1, argument_count: arguments.len(), body });
+            let replay_snippet = if let Some(contract) = &native_replay {
+                replay::render_native_replay(&arguments, contract, language).ok()
+            } else if record.protocol_version == Some(2) {
+                record.replay_snippet.filter(|snippet| !snippet.trim().is_empty())
+            } else { None };
+            let input_classification = if matches!(record.protocol_version, Some(2 | 3)) {
                 plan.map(|plan| planned_closed_input_classification(&record.function, record.line, &arguments, plan)).unwrap_or(InputClassification::Unknown)
             } else { InputClassification::Unknown };
             let confidence = if input_classification == InputClassification::Valid { FindingConfidence::High } else { FindingConfidence::Low };
@@ -7601,13 +7612,14 @@ fn parse_native_findings_with_plan(
                     arguments,
                     input_text: Some(record.input),
                     case_label: Some("native_coverage_guided".into()),
-                    snippet: record.replay_snippet.filter(|snippet| record.protocol_version == Some(2) && !snippet.trim().is_empty()).unwrap_or_else(|| match language {
+                    snippet: replay_snippet.unwrap_or_else(|| match language {
                         Language::Python => "raise RuntimeError('Court Jester native observation has no recorded replay contract')".into(),
                         Language::TypeScript => "throw new Error('Court Jester native observation has no recorded replay contract');".into(),
                     }),
                     command: None,
                     expectation,
                     differential: None,
+                    native_replay,
                 },
                 minimization: MinimizationInfo {
                     status: MinimizationStatus::NotNeeded,
@@ -7914,6 +7926,32 @@ mod tests {
             findings[0].input_classification,
             InputClassification::Unknown
         );
+        versioned["protocol_version"] = 3.into();
+        let missing_body = parse(&versioned);
+        assert_eq!(missing_body.len(), 1);
+        assert!(missing_body[0].repro.native_replay.is_none());
+        assert!(missing_body[0]
+            .repro
+            .snippet
+            .contains("no recorded replay contract"));
+        versioned["replay_body"] = "inspect(value=_cj_args[0])".into();
+        let rebound = parse(&versioned);
+        assert_eq!(
+            rebound[0]
+                .repro
+                .native_replay
+                .as_ref()
+                .unwrap()
+                .schema_version,
+            1
+        );
+        assert_eq!(
+            rebound[0].repro.snippet,
+            "_cj_args = [bytearray(b'abc')]\ninspect(value=_cj_args[0])"
+        );
+        versioned["replay_body"] = 7.into();
+        assert!(parse(&versioned).is_empty());
+        versioned.as_object_mut().unwrap().remove("replay_body");
         versioned["protocol_version"] = 99.into();
         assert!(parse(&versioned).is_empty());
         versioned["protocol_version"] = 2.into();

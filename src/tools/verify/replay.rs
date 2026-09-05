@@ -19,6 +19,35 @@ fn persisted_findings(report: &PersistedReport) -> Vec<VerificationFinding> {
     findings_from_stages(&report.stages)
 }
 
+pub(super) fn render_native_replay(
+    arguments: &[crate::types::ReproValue],
+    contract: &crate::types::NativeReplayContract,
+    language: &Language,
+) -> Result<String, String> {
+    if contract.schema_version != 1 || contract.body.trim().is_empty() {
+        return Err("unsupported or empty native replay binding contract".into());
+    }
+    if arguments.len() != contract.argument_count {
+        return Err("native replay binding contract argument count mismatch".into());
+    }
+    if arguments
+        .iter()
+        .any(|argument| argument.expression.trim().is_empty())
+    {
+        return Err("native replay arguments require executable expressions".into());
+    }
+    let arguments = arguments
+        .iter()
+        .map(|argument| argument.expression.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let binding = match language {
+        Language::Python => format!("_cj_args = [{arguments}]\n"),
+        Language::TypeScript => format!("const _cj_args = [{arguments}];\n"),
+    };
+    Ok(binding + &contract.body)
+}
+
 pub fn load_persisted_report(path: &str) -> Result<PersistedReport, String> {
     let bytes = std::fs::read_to_string(path)
         .map_err(|error| format!("failed to read report '{path}': {error}"))?;
@@ -669,12 +698,17 @@ pub async fn replay_report_with_candidate_options(
             .map_err(|error| format!("source context unavailable for replay: {error}"))?;
         source_file_owned = Some(source_path.to_string_lossy().to_string());
     }
-    let code = if source.is_empty() {
+    let snippet = if let Some(contract) = &finding.repro.native_replay {
+        render_native_replay(&finding.repro.arguments, contract, &language)?
+    } else {
         finding.repro.snippet.clone()
+    };
+    let code = if source.is_empty() {
+        snippet
     } else {
         let mut code = generated_target_source(&source, &language);
         code.push('\n');
-        code.push_str(&finding.repro.snippet);
+        code.push_str(&snippet);
         code
     };
     let source_file = source_file_owned.as_deref();

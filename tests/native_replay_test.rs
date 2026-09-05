@@ -41,6 +41,50 @@ fn replay(report: &Path, root: &Path, id: &str, outcome: &str, check_passed: boo
 }
 
 #[test]
+fn native_replay_contract_rebinds_arguments_in_fresh_processes() {
+    for (language, extension, engine, source) in [
+        ("python", "py", "atheris", "_calls = 0\ndef inspect(*, value: str) -> int:\n    global _calls\n    _calls += 1\n    if _calls == 1 and value:\n        raise ValueError('stable failure')\n    return 0\n"),
+        ("typescript", "ts", "jazzer", "let calls = 0; export async function inspect(value: string): Promise<number> { calls++; if (calls === 1 && value) throw new Error('stable failure'); return 0; }"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let target = root.join(format!("target.{extension}"));
+        fs::write(&target, source).unwrap();
+        if language == "python" {
+            fs::write(root.join("atheris.py"), "class FuzzedDataProvider:\n    def __init__(self, data): pass\n    def ConsumeIntInRange(self, lower, upper): return lower\n    def ConsumeUnicodeNoSurrogates(self, size): return 'long native input'\ndef instrument_all(): pass\ndef Setup(argv, callback):\n    global _callback\n    _callback = callback\ndef Fuzz(): _callback(b'input')\n").unwrap();
+        } else {
+            executable(&root.join("node_modules/.bin/jazzer"), r#"#!/bin/sh
+exec node --experimental-transform-types --input-type=module -e 'import {pathToFileURL} from "node:url"; const target = await import(pathToFileURL(process.argv[1]).href); try { await target.fuzz(new Uint8Array([0,3,97,98,99])); } catch { process.exitCode = 1; }' "$1"
+"#);
+        }
+        let output = cli(&["verify", "--file", target.to_str().unwrap(), "--language", language,
+            "--project-dir", root.to_str().unwrap(), "--native-fuzz-engine", engine, "--native-fuzz-runs", "1", "--summary", "repair-json"]);
+        let mut report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let finding = report["findings"].as_array().unwrap().iter().find(|finding| finding["classification"] == "native_coverage_guided").unwrap_or_else(|| panic!("{report}")).clone();
+        assert_eq!(finding["repro"]["native_replay"]["schema_version"], 1, "{finding}");
+        let id = finding["id"].as_str().unwrap();
+        report["findings"] = serde_json::json!([finding.clone()]);
+        let path = root.join("rebound.json");
+        for (value, expected, checked) in [("x", "reproduced", false), ("x", "reproduced", false), ("", "not_reproduced", true)] {
+            report["findings"][0]["repro"]["arguments"] = serde_json::json!([{"expression": serde_json::to_string(value).unwrap(), "json_value": value}]);
+            // The original display snippet deliberately stays unchanged.
+            fs::write(&path, serde_json::to_vec(&report).unwrap()).unwrap();
+            replay(&path, root, id, expected, checked);
+        }
+        for fault in ["version", "body", "arity"] {
+            let mut invalid = report.clone();
+            if fault == "version" { invalid["findings"][0]["repro"]["native_replay"]["schema_version"] = 99.into(); }
+            else if fault == "body" { invalid["findings"][0]["repro"]["native_replay"]["body"] = " ".into(); }
+            else { invalid["findings"][0]["repro"]["arguments"] = serde_json::json!([]); }
+            fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+            let output = cli(&["replay", "--report", path.to_str().unwrap(), "--finding", id, "--dependency-project-dir", root.to_str().unwrap()]);
+            assert_eq!(output.status.code(), Some(2));
+            assert!(String::from_utf8_lossy(&output.stderr).contains("native replay binding contract"));
+        }
+    }
+}
+
+#[test]
 fn native_replay_preserves_mutable_runtime_inputs_and_current_source() {
     native_mutable_input_contract(true);
 }

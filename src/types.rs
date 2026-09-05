@@ -1149,6 +1149,16 @@ pub struct StructuredRepro {
     pub expectation: ReplayExpectation,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub differential: Option<DifferentialRepro>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_replay: Option<NativeReplayContract>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NativeReplayContract {
+    pub schema_version: u32,
+    pub argument_count: usize,
+    /// Invocation and failure check using `_cj_args`, without binding the arguments.
+    pub body: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
