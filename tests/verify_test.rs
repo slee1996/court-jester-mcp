@@ -5138,6 +5138,183 @@ export function createReorderer() {
 }
 
 #[tokio::test]
+async fn typescript_factory_sequence_replay_preserves_setup_and_action_history() {
+    for returned in ["{ push }", "push"] {
+        let project = tempfile::tempdir().unwrap();
+        let source = project.path().join("target.ts");
+        let code = format!("export function createCounter(start: number) {{ let calls = start; function push(value: number): number {{ calls += 1; if (calls === start + 2) throw new ReferenceError('sequence failure: original'); return value; }} return {returned}; }}");
+        fs::write(&source, &code).unwrap();
+        let mut opts = default_opts(None);
+        opts.source_file = source.to_str();
+        opts.project_dir = project.path().to_str();
+        let report = verify(&code, &Language::TypeScript, opts).await;
+        let repair = repair_summary(&report, &Language::TypeScript);
+        let finding = repair
+            .findings
+            .iter()
+            .find(|finding| finding.message.contains("sequence failure"))
+            .unwrap_or_else(|| panic!("{}", report_human_summary(&report)));
+        let report_path = project.path().join("repair.json");
+        fs::write(&report_path, serde_json::to_vec(&repair).unwrap()).unwrap();
+        let replay = replay_report(
+            report_path.to_str().unwrap(),
+            &finding.id,
+            None,
+            RuntimeProfile::LocalTrusted,
+            DEFAULT_PYTHON_DOCKER_IMAGE,
+            DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            replay.outcome,
+            ReplayOutcome::Reproduced,
+            "{returned}: {replay:?}"
+        );
+        for (original, replacement) in [
+            ("calls === start + 2", "calls === start + 1"),
+            ("calls === start + 2", "false"),
+            ("failure: original", "failure: different"),
+        ] {
+            fs::write(&source, code.replace(original, replacement)).unwrap();
+            let replay = replay_report(
+                report_path.to_str().unwrap(),
+                &finding.id,
+                None,
+                RuntimeProfile::LocalTrusted,
+                DEFAULT_PYTHON_DOCKER_IMAGE,
+                DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                replay.outcome,
+                ReplayOutcome::NotReproduced,
+                "{returned}/{replacement}: {replay:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn typescript_factory_replay_preserves_receiver_and_uncertain_throw_identity() {
+    for (thrown, expected) in [
+        ("new Error('receiver failure')", ReplayOutcome::Reproduced),
+        ("NaN", ReplayOutcome::Reproduced),
+        ("Symbol('runtime-only')", ReplayOutcome::Inconclusive),
+    ] {
+        let project = tempfile::tempdir().unwrap();
+        let source = project.path().join("target.ts");
+        let code = format!("export function createCounter() {{ function push(value: number): number {{ this.calls += 1; if (this.calls === 2) throw {thrown}; return value; }} return {{calls: 0, push}}; }}");
+        fs::write(&source, &code).unwrap();
+        let mut opts = default_opts(None);
+        opts.source_file = source.to_str();
+        opts.project_dir = project.path().to_str();
+        let report = verify(&code, &Language::TypeScript, opts).await;
+        let repair = repair_summary(&report, &Language::TypeScript);
+        let finding = repair
+            .findings
+            .iter()
+            .find(|finding| finding.location.function == "createCounter().push")
+            .unwrap_or_else(|| panic!("{thrown}: {}", report_human_summary(&report)));
+        assert_eq!(finding.confidence, FindingConfidence::Low);
+        let report_path = project.path().join("repair.json");
+        fs::write(&report_path, serde_json::to_vec(&repair).unwrap()).unwrap();
+        let replay = replay_report(
+            report_path.to_str().unwrap(),
+            &finding.id,
+            None,
+            RuntimeProfile::LocalTrusted,
+            DEFAULT_PYTHON_DOCKER_IMAGE,
+            DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay.outcome, expected, "{thrown}: {replay:?}");
+        if expected == ReplayOutcome::Reproduced {
+            fs::write(&source, code.replace("this.calls === 2", "false")).unwrap();
+            let replay = replay_report(
+                report_path.to_str().unwrap(),
+                &finding.id,
+                None,
+                RuntimeProfile::LocalTrusted,
+                DEFAULT_PYTHON_DOCKER_IMAGE,
+                DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                replay.outcome,
+                ReplayOutcome::NotReproduced,
+                "{thrown}: {replay:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn typescript_factory_replay_preserves_action_availability_and_runtime_input_limits() {
+    for (parameter, setup_check, expected) in [
+        ("", "", ReplayOutcome::Reproduced),
+        (
+            "start: Date",
+            "if (!(start instanceof Date)) throw new Error('wrong setup shape');",
+            ReplayOutcome::Inconclusive,
+        ),
+    ] {
+        let project = tempfile::tempdir().unwrap();
+        let source = project.path().join("target.ts");
+        let code = format!("export function createCounter({parameter}) {{ {setup_check} function arm(): number {{ return 1; }} function fire(): number {{ throw new ReferenceError('later action'); }} return {{arm, fire}}; }}");
+        fs::write(&source, &code).unwrap();
+        let mut opts = default_opts(None);
+        opts.source_file = source.to_str();
+        opts.project_dir = project.path().to_str();
+        let report = verify(&code, &Language::TypeScript, opts).await;
+        let repair = repair_summary(&report, &Language::TypeScript);
+        let finding = repair
+            .findings
+            .iter()
+            .find(|finding| finding.message == "later action")
+            .unwrap_or_else(|| panic!("{parameter}: {}", report_human_summary(&report)));
+        let report_path = project.path().join("repair.json");
+        fs::write(&report_path, serde_json::to_vec(&repair).unwrap()).unwrap();
+        let replay = replay_report(
+            report_path.to_str().unwrap(),
+            &finding.id,
+            None,
+            RuntimeProfile::LocalTrusted,
+            DEFAULT_PYTHON_DOCKER_IMAGE,
+            DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay.outcome, expected, "{parameter}: {replay:?}");
+        if expected == ReplayOutcome::Reproduced {
+            fs::write(
+                &source,
+                code.replace("return {arm, fire}", "return {arm: null, fire}"),
+            )
+            .unwrap();
+            let replay = replay_report(
+                report_path.to_str().unwrap(),
+                &finding.id,
+                None,
+                RuntimeProfile::LocalTrusted,
+                DEFAULT_PYTHON_DOCKER_IMAGE,
+                DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                replay.outcome,
+                ReplayOutcome::NotReproduced,
+                "missing earlier action: {replay:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn typescript_factory_action_sequence_finds_second_step_crash() {
     let code = r#"
 export function createCounter() {

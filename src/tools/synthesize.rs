@@ -2645,7 +2645,13 @@ fn synthesize_typescript_factory_exercise(
         else {
             continue;
         };
-        let factory_arg_refs = factory_args.iter().map(String::as_str).collect::<Vec<_>>();
+        let factory_arg_slots = (0..factory_args.len())
+            .map(|index| format!("_args[{index}]"))
+            .collect::<Vec<_>>();
+        let factory_arg_refs = factory_arg_slots
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
         let factory_call = ts_call_with_args(func, &factory_arg_refs);
 
         let known_specs = func
@@ -2679,7 +2685,8 @@ fn synthesize_typescript_factory_exercise(
             r#"
 // Stateful factory action-sequence campaign: {name}
 {{
-  let _factoryPass = 0, _factoryCrash = 0;
+  let _factoryPass = 0, _factoryCrash = 0, _factoryUnknown = 0;
+  const _factoryInvoke = (_args: unknown[]) => {factory_call};
   const _knownFactoryCallables: Record<string, {{surface: string; line: number; args: () => unknown[]}}> = {known_specs_expr};
   const _actionKeys = Object.keys(_knownFactoryCallables);
   for (let _fi = 0; _fi < {iters}; _fi++) {{
@@ -2687,50 +2694,64 @@ fn synthesize_typescript_factory_exercise(
     let _activeFactorySurface = "{name} (factory)";
     let _activeFactoryLine = {factory_line};
     let _activeFactoryArgs: unknown[] = [];
-    const _actionTrace: Array<{{action: string; args: unknown[]}}> = [];
+    const _actionTrace: Array<{{action: string; expression: string | null; callable?: boolean}}> = [];
+    let _setupExpression: string | null = null;
+    let _factoryPhase = "arguments";
     try {{
-      const _factory = {factory_call};
+      const _setupArgs = [{factory_args}];
+      _setupExpression = _factoryArgumentExpression(_setupArgs);
+      _factoryPhase = "factory";
+      const _factory = _factoryInvoke(_setupArgs);
       const _actionPlan = [..._actionKeys];
       for (let _step = 0; _step < _fuzzIntRange(2, 5); _step++) {{
         _actionPlan.push(_actionKeys[_fuzzIntRange(0, _actionKeys.length - 1)]);
       }}
-      for (const _action of _actionPlan) {{
+      for (const [_index, _action] of _actionPlan.entries()) {{
         const _spec = _knownFactoryCallables[_action];
-        const _candidate = typeof _factory === "function" && _actionKeys.length === 1
-          ? _factory
-          : _factory && (typeof _factory === "object" || typeof _factory === "function")
-            ? (_factory as Record<string, unknown>)[_action]
-            : undefined;
-        if (typeof _candidate !== "function") continue;
         _activeFactoryCallable = _action;
         _activeFactorySurface = _spec.surface;
         _activeFactoryLine = _spec.line;
+        _factoryPhase = "resolve:" + _index;
+        const _entry: {{action: string; expression: string | null; callable?: boolean}} = {{ action: _action, expression: "[]" }};
+        _actionTrace.push(_entry);
+        const _candidate = _resolveFactoryAction(_factory, _action, _actionKeys.length === 1);
+        _entry.callable = typeof _candidate === "function";
+        if (typeof _candidate !== "function") continue;
+        _factoryPhase = "arguments:" + _index;
         _activeFactoryArgs = _spec.args();
-        _actionTrace.push({{ action: _action, args: _cloneSeed(_activeFactoryArgs) }});
+        _entry.expression = _factoryArgumentExpression(_activeFactoryArgs);
         _targetEntered(_activeFactorySurface);
+        _factoryPhase = "action:" + _index;
         (_candidate as Function).apply(_factory, _activeFactoryArgs);
       }}
       _factoryPass++;
     }} catch (_e: unknown) {{
-      if (_isCrash(_e)) {{
+      const _caseSource = _setupExpression === null || _actionTrace.some(entry => entry.expression === null)
+        ? null : "{{factory:" + _setupExpression + ",actions:[" + _actionTrace.map(entry =>
+          "{{action:" + JSON.stringify(entry.action) + ",args:" + entry.expression + ",callable:" + String(entry.callable) + "}}").join(",") + "]}}";
+      const _snippet = _factoryReplaySnippet(_factoryInvoke, _caseSource, _actionKeys.length === 1, _factoryPhase, _e);
+      const _originalCase = {{ arguments: [{{ expression: _caseSource ?? "undefined" }}], input_text: _clipText(_shortJson(_actionTrace)) }};
+      const _crash = _isCrash(_e);
+      _emitFinding(_activeFactorySurface, [], _e, "crash", "runtime_contract", "observed_call", _crash ? "high" : "low", "exception", null, {{factory: {{factory: "{name}", callable: _activeFactoryCallable}}}}, _clipText(_shortJson(_actionTrace)), _activeFactoryLine, _snippet, _crash ? "valid" : "unknown", null, "semantic_case", _originalCase);
+      if (_crash) {{
         _factoryCrash++;
-        _emitFinding(_activeFactorySurface, _activeFactoryArgs, _e, "crash", "runtime_contract", "observed_call", "high", "exception", null, {{factory: {{factory: "{name}", callable: _activeFactoryCallable}}}}, _clipText(_shortJson(_actionTrace)), _activeFactoryLine);
         if (_factoryCrash === 1) console.log(`  CRASH ${{_activeFactorySurface}} after actions ${{_clipText(_shortJson(_actionTrace))}}: ${{_clipText(_e)}}`);
-      }}
+      }} else {{ _factoryUnknown++; }}
     }}
   }}
-  const _ftotal = _factoryPass + _factoryCrash;
+  const _ftotal = _factoryPass + _factoryCrash + _factoryUnknown;
   if (_factoryCrash > 0) {{
     console.log(`FUZZ {name} (factory state machine): ${{_factoryPass}} passed, ${{_factoryCrash}} CRASHED (of ${{_ftotal}}) [actions: {returned_names}]`);
     _fuzzTotalFailures++;
   }} else {{
-    console.log(`FUZZ {name} (factory state machine): ${{_factoryPass}} passed (of ${{_ftotal}}) [actions: {returned_names}]`);
+    console.log(`FUZZ {name} (factory state machine): ${{_factoryPass}} passed, 0 rejected, 0 CRASHED, ${{_factoryUnknown}} unclassified (of ${{_ftotal}}) [actions: {returned_names}]`);
   }}
 }}
 "#,
             name = func.name,
             factory_line = func.line,
             factory_call = factory_call,
+            factory_args = factory_args.join(", "),
             known_specs_expr = known_specs_expr,
             iters = FUZZ_ITERATIONS,
             returned_names = returned_names,

@@ -548,6 +548,42 @@ function _emitFinding(name: string, args: unknown[], error: unknown, severity = 
   _fuzzResults.push(record);
   _cjEvent("finding", { finding: record });
 }
+function _resolveFactoryAction(result: unknown, action: string, single: boolean): unknown {
+  if (typeof result === "function" && single) return result;
+  return result && (typeof result === "object" || typeof result === "function")
+    ? (result as Record<string, unknown>)[action] : undefined;
+}
+function _factoryArgumentExpression(value: unknown): string | null {
+  const ancestors = new Set<object>();
+  const seen = new Set<object>();
+  const validate = (item: unknown): void => {
+    if (item === null || ["undefined", "string", "number", "boolean", "bigint"].includes(typeof item)) return;
+    if (typeof item !== "object" || seen.has(item) || ancestors.size >= 64) throw new Error("unsupported factory input");
+    seen.add(item);
+    if (item instanceof URL && Object.getPrototypeOf(item) === URL.prototype && Reflect.ownKeys(item).length === 0) return;
+    if (!Array.isArray(item) && Object.getPrototypeOf(item) !== Object.prototype) throw new Error("runtime-only factory input");
+    if (Array.isArray(item) && (Object.getPrototypeOf(item) !== Array.prototype || Object.keys(item).length !== item.length)) throw new Error("nonstandard factory array");
+    ancestors.add(item);
+    try {
+      for (const key of Reflect.ownKeys(item)) {
+        if (Array.isArray(item) && key === "length") continue;
+        const descriptor = Object.getOwnPropertyDescriptor(item, key)!;
+        if (typeof key !== "string" || !descriptor.enumerable || !descriptor.writable || !descriptor.configurable || !("value" in descriptor)
+            || (Array.isArray(item) && !/^(0|[1-9][0-9]*)$/.test(key))) throw new Error("runtime-only factory property");
+        validate(descriptor.value);
+      }
+    } finally { ancestors.delete(item); }
+  };
+  try { validate(value); return _reproExpression(value); } catch { return null; }
+}
+function _factoryReplaySnippet(invoke: (args: unknown[]) => unknown, caseSource: string | null, single: boolean, phase: string, error: unknown): string {
+  const primitive = error === null || ["undefined", "string", "number", "boolean", "bigint"].includes(typeof error);
+  const match = error instanceof Error
+    ? `_error instanceof Error && _error.constructor.name === ${JSON.stringify(error.constructor.name)} && _error.message === ${JSON.stringify(error.message)}`
+    : primitive ? `Object.is(_error, ${_reproExpression(error)})` : null;
+  if (caseSource === null || phase.startsWith("arguments") || match === null) return 'throw new Error("Court Jester cannot replay this runtime-only factory observation");';
+  return `((_invoke) => {\n${_resolveFactoryAction.toString()}\nconst _case = ${caseSource};\nlet _phase = "factory", _reproduced = false;\ntry {\n const _result = _invoke(_case.factory);\n for (let _index = 0; _index < _case.actions.length; _index++) {\n  const _entry = _case.actions[_index];\n  _phase = "resolve:" + _index;\n  const _candidate = _resolveFactoryAction(_result, _entry.action, ${single});\n  if ((typeof _candidate === "function") !== _entry.callable) break;\n  if (typeof _candidate !== "function") continue;\n  _phase = "action:" + _index;\n  _candidate.apply(_result, _entry.args);\n }\n} catch (_error) { _reproduced = _phase === ${JSON.stringify(phase)} && (${match}); }\nconsole.log("__COURT_JESTER_REPLAY_JSON__");\nconsole.log(JSON.stringify({reproduced:_reproduced,severity:"crash",oracle_kind:"runtime_contract",category:"exception"}));\n})(${invoke.toString()});`;
+}
 function _semanticProject(value: unknown, projection: string | { property: string } | ((value: any, step: (label: string) => void) => unknown), step: (label: string) => void): unknown {
   if (typeof projection === "function") return projection(value, step);
   if (typeof projection !== "string") return (value as Record<string, unknown>)[projection.property];

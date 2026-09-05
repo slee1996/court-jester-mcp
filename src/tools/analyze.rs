@@ -3033,7 +3033,55 @@ fn extract_ts_returned_object_callables(
     source: &[u8],
 ) -> Vec<String> {
     let Some(object) = ts_returned_object_node(*callable) else {
-        return Vec::new();
+        fn visit(
+            node: tree_sitter::Node<'_>,
+            factory: tree_sitter::Node<'_>,
+            source: &[u8],
+            names: &mut Vec<String>,
+        ) {
+            if matches!(
+                node.kind(),
+                "function_declaration"
+                    | "function_expression"
+                    | "arrow_function"
+                    | "method_definition"
+            ) {
+                return;
+            }
+            if node.kind() == "return_statement" {
+                if let Some(mut reference) = node.named_child(0) {
+                    while matches!(
+                        reference.kind(),
+                        "parenthesized_expression"
+                            | "as_expression"
+                            | "satisfies_expression"
+                            | "non_null_expression"
+                    ) {
+                        let Some(inner) = reference.named_child(0) else {
+                            break;
+                        };
+                        reference = inner;
+                    }
+                    let name = text(&reference, source).trim();
+                    if reference.kind() == "identifier"
+                        && ts_shorthand_resolves_to_callable(factory, reference, name, source)
+                        && !names.iter().any(|existing| existing == name)
+                    {
+                        names.push(name.to_string());
+                    }
+                }
+                return;
+            }
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                visit(child, factory, source, names);
+            }
+        }
+        let mut names = Vec::new();
+        if let Some(body) = callable.child_by_field_name("body") {
+            visit(body, *callable, source, &mut names);
+        }
+        return names;
     };
 
     let mut callables = Vec::new();

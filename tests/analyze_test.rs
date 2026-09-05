@@ -511,6 +511,24 @@ export class Choice {
 }
 
 #[test]
+fn typescript_direct_factory_returns_respect_callable_binding_scope() {
+    let code = "export function direct() { function push(value: number) { return value; } return (push); }\nexport function shadowed() { function push(value: number) { return value; } { const push = 42; return push; } }\nexport function unrelated() { function inner() { function push(value: number) { return value; } return push; } return 1; }";
+    let analysis = analyze(code, &Language::TypeScript);
+    for (name, expected) in [
+        ("direct", vec!["push"]),
+        ("shadowed", vec![]),
+        ("unrelated", vec![]),
+    ] {
+        let function = analysis
+            .functions
+            .iter()
+            .find(|function| function.name == name)
+            .unwrap();
+        assert_eq!(function.returned_callables, expected, "{name}");
+    }
+}
+
+#[test]
 fn typescript_factory_functions_record_returned_callables() {
     let code = "\
 export function createReorderer() {
