@@ -3644,6 +3644,103 @@ export function decorateResponse(response: ResponseLike, request: RequestLike): 
 }
 
 #[tokio::test]
+async fn static_middleware_replay_repeats_factory_handler_and_response_observation() {
+    for mutation in [
+        "next();",
+        "res.end('wrong');",
+        "res.__body = readFileSync(root + req.url, 'utf8');",
+        "throw new Error('handler failed');",
+        "non-handler",
+    ] {
+        let project = tempfile::tempdir().unwrap();
+        let source = project.path().join("target.ts");
+        fs::create_dir(project.path().join("static")).unwrap();
+        fs::write(project.path().join("static/hello.txt"), "hello world\n").unwrap();
+        let prefix = "import { readFileSync } from 'node:fs';\ntype Handler = (req: any, res: any, next: () => void) => void;\n// court-jester-properties http_static_file_middleware\nexport function createStaticMiddleware(root: string): Handler";
+        let code = if mutation == "non-handler" {
+            format!("{prefix} {{ return null as any; }}")
+        } else {
+            format!("{prefix} {{ return (req, res, next) => {{ {mutation} }}; }}")
+        };
+        fs::write(&source, &code).unwrap();
+        let mut opts = default_opts(None);
+        opts.source_file = source.to_str();
+        opts.project_dir = project.path().to_str();
+        let report = verify(&code, &Language::TypeScript, opts).await;
+        let repair = repair_summary(&report, &Language::TypeScript);
+        let finding = repair
+            .findings
+            .iter()
+            .find(|finding| {
+                finding.oracle.kind == OracleKind::InferredSemantic
+                    && finding
+                        .repro
+                        .case_label
+                        .as_ref()
+                        .is_some_and(|label| label.contains("serve known file"))
+            })
+            .unwrap_or_else(|| panic!("{mutation}: {}", report_human_summary(&report)));
+        let report_path = project.path().join("repair.json");
+        fs::write(&report_path, serde_json::to_vec(&repair).unwrap()).unwrap();
+        let replay = replay_report(
+            report_path.to_str().unwrap(),
+            &finding.id,
+            None,
+            RuntimeProfile::LocalTrusted,
+            DEFAULT_PYTHON_DOCKER_IMAGE,
+            DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            replay.outcome,
+            ReplayOutcome::Reproduced,
+            "{mutation}: {replay:?}"
+        );
+        assert_eq!(finding.confidence, FindingConfidence::Low);
+        assert_eq!(finding.repro.arguments.len(), 1);
+        if mutation == "throw new Error('handler failed');" {
+            fs::write(
+                &source,
+                format!("{prefix} {{ throw new Error('handler failed'); }}"),
+            )
+            .unwrap();
+            let replay = replay_report(
+                report_path.to_str().unwrap(),
+                &finding.id,
+                None,
+                RuntimeProfile::LocalTrusted,
+                DEFAULT_PYTHON_DOCKER_IMAGE,
+                DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                replay.outcome,
+                ReplayOutcome::NotReproduced,
+                "factory error cannot impersonate the handler error: {replay:?}"
+            );
+        }
+        fs::write(&source, format!("{prefix} {{ return (req, res, next) => {{ res.send(readFileSync(root + req.url, 'utf8')); }}; }}")).unwrap();
+        let replay = replay_report(
+            report_path.to_str().unwrap(),
+            &finding.id,
+            None,
+            RuntimeProfile::LocalTrusted,
+            DEFAULT_PYTHON_DOCKER_IMAGE,
+            DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            replay.outcome,
+            ReplayOutcome::NotReproduced,
+            "{mutation}: {replay:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn typescript_static_file_context_promotes_internal_middleware_factory() {
     let dir = tempfile::tempdir().unwrap();
     let source_path = dir.path().join("index.ts");

@@ -3615,38 +3615,35 @@ fn ts_http_static_file_semantic_check(func: &FunctionInfo, param_types: &[String
     {
         return String::new();
     }
-    let factory_call = ts_call_with_args(func, &["_staticRoot"]);
+    let factory_call = ts_call_with_args(func, &["_args[0]"]);
 
     format!(
         r#"  {{
-    let _staticLabel = "serve known file";
-    try {{
-      const _staticRoot = `${{process.cwd()}}/static`;
-      const _handler = {factory_call};
+    const _staticArgs = () => [process.cwd() + "/static"];
+    _semanticCase("{name}", (_args: unknown[]) => {factory_call}, _staticArgs,
+      [true, false, "hello world\n"], (_handler: any, _step: (label: string) => void) => {{
+      _step("handler_shape");
       if (typeof _handler !== "function") {{
-        throw new Error(`HTTP static file middleware (${{_staticLabel}}): factory did not return a handler`);
+        throw new Error("HTTP static file middleware: factory did not return a handler");
       }}
       let _nextCalled = false;
       const _request: any = {{ method: "GET", url: "/hello.txt" }};
       const _response: any = {{
         statusCode: 200,
         headersSent: false,
-        __headers: new Map<string, string>(),
+        __headers: new globalThis.Map<string, string>(),
         setHeader(name: string, value: string) {{ this.__headers.set(name.toLowerCase(), value); }},
         getHeader(name: string) {{ return this.__headers.get(name.toLowerCase()); }},
         end(body?: unknown) {{ this.headersSent = true; this.__body = body ?? ""; }},
         send(body?: unknown) {{ this.end(body ?? ""); return this; }},
       }};
+      _step("handler");
       _handler(_request, _response, () => {{ _nextCalled = true; }});
+      _step("body");
       const _body = String(_response.__body ?? "");
-      if (!_response.headersSent || _nextCalled || _body !== "hello world\n") {{
-        throw new Error(`HTTP static file middleware (${{_staticLabel}}): ${{JSON.stringify({{ headersSent: _response.headersSent, nextCalled: _nextCalled, body: _body }})}}`);
-      }}
-    }} catch (_e: unknown) {{
-      _emitFinding("{name}", [], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", null, "direct", _staticLabel);
-      console.log(`  CRASH {name}(http static file middleware): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
-      _fuzzTotalFailures++;
-    }}
+      _step("headersSent");
+      return [Boolean(_response.headersSent), _nextCalled, _body];
+    }}, "HTTP static file middleware (serve known file)");
   }}
 "#,
         name = func.name,
