@@ -55,9 +55,10 @@ bench-summarize dir:
 repair-check: build
     python3 scripts/check_repair_loop.py --binary target/release/court-jester
 
-# Fresh Python project config/readiness/entrypoint onboarding contract.
+# Fresh Python/TypeScript project config/readiness/entrypoint contracts (Node >=24).
 onboarding-check: build
     python3 scripts/check_onboarding.py --binary target/release/court-jester
+    python3 scripts/check_onboarding.py --binary target/release/court-jester --language typescript
 
 # Requires a running Docker daemon and the default Python/Node images already installed.
 isolated-onboarding-check:
@@ -95,6 +96,7 @@ release-check:
     python3 scripts/smoke_cli.py --binary target/release/court-jester --verify-sample
     python3 scripts/check_repair_loop.py --binary target/release/court-jester
     python3 scripts/check_onboarding.py --binary target/release/court-jester
+    python3 scripts/check_onboarding.py --binary target/release/court-jester --language typescript
     python3 -m bench.test_quality_corpus --binary target/release/court-jester --validation-binary target/release/examples/test_quality_validation
     python3 -m bench.fuzz_effectiveness --binary target/release/court-jester
     python3 scripts/prepare_release.py --binary target/release/court-jester --bundle-dir target/release-check/staged

@@ -92,6 +92,9 @@ jobs:
       - name: Verify fresh-project onboarding
         run: python3 scripts/check_onboarding.py --binary target/release/court-jester --output target/onboarding-contract.json
 
+      - name: Verify TypeScript fresh-project onboarding
+        run: python3 scripts/check_onboarding.py --binary target/release/court-jester --language typescript --output target/typescript-onboarding-contract.json
+
       - name: Verify advisory test-quality classifications
         run: python3 -m bench.test_quality_corpus --binary target/release/court-jester --validation-binary target/release/examples/test_quality_validation --output target/test-quality-corpus.json
 
@@ -109,6 +112,13 @@ jobs:
         with:
           name: onboarding-contract-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/onboarding-contract.json
+
+      - name: Upload TypeScript onboarding evidence
+        if: ${{ !cancelled() && hashFiles('target/typescript-onboarding-contract.json') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: typescript-onboarding-contract-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/typescript-onboarding-contract.json
 
       - name: Upload repair contract evidence
         if: ${{ !cancelled() && hashFiles('target/repair-contract.json') != '' }}
