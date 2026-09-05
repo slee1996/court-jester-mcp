@@ -17,6 +17,7 @@ use decisions::{
     is_typescript_portability_error,
 };
 pub use decisions::{final_verdict, stage_diagnostics};
+mod native_minimization;
 mod provenance;
 mod regression;
 mod replay;
@@ -6712,6 +6713,7 @@ pub async fn verify(
                             .unwrap_or_else(|| generated_target_source(code, language)),
                             Language::Python => generated_target_source(code, language),
                         };
+                        let native_target = native_code.clone();
                         native_code.push('\n');
                         native_code.push_str(&native_plan.code);
                         let native_start = Instant::now();
@@ -6727,7 +6729,6 @@ pub async fn verify(
                             candidate_source_file_owned.as_deref(),
                         )
                         .await;
-                        let native_ms = native_start.elapsed().as_millis() as u64;
                         let native_output = format!(
                             "{}\n{}",
                             native_execution.process.stdout, native_execution.process.stderr
@@ -6748,6 +6749,20 @@ pub async fn verify(
                         let native_suppressed_count = suppressed_native.len();
                         native_findings =
                             active_native.into_iter().chain(suppressed_native).collect();
+                        let native_minimization = native_minimization::minimize(
+                            &mut native_findings,
+                            &verification_context.candidate,
+                            &native_target,
+                            &verification_plan,
+                            &opts,
+                            language,
+                            (execute_timeout.max(30.0) - native_start.elapsed().as_secs_f64())
+                                .max(0.0),
+                            Some(candidate_project_dir_owned.as_str()),
+                            candidate_source_file_owned.as_deref(),
+                        )
+                        .await;
+                        let native_ms = native_start.elapsed().as_millis() as u64;
                         let native_gating_count = native_findings
                             .iter()
                             .filter(|finding| !finding.suppressed)
@@ -6835,6 +6850,7 @@ pub async fn verify(
                                 "target_count": native_plan.target_count,
                                 "execution": native_execution.process,
                                 "native_findings": &native_findings,
+                                "minimization": native_minimization,
                                 "unknown_finding_count": native_unknown_count,
                                 "suppressed_finding_count": native_suppressed_count,
                                 "gating_finding_count": native_gating_count,

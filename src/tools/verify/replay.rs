@@ -111,7 +111,7 @@ pub fn replay_launch_context(
     Ok(finding.launch_context)
 }
 
-fn replay_payload(stdout: &str) -> Result<serde_json::Value, String> {
+pub(super) fn replay_payload(stdout: &str) -> Result<serde_json::Value, String> {
     const MARKER: &str = "__COURT_JESTER_REPLAY_JSON__";
     if stdout.matches(MARKER).count() != 1 {
         return Err("replay sentinel must occur exactly once".into());

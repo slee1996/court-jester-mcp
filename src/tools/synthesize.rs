@@ -4550,30 +4550,7 @@ import atheris as _cj_atheris
 import json as _cj_native_json
 import sys as _cj_native_sys
 
-def _cj_native_value(value):
-    def expression(item, depth=0):
-        if depth > 16:
-            raise ValueError('native snapshot exceeds supported depth')
-        if type(item) is float:
-            if item != item:
-                return "float('nan')"
-            if item == float('inf'):
-                return "float('inf')"
-            if item == float('-inf'):
-                return "float('-inf')"
-        if type(item) is list:
-            return '[' + ', '.join(expression(child, depth + 1) for child in item) + ']'
-        if type(item) not in (type(None), bool, int, float, str, bytes, bytearray):
-            raise ValueError('unsupported native snapshot value')
-        return repr(item)
-    snapshot = {{"expression": expression(value)}}
-    try:
-        encoded = _cj_native_json.dumps(value, ensure_ascii=False, allow_nan=False)
-        encoded.encode('utf-8')
-        snapshot["json_value"] = _cj_native_json.loads(encoded)
-    except Exception:
-        pass
-    return snapshot
+{value_codec}
 
 def _cj_native_emit(function, line, arguments, error, data, call):
     body = (
@@ -4601,7 +4578,8 @@ def TestOneInput(data):
     _cj_data = _cj_atheris.FuzzedDataProvider(data)
     _cj_target = _cj_data.ConsumeIntInRange(0, {last_target})
 "#,
-        last_target = targets.len() - 1
+        last_target = targets.len() - 1,
+        value_codec = include_str!("synthesize/native/python_value.py")
     );
 
     for (index, (func, arguments)) in targets.iter().enumerate() {
@@ -4702,35 +4680,7 @@ class _CourtJesterNativeInput {{
   }}
 }}
 
-function _cjNativeValue(value: unknown): unknown {{
-  function expression(item: unknown, depth = 0): string {{
-    if (depth > 16) throw new Error("native snapshot exceeds supported depth");
-    if (item === undefined) return "undefined";
-    if (item === null) return "null";
-    if (typeof item === "bigint") return item.toString() + "n";
-    if (typeof item === "number") {{
-      if (Object.is(item, -0)) return "-0";
-      return String(item);
-    }}
-    if (typeof item === "string" || typeof item === "boolean") return JSON.stringify(item);
-    if (item instanceof Date) return "new Date(" + expression(item.getTime()) + ")";
-    if (item instanceof Uint8Array) {{
-      const bytes = JSON.stringify(Array.from(item));
-      return Buffer.isBuffer(item) ? "Buffer.from(" + bytes + ")" : "new Uint8Array(" + bytes + ")";
-    }}
-    if (Array.isArray(item)) return "[" + item.map(child => expression(child, depth + 1)).join(", ") + "]";
-    throw new Error("unsupported native snapshot value");
-  }}
-  // Expressions retain runtime types; optional JSON is only faithful JSON data.
-  function jsonSafe(item: unknown): boolean {{
-    if (item === null || typeof item === "string" || typeof item === "boolean") return true;
-    if (typeof item === "number") return Number.isFinite(item) && !Object.is(item, -0);
-    return Array.isArray(item) && item.every(jsonSafe);
-  }}
-  const snapshot: {{expression: string, json_value?: unknown}} = {{expression: expression(value)}};
-  if (jsonSafe(value)) snapshot.json_value = JSON.parse(JSON.stringify(value));
-  return snapshot;
-}}
+{value_codec}
 
 function _cjNativeEmit(functionName: string, line: number, args: any[], error: unknown, input: Uint8Array, call: string): void {{
   let match: string | null = null;
@@ -4761,7 +4711,8 @@ export async function fuzz(data: Uint8Array): Promise<void> {{
   const _cj_data = new _CourtJesterNativeInput(data);
   const _cj_target = (data[0] ?? 0) % {target_count};
 "#,
-        target_count = targets.len()
+        target_count = targets.len(),
+        value_codec = include_str!("synthesize/native/typescript_value.ts")
     );
 
     for (index, (func, arguments)) in targets.iter().enumerate() {

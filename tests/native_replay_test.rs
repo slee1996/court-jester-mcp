@@ -62,6 +62,13 @@ exec node --experimental-transform-types --input-type=module -e 'import {pathToF
         let mut report: Value = serde_json::from_slice(&output.stdout).unwrap();
         let finding = report["findings"].as_array().unwrap().iter().find(|finding| finding["classification"] == "native_coverage_guided").unwrap_or_else(|| panic!("{report}")).clone();
         assert_eq!(finding["repro"]["native_replay"]["schema_version"], 1, "{finding}");
+        assert_eq!(finding["minimization"]["status"], "preserved", "{finding}");
+        assert!(finding["minimization"]["attempts"].as_u64().unwrap() > 1);
+        assert_eq!(finding["minimization"]["minimized"]["arguments"][0]["json_value"].as_str().unwrap().chars().count(), 1);
+        assert!(finding["minimization"]["original"]["arguments"][0]["json_value"].as_str().unwrap().chars().count() > 1);
+        assert_eq!(finding["input_classification"], "unknown");
+        assert!(finding["repro"]["input_text"].is_null());
+        assert!(finding["minimization"]["original"]["input_text"].as_str().is_some());
         let id = finding["id"].as_str().unwrap();
         report["findings"] = serde_json::json!([finding.clone()]);
         let path = root.join("rebound.json");
@@ -81,6 +88,77 @@ exec node --experimental-transform-types --input-type=module -e 'import {pathToF
             assert_eq!(output.status.code(), Some(2));
             assert!(String::from_utf8_lossy(&output.stderr).contains("native replay binding contract"));
         }
+    }
+}
+
+#[test]
+fn native_minimization_retains_original_when_revalidation_or_budget_stops_search() {
+    for (condition, expected_status, retains_smaller) in [
+        ("'atheris' in sys.modules", "failed", false),
+        ("len(value) == 64", "budget_exhausted", false),
+        ("len(value) >= 32", "budget_exhausted", true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let target = root.join("target.py");
+        fs::write(&target, format!("import sys\ndef inspect(value: str) -> int:\n    if {condition}:\n        raise ValueError('native failure')\n    return 0\n")).unwrap();
+        fs::write(root.join("atheris.py"), "class FuzzedDataProvider:\n    def __init__(self, data): pass\n    def ConsumeIntInRange(self, lower, upper): return lower\n    def ConsumeUnicodeNoSurrogates(self, size): return ''.join(chr(33 + n) for n in range(64))\ndef instrument_all(): pass\ndef Setup(argv, callback):\n    global _callback\n    _callback = callback\ndef Fuzz(): _callback(b'input')\n").unwrap();
+        let output = cli(&[
+            "verify",
+            "--file",
+            target.to_str().unwrap(),
+            "--language",
+            "python",
+            "--project-dir",
+            root.to_str().unwrap(),
+            "--native-fuzz-engine",
+            "atheris",
+            "--native-fuzz-runs",
+            "1",
+            "--summary",
+            "repair-json",
+        ]);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let finding = report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|finding| finding["classification"] == "native_coverage_guided")
+            .unwrap();
+        assert_eq!(
+            finding["minimization"]["status"], expected_status,
+            "{finding}"
+        );
+        if retains_smaller {
+            assert_eq!(
+                finding["repro"]["arguments"][0]["json_value"]
+                    .as_str()
+                    .unwrap()
+                    .len(),
+                32
+            );
+            assert_eq!(
+                finding["repro"]["arguments"],
+                finding["minimization"]["minimized"]["arguments"]
+            );
+            assert!(finding["repro"]["input_text"].is_null());
+        } else {
+            assert_eq!(
+                finding["repro"]["arguments"],
+                finding["minimization"]["original"]["arguments"]
+            );
+            assert!(finding["minimization"]["minimized"].is_null());
+            assert!(finding["repro"]["input_text"].as_str().is_some());
+        }
+        assert_eq!(
+            finding["minimization"]["original"]["arguments"][0]["json_value"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
+        assert!(finding["minimization"]["attempts"].as_u64().unwrap() <= 32);
+        assert_eq!(finding["input_classification"], "unknown");
     }
 }
 
@@ -107,10 +185,10 @@ fn admitted_native_findings_export_regressions_for_current_source() {
         let bundle = root.join("regression");
         fs::write(&source, buggy).unwrap();
         if language == "python" {
-            fs::write(root.join("atheris.py"), "class FuzzedDataProvider:\n    def __init__(self, data): pass\n    def ConsumeIntInRange(self, lower, upper): return lower\n    def ConsumeBool(self): return False\ndef instrument_all(): pass\ndef Setup(argv, callback):\n    global _callback\n    _callback = callback\ndef Fuzz(): _callback(b'input')\n").unwrap();
+            fs::write(root.join("atheris.py"), "class FuzzedDataProvider:\n    def __init__(self, data): pass\n    def ConsumeIntInRange(self, lower, upper): return lower\n    def ConsumeBool(self): return True\ndef instrument_all(): pass\ndef Setup(argv, callback):\n    global _callback\n    _callback = callback\ndef Fuzz(): _callback(b'input')\n").unwrap();
         } else {
             executable(&root.join("node_modules/.bin/jazzer"), r#"#!/bin/sh
-exec node --experimental-transform-types --input-type=module -e 'import {pathToFileURL} from "node:url"; const target = await import(pathToFileURL(process.argv[1]).href); try { await target.fuzz(new Uint8Array([0,0])); } catch { process.exitCode = 1; }' "$1"
+exec node --experimental-transform-types --input-type=module -e 'import {pathToFileURL} from "node:url"; const target = await import(pathToFileURL(process.argv[1]).href); try { await target.fuzz(new Uint8Array([0,1])); } catch { process.exitCode = 1; }' "$1"
 "#);
         }
         let output = cli(&["verify", "--file", source.to_str().unwrap(), "--language", language,
@@ -124,6 +202,9 @@ exec node --experimental-transform-types --input-type=module -e 'import {pathToF
         let finding = execute["detail"]["findings"].as_array().unwrap().iter()
             .find(|finding| finding["classification"] == "native_coverage_guided").unwrap();
         assert_eq!(finding["input_classification"], "valid");
+        assert_eq!(finding["minimization"]["status"], "preserved", "{finding}");
+        assert_eq!(finding["minimization"]["original"]["arguments"][0]["json_value"], true);
+        assert_eq!(finding["repro"]["arguments"][0]["json_value"], false);
         let id = finding["id"].as_str().unwrap();
         let persisted = Path::new(report["report_path"].as_str().unwrap());
         replay(persisted, root, id, "reproduced", false);
