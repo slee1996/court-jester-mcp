@@ -5002,6 +5002,112 @@ def increment(value: int) -> int:
 }
 
 #[tokio::test]
+async fn direct_exception_replay_requires_the_complete_message() {
+    for (language, template) in [
+        (Language::Python, "calls = 0\n# court-jester-properties idempotent\ndef inspect_value(value: str) -> str:\n    global calls\n    calls += 1\n    if __WHEN__:\n        raise TypeError('same prefix: original')\n    return value\n"),
+        (Language::TypeScript, "let calls = 0;\n// court-jester-properties idempotent\nexport function inspectValue(value: string): string { calls += 1; if (__WHEN__) throw new ReferenceError('same prefix: original'); return value; }\n"),
+    ] {
+        for repeated in [false, true] {
+            let project = tempfile::tempdir().unwrap();
+            let source = project.path().join(if language == Language::Python { "target.py" } else { "target.ts" });
+            let condition = if repeated { if language == Language::Python { "calls % 2 == 0" } else { "calls % 2 === 0" } } else if language == Language::Python { "True" } else { "true" };
+            let code = template.replace("__WHEN__", condition);
+            fs::write(&source, &code).unwrap();
+            let mut opts = default_opts(None);
+            opts.source_file = source.to_str();
+            opts.project_dir = project.path().to_str();
+            let report = verify(&code, &language, opts).await;
+            let repair = repair_summary(&report, &language);
+            let finding = repair.findings.iter().find(|finding| finding.message == "same prefix: original").unwrap_or_else(|| panic!("{language:?}/{repeated}: {}", report_human_summary(&report)));
+            let report_path = project.path().join("repair.json");
+            fs::write(&report_path, serde_json::to_vec(&repair).unwrap()).unwrap();
+            let replay = replay_report(report_path.to_str().unwrap(), &finding.id, None, RuntimeProfile::LocalTrusted, DEFAULT_PYTHON_DOCKER_IMAGE, DEFAULT_TYPESCRIPT_DOCKER_IMAGE).await.unwrap();
+            assert_eq!(replay.outcome, ReplayOutcome::Reproduced, "{language:?}/{repeated}: {replay:?}; snippet: {}", finding.repro.snippet);
+            fs::write(&source, code.replace("prefix: original", "prefix: different")).unwrap();
+            let replay = replay_report(report_path.to_str().unwrap(), &finding.id, None, RuntimeProfile::LocalTrusted, DEFAULT_PYTHON_DOCKER_IMAGE, DEFAULT_TYPESCRIPT_DOCKER_IMAGE).await.unwrap();
+            assert_eq!(replay.outcome, ReplayOutcome::NotReproduced, "{language:?}/{repeated}: {replay:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn typescript_repeat_call_exceptions_replay_exact_values_or_abstain() {
+    for (thrown, replacement, expected) in [
+        (
+            "new Error('prefix: original')",
+            "new Error('prefix: different')",
+            ReplayOutcome::Reproduced,
+        ),
+        (
+            "'prefix: original'",
+            "'prefix: different'",
+            ReplayOutcome::Reproduced,
+        ),
+        ("-0", "0", ReplayOutcome::Reproduced),
+        ("NaN", "0", ReplayOutcome::Reproduced),
+        ("null", "undefined", ReplayOutcome::Reproduced),
+        ("undefined", "null", ReplayOutcome::Reproduced),
+        ("true", "false", ReplayOutcome::Reproduced),
+        ("1n", "2n", ReplayOutcome::Reproduced),
+        ("Symbol('opaque')", "null", ReplayOutcome::Inconclusive),
+        ("({detail: 'opaque'})", "null", ReplayOutcome::Inconclusive),
+    ] {
+        let project = tempfile::tempdir().unwrap();
+        let source = project.path().join("target.ts");
+        let code = format!("let calls = 0;\n// court-jester-properties idempotent\nexport function inspectValue(value: string): string {{ calls += 1; if (calls % 2 === 0) throw {thrown}; return value; }}\n");
+        fs::write(&source, &code).unwrap();
+        let mut opts = default_opts(None);
+        opts.source_file = source.to_str();
+        opts.project_dir = project.path().to_str();
+        let report = verify(&code, &Language::TypeScript, opts).await;
+        let repair = repair_summary(&report, &Language::TypeScript);
+        let finding = repair
+            .findings
+            .iter()
+            .find(|finding| {
+                finding.confidence == FindingConfidence::Low
+                    && finding.location.function == "inspectValue"
+            })
+            .unwrap_or_else(|| panic!("{thrown}: {}", report_human_summary(&report)));
+        let report_path = project.path().join("repair.json");
+        fs::write(&report_path, serde_json::to_vec(&repair).unwrap()).unwrap();
+        let replay = replay_report(
+            report_path.to_str().unwrap(),
+            &finding.id,
+            None,
+            RuntimeProfile::LocalTrusted,
+            DEFAULT_PYTHON_DOCKER_IMAGE,
+            DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay.outcome, expected, "{thrown}: {replay:?}");
+        if expected == ReplayOutcome::Reproduced {
+            fs::write(
+                &source,
+                code.replace(&format!("throw {thrown}"), &format!("throw {replacement}")),
+            )
+            .unwrap();
+            let replay = replay_report(
+                report_path.to_str().unwrap(),
+                &finding.id,
+                None,
+                RuntimeProfile::LocalTrusted,
+                DEFAULT_PYTHON_DOCKER_IMAGE,
+                DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                replay.outcome,
+                ReplayOutcome::NotReproduced,
+                "{thrown}/{replacement}: {replay:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn paired_function_replay_repeats_both_calls_and_the_comparison() {
     for (language, template, identity, mismatch, thrown) in [
         (Language::Python, "def encode(value: str) -> str:\n    __ENC__\ndef decode(value: str) -> str:\n    __DEC__\n", "return value", "return value + 'x'", "raise ValueError('pair failure')"),

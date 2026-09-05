@@ -509,11 +509,14 @@ function _rankLess(candidate: unknown, current: unknown): boolean {
   const candidateRank = _shrinkRank(candidate); const currentRank = _shrinkRank(current);
   return candidateRank[0] < currentRank[0] || (candidateRank[0] === currentRank[0] && candidateRank[1] < currentRank[1]);
 }
-function _failureIdentity(error: unknown): string {
+function _failureIdentity(error: unknown): string | null {
   const property = _declaredPropertyForFailure(error);
   if (property !== null) return `property:${property}`;
-  if (error instanceof Error) return `exception:${error.constructor.name}:${error.message.split(":", 1)[0]}`;
-  return `exception:${typeof error}:${String(error).split(":", 1)[0]}`;
+  if (error instanceof Error) return JSON.stringify(["exception", error.constructor.name, error.message]);
+  if (error === null) return JSON.stringify(["null"]);
+  if (typeof error === "number") return JSON.stringify(["number", Number.isNaN(error) ? "NaN" : Object.is(error, -0) ? "-0" : String(error)]);
+  if (["undefined", "string", "boolean", "bigint"].includes(typeof error)) return JSON.stringify([typeof error, String(error)]);
+  return null;
 }
 function _minimizeFailure(original: unknown[], reproduce: (candidate: unknown[]) => boolean): [string, number, unknown[]] {
   let current = _cloneSeed(original); let attempts = 0; const deadline = Date.now() + 250;
@@ -540,7 +543,7 @@ function _emitFinding(name: string, args: unknown[], error: unknown, severity = 
   const errorType = error instanceof Error ? error.constructor.name : "unknown";
   const primitiveException = error === null || ["undefined", "string", "number", "boolean", "bigint"].includes(typeof error);
   const replayMatch = error instanceof Error
-    ? `_replayError instanceof Error && _replayError.constructor.name === ${JSON.stringify(errorType)}`
+    ? `_replayError instanceof Error && _replayError.constructor.name === ${JSON.stringify(errorType)} && _replayError.message === ${JSON.stringify(message)}`
     : primitiveException ? `Object.is(_replayError, ${_reproExpression(error)})` : null;
   const snippet = replaySnippet ?? (replayMatch === null ? `throw new Error("Court Jester cannot replay this runtime-only thrown value");` : `// Court Jester replay snippet\nlet _reproduced = false;\ntry { (${name} as Function)(${reproArgs.map((value) => _reproExpression(value)).join(", ")}); } catch (_replayError) { _reproduced = ${replayMatch}; }\nconsole.log("__COURT_JESTER_REPLAY_JSON__");\nconsole.log(JSON.stringify({reproduced:_reproduced,severity:${JSON.stringify(severity)},oracle_kind:${JSON.stringify(oracleKind)},category:${JSON.stringify(category)}}));`);
   const recordedCase = originalCase ?? _reproCase(args, caseLabel);
@@ -763,7 +766,8 @@ function _evaluateProperties(fn: (args: unknown[]) => unknown, args: unknown[], 
     }
   }
 }
-function _propertyReplaySnippet(name: string, args: unknown[], expectedType: string | null, properties: string[], failureIdentity: string, severity: string, oracleKind: string, category: string): string {
+function _propertyReplaySnippet(name: string, args: unknown[], expectedType: string | null, properties: string[], failureIdentity: string | null, severity: string, oracleKind: string, category: string): string {
+  if (failureIdentity === null) return 'throw new Error("Court Jester cannot replay this runtime-only thrown value");';
   // Persist the actual evaluator and its pure dependencies. Replay neither
   // regenerates inputs nor guesses an oracle from a diagnostic message.
   const helpers = [_PropertyFailure, _cloneSeedFallback, _cloneSeed, _nanSafeEq, _containsNullish,
@@ -881,7 +885,7 @@ function _fuzzOne(
             if (checkingProperties) _evaluateProperties(fn, candidate, candidateResult, expectedType, properties);
             return false;
           } catch (candidateError) {
-            return (!checkingProperties || candidateChecking) && (contractTargetException || _isCrash(candidateError)) && _failureIdentity(candidateError) === failureIdentity;
+            return failureIdentity !== null && (!checkingProperties || candidateChecking) && (contractTargetException || _isCrash(candidateError)) && _failureIdentity(candidateError) === failureIdentity;
           }
         });
         const replayArgs = minimized[0] === "preserved" ? minimized[2] : args;
@@ -895,7 +899,8 @@ function _fuzzOne(
       } else {
         unclassified++;
         _cjUnitCompleted(`${name}:${sourceLine}`, i, "unclassified_exception");
-        _emitFinding(name, args, e, "crash", "runtime_contract", "observed_call", "low", "exception", null, "direct", null, sourceLine, null, "unknown");
+        const replaySnippet = checkingProperties ? _propertyReplaySnippet(name, args, expectedType, properties, _failureIdentity(e), "crash", "runtime_contract", "exception") : null;
+        _emitFinding(name, args, e, "crash", "runtime_contract", "observed_call", "low", "exception", null, "direct", null, sourceLine, replaySnippet, "unknown");
       }
     }
   }

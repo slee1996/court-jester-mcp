@@ -383,7 +383,7 @@ def _python_failure_identity(error):
     prefix = str(error).split(":", 1)[0]
     if isinstance(error, _PropertyFailure):
         return ("property", error.oracle_id, prefix)
-    return ("exception", type(error).__name__, prefix)
+    return ("exception", type(error).__name__, str(error))
 def _reproduces_python(candidate, original, invoke):
     try:
         invoke()
