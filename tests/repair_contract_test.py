@@ -17,6 +17,44 @@ SPEC.loader.exec_module(CHECK)
 
 
 class RepairContractTest(unittest.TestCase):
+    def test_independent_examples_execute_real_repairs_and_reject_constant_standins(self):
+        for case in CHECK.CASES:
+            with self.subTest(case=case["id"]), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = root / ("target.py" if case["language"] == "python" else "target.ts")
+                source.write_text(case["fixed"])
+                evidence = []
+                CHECK.check_repair_examples(root, case, evidence)
+                self.assertEqual(evidence[-1]["phase"], "independent_repair_examples")
+                self.assertEqual(evidence[-1]["expected"], evidence[-1]["observed"])
+                if case["oracle"] == "declared_property":
+                    source.write_text("def reorder(values):\n    return [1, 2]\n" if case["language"] == "python"
+                                      else "export function reorder(values) { return [1, 2]; }")
+                    with self.assertRaises(CHECK.ContractFailure):
+                        CHECK.check_repair_examples(root, case, [])
+
+    def test_independent_examples_reject_mutation_wrong_values_and_failed_processes(self):
+        case = next(case for case in CHECK.CASES if case["id"] == "python-property")
+        correct = {"outputs": [value for _, value in case["examples"]],
+                   "inputs_after": [value for value, _ in case["examples"]]}
+        for code, stdout in [(0, "not json"), (1, json.dumps(correct)),
+                             (0, json.dumps({**correct, "outputs": []})),
+                             (0, json.dumps({**correct, "inputs_after": []}))]:
+            def fake_command(*args, **kwargs):
+                args[3].append({"phase": args[2]})
+                return subprocess.CompletedProcess([], code, stdout, "")
+            with patch.object(CHECK, "command", side_effect=fake_command), self.assertRaises(CHECK.ContractFailure):
+                CHECK.check_repair_examples(ROOT, case, [])
+
+    def test_python_property_repair_is_input_dependent(self):
+        case = next(case for case in CHECK.CASES if case["id"] == "python-property")
+        scope = {}
+        exec(case["fixed"], scope)
+        for values in ([], [4], [9, -2, 9, 0]):
+            original = values.copy()
+            self.assertEqual(scope["reorder"](values), sorted(original))
+            self.assertEqual(values, original)
+
     def test_fixture_coverage_is_explicit(self):
         self.assertEqual(len(CHECK.CASES), 4)
         self.assertEqual(len({case["id"] for case in CHECK.CASES}), 4)

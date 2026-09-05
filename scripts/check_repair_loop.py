@@ -17,19 +17,23 @@ CASES = (
     dict(id="python-runtime", language="python", oracle="runtime_contract",
          bug="from typing import Literal\ndef first_character(value: Literal['', 'a']) -> str:\n    return value[0]\n",
          other="def first_character(value: str) -> str:\n    raise ValueError('different failure')\n",
-         fixed="def first_character(value: str) -> str:\n    return value[0] if value else ''\n"),
+         fixed="def first_character(value: str) -> str:\n    return value[0] if value else ''\n",
+         symbol="first_character", examples=[("", ""), ("a", "a"), ("hello", "h")]),
     dict(id="typescript-runtime", language="typescript", oracle="runtime_contract",
          bug="export function firstCharacter(value: '' | 'a'): string { return value[0].toUpperCase(); }",
          other="export function firstCharacter(value: string): string { throw new Error('different failure'); }",
-         fixed="export function firstCharacter(value: string): string { return value[0]?.toUpperCase() ?? ''; }"),
+         fixed="export function firstCharacter(value: string): string { return value[0]?.toUpperCase() ?? ''; }",
+         symbol="firstCharacter", examples=[("", ""), ("a", "A"), ("hello", "H")]),
     dict(id="python-property", language="python", oracle="declared_property",
          bug="# court-jester-properties sorted\ndef reorder(values: list[int]):\n    return [2, 1]\n",
          other="def reorder(values: list[int]):\n    return {}\n",
-         fixed="def reorder(values: list[int]):\n    return [1, 2]\n"),
+         fixed="def reorder(values: list[int]):\n    return sorted(values)\n",
+         symbol="reorder", examples=[([], []), ([4], [4]), ([9, -2, 9, 0], [-2, 0, 9, 9])]),
     dict(id="typescript-property", language="typescript", oracle="declared_property",
          bug="// court-jester-properties sorted\nexport function reorder(values: number[]): any { return [2, 1]; }",
          other="export function reorder(values: number[]): any { return {}; }",
-         fixed="export function reorder(values: number[]): any { return [1, 2]; }"),
+         fixed="export function reorder(values: number[]): number[] { return [...values].sort((a, b) => a - b); }",
+         symbol="reorder", examples=[([], []), ([4], [4]), ([9, -2, 9, 0], [-2, 0, 9, 9])]),
 )
 
 
@@ -89,6 +93,33 @@ def replay(binary: Path, root: Path, report: Path, finding: str, phase: str,
     return value
 
 
+def check_repair_examples(root: Path, case: dict, evidence: list[dict]) -> None:
+    """Independent public fixture checks, not claims inferred from replay success."""
+    inputs = [value for value, _ in case["examples"]]
+    if case["language"] == "python":
+        script = ("import json, target\n"
+                  f"inputs = json.loads({json.dumps(json.dumps(inputs))})\n"
+                  f"outputs = [getattr(target, {case['symbol']!r})(value) for value in inputs]\n"
+                  "print(json.dumps({'outputs': outputs, 'inputs_after': inputs}))\n")
+        argv = [sys.executable, "-c", script]
+    else:
+        script = ("import * as target from './target.ts';\n"
+                  f"const inputs = {json.dumps(inputs)};\n"
+                  f"const outputs = inputs.map(value => target[{json.dumps(case['symbol'])}](value));\n"
+                  "console.log(JSON.stringify({outputs, inputs_after: inputs}));\n")
+        argv = ["node", "--no-warnings", "--experimental-transform-types", "--input-type=module", "-e", script]
+    result = command(argv, root, "independent_repair_examples", evidence)
+    require(result.returncode == 0, "repaired implementation failed independent examples")
+    try:
+        actual = json.loads(result.stdout)
+    except (ValueError, TypeError) as error:
+        raise ContractFailure("protocol", "independent repair examples returned non-JSON output") from error
+    expected = {"outputs": [value for _, value in case["examples"]], "inputs_after": inputs}
+    evidence[-1]["expected"] = expected
+    evidence[-1]["observed"] = actual
+    require(actual == expected, "repair does not preserve independent fixture behavior and input values")
+
+
 def check_case(binary: Path, case: dict) -> dict:
     record = {"id": case["id"], "language": case["language"], "status": "failed", "phases": []}
     evidence = record["phases"]
@@ -119,6 +150,7 @@ def check_case(binary: Path, case: dict) -> dict:
             source.write_text(case["other"], encoding="utf-8")
             replay(binary, root, report_path, finding_id, "reject_false_repair", "not_reproduced", False, evidence)
             source.write_text(case["fixed"], encoding="utf-8")
+            check_repair_examples(root, case, evidence)
             replay(binary, root, report_path, finding_id, "replay_fixed", "not_reproduced", True, evidence)
             bundle = root / "regression"
             exported = command([str(binary), "replay", "--report", str(report_path), "--finding", finding_id,

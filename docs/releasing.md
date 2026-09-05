@@ -46,6 +46,8 @@ python3 scripts/check_repair_loop.py --binary target/release/court-jester
 
 An optional `--output <new-file>` writes artifact-v1 JSON without overwriting an existing file. The four cases cover Python/TypeScript runtime and declared-property failures. Each checks original detection/replay, rejection of a different error or skipped oracle, replay after a supplied repair, and exported-test behavior against the repair, false repair, and original bug. The artifact records phase timings, fixture digest, binary version and SHA-256 before/after, and separate contract/protocol/inconclusive/launch/timeout failure causes. Changing the binary mid-run or supplying an empty suite cannot produce success.
 
+Each supplied repair also runs three independent public fixture examples, with exact output and input-preservation expectations retained in the artifact. Property repairs sort the actual input rather than returning a constant sorted array. These 12 examples supplement the recorded counterexample check; they are neither held-out cases nor proof of general correctness. They prevent the gate from treating a witness-only stand-in as its reference repair.
+
 CI uploads `target/repair-contract.json` when produced, including failed-case evidence, under a run/attempt-specific artifact name. This is a current-binary contract check using deterministic repairs, **not** an agent benchmark, precision/recall estimate, or proof for every release platform. Hosted CI execution, platform-specific binaries, broader held-out evidence, and real user outcomes remain separate acceptance requirements. No release is published merely by running this check or pushing to `main`.
 
 ## Verify the published release

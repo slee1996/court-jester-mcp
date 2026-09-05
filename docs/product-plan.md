@@ -434,6 +434,13 @@ This is a single-owner Plan-mode execution record. The completed historical rele
 - Final-source focused verification: all 22 CLI unit tests and 16 ordinary doctor integration tests pass; the two Docker-dependent tests pass separately against real installed images. The rebuilt release binary also passes default-memory isolated smoke checks with Python 3.12.14 and Node 24.19.0. Strict Clippy, formatting/whitespace checks, release build, smoke, five-phase local onboarding, four-case repair contract, all 22 bounded classification cases, three onboarding unit tests, and two release tests pass. The full Rust suite was not rerun for this CLI-only increment; increment 41 retains its separately scoped broad evidence.
 - The broader P1–P9 objective remains active. This closes a false-readiness defect, not the outstanding product acceptance or account-authorized push requirements.
 
+### Increment 43: make reference repairs input-dependent
+
+- The P4/P8 audit found that the deterministic repair gate's property repairs returned constant sorted arrays. Those fixtures proved a recorded sortedness check could pass but did not exercise an actual input-dependent repair. A regression reproduced the Python stand-in returning `[1, 2]` for an empty input.
+- Both property repairs now sort the supplied values without mutating their inputs. All four runtime/property repair fixtures have three independently specified public examples. The gate executes those examples before replaying the repaired candidate and retains expected/observed outputs and post-call inputs in the evidence artifact. These examples are separate from replay's positive-check evidence, not inferred from it.
+- Nine repair-gate unit tests pass, including real Python/TypeScript repair execution, rejection of constant sorted stand-ins, wrong output/input-preservation evidence, malformed output, and process failure. The actual current-binary repair gate passes all four complete detection/replay/export sequences and all 12 independent examples. Evidence binds to binary SHA-256 `3089a7a144ccc64589ee3b9fbf4416c48e00e612255c0b72aea7d0e3c1003725`; Rust implementation is unchanged in this increment. Whitespace validation passes.
+- These are public deterministic fixture checks, not a held-out benchmark or participant outcomes. Native minimization, live-candidate differential export, broader acceptance evidence, and the rest of the P1–P9 objective remain required. The pending account authorization still prevents pushing.
+
 ## Completion audit
 
 All P1–P9 remain required. Local gates do not substitute for actual design-partner results or current-build paired repair evidence. Record missing authority/data explicitly; do not call the full product objective complete on implementation alone.
