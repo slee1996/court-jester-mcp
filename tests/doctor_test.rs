@@ -400,15 +400,144 @@ fn doctor_timeout_terminates_linter_descendants() {
 }
 
 #[test]
-fn doctor_does_not_claim_project_readiness_for_isolated_profile() {
+fn doctor_isolated_project_reports_runtime_failure_without_executing_target() {
     let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("target.py");
+    let marker = root.path().join("executed");
+    std::fs::write(
+        &target,
+        format!("open({:?}, 'w').close()\n", marker.to_str().unwrap()),
+    )
+    .unwrap();
+    executable(
+        &root.path().join("bin/docker"),
+        "#!/bin/sh\necho 'fixture docker unavailable' >&2\nexit 42\n",
+    );
     let output = Command::new(env!("CARGO_BIN_EXE_court-jester"))
-        .args(["doctor", "--runtime-profile", "isolated", "--project-dir"])
+        .args([
+            "doctor",
+            "--language",
+            "python",
+            "--runtime-profile",
+            "isolated",
+            "--project-dir",
+        ])
         .arg(root.path())
+        .arg("--file")
+        .arg(&target)
+        .env("PATH", root.path().join("bin"))
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("image readiness only"));
+    assert_eq!(output.status.code(), Some(1), "{:?}", output);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        check(&report, "project_context")["detail"]["executed"],
+        false
+    );
+    assert_eq!(check(&report, "docker_daemon")["status"], "failed");
+    assert!(!marker.exists());
+}
+
+#[test]
+#[ignore = "requires a running Docker daemon and preinstalled Python/Node images"]
+fn isolated_entrypoint_probe_checks_real_project_imports_and_assertions() {
+    for (language, extension, good, bad, tests, missing) in [
+        ("python", "py", "def eligible(value):\n    return value\n", "def eligible(value):\n    return not value\n",
+         "from target import eligible\nassert eligible(True) is True\n", "import missing_doctor_fixture_dependency\n"),
+        ("typescript", "ts", "export function eligible(value: boolean) { return value; }\n", "export function eligible(value: boolean) { return !value; }\n",
+         "import {eligible} from './target.ts';\nimport assert from 'node:assert/strict';\nassert.equal(eligible(true), true);\n", "import 'missing-doctor-fixture-dependency';\n"),
+    ] {
+        let root = court_jester::tools::sandbox::runtime_tempdir(court_jester::types::RuntimeProfile::Isolated).unwrap();
+        let target = root.path().join(format!("target.{extension}"));
+        let entrypoint = root.path().join(format!("checks.test.{extension}"));
+        std::fs::write(&entrypoint, tests).unwrap();
+        for (source, expected) in [(good, "passed"), (bad, "failed"), (missing, "failed")] {
+            std::fs::write(&target, source).unwrap();
+            let output = Command::new(env!("CARGO_BIN_EXE_court-jester"))
+                .args(["doctor", "--language", language, "--runtime-profile", "isolated", "--project-dir"])
+                .arg(root.path()).arg("--file").arg(&target)
+                .arg("--test-file").arg(&entrypoint)
+                .args(["--probe-entrypoint", "--test-runner", "node", "--memory-mb", "512", "--timeout-seconds", "10"])
+                .output().unwrap();
+            let report: Value = serde_json::from_slice(&output.stdout)
+                .unwrap_or_else(|_| panic!("{output:?}"));
+            assert_eq!(check(&report, "entrypoint_probe")["status"], expected, "{language}: {report:#}");
+            if expected == "passed" {
+                assert!(output.status.success(), "{report:#}");
+                assert_eq!(check(&report, "entrypoint_probe")["detail"]["test_stage"]["detail"]["target_module_loaded"], true);
+            } else {
+                assert_eq!(output.status.code(), Some(1), "{report:#}");
+            }
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), source);
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a running Docker daemon and the preinstalled Node image"]
+fn isolated_node_verification_retains_target_entry_and_kills_boundary_mutant() {
+    let root = court_jester::tools::sandbox::runtime_tempdir(
+        court_jester::types::RuntimeProfile::Isolated,
+    )
+    .unwrap();
+    let target = root.path().join("target.ts");
+    let test = root.path().join("checks.test.ts");
+    let source = "export function eligible(value: number) { return value >= 1; }\n";
+    std::fs::write(&target, source).unwrap();
+    std::fs::write(&test, "import {eligible} from './target.ts';\nimport assert from 'node:assert/strict';\nassert.equal(eligible(1), true);\n").unwrap();
+    std::thread::scope(|scope| {
+        let runs = (0..2)
+            .map(|_| {
+                scope.spawn(|| {
+                    let output = Command::new(env!("CARGO_BIN_EXE_court-jester"))
+                        .args([
+                            "verify",
+                            "--language",
+                            "typescript",
+                            "--runtime-profile",
+                            "isolated",
+                            "--project-dir",
+                        ])
+                        .arg(root.path())
+                        .arg("--file")
+                        .arg(&target)
+                        .arg("--test-file")
+                        .arg(&test)
+                        .args([
+                            "--tests-only",
+                            "--test-runner",
+                            "node",
+                            "--test-quality",
+                            "1",
+                            "--no-auto-seed",
+                            "--no-repo-config",
+                            "--memory-mb",
+                            "512",
+                        ])
+                        .output()
+                        .unwrap();
+                    let report: Value = serde_json::from_slice(&output.stdout)
+                        .unwrap_or_else(|_| panic!("{output:?}"));
+                    assert!(output.status.success(), "{report:#}");
+                    let quality = report["stages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|stage| stage["name"] == "test_quality")
+                        .unwrap();
+                    assert_eq!(quality["detail"]["counts"]["killed"], 1, "{report:#}");
+                    assert_eq!(
+                        quality["detail"]["mutants"][0]["entered_mutated_surface"],
+                        true
+                    );
+                })
+            })
+            .collect::<Vec<_>>();
+        for run in runs {
+            run.join().unwrap();
+        }
+    });
+    assert_eq!(std::fs::read_to_string(target).unwrap(), source);
 }
 
 #[test]

@@ -3945,6 +3945,18 @@ fn insert_docker_environment(create: &mut Vec<String>, value: String) {
     create.splice(image_index..image_index, ["-e".to_string(), value]);
 }
 
+fn append_docker_node_preload(create: &mut Vec<String>, preload: &str) {
+    let option = format!("--require={preload}");
+    for index in 1..create.len() {
+        if create[index - 1] == "-e" && create[index].starts_with("NODE_OPTIONS=") {
+            create[index].push(' ');
+            create[index].push_str(&option);
+            return;
+        }
+    }
+    insert_docker_environment(create, format!("NODE_OPTIONS={option}"));
+}
+
 fn configure_docker_node_loader(
     runtime: crate::types::HarnessRuntime,
     loader: &str,
@@ -4489,6 +4501,17 @@ async fn run_harness_in_docker(
     }
     if use_portable_typescript {
         configure_docker_typescript_loader("/court-jester/typescript-loader.mjs", &mut command);
+    }
+    if limits.instrumented_source.is_some()
+        && portable_vitest.is_none()
+        && !matches!(
+            harness.runtime,
+            crate::types::HarnessRuntime::Python
+                | crate::types::HarnessRuntime::BunScript
+                | crate::types::HarnessRuntime::BunTest
+        )
+    {
+        append_docker_node_preload(&mut create, "/court-jester/instrumentation-preload.cjs");
     }
     for argument in harness.args.iter().chain(limits.harness_args.iter()) {
         match argument {
@@ -5399,6 +5422,35 @@ pub async fn execute_harness(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn docker_instrumentation_preload_preserves_loader_options_and_image_position() {
+        for existing in [
+            None,
+            Some("--experimental-loader=/court-jester/resolver.mjs"),
+        ] {
+            let mut create = vec![
+                "create".into(),
+                "-e".into(),
+                "HOME=/tmp".into(),
+                "image".into(),
+            ];
+            if let Some(options) = existing {
+                super::insert_docker_environment(&mut create, format!("NODE_OPTIONS={options}"));
+            }
+            super::append_docker_node_preload(&mut create, "/court-jester/instrumentation.cjs");
+            assert_eq!(create.last().unwrap(), "image");
+            let options = create
+                .iter()
+                .filter(|value| value.starts_with("NODE_OPTIONS="))
+                .collect::<Vec<_>>();
+            assert_eq!(options.len(), 1);
+            assert!(options[0].ends_with("--require=/court-jester/instrumentation.cjs"));
+            if let Some(existing) = existing {
+                assert!(options[0].contains(existing));
+            }
+            assert!(create.iter().any(|value| value == "HOME=/tmp"));
+        }
+    }
     #[cfg(target_os = "macos")]
     use super::docker_runtime_user;
     use super::{

@@ -117,11 +117,6 @@ pub(super) async fn run_doctor(
     {
         return Err("doctor --file requires --language python or typescript".into());
     }
-    if args.runtime_profile == RuntimeProfile::Isolated
-        && (args.file.is_some() || args.project_dir.is_some())
-    {
-        return Err("project-aware doctor currently requires --runtime-profile local-trusted; isolated doctor checks image readiness only".into());
-    }
     let selected = match args
         .language
         .as_deref()
@@ -139,6 +134,37 @@ pub(super) async fn run_doctor(
         }
     };
     let mut checks = Vec::new();
+    if args.file.is_some() || args.project_dir.is_some() {
+        let invocation = std::env::current_dir().map_err(|error| error.to_string())?;
+        let project = args
+            .project_dir
+            .as_deref()
+            .map(|path| invocation.join(path));
+        for language in &selected {
+            let context =
+                court_jester::resolve_execution_context(court_jester::types::ContextRequest {
+                    invocation_dir: &invocation,
+                    explicit_project_dir: project.as_deref(),
+                    target_file: args.file.as_deref().map(Path::new),
+                    test_file: None,
+                    language: *language,
+                    virtual_file_path: None,
+                })
+                .map_err(|error| error.to_string())?;
+            checks.push(doctor_check(
+                "project_context",
+                Some(*language),
+                StageStatus::Passed,
+                serde_json::json!({"workspace_root": context.workspace_root,
+                    "target_package_root": context.target_package_root,
+                    "source_mode": context.target_source.mode, "executed": false}),
+                Some(
+                    "Project paths resolved; imports and test behavior require --probe-entrypoint"
+                        .into(),
+                ),
+            ));
+        }
+    }
     if args.repo_config.is_some() {
         checks.push(doctor_check("repository_config", None, StageStatus::Passed,
             super::config::selected_settings("doctor", args),
@@ -368,6 +394,15 @@ pub(super) async fn run_doctor(
                         test_runner: args.test_runner,
                         timeout_seconds: args.timeout_seconds.unwrap_or(10.0),
                         memory_mb: args.verification_memory_mb(),
+                        runtime_profile: args.runtime_profile,
+                        python_docker_image: args
+                            .python_docker_image
+                            .as_deref()
+                            .unwrap_or(DEFAULT_PYTHON_DOCKER_IMAGE),
+                        typescript_docker_image: args
+                            .typescript_docker_image
+                            .as_deref()
+                            .unwrap_or(DEFAULT_TYPESCRIPT_DOCKER_IMAGE),
                     },
                 )
                 .await

@@ -4699,9 +4699,12 @@ pub struct EntrypointProbeOptions<'a> {
     pub test_runner: TestRunner,
     pub timeout_seconds: f64,
     pub memory_mb: u64,
+    pub runtime_profile: RuntimeProfile,
+    pub python_docker_image: &'a str,
+    pub typescript_docker_image: &'a str,
 }
 
-/// Execute only the selected authoritative entrypoint through the normal local
+/// Execute only the selected authoritative entrypoint through the selected runtime
 /// test adapter. This is an opt-in readiness probe, not fuzzing or a coverage claim.
 pub async fn probe_authoritative_entrypoint(
     code: &str,
@@ -4736,12 +4739,12 @@ pub async fn probe_authoritative_entrypoint(
         execute_gate: ExecuteGate::None,
         coverage_gate: CoverageGate::None,
         inferred_oracle_gate: InferredOracleGate::Advisory,
-        runtime_profile: RuntimeProfile::LocalTrusted,
+        runtime_profile: probe.runtime_profile,
         memory_mb: probe.memory_mb,
         network: NetworkPolicy::Deny,
         harness_args: vec![],
-        python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
-        typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        python_docker_image: probe.python_docker_image,
+        typescript_docker_image: probe.typescript_docker_image,
     };
     let context = resolve_verification_contexts(&opts, language)?;
     let nonce = tempfile::Builder::new()

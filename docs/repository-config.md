@@ -96,7 +96,9 @@ court-jester doctor --file src/profile.ts --language typescript \
   --test-file tests/profile.test.ts --test-runner node --probe-entrypoint
 ```
 
-`--probe-entrypoint` explicitly runs the selected authoritative test entrypoint and its imports. It requires one source file, one language, and exactly one configured or explicit test file. Only use it for code you trust to execute. Without this flag, doctor does not run target imports or tests. Project-aware probes currently require `local-trusted`; isolated doctor still checks image readiness only.
+`--probe-entrypoint` explicitly runs the selected authoritative test entrypoint and its imports. It requires one source file, one language, and exactly one configured or explicit test file. Without this flag, doctor does not run target imports or tests: `project_context` only validates paths, and `configured_entrypoints` only checks readability.
+
+The probe supports both runtime profiles. `local-trusted` executes trusted project code on the host. Add `--runtime-profile isolated` to use verification's existing Docker execution path, selected image overrides, no network, read-only project mounts, and resource limits. Images and dependencies must already be available; doctor neither installs dependencies nor pulls images and never falls back to host execution. Image smoke checks alone do not establish project readiness; the opt-in entrypoint must also pass. `just isolated-onboarding-check` runs real Python/Node container regressions, including concurrent Node mutation campaigns, using installed images.
 
 The probe uses verification's normal test adapter and context resolution, but runs neither fuzzing nor mutation tests. It requires successful test execution and per-run evidence that the selected target module finished loading. Exit zero without that evidence is inconclusive in the nested test stage and fails the doctor readiness check. A passed probe does not prove function coverage or application correctness. Broken imports, assertions, unavailable adapters, resource limits, and instrumentation failures remain visible in `entrypoint_probe.detail.test_stage`; read errors appear in `error`.
 
