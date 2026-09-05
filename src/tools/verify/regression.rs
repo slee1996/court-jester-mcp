@@ -181,6 +181,9 @@ pub fn write_regression_export(
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw.trim()).ok())
             .ok_or("differential export requires structured live-candidate comparison evidence")?;
         let expected_entry = plan.project.join(&plan.source);
+        if payload["input_classification"] != "valid" {
+            return Err("differential export requires fresh valid input evidence from both source trees; reverify or add an input contract".into());
+        }
         if payload["candidate_mode"] != "live"
             || payload["check_passed"].as_bool() != replay.check_passed
             || payload["reproduced"].as_bool() != Some(replay.outcome == ReplayOutcome::Reproduced)

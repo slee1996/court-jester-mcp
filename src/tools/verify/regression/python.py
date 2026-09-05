@@ -33,6 +33,13 @@ class CourtJesterRegression(unittest.TestCase):
         self.assertEqual(replay["finding_id"], manifest["finding_id"])
         self.assertEqual(replay["outcome"], "not_reproduced")
         self.assertIs(replay.get("check_passed"), True, "recorded check did not pass: " + result.stdout)
+        if mode == "differential_live":
+            payload = replay["execution"]["stdout"]
+            marker = "__COURT_JESTER_REPLAY_JSON__"
+            self.assertTrue(payload.startswith(marker))
+            comparison = json.loads(payload[len(marker):])
+            self.assertEqual(comparison["candidate_mode"], "live")
+            self.assertEqual(comparison["input_classification"], "valid", "current comparison lacks input admission")
 
 
 if __name__ == "__main__":

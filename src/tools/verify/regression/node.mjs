@@ -31,4 +31,12 @@ test('Court Jester recorded check', () => {
   assert.equal(replay.finding_id, manifest.finding_id);
   assert.equal(replay.outcome, 'not_reproduced');
   assert.equal(replay.check_passed, true, 'recorded check did not pass: ' + result.stdout);
+  if (mode === 'differential_live') {
+    const payload = replay.execution.stdout;
+    const marker = '__COURT_JESTER_REPLAY_JSON__';
+    assert.ok(payload.startsWith(marker));
+    const comparison = JSON.parse(payload.slice(marker.length));
+    assert.equal(comparison.candidate_mode, 'live');
+    assert.equal(comparison.input_classification, 'valid', 'current comparison lacks input admission');
+  }
 });

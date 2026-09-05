@@ -6,9 +6,11 @@ It is intentionally a methodology writeup, not a single-run results page.
 
 ## Deterministic effectiveness corpus versions
 
-`python3 -m bench.fuzz_effectiveness --binary target/release/court-jester` uses `fuzz-effectiveness-v3`: 13 cases comprising four mutation cases, four clean controls, and five uncertain exception observations. The observations require inconclusive verdicts and unknown input classification; discovery alone does not establish that an exception violates an application contract. Explicit closed-domain Python/TypeScript bug/control pairs separately require valid-input failures and clean repairs.
+`python3 -m bench.fuzz_effectiveness --binary target/release/court-jester` uses `fuzz-effectiveness-v4`: 13 cases comprising three mutation cases, four clean controls, and six uncertain observations. The observations require inconclusive verdicts and unknown input classification; discovery alone does not establish that an exception or behavioral difference violates an application contract. Explicit closed-domain Python/TypeScript bug/control pairs separately require valid-input failures and clean repairs.
 
 The original nine-case v2 manifest is retained at `bench/fuzz_effectiveness_cases_v2.json` with unchanged fixture sources. Run it explicitly with `--manifest bench/fuzz_effectiveness_cases_v2.json` to reproduce the historical expectation set. V3 reclassifies predicate/stateful/LLM exception observations whose admission was previously inferred from exception classes or finding counts. Its categories and denominators differ: do not compare its `mutation_recall` to v2 or advertise either small fixture suite as general accuracy or agent repair utility. Historical v2 failures remain evidence, not results to overwrite.
+
+The complete v3 manifest is preserved at `bench/fuzz_effectiveness_cases_v3.json`. V4 keeps every fixture and changes only the open-integer differential case to an unknown-input observation: deterministic exploration does not establish an accepted input domain. The v3 run exposed this mismatch as 12/13 matched and is not erased by the version change. V4 separately requires the finding to remain present, the input to remain unknown, and the verdict/stage to be inconclusive. Its mutation denominator is three rather than four, so v4 recall is not comparable to v3. Live closed-boolean differential repair/export behavior is covered by the Rust integration matrix, not included as an additional mutation in this corpus.
 
 ## Goal
 

@@ -23,6 +23,51 @@ fn run_bundle(bundle: &Path, language: &str) -> Output {
 }
 
 #[test]
+fn differential_exploration_does_not_invent_input_admission() {
+    for (language, extension, baseline, candidate) in [
+        ("python", "py", "def inspect(value: str) -> str:\n    if not value: raise ValueError('reserved input')\n    return value\n",
+         "def inspect(value: str) -> str:\n    return 'changed'\n"),
+        ("typescript", "ts", "export function inspect(value: string): string { if (!value) throw new Error('reserved input'); return value; }",
+         "export function inspect(value: string): string { return 'changed'; }"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let entry = format!("target.{extension}");
+        std::fs::write(root.path().join(&entry), candidate).unwrap();
+        std::fs::write(base.path().join(&entry), baseline).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_court-jester"))
+            .args(["verify", "--language", language, "--file"]).arg(root.path().join(&entry))
+            .arg("--project-dir").arg(root.path()).arg("--base-file").arg(base.path().join(&entry))
+            .arg("--base-project-dir").arg(base.path()).args(["--summary", "repair-json"]).output().unwrap();
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let finding = report["findings"].as_array().unwrap().iter().find(|finding| finding["category"] == "differential").unwrap();
+        assert_eq!(finding["input_classification"], "unknown", "{finding}");
+        let report_path = root.path().join("report.json");
+        std::fs::write(&report_path, &output.stdout).unwrap();
+        let bundle = root.path().join("regression");
+        let output = Command::new(env!("CARGO_BIN_EXE_court-jester"))
+            .args(["replay", "--report"]).arg(&report_path).args(["--finding", finding["id"].as_str().unwrap()])
+            .arg("--dependency-project-dir").arg(root.path()).arg("--candidate-project-dir").arg(root.path())
+            .arg("--export-regression").arg(&bundle).arg("--accept-inferred").output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("valid input evidence"));
+        assert!(!bundle.exists());
+        let mut legacy = report.clone();
+        for finding in legacy["findings"].as_array_mut().unwrap() {
+            if finding["category"] == "differential" { finding["input_classification"] = Value::String("valid".into()); }
+        }
+        std::fs::write(&report_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let legacy_export = Command::new(env!("CARGO_BIN_EXE_court-jester"))
+            .args(["replay", "--report"]).arg(&report_path).args(["--finding", finding["id"].as_str().unwrap()])
+            .arg("--dependency-project-dir").arg(root.path()).arg("--candidate-project-dir").arg(root.path())
+            .arg("--export-regression").arg(&bundle).arg("--accept-inferred").output().unwrap();
+        assert_eq!(legacy_export.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&legacy_export.stderr).contains("fresh valid input evidence"));
+        assert!(!bundle.exists());
+    }
+}
+
+#[test]
 fn differential_replay_explicitly_checks_live_candidate_and_imports() {
     for (language, extension, target, original, fixed, broken) in [
         ("python", "py", "from dependency import answer\ndef inspect(value: bool) -> bool:\n    return answer(value)\n",
@@ -123,6 +168,13 @@ fn differential_replay_explicitly_checks_live_candidate_and_imports() {
             assert!(!run_bundle(&bundle, language).status.success(), "{wrong_mode} must not pass a differential live check");
         }
         std::fs::write(bundle.join("regression.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let mut legacy = retained.clone();
+        for argument in legacy["stages"][0]["detail"]["findings"][0]["repro"]["arguments"].as_array_mut().unwrap() {
+            argument.as_object_mut().unwrap().remove("json_value");
+        }
+        std::fs::write(bundle.join("report.json"), serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(!run_bundle(&bundle, language).status.success(), "legacy classification without argument evidence must not authorize a passing bundle");
+        std::fs::write(bundle.join("report.json"), serde_json::to_vec(&retained).unwrap()).unwrap();
         assert_eq!(replay(false)["outcome"], "reproduced", "historical replay must retain the embedded candidate");
         std::fs::write(project.path().join(&dependency), broken).unwrap();
         assert_ne!(replay(true)["check_passed"], true);

@@ -320,6 +320,8 @@ This command replays the finding before writing. Inferred expectations require e
 
 For a differential finding, also pass `--candidate-project-dir . --accept-inferred`. The candidate and dependency roots must refer to the same project. The resulting test compares current code/imports with the embedded baseline for the recorded input. Accepting that baseline expectation does not assert that the baseline is generally correct. The bundle includes `BASELINE.md` explaining this contract; review the saved baseline code before running it.
 
+Differential export requires fresh closed-domain input evidence from both versions, not just a saved `valid` label. Differences found by exploring open domains remain visible but are not exportable through `--accept-inferred`. Reverify and re-export older findings that lack argument evidence.
+
 Run `python3 tests/first-character-regression/test_regression.py` for Python, or `node --test tests/first-character-regression/regression.test.mjs` for TypeScript. These standard-library test wrappers **require Court Jester** on PATH; `COURT_JESTER_BINARY` can select its executable. They are not standalone translations of the check. Keep the bundle at the same relative location when moving the checkout.
 
 The test checks the current source using the saved runtime profile, limits, and harness arguments. It passes only when the recorded check positively completes—not merely when the original exception disappears. A different exception, incomplete action sequence, missing source/runtime, or inconclusive replay fails. A successful export exits `0`, even if its recorded check currently fails; ordinary replay exit codes are unchanged. Never run untrusted report snippets in `local-trusted` mode.

@@ -8713,29 +8713,43 @@ async fn inferred_oracle_findings_are_advisory_but_directives_are_authoritative(
 }
 #[tokio::test]
 async fn base_candidate_divergence_is_advisory_without_authoritative_oracle() {
-    let candidate = "def identity(value: int) -> int:\n    return value + 1";
-    let base = "def identity(value: int) -> int:\n    return value";
-    let report = verify_differential_files(candidate, base, Language::Python).await;
-    let differential = report
-        .stages
-        .iter()
-        .find(|stage| stage.name == "differential");
-    assert!(
-        differential.is_some(),
-        "differential stage should be explicit"
-    );
-    let detail = differential
-        .and_then(|stage| stage.detail.as_ref())
-        .expect("differential detail");
-    assert!(detail["findings"]
-        .as_array()
-        .map(|findings| !findings.is_empty())
-        .unwrap_or(false));
-    assert_eq!(
-        report.verdict,
-        VerificationVerdict::Pass,
-        "unproven divergence is advisory"
-    );
+    for (candidate, base, classification, expected) in [
+        (
+            "def identity(value: int) -> int:\n    return value + 1",
+            "def identity(value: int) -> int:\n    return value",
+            "unknown",
+            VerificationVerdict::Inconclusive,
+        ),
+        (
+            "def identity(value: bool) -> bool:\n    return not value",
+            "def identity(value: bool) -> bool:\n    return value",
+            "valid",
+            VerificationVerdict::Pass,
+        ),
+    ] {
+        let report = verify_differential_files(candidate, base, Language::Python).await;
+        let differential = report
+            .stages
+            .iter()
+            .find(|stage| stage.name == "differential");
+        assert!(
+            differential.is_some(),
+            "differential stage should be explicit"
+        );
+        let detail = differential
+            .and_then(|stage| stage.detail.as_ref())
+            .expect("differential detail");
+        let findings = detail["findings"].as_array().unwrap();
+        assert!(!findings.is_empty());
+        for finding in findings {
+            assert_eq!(finding["input_classification"], classification);
+            assert_eq!(finding["confidence"], "low");
+        }
+        assert_eq!(
+            report.verdict, expected,
+            "baseline expectations remain advisory; unknown inputs must not pass"
+        );
+    }
 }
 
 #[tokio::test]

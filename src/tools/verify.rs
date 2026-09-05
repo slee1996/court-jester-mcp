@@ -1643,7 +1643,13 @@ fn differential_case(function: &FunctionInfo, language: &Language) -> Option<Dif
         .map(|param| {
             differential_argument(param, language).map(|expression| ReproValue {
                 expression: expression.to_string(),
-                json_value: None,
+                // These deterministic expressions are generated above, not arbitrary
+                // report text. Preserve their JSON representation for shared admission.
+                json_value: match expression {
+                    "False" | "false" => Some(serde_json::Value::Bool(false)),
+                    "''" => Some(serde_json::Value::String(String::new())),
+                    value => serde_json::from_str(value).ok(),
+                },
             })
         })
         .collect::<Option<Vec<_>>>()?;
@@ -1975,6 +1981,7 @@ fn differential_finding(
     relative_entry: String,
     base_files: Vec<EmbeddedSource>,
     candidate_files: Vec<EmbeddedSource>,
+    input_classification: InputClassification,
 ) -> VerificationFinding {
     let expectation = ReplayExpectation {
         severity: FindingSeverity::BehavioralRegression,
@@ -2030,7 +2037,7 @@ fn differential_finding(
             expected: Some(serde_json::to_string(baseline_snapshot).unwrap_or_default()),
             actual: Some(serde_json::to_string(candidate_snapshot).unwrap_or_default()),
         },
-        input_classification: InputClassification::Valid,
+        input_classification,
         repro,
         minimization: MinimizationInfo {
             status: MinimizationStatus::NotNeeded,
@@ -6444,6 +6451,12 @@ pub async fn verify(
                                         relative_entry.clone(),
                                         base_files.clone(),
                                         candidate_files.clone(),
+                                        planned_closed_input_classification(
+                                            &candidate_function.name,
+                                            candidate_function.line,
+                                            &differential_case.repro_arguments(),
+                                            &verification_plan,
+                                        ),
                                     ));
                                     units.push(serde_json::json!({ "surface": surface, "status": "different" }));
                                 }
@@ -7483,7 +7496,7 @@ fn parse_native_findings(output: &str, language: &Language) -> Vec<VerificationF
     parse_native_findings_with_plan(output, language, None)
 }
 
-fn native_input_classification(
+fn planned_closed_input_classification(
     function: &str,
     line: usize,
     arguments: &[ReproValue],
@@ -7564,7 +7577,7 @@ fn parse_native_findings_with_plan(
                 input_text: Some(record.input.clone()),
             };
             let input_classification = if record.protocol_version == Some(2) {
-                plan.map(|plan| native_input_classification(&record.function, record.line, &arguments, plan)).unwrap_or(InputClassification::Unknown)
+                plan.map(|plan| planned_closed_input_classification(&record.function, record.line, &arguments, plan)).unwrap_or(InputClassification::Unknown)
             } else { InputClassification::Unknown };
             let confidence = if input_classification == InputClassification::Valid { FindingConfidence::High } else { FindingConfidence::Low };
             let expectation = ReplayExpectation {
@@ -7824,19 +7837,34 @@ mod tests {
             json_value: Some(serde_json::json!(false)),
         };
         assert_eq!(
-            native_input_classification("inspect", 1, std::slice::from_ref(&argument), &plan),
+            planned_closed_input_classification(
+                "inspect",
+                1,
+                std::slice::from_ref(&argument),
+                &plan
+            ),
             InputClassification::Valid
         );
         assert_eq!(
-            native_input_classification("inspect", 2, std::slice::from_ref(&argument), &plan),
+            planned_closed_input_classification(
+                "inspect",
+                2,
+                std::slice::from_ref(&argument),
+                &plan
+            ),
             InputClassification::Unknown
         );
         assert_eq!(
-            native_input_classification("inspect", 1, &[], &plan),
+            planned_closed_input_classification("inspect", 1, &[], &plan),
             InputClassification::Unknown
         );
         assert_eq!(
-            native_input_classification("inspect", 1, &[argument.clone(), argument.clone()], &plan),
+            planned_closed_input_classification(
+                "inspect",
+                1,
+                &[argument.clone(), argument.clone()],
+                &plan
+            ),
             InputClassification::Unknown
         );
         let absent = ReproValue {
@@ -7844,7 +7872,7 @@ mod tests {
             json_value: None,
         };
         assert_eq!(
-            native_input_classification("inspect", 1, &[absent], &plan),
+            planned_closed_input_classification("inspect", 1, &[absent], &plan),
             InputClassification::Unknown
         );
         let invalid = ReproValue {
@@ -7852,7 +7880,7 @@ mod tests {
             json_value: Some(serde_json::json!("false")),
         };
         assert_eq!(
-            native_input_classification("inspect", 1, &[invalid], &plan),
+            planned_closed_input_classification("inspect", 1, &[invalid], &plan),
             InputClassification::Invalid
         );
     }

@@ -562,6 +562,38 @@ pub async fn replay_report_with_candidate_options(
             });
         }
         let reproduced = base_snapshot != candidate_snapshot;
+        let classify = |analysis: &crate::types::AnalysisResult,
+                        function: &crate::types::FunctionInfo| {
+            let plan = crate::tools::domain::build_verification_plan(
+                &analysis.functions,
+                &analysis.classes,
+                &analysis.aliases,
+                &language,
+                &[],
+                &[],
+                &[],
+            );
+            super::planned_closed_input_classification(
+                &function.name,
+                function.line,
+                &finding.repro.arguments,
+                &plan,
+            )
+        };
+        let input_classification = match (
+            classify(&base_analysis, base_function),
+            classify(&candidate_analysis, candidate_function),
+        ) {
+            (
+                crate::types::InputClassification::Valid,
+                crate::types::InputClassification::Valid,
+            ) => crate::types::InputClassification::Valid,
+            (crate::types::InputClassification::Invalid, _)
+            | (_, crate::types::InputClassification::Invalid) => {
+                crate::types::InputClassification::Invalid
+            }
+            _ => crate::types::InputClassification::Unknown,
+        };
         let check_passed = candidate_project_dir.map(|_| {
             !reproduced
                 && base_snapshot.exception_type.is_none()
@@ -570,6 +602,7 @@ pub async fn replay_report_with_candidate_options(
         let payload = serde_json::json!({
             "reproduced": reproduced,
             "candidate_mode": if candidate_project_dir.is_some() { "live" } else { "embedded" },
+            "input_classification": input_classification,
             "candidate_entry": candidate_entry,
             "candidate_source_sha256": stable_digest(&candidate_source),
             "base_tree_sha256": differential.base_tree_sha256,

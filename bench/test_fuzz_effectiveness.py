@@ -9,7 +9,7 @@ from bench.fuzz_effectiveness import DEFAULT_MANIFEST, evaluate_case, load_manif
 class FuzzEffectivenessTest(unittest.TestCase):
     def test_v3_separates_admission_from_observation_without_rewriting_v2(self) -> None:
         legacy = load_manifest(DEFAULT_MANIFEST.with_name("fuzz_effectiveness_cases_v2.json"))
-        current = load_manifest(DEFAULT_MANIFEST)
+        current = load_manifest(DEFAULT_MANIFEST.with_name("fuzz_effectiveness_cases_v3.json"))
         self.assertEqual(legacy["suite"], "fuzz-effectiveness-v2")
         self.assertEqual(current["suite"], "fuzz-effectiveness-v3")
         self.assertEqual(len(legacy["cases"]), 9)
@@ -24,6 +24,24 @@ class FuzzEffectivenessTest(unittest.TestCase):
             pair = [case for case in current["cases"]
                     if case["language"] == language and case["technique"] == "closed_domain_runtime_contract"]
             self.assertEqual({case["kind"] for case in pair}, {"mutation", "control"})
+
+    def test_v4_keeps_differential_fixture_and_preserves_historical_denominator(self) -> None:
+        legacy = load_manifest(DEFAULT_MANIFEST.with_name("fuzz_effectiveness_cases_v3.json"))
+        current = load_manifest(DEFAULT_MANIFEST)
+        self.assertEqual(current["suite"], "fuzz-effectiveness-v4")
+        self.assertEqual(len(current["cases"]), 13)
+        self.assertEqual(sum(case["kind"] == "mutation" for case in legacy["cases"]), 4)
+        self.assertEqual(sum(case["kind"] == "mutation" for case in current["cases"]), 3)
+        for before, after in zip(legacy["cases"], current["cases"]):
+            if before["id"] != "python-differential-regression":
+                self.assertEqual(before, after)
+                continue
+            self.assertEqual(before["source"], after["source"])
+            self.assertEqual(before["base_source"], after["base_source"])
+            self.assertEqual(before["kind"], "mutation")
+            self.assertEqual(after["kind"], "observation")
+            self.assertEqual(after["expected_verdict"], "inconclusive")
+            self.assertEqual(after["expected_finding"]["input_classification"], "unknown")
 
     def test_observation_requires_unknown_input_evidence_and_consistent_exit(self) -> None:
         case = {

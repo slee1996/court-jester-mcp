@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "suite": "fuzz-effectiveness-v4",
+  "suite": "fuzz-effectiveness-v3",
   "cases": [
     {
       "id": "python-predicate-seed-crash",
@@ -88,20 +88,19 @@
     },
     {
       "id": "python-differential-regression",
-      "kind": "observation",
+      "kind": "mutation",
       "technique": "differential_oracle",
       "source": "repos/fuzz_effectiveness/differential_candidate/normalize.py",
       "base_source": "repos/fuzz_effectiveness/differential_base/normalize.py",
       "language": "python",
-      "expected_verdict": "inconclusive",
+      "expected_verdict": "pass",
       "expected_stage": {
         "name": "execute",
-        "status": "inconclusive"
+        "status": "passed"
       },
       "expected_finding": {
         "function": "normalize_limit",
-        "category": "differential",
-        "input_classification": "unknown"
+        "category": "differential"
       }
     },
     {
