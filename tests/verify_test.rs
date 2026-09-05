@@ -9996,13 +9996,84 @@ async fn typescript_shrinking_large_nested_inputs_stays_within_the_campaign_budg
     );
 }
 
+fn assert_native_observation_refuses_unproven_repair(
+    root: &Path,
+    report: &serde_json::Value,
+    function: &str,
+) {
+    // Native-stage records are raw observations; the aggregate execute view
+    // assigns the canonical finding IDs accepted by persisted replay.
+    let execute = report["stages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|stage| stage["name"] == "execute")
+        .unwrap();
+    let finding = execute["detail"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| {
+            finding["location"]["function"] == function
+                && finding["classification"] == "native_coverage_guided"
+        })
+        .unwrap();
+    let id = finding["id"].as_str().unwrap();
+    let path = PathBuf::from(
+        report["report_path"]
+            .as_str()
+            .expect("persisted native report"),
+    );
+    let replay = std::process::Command::new(env!("CARGO_BIN_EXE_court-jester"))
+        .args([
+            "replay",
+            "--report",
+            path.to_str().unwrap(),
+            "--finding",
+            id,
+            "--dependency-project-dir",
+            root.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        replay.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&replay.stdout).unwrap();
+    assert_eq!(result["outcome"], "inconclusive");
+    assert!(result["check_passed"].is_null());
+    let bundle = root.join("native-regression");
+    let export = std::process::Command::new(env!("CARGO_BIN_EXE_court-jester"))
+        .args([
+            "replay",
+            "--report",
+            path.to_str().unwrap(),
+            "--finding",
+            id,
+            "--dependency-project-dir",
+            root.to_str().unwrap(),
+            "--accept-inferred",
+            "--export-regression",
+            bundle.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(export.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&export.stderr).contains("valid input evidence"));
+    assert!(!bundle.exists());
+}
+
 #[test]
-fn cli_atheris_adapter_runs_installed_engine_and_reports_crashing_input() {
+fn cli_atheris_adapter_does_not_invent_admission_or_minimization() {
     let dir = tempfile::tempdir().unwrap();
+    let reports = dir.path().join("reports");
     let source = dir.path().join("target.py");
     fs::write(
         &source,
-        "def explode(value: int) -> int:\n    if value == 7:\n        raise RuntimeError('native crash')\n    return value\n",
+        "def explode(value: int) -> int:\n    if value * 13 == 3897301954:\n        raise RuntimeError('native crash')\n    return value\n",
     )
     .unwrap();
     fs::write(
@@ -10013,7 +10084,7 @@ fn cli_atheris_adapter_runs_installed_engine_and_reports_crashing_input() {
     def ConsumeIntInRange(self, lower, upper):
         return lower
     def ConsumeInt(self, size):
-        return 7
+        return 299792458
 
 _callback = None
 
@@ -10041,6 +10112,8 @@ def Fuzz():
             dir.path().to_str().unwrap(),
             "--native-fuzz-engine",
             "atheris",
+            "--output-dir",
+            reports.to_str().unwrap(),
             "--native-fuzz-runs",
             "1",
             "--timeout-seconds",
@@ -10065,7 +10138,7 @@ def Fuzz():
         })
         .unwrap_or_else(|| panic!("native_fuzz stage missing: {report:#?}"));
 
-    assert_eq!(native["status"].as_str(), Some("failed"));
+    assert_eq!(native["status"].as_str(), Some("inconclusive"));
     assert_eq!(native["detail"]["engine"].as_str(), Some("atheris"));
     assert_eq!(native["detail"]["runs"].as_u64(), Some(1));
     assert_eq!(
@@ -10075,6 +10148,78 @@ def Fuzz():
     assert_eq!(
         native["detail"]["native_findings"][0]["classification"].as_str(),
         Some("native_coverage_guided")
+    );
+    let finding = &native["detail"]["native_findings"][0];
+    assert_eq!(finding["input_classification"], "unknown");
+    assert_eq!(finding["confidence"], "low");
+    assert_eq!(finding["minimization"]["status"], "not_needed");
+    assert!(finding["minimization"]["minimized"].is_null());
+    assert_eq!(report["verdict"], "inconclusive");
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(report["summary"]["findings"]["gating"], 0);
+    assert_native_observation_refuses_unproven_repair(
+        dir.path(),
+        &report,
+        finding["location"]["function"].as_str().unwrap(),
+    );
+}
+
+#[test]
+fn cli_jazzer_adapter_does_not_invent_admission_or_minimization() {
+    let dir = tempfile::tempdir().unwrap();
+    let reports = dir.path().join("reports");
+    let source = dir.path().join("target.ts");
+    fs::write(&source, "export function inspect(value: number): number { if (value * 13 === 3897301954) throw new Error('native observation'); return value; }").unwrap();
+    // This deterministic adapter driver runs the generated native harness. It
+    // is not evidence that a real Jazzer installation or fuzzing search works.
+    install_fake_tool_at(
+        dir.path(),
+        "node_modules/.bin/jazzer",
+        r#"#!/bin/sh
+exec node --experimental-transform-types --input-type=module -e 'import {pathToFileURL} from "node:url"; const target = await import(pathToFileURL(process.argv[1]).href); const input = new Uint8Array(8); let n = 2 ** 47 + 299792458; for (let i = 6; i > 0; i--) { input[i] = n % 256; n = Math.floor(n / 256); } try { await target.fuzz(input); } catch { process.exitCode = 1; }' "$1"
+"#,
+    );
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_court-jester"))
+        .args([
+            "verify",
+            "--file",
+            source.to_str().unwrap(),
+            "--language",
+            "typescript",
+            "--project-dir",
+            dir.path().to_str().unwrap(),
+            "--native-fuzz-engine",
+            "jazzer",
+            "--output-dir",
+            reports.to_str().unwrap(),
+            "--native-fuzz-runs",
+            "1",
+            "--timeout-seconds",
+            "10",
+        ])
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let native = report["stages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|stage| stage["name"] == "native_fuzz")
+        .unwrap();
+    assert_eq!(native["status"], "inconclusive", "{native:#?}");
+    let finding = &native["detail"]["native_findings"][0];
+    assert_eq!(finding["location"]["function"], "inspect", "{native:#?}");
+    assert_eq!(finding["input_classification"], "unknown");
+    assert_eq!(finding["confidence"], "low");
+    assert_eq!(finding["minimization"]["status"], "not_needed");
+    assert!(finding["minimization"]["minimized"].is_null());
+    assert_eq!(report["verdict"], "inconclusive");
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(report["summary"]["findings"]["gating"], 0);
+    assert_native_observation_refuses_unproven_repair(
+        dir.path(),
+        &report,
+        finding["location"]["function"].as_str().unwrap(),
     );
 }
 

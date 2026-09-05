@@ -289,6 +289,8 @@ Useful `verify` flags:
 - `--base-file <PATH>` with `--base-project-dir <PATH>`: compare the candidate against a complete read-only baseline tree; both options are required together.
 - `--summary json|human|repair-json`: select machine, human, or repair-loop output.
 
+Native-engine exceptions currently provide observations, not proven bugs: they remain unknown-input/low-confidence and make the native stage inconclusive. Native minimization and replay contracts are not yet supported; replay abstains and regression export refuses these observations.
+
 Runtime and evidence controls:
 
 - `--coverage-gate changed-exports|none` (default `changed-exports`) requires changed exported/invocable surfaces to be behaviorally checked; `none` disables per-surface enforcement but does not turn zero evidence into a pass.

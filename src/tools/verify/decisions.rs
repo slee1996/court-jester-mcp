@@ -320,7 +320,7 @@ fn diagnostic_from_stage(
             DiagnosticComponent::DifferentialRunner,
             DiagnosticImpact::Advisory,
         )),
-        "llm_plateau_escape" => Some(
+        "llm_plateau_escape" | "native_fuzz" => Some(
             if detail
                 .and_then(|value| value.get("gating_finding_count"))
                 .and_then(|value| value.as_u64())

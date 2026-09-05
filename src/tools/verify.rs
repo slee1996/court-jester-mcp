@@ -6465,7 +6465,7 @@ pub async fn verify(
                             "{}\n{}",
                             native_execution.process.stdout, native_execution.process.stderr
                         );
-                        native_findings = parse_native_findings(&native_output);
+                        native_findings = parse_native_findings(&native_output, language);
                         let unavailable = native_engine_unavailable(&native_output);
                         let succeeded = native_execution.process.exit_code == Some(0)
                             && !native_execution.process.timed_out
@@ -6487,9 +6487,9 @@ pub async fn verify(
                             )
                         } else if !native_findings.is_empty() {
                             (
-                                StageStatus::Failed,
+                                StageStatus::Inconclusive,
                                 Some(format!(
-                                    "{} found {} crashing input(s)",
+                                    "{} observed {} exception input(s) without admission evidence",
                                     match native_plan.engine {
                                         NativeFuzzEngine::Atheris => "Atheris",
                                         NativeFuzzEngine::Jazzer => "Jazzer.js",
@@ -6520,6 +6520,7 @@ pub async fn verify(
                                 "target_count": native_plan.target_count,
                                 "execution": native_execution.process,
                                 "native_findings": &native_findings,
+                                "unknown_finding_count": native_findings.len(),
                                 "diagnostics": native_execution.diagnostics,
                             })),
                             message,
@@ -7188,7 +7189,7 @@ struct NativeFindingRecord {
     message: String,
 }
 
-fn parse_native_findings(output: &str) -> Vec<VerificationFinding> {
+fn parse_native_findings(output: &str, language: &Language) -> Vec<VerificationFinding> {
     output
         .lines()
         .filter_map(|line| line.find(NATIVE_FINDING_MARKER).map(|index| &line[index..]))
@@ -7216,7 +7217,7 @@ fn parse_native_findings(output: &str) -> Vec<VerificationFinding> {
             VerificationFinding {
                 id: format!("native:{}", record.function),
                 severity: FindingSeverity::Crash,
-                confidence: FindingConfidence::High,
+                confidence: FindingConfidence::Low,
                 category: FindingCategory::Exception,
                 occurrences: 1,
                 sample_inputs: vec![original.clone()],
@@ -7229,28 +7230,31 @@ fn parse_native_findings(output: &str) -> Vec<VerificationFinding> {
                 oracle: OracleInfo {
                     id: format!("native_runtime:{}", record.function),
                     kind: OracleKind::RuntimeContract,
-                    provenance: OracleProvenance::LanguageRuntime,
-                    confidence: FindingConfidence::High,
+                    provenance: OracleProvenance::ObservedCall,
+                    confidence: FindingConfidence::Low,
                     expected: None,
                     actual: Some(record.message.clone()),
                 },
-                input_classification: InputClassification::Valid,
+                input_classification: InputClassification::Unknown,
                 repro: StructuredRepro {
                     kind: ReproKind::FunctionCall,
                     function: Some(record.function.clone()),
                     arguments,
                     input_text: Some(record.input),
                     case_label: Some("native_coverage_guided".into()),
-                    snippet: format!("{}(/* minimized native input */)", record.function),
+                    snippet: match language {
+                        Language::Python => "raise RuntimeError('Court Jester native observation has no recorded replay contract')".into(),
+                        Language::TypeScript => "throw new Error('Court Jester native observation has no recorded replay contract');".into(),
+                    },
                     command: None,
                     expectation,
                     differential: None,
                 },
                 minimization: MinimizationInfo {
-                    status: MinimizationStatus::Preserved,
+                    status: MinimizationStatus::NotNeeded,
                     attempts: 0,
                     original: original.clone(),
-                    minimized: Some(original),
+                    minimized: None,
                 },
                 launch_context: None,
                 error_type: record.error_type,
