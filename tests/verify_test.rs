@@ -5178,6 +5178,124 @@ export function createCounter() {
 }
 
 #[tokio::test]
+async fn python_factory_sequence_replay_preserves_setup_and_action_history() {
+    for (binding, returned, error_type) in [
+        ("", "{'push': push}", "ValueError"),
+        ("*, ", "push", "Exception"),
+    ] {
+        let project = tempfile::tempdir().unwrap();
+        let source = project.path().join("target.py");
+        let code = format!("def create_counter({binding}start: int):\n    calls = start\n    def push({binding}value: int) -> int:\n        nonlocal calls\n        calls += 1\n        if calls == start + 2:\n            raise {error_type}('stateful replay failure: original')\n        return value\n    return {returned}\n");
+        fs::write(&source, &code).unwrap();
+        let mut opts = default_opts(None);
+        opts.source_file = source.to_str();
+        opts.project_dir = project.path().to_str();
+        let report = verify(&code, &Language::Python, opts).await;
+        let repair = repair_summary(&report, &Language::Python);
+        let finding = repair
+            .findings
+            .iter()
+            .find(|finding| finding.message.contains("stateful replay failure"))
+            .unwrap_or_else(|| panic!("{}", report_human_summary(&report)));
+        let report_path = project.path().join("repair.json");
+        fs::write(&report_path, serde_json::to_vec(&repair).unwrap()).unwrap();
+        let replay = replay_report(
+            report_path.to_str().unwrap(),
+            &finding.id,
+            None,
+            RuntimeProfile::LocalTrusted,
+            DEFAULT_PYTHON_DOCKER_IMAGE,
+            DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            replay.outcome,
+            ReplayOutcome::Reproduced,
+            "{binding}/{returned}: {replay:?}"
+        );
+        let recorded = serde_json::to_value(&finding.repro).unwrap();
+        assert_eq!(recorded["kind"], "semantic_case");
+        let sequence = &recorded["arguments"][0]["json_value"];
+        assert_eq!(sequence["actions"].as_array().unwrap().len(), 2);
+        let argument_field = if binding.is_empty() { "args" } else { "kwargs" };
+        assert!(!sequence["factory"][argument_field].is_null());
+        if error_type == "Exception" {
+            assert_eq!(finding.confidence, FindingConfidence::Low);
+        }
+        for (original, replacement) in [
+            ("calls == start + 2", "calls == start + 1"),
+            ("calls == start + 2", "False"),
+            ("failure: original", "failure: different"),
+        ] {
+            fs::write(&source, code.replace(original, replacement)).unwrap();
+            let replay = replay_report(
+                report_path.to_str().unwrap(),
+                &finding.id,
+                None,
+                RuntimeProfile::LocalTrusted,
+                DEFAULT_PYTHON_DOCKER_IMAGE,
+                DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                replay.outcome,
+                ReplayOutcome::NotReproduced,
+                "{binding}/{replacement}: {replay:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn python_factory_replay_requires_preceding_actions_to_remain_callable() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("target.py");
+    let code = "def create_counter():\n    def arm() -> int:\n        return 1\n    def fire() -> int:\n        raise ValueError('action failed')\n    return {'arm': arm, 'fire': fire}\n";
+    fs::write(&source, code).unwrap();
+    let mut opts = default_opts(None);
+    opts.source_file = source.to_str();
+    opts.project_dir = project.path().to_str();
+    let report = verify(code, &Language::Python, opts).await;
+    let repair = repair_summary(&report, &Language::Python);
+    let finding = repair
+        .findings
+        .iter()
+        .find(|finding| finding.message.contains("action failed"))
+        .unwrap();
+    let report_path = project.path().join("repair.json");
+    fs::write(&report_path, serde_json::to_vec(&repair).unwrap()).unwrap();
+    let replay = replay_report(
+        report_path.to_str().unwrap(),
+        &finding.id,
+        None,
+        RuntimeProfile::LocalTrusted,
+        DEFAULT_PYTHON_DOCKER_IMAGE,
+        DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay.outcome, ReplayOutcome::Reproduced, "{replay:?}");
+    fs::write(&source, code.replace("'arm': arm", "'arm': None")).unwrap();
+    let replay = replay_report(
+        report_path.to_str().unwrap(),
+        &finding.id,
+        None,
+        RuntimeProfile::LocalTrusted,
+        DEFAULT_PYTHON_DOCKER_IMAGE,
+        DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        replay.outcome,
+        ReplayOutcome::NotReproduced,
+        "missing earlier action changes the recorded sequence: {replay:?}"
+    );
+}
+
+#[tokio::test]
 async fn python_factory_action_sequence_finds_second_step_crash() {
     let code = "\
 def create_counter():

@@ -1102,15 +1102,21 @@ else:
         }
         let callable_params: Vec<&ParamInfo> =
             func.params.iter().filter(|p| !p.is_variadic()).collect();
-        let factory_args = callable_params
+        let factory_positional = callable_params
             .iter()
+            .filter(|param| !param.keyword_only)
+            .map(|param| python_generator(param.type_annotation.as_deref(), type_defs))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let factory_keyword = callable_params
+            .iter()
+            .filter(|param| param.keyword_only)
             .map(|param| {
-                let generated = python_generator(param.type_annotation.as_deref(), type_defs);
-                if param.keyword_only {
-                    format!("{}={generated}", param.name)
-                } else {
-                    generated
-                }
+                format!(
+                    "{:?}: {}",
+                    param.name,
+                    python_generator(param.type_annotation.as_deref(), type_defs)
+                )
             })
             .collect::<Vec<_>>()
             .join(", ");
@@ -1175,44 +1181,50 @@ for _fi in range({iters}):
     _active_factory_kwargs = {{}}
     _action_trace = []
     _active_factory_unit = None
+    _factory_setup = {{"args": [], "kwargs": {{}}}}
+    _factory_phase = "arguments"
     try:
-        _factory_result = {name}({factory_args})
+        _factory_setup = {{"args": [{factory_positional}], "kwargs": {{{factory_keyword}}}}}
+        _factory_phase = "factory"
+        _factory_result = {name}(*_copy.deepcopy(_factory_setup["args"]), **_copy.deepcopy(_factory_setup["kwargs"]))
         _action_plan = list(_action_keys)
         for _ in range(_fuzz_int_range(2, 5)):
             _action_plan.append(_rng.choice(_action_keys))
         for _step_index, _action in enumerate(_action_plan):
             _spec = _known_factory_callables[_action]
-            if callable(_factory_result) and len(_action_keys) == 1:
-                _candidate = _factory_result
-            elif isinstance(_factory_result, dict):
-                _candidate = _factory_result.get(_action)
-            else:
-                _candidate = getattr(_factory_result, _action, None)
-            if not callable(_candidate):
-                continue
             _active_factory_callable = _action
             _active_factory_surface = _spec["surface"]
             _active_factory_line = _spec["line"]
+            _factory_phase = "resolve:" + str(_step_index)
+            _action_trace.append({{"action": _action, "args": [], "kwargs": {{}}}})
+            _candidate = _resolve_factory_action(_factory_result, _action, len(_action_keys) == 1)
+            _action_trace[-1]["callable"] = callable(_candidate)
+            if not callable(_candidate):
+                continue
+            _factory_phase = "arguments:" + str(_step_index)
             _active_factory_args = _spec["args"]()
             _active_factory_kwargs = _spec["kwargs"]()
-            _action_trace.append({{"action": _action, "args": _copy.deepcopy(_active_factory_args), "kwargs": _copy.deepcopy(_active_factory_kwargs)}})
+            _action_trace[-1].update({{"args": _copy.deepcopy(_active_factory_args), "kwargs": _copy.deepcopy(_active_factory_kwargs)}})
             _active_factory_unit = _fi * (len(_action_keys) + 5) + _step_index
             _target_entered(_active_factory_surface, _active_factory_unit)
+            _factory_phase = "action:" + str(_step_index)
             _candidate(*_copy.deepcopy(_active_factory_args), **_copy.deepcopy(_active_factory_kwargs))
             _cj_unit_completed(_active_factory_surface, _active_factory_unit, "passed")
             _active_factory_unit = None
         _factory_pass += 1
     except Exception as _e:
+        _factory_snippet = _factory_replay_snippet("{name}", _factory_setup, _action_trace, len(_action_keys) == 1, _factory_phase, _e)
+        _factory_case = [{{"factory": _factory_setup, "actions": _action_trace}}]
         if _active_factory_unit is not None:
             _cj_unit_completed(_active_factory_surface, _active_factory_unit, "target_exception" if _is_crash(_e) else "unclassified_exception")
         if _is_crash(_e):
             _factory_crash += 1
-            _emit_finding(_active_factory_surface, _active_factory_args, _e, "crash", "runtime_contract", "observed_call", "high", "exception", case_label=_clip_text(_action_trace), invocation_path={{"factory": {{"factory": "{name}", "callable": _active_factory_callable}}}})
+            _emit_finding(_active_factory_surface, _factory_case, _e, "crash", "runtime_contract", "observed_call", "high", "exception", case_label=_clip_text(_action_trace), invocation_path={{"factory": {{"factory": "{name}", "callable": _active_factory_callable}}}}, replay_snippet=_factory_snippet, repro_kind="semantic_case")
             if _factory_crash == 1:
                 print(f"  CRASH {{_active_factory_surface}} after actions {{_clip_text(_action_trace)}}: {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
         else:
             _factory_unknown += 1
-            _emit_uncertain_exception(_active_factory_surface, _active_factory_args, _e, case_label=_clip_text(_action_trace), invocation_path={{"factory": {{"factory": "{name}", "callable": _active_factory_callable}}}})
+            _emit_uncertain_exception(_active_factory_surface, _factory_case, _e, case_label=_clip_text(_action_trace), invocation_path={{"factory": {{"factory": "{name}", "callable": _active_factory_callable}}}}, replay_snippet=_factory_snippet, repro_kind="semantic_case")
 _factory_total = _factory_pass + _factory_crash + _factory_unknown
 if _factory_crash > 0:
     print(f"FUZZ {name} (factory state machine): {{_factory_pass}} passed, {{_factory_crash}} CRASHED (of {{_factory_total}}) [actions: {nested_names}]")
@@ -1223,7 +1235,8 @@ else:
             func_line = func.line,
             name = func.name,
             known_specs_expr = known_specs_expr,
-            factory_args = factory_args,
+            factory_positional = factory_positional,
+            factory_keyword = factory_keyword,
             iters = FUZZ_ITERATIONS,
             nested_names = nested_names,
         ));

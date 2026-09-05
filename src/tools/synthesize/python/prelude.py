@@ -231,14 +231,44 @@ def _invocation_replay_snippet(source, args, error, severity, oracle_kind, categ
             + "print('__COURT_JESTER_REPLAY_JSON__')\n"
             + f"print(_json.dumps(dict({payload!r}, reproduced=_reproduced), ensure_ascii=False))")
 
-def _emit_finding(function, args, error, severity="crash", oracle_kind="runtime_contract", oracle_provenance="language_runtime", confidence="high", category="exception", expected=None, actual=None, input_classification="valid", case_label=None, minimize=None, invocation_path="direct", replay_snippet=None):
+def _resolve_factory_action(result, action, single):
+    if callable(result) and single: return result
+    if isinstance(result, dict): return result.get(action)
+    return getattr(result, action, None)
+
+def _factory_replay_snippet(factory, setup, trace, single, phase, error):
+    if phase.startswith("arguments"):
+        return "raise RuntimeError('Court Jester cannot replay factory input-construction failures')"
+    try:
+        inputs = _repro_expression((setup, trace))
+    except ValueError:
+        return "raise RuntimeError('Court Jester cannot replay this runtime-only factory input')"
+    import inspect as _inspect
+    resolver = _inspect.getsource(_resolve_factory_action)
+    identity = (type(error).__name__, str(error))
+    return ("import copy as _copy\nimport json as _json\n" + resolver
+            + f"\n_setup, _trace = {inputs}\n_phase = 'factory'\n_reproduced = False\ntry:\n"
+            + f"    _result = {factory}(*_copy.deepcopy(_setup['args']), **_copy.deepcopy(_setup['kwargs']))\n"
+            + "    for _index, _entry in enumerate(_trace):\n"
+            + "        _phase = 'resolve:' + str(_index)\n"
+            + f"        _candidate = _resolve_factory_action(_result, _entry['action'], {single!r})\n"
+            + "        if callable(_candidate) != _entry.get('callable'): break\n"
+            + "        if not callable(_candidate): continue\n"
+            + "        _phase = 'action:' + str(_index)\n"
+            + "        _candidate(*_copy.deepcopy(_entry['args']), **_copy.deepcopy(_entry['kwargs']))\n"
+            + "except Exception as _error:\n"
+            + f"    _reproduced = _phase == {phase!r} and (type(_error).__name__, str(_error)) == {identity!r}\n"
+            + "print('__COURT_JESTER_REPLAY_JSON__')\n"
+            + "print(_json.dumps(dict(reproduced=_reproduced, severity='crash', oracle_kind='runtime_contract', category='exception')))\n")
+
+def _emit_finding(function, args, error, severity="crash", oracle_kind="runtime_contract", oracle_provenance="language_runtime", confidence="high", category="exception", expected=None, actual=None, input_classification="valid", case_label=None, minimize=None, invocation_path="direct", replay_snippet=None, repro_kind="function_call"):
     oracle_id = f"{oracle_kind}:{_sanitize_symbol(function)}"
     status, attempts, minimized = ("not_needed", 0, args) if minimize is None else minimize
     original_case = _repro_case(args, case_label)
     minimized_case = None if status in ("not_needed", "failed") else _repro_case(minimized, case_label)
     repro_args = minimized if minimized_case is not None else args
     expectation = {"severity": severity, "oracle_kind": oracle_kind, "category": category}
-    repro = {"kind": "function_call", "function": str(function), "arguments": original_case["arguments"], "input_text": original_case["input_text"], "case_label": case_label, "snippet": replay_snippet if replay_snippet is not None else _replay_snippet(function, repro_args, severity, oracle_kind, category, type(error).__name__), "command": None, "expectation": expectation}
+    repro = {"kind": repro_kind, "function": str(function), "arguments": original_case["arguments"], "input_text": original_case["input_text"], "case_label": case_label, "snippet": replay_snippet if replay_snippet is not None else _replay_snippet(function, repro_args, severity, oracle_kind, category, type(error).__name__), "command": None, "expectation": expectation}
     record = {"id": _finding_id(function), "severity": severity, "confidence": confidence, "category": category, "location": {"source_file": "", "function": str(function), "line": 0, "invocation_path": invocation_path}, "oracle": {"id": oracle_id, "kind": oracle_kind, "provenance": oracle_provenance, "confidence": confidence, "expected": expected, "actual": actual if actual is not None else _clip_text(error)}, "input_classification": input_classification, "repro": repro, "minimization": {"status": status, "attempts": attempts, "original": original_case, "minimized": minimized_case}, "error_type": type(error).__name__, "message": _clip_text(error), "suppressed": False}
     _FUZZ_RESULTS.append(record)
     _cj_event("finding", {"finding": record})
@@ -286,10 +316,10 @@ def _is_generated_collaborator_mismatch(error):
     message = str(error)
     return "object has no attribute 'execute'" in message or 'object has no attribute "execute"' in message
 
-def _emit_uncertain_exception(function, args, error, case_label=None, invocation_path="direct", replay_source=None, evaluate=False):
-    snippet = _invocation_replay_snippet(replay_source, args, error, "crash", "runtime_contract", "exception", evaluate) if replay_source is not None else None
+def _emit_uncertain_exception(function, args, error, case_label=None, invocation_path="direct", replay_source=None, evaluate=False, replay_snippet=None, repro_kind="function_call"):
+    snippet = replay_snippet if replay_snippet is not None else (_invocation_replay_snippet(replay_source, args, error, "crash", "runtime_contract", "exception", evaluate) if replay_source is not None else None)
     _emit_finding(function, args, error, "crash", "runtime_contract", "observed_call", "low", "exception",
-                  input_classification="unknown", case_label=case_label, invocation_path=invocation_path, replay_snippet=snippet)
+                  input_classification="unknown", case_label=case_label, invocation_path=invocation_path, replay_snippet=snippet, repro_kind=repro_kind)
 
 def _outside_closed_domain(args, domains):
     return any(index < len(args) and not any(_same_input(args[index], value) for value in values)
