@@ -11,6 +11,33 @@ fn executable(path: &Path, source: &str) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+#[test]
+fn isolated_doctor_rejects_successful_process_without_runtime_evidence() {
+    let root = tempfile::tempdir().unwrap();
+    executable(&root.path().join("docker"), "#!/bin/sh\ncase \"$1\" in\nimage) echo '[{\"Id\":\"fixture-image\"}]' ;;\ninspect) echo '{\"ExitCode\":0,\"OOMKilled\":false}' ;;\nlogs) echo 'not runtime evidence' ;;\nesac\nexit 0\n");
+    for language in ["python", "typescript"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_court-jester"))
+            .args([
+                "doctor",
+                "--language",
+                language,
+                "--runtime-profile",
+                "isolated",
+            ])
+            .env("PATH", root.path())
+            .output()
+            .unwrap();
+        let report: Value =
+            serde_json::from_slice(&output.stdout).unwrap_or_else(|_| panic!("{output:?}"));
+        assert_eq!(
+            check(&report, "runtime_smoke")["status"],
+            "failed",
+            "{report:#}"
+        );
+        assert_eq!(output.status.code(), Some(1));
+    }
+}
+
 fn doctor(root: &Path, extra: &[&str]) -> (std::process::Output, Value) {
     let output = Command::new(env!("CARGO_BIN_EXE_court-jester"))
         .args(["doctor", "--language", "python", "--project-dir"])

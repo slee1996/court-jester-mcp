@@ -24,20 +24,71 @@ fn doctor_check(
     }
 }
 
+fn runtime_probe(
+    mode: court_jester::types::SourceMode,
+) -> (
+    court_jester::types::HarnessRuntime,
+    &'static str,
+    &'static str,
+) {
+    use court_jester::types::*;
+    match mode {
+        SourceMode::Python => (HarnessRuntime::Python,
+            "import json, sys\nprint('__COURT_JESTER_DOCTOR__' + json.dumps({'version': '.'.join(map(str, sys.version_info[:3])), 'executable': sys.executable}))", "py"),
+        SourceMode::TypeScript | SourceMode::Tsx => (
+            if mode == SourceMode::Tsx { HarnessRuntime::TsxScript } else { HarnessRuntime::NodeScript },
+            "const evidence: {version: string, executable: string} = {version: process.versions.node, executable: process.execPath}; console.log('__COURT_JESTER_DOCTOR__' + JSON.stringify(evidence));",
+            if mode == SourceMode::Tsx { "tsx" } else { "ts" }),
+    }
+}
+
+fn runtime_evidence(
+    language: Language,
+    result: &court_jester::types::ExecutionResult,
+) -> (bool, serde_json::Value) {
+    let records = result
+        .stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("__COURT_JESTER_DOCTOR__"))
+        .collect::<Vec<_>>();
+    let evidence = if records.len() == 1 {
+        serde_json::from_str::<serde_json::Value>(records[0]).ok()
+    } else {
+        None
+    };
+    let version = evidence
+        .as_ref()
+        .and_then(|value| value.get("version"))
+        .and_then(|value| value.as_str());
+    let executable = evidence
+        .as_ref()
+        .and_then(|value| value.get("executable"))
+        .and_then(|value| value.as_str());
+    let major = version
+        .and_then(|value| value.split('.').next())
+        .and_then(|value| value.parse::<u32>().ok());
+    let version_ok = match language {
+        Language::Python => major == Some(3),
+        Language::TypeScript => major.is_some_and(|major| major >= 24),
+    };
+    let passed = result.exit_code == Some(0)
+        && !result.timed_out
+        && !result.memory_error
+        && version_ok
+        && executable.is_some_and(|value| !value.trim().is_empty());
+    (
+        passed,
+        serde_json::json!({"version": version, "executable": executable}),
+    )
+}
+
 async fn local_runtime_check(
     args: &CliArgs,
     language: Language,
     context: &court_jester::types::ExecutionContext,
 ) -> court_jester::types::DoctorCheck {
     use court_jester::types::*;
-    let (runtime, code, extension) = match context.target_source.mode {
-        SourceMode::Python => (HarnessRuntime::Python,
-            "import json, sys\nprint('__COURT_JESTER_DOCTOR__' + json.dumps({'version': '.'.join(map(str, sys.version_info[:3])), 'executable': sys.executable}))", "py"),
-        SourceMode::TypeScript | SourceMode::Tsx => (
-            if context.target_source.mode == SourceMode::Tsx { HarnessRuntime::TsxScript } else { HarnessRuntime::NodeScript },
-            "const evidence: {version: string, executable: string} = {version: process.versions.node, executable: process.execPath}; console.log('__COURT_JESTER_DOCTOR__' + JSON.stringify(evidence));",
-            if context.target_source.mode == SourceMode::Tsx { "tsx" } else { "ts" }),
-    };
+    let (runtime, code, extension) = runtime_probe(context.target_source.mode);
     let result = tools::sandbox::execute_harness(
         context,
         HarnessSpec {
@@ -68,33 +119,9 @@ async fn local_runtime_check(
     )
     .await
     .process;
-    let records: Vec<serde_json::Value> = result
-        .stdout
-        .lines()
-        .filter_map(|line| line.strip_prefix("__COURT_JESTER_DOCTOR__"))
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect();
-    let evidence = (records.len() == 1).then(|| &records[0]);
-    let version = evidence
-        .and_then(|value| value.get("version"))
-        .and_then(|value| value.as_str());
-    let executable = evidence
-        .and_then(|value| value.get("executable"))
-        .and_then(|value| value.as_str());
-    let major = version
-        .and_then(|value| value.split('.').next())
-        .and_then(|value| value.parse::<u32>().ok());
-    let version_ok = match language {
-        Language::Python => major == Some(3),
-        Language::TypeScript => major.is_some_and(|major| major >= 24),
-    };
-    let passed = result.exit_code == Some(0)
-        && !result.timed_out
-        && !result.memory_error
-        && version_ok
-        && executable.is_some_and(|value| !value.is_empty());
+    let (passed, evidence) = runtime_evidence(language, &result);
     doctor_check("runtime", Some(language), if passed { StageStatus::Passed } else { StageStatus::Failed },
-        serde_json::json!({"version": version, "executable": executable,
+        serde_json::json!({"version": evidence["version"], "executable": evidence["executable"],
             "workspace_root": context.workspace_root, "target_package_root": context.target_package_root,
             "source_mode": context.target_source.mode, "execution": result}),
         (!passed).then(|| match language {
@@ -287,10 +314,6 @@ pub(super) async fn run_doctor(
                     Some(error),
                 )),
             }
-            let code = match language {
-                Language::Python => "print('court-jester doctor')",
-                Language::TypeScript => "console.log(process.versions.node)",
-            };
             let project = tools::sandbox::runtime_tempdir(RuntimeProfile::Isolated)
                 .map_err(|error| format!("failed to create doctor workspace: {error}"))?;
             let project_path = project.path().to_path_buf();
@@ -326,17 +349,7 @@ pub(super) async fn run_doctor(
                 instrumentation_target: None,
                 instrumented_source: None,
             };
-            let runtime = match source_mode {
-                court_jester::types::SourceMode::Python => {
-                    court_jester::types::HarnessRuntime::Python
-                }
-                court_jester::types::SourceMode::TypeScript => {
-                    court_jester::types::HarnessRuntime::NodeScript
-                }
-                court_jester::types::SourceMode::Tsx => {
-                    court_jester::types::HarnessRuntime::TsxScript
-                }
-            };
+            let (runtime, code, extension) = runtime_probe(source_mode);
             let result = tools::sandbox::execute_harness(
                 &context,
                 court_jester::types::HarnessSpec {
@@ -347,13 +360,7 @@ pub(super) async fn run_doctor(
                     artifact: court_jester::types::HarnessArtifact::Generated {
                         code: code.to_string(),
                         relative_path: std::path::PathBuf::from(format!(
-                            ".court-jester/doctor.{extension}",
-                            extension =
-                                if matches!(source_mode, court_jester::types::SourceMode::Python) {
-                                    "py"
-                                } else {
-                                    "ts"
-                                }
+                            ".court-jester/doctor.{extension}"
                         )),
                     },
                     args: Vec::new(),
@@ -363,16 +370,12 @@ pub(super) async fn run_doctor(
             )
             .await
             .process;
-            let smoke_ok = result.exit_code == Some(0) && !result.timed_out && !result.memory_error;
-            let node_bad = matches!(language, Language::TypeScript)
-                && result
-                    .stdout
-                    .trim()
-                    .split('.')
-                    .next()
-                    .and_then(|v| v.parse::<u32>().ok())
-                    .is_some_and(|v| v < 24);
-            checks.push(doctor_check("runtime_smoke", Some(*language), if smoke_ok && !node_bad { StageStatus::Passed } else { StageStatus::Failed }, serde_json::json!({"image": image, "stdout": result.stdout, "stderr": result.stderr, "network": "none", "read_only": true, "memory_mb": args.memory_mb.unwrap_or(128)}), (!smoke_ok).then(|| "isolated runtime smoke failed".into()).or_else(|| node_bad.then(|| "Node.js >=24 is required".into()))));
+            let (passed, evidence) = runtime_evidence(*language, &result);
+            checks.push(doctor_check("runtime_smoke", Some(*language), if passed { StageStatus::Passed } else { StageStatus::Failed },
+                serde_json::json!({"image": image, "version": evidence["version"], "executable": evidence["executable"],
+                    "stdout": result.stdout, "stderr": result.stderr, "execution": result,
+                    "network": "none", "read_only": true, "memory_mb": args.memory_mb.unwrap_or(128)}),
+                (!passed).then(|| "Isolated runtime probe requires successful execution and one structured version/executable record (Python 3 or Node.js >=24); repair the selected image/runtime and rerun doctor".into())));
         }
     }
     if args.probe_entrypoint {
@@ -434,4 +437,67 @@ pub(super) async fn run_doctor(
         runtime_profile: args.runtime_profile,
         checks,
     })
+}
+
+#[cfg(test)]
+mod evidence_tests {
+    use super::*;
+
+    fn process(stdout: String) -> court_jester::types::ExecutionResult {
+        court_jester::types::ExecutionResult {
+            stdout,
+            stderr: String::new(),
+            exit_code: Some(0),
+            duration_ms: 0,
+            timed_out: false,
+            memory_error: false,
+            termination: None,
+            diagnostics: vec![],
+        }
+    }
+
+    #[test]
+    fn readiness_requires_one_valid_record_and_successful_process() {
+        for (language, version) in [
+            (Language::Python, "3.12.0"),
+            (Language::TypeScript, "24.1.0"),
+        ] {
+            let record = format!(
+                "__COURT_JESTER_DOCTOR__{{\"version\":\"{version}\",\"executable\":\"/runtime\"}}"
+            );
+            assert!(runtime_evidence(language, &process(format!("startup notice\n{record}\n"))).0);
+            for stdout in [
+                String::new(),
+                "unstructured output".into(),
+                "__COURT_JESTER_DOCTOR__not json".into(),
+                format!("{record}\n{record}"),
+                format!("{record}\n__COURT_JESTER_DOCTOR__not json"),
+                record.replace("/runtime", " "),
+                record.replace(version, "unknown"),
+                record.replace("executable", "missing"),
+                record.replace(version, "2.0.0"),
+            ] {
+                assert!(
+                    !runtime_evidence(language, &process(stdout.clone())).0,
+                    "{stdout}"
+                );
+            }
+            for (exit_code, timed_out, memory_error) in [
+                (Some(1), false, false),
+                (None, false, false),
+                (Some(0), true, false),
+                (Some(0), false, true),
+            ] {
+                let mut failed = process(record.clone());
+                failed.exit_code = exit_code;
+                failed.timed_out = timed_out;
+                failed.memory_error = memory_error;
+                assert!(!runtime_evidence(language, &failed).0);
+            }
+        }
+        let old_node = process(
+            "__COURT_JESTER_DOCTOR__{\"version\":\"23.0.0\",\"executable\":\"/node\"}".into(),
+        );
+        assert!(!runtime_evidence(Language::TypeScript, &old_node).0);
+    }
 }
