@@ -302,9 +302,9 @@ pub fn resolve_execution_context(
     let target_parent = source_file
         .as_deref()
         .and_then(Path::parent)
-        .unwrap_or(&invocation_dir);
+        .unwrap_or_else(|| explicit_root.as_deref().unwrap_or(&invocation_dir));
 
-    let workspace_root = if let Some(root) = explicit_root {
+    let workspace_root = if let Some(root) = explicit_root.clone() {
         declared_workspace_root(&root)
     } else {
         let target_dependencies = ancestors(target_parent)

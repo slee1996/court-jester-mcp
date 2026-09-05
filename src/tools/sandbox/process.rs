@@ -210,7 +210,7 @@ pub(super) fn launch_failure(message: impl Into<String>) -> ExecutionResult {
     }
 }
 #[allow(clippy::too_many_arguments)]
-async fn run_command_with_limits(
+pub(crate) async fn run_command_with_limits(
     mut command: Command,
     timeout_seconds: f64,
     memory_mb: u64,

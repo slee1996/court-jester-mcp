@@ -32,7 +32,7 @@ court-jester — code verification CLI for Python and TypeScript
   court-jester lint     [OPTIONS]   Run Ruff or Biome
   court-jester execute  [OPTIONS]   Run code in the sandbox
   court-jester replay   [OPTIONS]   Replay a persisted finding
-  court-jester doctor   [OPTIONS]   Check runtime and sandbox readiness
+  court-jester doctor   [OPTIONS]   Check project runtime or isolated image readiness
   court-jester --help               Print this help
   court-jester --version            Print the version
 
@@ -82,6 +82,11 @@ CI OPTIONS:
   --test-file <PATH>         Quality-test entrypoint (repeat once per target language)
   --test-runner <MODE>       auto | node | bun | repo-native (default auto)
   --test-quality [N]         Run up to N mutants globally across changed files (default 8)
+
+DOCTOR OPTIONS:
+  --file <PATH>             Local source context only; requires one explicit language
+  --project-dir <PATH>      Local dependency/runtime root (isolated: unsupported)
+  --timeout-seconds <F>     Per runtime/linter probe timeout (default 10)
 
 EXECUTE OPTIONS:
   --timeout-seconds <F>      Sandbox timeout (default 10)

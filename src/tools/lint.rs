@@ -88,6 +88,59 @@ fn resolve_binary(
         .or_else(|| find_binary_on_path(path_env, binary))
 }
 
+/// Resolve the exact linter used by both verification and readiness checks.
+pub fn resolve_linter(language: &Language, project_dir: Option<&str>) -> Option<String> {
+    let binary = match language {
+        Language::Python => "ruff",
+        Language::TypeScript => "biome",
+    };
+    resolve_binary(
+        &extended_path(),
+        binary,
+        current_exe_dir().as_deref(),
+        project_dir,
+    )
+}
+
+/// Probe a resolved linter with the shared process-group timeout and cleanup rules.
+pub async fn probe_linter_version(
+    program: &str,
+    cwd: &Path,
+    timeout: f64,
+) -> Result<String, String> {
+    let mut command = Command::new(program);
+    command
+        .arg("--version")
+        .current_dir(cwd)
+        .env("PATH", extended_path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let result = crate::tools::sandbox::run_command_with_limits(
+        command,
+        timeout,
+        128,
+        RuntimeProfile::LocalTrusted,
+        NetworkPolicy::Deny,
+        true,
+        "failed to launch linter probe",
+    )
+    .await;
+    if result.exit_code != Some(0) || result.timed_out || result.memory_error {
+        return Err(format!(
+            "{program} readiness probe failed (exit {:?}): {}",
+            result.exit_code,
+            result.stderr.trim()
+        ));
+    }
+    let version = result.stdout.trim().to_string();
+    if version.is_empty() {
+        return Err(format!("{program} returned no version evidence"));
+    }
+    Ok(version)
+}
+
 pub async fn lint(code: &str, language: &Language) -> LintResult {
     lint_with_options(code, language, LintOptions::default()).await
 }
@@ -411,8 +464,7 @@ fn prepare_typescript_inline_file(
 
 async fn lint_python(code: &str, opts: &LintOptions<'_>) -> LintResult {
     let path = extended_path();
-    let exe_dir = current_exe_dir();
-    let Some(ruff) = resolve_binary(&path, "ruff", exe_dir.as_deref(), opts.project_dir) else {
+    let Some(ruff) = resolve_linter(&Language::Python, opts.project_dir) else {
         return LintResult {
             diagnostics: vec![],
             runner_diagnostics: vec![],
@@ -541,8 +593,7 @@ fn parse_ruff_output(output: &str) -> LintResult {
 
 async fn lint_typescript(code: &str, opts: &LintOptions<'_>) -> LintResult {
     let path = extended_path();
-    let exe_dir = current_exe_dir();
-    let Some(biome) = resolve_binary(&path, "biome", exe_dir.as_deref(), opts.project_dir) else {
+    let Some(biome) = resolve_linter(&Language::TypeScript, opts.project_dir) else {
         return LintResult {
             diagnostics: vec![],
             runner_diagnostics: vec![],

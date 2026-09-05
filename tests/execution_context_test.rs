@@ -4,6 +4,29 @@ use court_jester::types::{ContextRequest, Language, SourceMode};
 use court_jester::{resolve_execution_context, resolve_verification_context};
 
 #[test]
+fn project_only_context_resolves_from_project_not_invocation_directory() {
+    let invocation = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(project.path().join(".venv")).unwrap();
+    let context = resolve_execution_context(ContextRequest {
+        invocation_dir: invocation.path(),
+        explicit_project_dir: Some(project.path()),
+        target_file: None,
+        test_file: None,
+        language: Language::Python,
+        virtual_file_path: None,
+    })
+    .unwrap();
+    let root = project.path().canonicalize().unwrap();
+    assert_eq!(context.target_package_root, root);
+    assert_eq!(context.dependency_roots, vec![root]);
+    assert_eq!(
+        context.invocation_dir,
+        invocation.path().canonicalize().unwrap()
+    );
+}
+
+#[test]
 fn monorepo_execution_context_preserves_package_and_dependency_roots() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path();

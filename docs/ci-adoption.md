@@ -74,6 +74,8 @@ court-jester ci \
 
 Run `doctor` before a release or benchmark lane. It reports the selected profile, runtime/image checks, and optional linter checks with schema v3 typed statuses. `doctor` exits `0` for readiness pass, `1` for failed readiness, and `2` for usage.
 
+For local readiness, use `court-jester doctor --language typescript --project-dir . --file src/index.ts --timeout-seconds 10`. It probes the runtime selected by the shared execution context (including project-local tools and TSX mode), and resolves Ruff/Biome with the same precedence as lint. A broken selected tool does not silently fall back to a different installation. Linter readiness requires a successful, nonempty version response; missing, broken, or timed-out optional linters are advisory. Runtime probes require successful execution and structured version evidence. Local execution is trusted host execution, not network isolation. The target itself is not imported: project dependencies and authoritative test entrypoints still require verification. Project/file options are not yet supported by isolated doctor.
+
 ## Authoritative tests, suppression, and reports
 
 Add `--test-file <PATH>` to run a caller-supplied authoritative stage. `--tests-only` makes that test the sole behavioral gate. Choose `--test-runner auto|node|bun|repo-native` for TypeScript.

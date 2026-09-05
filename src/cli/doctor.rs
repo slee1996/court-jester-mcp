@@ -6,18 +6,7 @@ use court_jester::types::{
     Language, NetworkPolicy, RuntimeProfile, StageStatus, VerificationVerdict,
     DEFAULT_PYTHON_DOCKER_IMAGE, DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
 };
-use std::process::Command;
-
-fn command_version(program: &str, args: &[&str]) -> Result<String, String> {
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|e| format!("{program} unavailable: {e}"))?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
+use std::path::Path;
 
 fn doctor_check(
     name: &str,
@@ -35,11 +24,100 @@ fn doctor_check(
     }
 }
 
+async fn local_runtime_check(
+    args: &CliArgs,
+    language: Language,
+    context: &court_jester::types::ExecutionContext,
+) -> court_jester::types::DoctorCheck {
+    use court_jester::types::*;
+    let (runtime, code, extension) = match context.target_source.mode {
+        SourceMode::Python => (HarnessRuntime::Python,
+            "import json, sys\nprint('__COURT_JESTER_DOCTOR__' + json.dumps({'version': '.'.join(map(str, sys.version_info[:3])), 'executable': sys.executable}))", "py"),
+        SourceMode::TypeScript | SourceMode::Tsx => (
+            if context.target_source.mode == SourceMode::Tsx { HarnessRuntime::TsxScript } else { HarnessRuntime::NodeScript },
+            "const evidence: {version: string, executable: string} = {version: process.versions.node, executable: process.execPath}; console.log('__COURT_JESTER_DOCTOR__' + JSON.stringify(evidence));",
+            if context.target_source.mode == SourceMode::Tsx { "tsx" } else { "ts" }),
+    };
+    let result = tools::sandbox::execute_harness(
+        context,
+        HarnessSpec {
+            kind: HarnessKind::Standalone,
+            runtime,
+            test_adapter: None,
+            source_mode: context.target_source.mode,
+            artifact: HarnessArtifact::Generated {
+                code: code.into(),
+                relative_path: format!(".court-jester/doctor.{extension}").into(),
+            },
+            args: Vec::new(),
+            network: NetworkPolicy::Deny,
+        },
+        SandboxOptions {
+            timeout_seconds: args.timeout_seconds.unwrap_or(10.0),
+            memory_mb: 128,
+            runtime_profile: RuntimeProfile::LocalTrusted,
+            network_policy: NetworkPolicy::Deny,
+            harness_args: &[],
+            docker_image: None,
+            // Resolve project runtimes, but do not copy or execute the user's sources.
+            project_dir: None,
+            source_file: None,
+            instrumentation_target: None,
+            instrumented_source: None,
+        },
+    )
+    .await
+    .process;
+    let records: Vec<serde_json::Value> = result
+        .stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("__COURT_JESTER_DOCTOR__"))
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let evidence = (records.len() == 1).then(|| &records[0]);
+    let version = evidence
+        .and_then(|value| value.get("version"))
+        .and_then(|value| value.as_str());
+    let executable = evidence
+        .and_then(|value| value.get("executable"))
+        .and_then(|value| value.as_str());
+    let major = version
+        .and_then(|value| value.split('.').next())
+        .and_then(|value| value.parse::<u32>().ok());
+    let version_ok = match language {
+        Language::Python => major == Some(3),
+        Language::TypeScript => major.is_some_and(|major| major >= 24),
+    };
+    let passed = result.exit_code == Some(0)
+        && !result.timed_out
+        && !result.memory_error
+        && version_ok
+        && executable.is_some_and(|value| !value.is_empty());
+    doctor_check("runtime", Some(language), if passed { StageStatus::Passed } else { StageStatus::Failed },
+        serde_json::json!({"version": version, "executable": executable,
+            "workspace_root": context.workspace_root, "target_package_root": context.target_package_root,
+            "source_mode": context.target_source.mode, "execution": result}),
+        (!passed).then(|| match language {
+            Language::Python => "Project Python smoke failed; repair the selected virtualenv/runtime (Python 3 required). Target imports were not checked.".into(),
+            Language::TypeScript => "Project TypeScript smoke failed; install Node.js >=24 and, for TSX, the project tsx runner. Target imports were not checked.".into(),
+        }))
+}
+
 pub(super) async fn run_doctor(
     args: &CliArgs,
 ) -> Result<court_jester::types::DoctorReport, String> {
-    if args.file.is_some() || args.project_dir.is_some() {
-        return Err("doctor does not accept --file or --project-dir".into());
+    if args.file.is_some()
+        && args
+            .language
+            .as_deref()
+            .is_none_or(|language| language.eq_ignore_ascii_case("all"))
+    {
+        return Err("doctor --file requires --language python or typescript".into());
+    }
+    if args.runtime_profile == RuntimeProfile::Isolated
+        && (args.file.is_some() || args.project_dir.is_some())
+    {
+        return Err("project-aware doctor currently requires --runtime-profile local-trusted; isolated doctor checks image readiness only".into());
     }
     let selected = match args
         .language
@@ -59,55 +137,51 @@ pub(super) async fn run_doctor(
     };
     let mut checks = Vec::new();
     if args.runtime_profile == RuntimeProfile::LocalTrusted {
+        let invocation = std::env::current_dir().map_err(|error| error.to_string())?;
+        let explicit_project = args
+            .project_dir
+            .as_deref()
+            .map(|path| invocation.join(path));
         for language in &selected {
-            let (program, version_args) = match language {
-                Language::Python => ("python3", vec!["--version"]),
-                Language::TypeScript => ("node", vec!["--version"]),
-            };
-            match command_version(program, &version_args) {
-                Ok(version) => {
-                    let node_bad = matches!(language, Language::TypeScript)
-                        && version
-                            .split('.')
-                            .next()
-                            .and_then(|v| v.trim_start_matches('v').parse::<u32>().ok())
-                            .is_some_and(|v| v < 24);
-                    checks.push(doctor_check(
-                        "runtime",
-                        Some(*language),
-                        if node_bad {
-                            StageStatus::Failed
-                        } else {
-                            StageStatus::Passed
-                        },
-                        serde_json::json!({"version": version}),
-                        node_bad.then(|| "Node.js >=24 is required".into()),
-                    ));
+            let context =
+                court_jester::resolve_execution_context(court_jester::types::ContextRequest {
+                    invocation_dir: &invocation,
+                    explicit_project_dir: explicit_project.as_deref(),
+                    target_file: args.file.as_deref().map(Path::new),
+                    test_file: None,
+                    language: *language,
+                    virtual_file_path: None,
+                })
+                .map_err(|error| error.to_string())?;
+            checks.push(local_runtime_check(args, *language, &context).await);
+            let project = explicit_project
+                .as_deref()
+                .unwrap_or(&context.workspace_root);
+            let program = tools::lint::resolve_linter(language, project.to_str());
+            let version = match program.as_deref() {
+                Some(program) => {
+                    tools::lint::probe_linter_version(
+                        program,
+                        &context.target_package_root,
+                        args.timeout_seconds.unwrap_or(10.0),
+                    )
+                    .await
                 }
-                Err(error) => checks.push(doctor_check(
-                    "runtime",
-                    Some(*language),
-                    StageStatus::Failed,
-                    serde_json::Value::Null,
-                    Some(error),
+                None => Err(format!(
+                    "optional {:?} linter is unavailable; install it in the project environment",
+                    language
                 )),
-            }
-            let linter = match language {
-                Language::Python => "ruff",
-                Language::TypeScript => "biome",
-            };
-            let status = if Command::new(linter).arg("--version").output().is_ok() {
-                StageStatus::Passed
-            } else {
-                StageStatus::Advisory
             };
             checks.push(doctor_check(
                 "linter",
                 Some(*language),
-                status,
-                serde_json::json!({"program": linter}),
-                (status == StageStatus::Advisory)
-                    .then(|| format!("optional linter {linter} is unavailable")),
+                if version.is_ok() {
+                    StageStatus::Passed
+                } else {
+                    StageStatus::Advisory
+                },
+                serde_json::json!({"program": program, "version": version.as_ref().ok()}),
+                version.err(),
             ));
         }
     } else {
@@ -182,7 +256,7 @@ pub(super) async fn run_doctor(
             };
             let project_dir_owned = project_path.to_string_lossy().into_owned();
             let options = court_jester::types::SandboxOptions {
-                timeout_seconds: 10.0,
+                timeout_seconds: args.timeout_seconds.unwrap_or(10.0),
                 memory_mb: 128,
                 runtime_profile: RuntimeProfile::Isolated,
                 network_policy: NetworkPolicy::Deny,

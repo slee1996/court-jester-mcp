@@ -4,6 +4,7 @@ use crate::types::{FailureDiagnostic, FailureDomain, FailureKind, ProcessTermina
 
 mod events;
 mod process;
+pub(crate) use process::run_command_with_limits;
 use process::{launch_failure, run_launch_command, termination};
 
 pub use events::{

@@ -438,7 +438,7 @@ pub(super) fn validate_runtime_flags(cmd: &str, args: &CliArgs) -> Result<(), St
         if !timeout.is_finite() || timeout <= 0.0 {
             return Err("--timeout-seconds must be finite and greater than zero".into());
         }
-        if !matches!(cmd, "verify" | "execute" | "ci" | "replay") {
+        if !matches!(cmd, "verify" | "execute" | "ci" | "replay" | "doctor") {
             return Err(format!("--timeout-seconds is not supported for `{cmd}`"));
         }
     }
