@@ -8,6 +8,26 @@ use crate::types::{
 use std::time::Instant;
 use tokio::process::Command;
 
+/// Own the process group and auxiliary tasks for the entire execution future.
+/// Dropping a JoinHandle detaches it; dropping this owner must not do so.
+struct ManagedProcessOwner {
+    group_id: u32,
+    tasks: Vec<tokio::task::AbortHandle>,
+}
+
+impl Drop for ManagedProcessOwner {
+    fn drop(&mut self) {
+        if self.group_id > 0 {
+            unsafe {
+                libc::kill(-(self.group_id as i32), libc::SIGKILL);
+            }
+        }
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
 pub(super) fn termination(
     kind: ProcessTerminationKind,
     exit_code: Option<i32>,
@@ -76,6 +96,100 @@ async fn descendant_pipe_timeout_preserves_captured_output() {
     assert_eq!(result.stderr, "diagnostic");
     std::thread::sleep(std::time::Duration::from_millis(1600));
     assert!(!marker.exists());
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn cancelling_managed_execution_terminates_its_process_group() {
+    for parent_exits in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let ready = root.path().join("ready");
+        let orphan = root.path().join("orphan");
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(format!(
+                "(echo ready > '{}'; sleep 0.8; echo orphan > '{}') & {}",
+                ready.display(),
+                orphan.display(),
+                if parent_exits { "exit 0" } else { "wait" }
+            ))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let task = tokio::spawn(run_command_with_limits(
+            command,
+            10.0,
+            128,
+            RuntimeProfile::LocalTrusted,
+            NetworkPolicy::Deny,
+            true,
+            "fixture",
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !ready.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fixture did not start");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+        assert!(
+            !orphan.exists(),
+            "cancelled execution left a descendant; parent_exits={parent_exits}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn completed_execution_does_not_detach_background_children() {
+    let root = tempfile::tempdir().unwrap();
+    let orphan = root.path().join("orphan");
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg(format!(
+            "(sleep 0.8; echo orphan > '{}') >/dev/null 2>&1 & echo completed; exit 0",
+            orphan.display()
+        ))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let result = run_command_with_limits(
+        command,
+        5.0,
+        128,
+        RuntimeProfile::LocalTrusted,
+        NetworkPolicy::Deny,
+        true,
+        "fixture",
+    )
+    .await;
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    assert_eq!(result.stdout.trim(), "completed");
+    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+    assert!(!orphan.exists());
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn process_owner_aborts_only_its_registered_tasks() {
+    let owned = tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    });
+    let unrelated = tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        42
+    });
+    let owner = ManagedProcessOwner {
+        group_id: 0,
+        tasks: vec![owned.abort_handle()],
+    };
+    drop(owner);
+    assert!(owned.await.unwrap_err().is_cancelled());
+    assert_eq!(unrelated.await.unwrap(), 42);
 }
 
 #[cfg(target_os = "macos")]
@@ -264,7 +378,9 @@ pub(crate) async fn run_command_with_limits(
     unsafe {
         command.pre_exec(move || {
             use nix::sys::resource::{setrlimit, Resource};
-            libc::setsid();
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             if !is_typescript {
                 let _ = setrlimit(Resource::RLIMIT_AS, memory_bytes, memory_bytes);
                 let _ = setrlimit(Resource::RLIMIT_DATA, memory_bytes, memory_bytes);
@@ -276,6 +392,7 @@ pub(crate) async fn run_command_with_limits(
     }
 
     let started = Instant::now();
+    command.kill_on_drop(true);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -283,6 +400,10 @@ pub(crate) async fn run_command_with_limits(
         }
     };
     let pid = child.id().unwrap_or_default();
+    let mut owner = ManagedProcessOwner {
+        group_id: pid,
+        tasks: Vec::new(),
+    };
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
     let stdout_bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -302,6 +423,7 @@ pub(crate) async fn run_command_with_limits(
         }
     });
     let stderr_bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    owner.tasks.push(stdout_task.abort_handle());
     let captured_stderr = stderr_bytes.clone();
     let stderr_task = tokio::spawn(async move {
         if let Some(mut pipe) = stderr_pipe {
@@ -318,6 +440,7 @@ pub(crate) async fn run_command_with_limits(
         }
     });
     let memory_killed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    owner.tasks.push(stderr_task.abort_handle());
     let memory_killed_clone = memory_killed.clone();
     let monitor = (pid > 0).then(|| {
         tokio::spawn(async move {
@@ -336,6 +459,9 @@ pub(crate) async fn run_command_with_limits(
     });
 
     let mut wait = Box::pin(child.wait());
+    if let Some(task) = &monitor {
+        owner.tasks.push(task.abort_handle());
+    }
     let mut timeout = Box::pin(tokio::time::sleep(std::time::Duration::from_secs_f64(
         timeout_seconds,
     )));
@@ -364,6 +490,7 @@ pub(crate) async fn run_command_with_limits(
         )
     });
     let remaining = (timeout_seconds - started.elapsed().as_secs_f64()).max(0.0);
+    owner.tasks.push(collected.abort_handle());
     match tokio::time::timeout(
         std::time::Duration::from_secs_f64(remaining),
         &mut collected,

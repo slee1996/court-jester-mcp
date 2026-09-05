@@ -98,6 +98,8 @@ Lint is advisory by design. Portability is advisory after a successful repositor
 
 Docker control-plane failures (including create/start/wait/state/log collection and unconfirmed cleanup) remain blocking infrastructure evidence, not target exceptions. Container completion requires successful state inspection with an explicit stopped state, exit code, and OOM flag. Managed output collection shares the process deadline even when the parent has exited and descendants still hold the pipes; bytes already captured are retained on timeout.
 
+Managed host commands own their process group, output collectors, and memory monitor for the execution future's lifetime. Dropping/cancelling that future terminates its group and aborts its auxiliary tasks; ordinary completion also terminates remaining background members of that group. A cancelled future does not produce a successful execution report. Killing a Docker client group is not proof that a daemon-owned container was removed: cancellation of the enclosing container workflow remains a distinct ownership requirement from the normal/timeout cleanup path.
+
 ### Stable advisory test-quality detail
 
 `--test-quality [N]` adds the non-gating `test_quality` stage after authoritative baseline-test and coverage eligibility are established. Direct `verify` requires exactly one `--test-file`. In `ci`, `--test-file` is repeatable with at most one Python and one TypeScript/TSX entrypoint; the matching entrypoint is selected for each target language. The default budget is 8 and the valid range is 1 through 32.
