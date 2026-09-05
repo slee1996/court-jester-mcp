@@ -4551,23 +4551,52 @@ import json as _cj_native_json
 import sys as _cj_native_sys
 
 def _cj_native_value(value):
+    def expression(item, depth=0):
+        if depth > 16:
+            raise ValueError('native snapshot exceeds supported depth')
+        if type(item) is float:
+            if item != item:
+                return "float('nan')"
+            if item == float('inf'):
+                return "float('inf')"
+            if item == float('-inf'):
+                return "float('-inf')"
+        if type(item) is list:
+            return '[' + ', '.join(expression(child, depth + 1) for child in item) + ']'
+        if type(item) not in (type(None), bool, int, float, str, bytes, bytearray):
+            raise ValueError('unsupported native snapshot value')
+        return repr(item)
+    snapshot = {{"expression": expression(value)}}
     try:
-        return _cj_native_json.loads(
-            _cj_native_json.dumps(value, ensure_ascii=False, allow_nan=False)
-        )
+        encoded = _cj_native_json.dumps(value, ensure_ascii=False, allow_nan=False)
+        encoded.encode('utf-8')
+        snapshot["json_value"] = _cj_native_json.loads(encoded)
     except Exception:
-        return repr(value)
+        pass
+    return snapshot
 
-def _cj_native_emit(function, line, arguments, error, data):
+def _cj_native_emit(function, line, arguments, error, data, call):
+    snippet = (
+        "import json as _cj_replay_json\n"
+        + "_cj_args = [" + ', '.join(value['expression'] for value in arguments) + "]\n"
+        + "_cj_reproduced = False\n_cj_passed = False\ntry:\n    " + call
+        + "\n    _cj_passed = True\nexcept Exception as _cj_error:\n"
+        + "    _cj_reproduced = (type(_cj_error).__qualname__ == " + repr(type(error).__qualname__)
+        + " and str(_cj_error) == " + repr(str(error)) + ")\n"
+        + "print('__COURT_JESTER_REPLAY_JSON__')\n"
+        + "print(_cj_replay_json.dumps(dict(reproduced=_cj_reproduced, check_passed=_cj_passed, severity='crash', oracle_kind='runtime_contract', category='exception')))\n"
+    )
     payload = {{
         "function": function,
         "line": line,
-        "arguments": [_cj_native_value(value) for value in arguments],
+        "protocol_version": 2,
+        "argument_snapshots": arguments,
+        "replay_snippet": snippet,
         "input": bytes(data).hex(),
         "error_type": type(error).__name__,
         "message": str(error),
     }}
-    print("__COURT_JESTER_NATIVE_FINDING__" + _cj_native_json.dumps(payload, ensure_ascii=False))
+    print("__COURT_JESTER_NATIVE_FINDING__" + _cj_native_json.dumps(payload, ensure_ascii=True))
 
 def TestOneInput(data):
     _cj_data = _cj_atheris.FuzzedDataProvider(data)
@@ -4594,9 +4623,10 @@ def TestOneInput(data):
             .join(", ");
         let function_label =
             serde_json::to_string(&func.name).unwrap_or_else(|_| "\"unknown\"".into());
+        let replay_call = serde_json::to_string(&format!("{}({call_args})", func.name)).unwrap();
         let _ = writeln!(
             code,
-            "    {branch} _cj_target == {index}:\n        _cj_args = [{}]\n        try:\n            {}({call_args})\n        except Exception as _cj_error:\n            _cj_native_emit({function_label}, {}, _cj_args, _cj_error, data)\n            raise",
+            "    {branch} _cj_target == {index}:\n        _cj_args = [{}]\n        _cj_snapshots = [_cj_native_value(value) for value in _cj_args]\n        try:\n            {}({call_args})\n        except Exception as _cj_error:\n            _cj_native_emit({function_label}, {}, _cj_snapshots, _cj_error, data, {replay_call})\n            raise",
             arguments.join(", "),
             func.name,
             func.line,
@@ -4674,20 +4704,54 @@ class _CourtJesterNativeInput {{
 }}
 
 function _cjNativeValue(value: unknown): unknown {{
-  if (typeof value === "bigint") return value.toString();
-  if (value instanceof Uint8Array) return Array.from(value);
-  try {{
-    return JSON.parse(JSON.stringify(value));
-  }} catch {{
-    return String(value);
+  function expression(item: unknown, depth = 0): string {{
+    if (depth > 16) throw new Error("native snapshot exceeds supported depth");
+    if (item === undefined) return "undefined";
+    if (item === null) return "null";
+    if (typeof item === "bigint") return item.toString() + "n";
+    if (typeof item === "number") {{
+      if (Object.is(item, -0)) return "-0";
+      return String(item);
+    }}
+    if (typeof item === "string" || typeof item === "boolean") return JSON.stringify(item);
+    if (item instanceof Date) return "new Date(" + expression(item.getTime()) + ")";
+    if (item instanceof Uint8Array) {{
+      const bytes = JSON.stringify(Array.from(item));
+      return Buffer.isBuffer(item) ? "Buffer.from(" + bytes + ")" : "new Uint8Array(" + bytes + ")";
+    }}
+    if (Array.isArray(item)) return "[" + item.map(child => expression(child, depth + 1)).join(", ") + "]";
+    throw new Error("unsupported native snapshot value");
   }}
+  // Expressions retain runtime types; optional JSON is only faithful JSON data.
+  function jsonSafe(item: unknown): boolean {{
+    if (item === null || typeof item === "string" || typeof item === "boolean") return true;
+    if (typeof item === "number") return Number.isFinite(item) && !Object.is(item, -0);
+    return Array.isArray(item) && item.every(jsonSafe);
+  }}
+  const snapshot: {{expression: string, json_value?: unknown}} = {{expression: expression(value)}};
+  if (jsonSafe(value)) snapshot.json_value = JSON.parse(JSON.stringify(value));
+  return snapshot;
 }}
 
-function _cjNativeEmit(functionName: string, line: number, args: unknown[], error: unknown, input: Uint8Array): void {{
+function _cjNativeEmit(functionName: string, line: number, args: any[], error: unknown, input: Uint8Array, call: string): void {{
+  let match: string | null = null;
+  if (error instanceof Error) {{
+    match = "_cj_error instanceof Error && _cj_error.constructor.name === " + JSON.stringify(error.constructor.name)
+      + " && _cj_error.message === " + JSON.stringify(error.message);
+  }} else if (error === null || ["undefined", "string", "boolean", "number", "bigint"].includes(typeof error)) {{
+    match = "Object.is(_cj_error, " + (_cjNativeValue(error) as any).expression + ")";
+  }}
+  const snippet = match === null ? null : "const _cj_args = [" + args.map(value => value.expression).join(", ") + "];\n"
+    + "let _cj_reproduced = false, _cj_passed = false;\ntry {{ await " + call
+    + "; _cj_passed = true; }} catch (_cj_error) {{ _cj_reproduced = (" + match + "); }}\n"
+    + "console.log('__COURT_JESTER_REPLAY_JSON__');\n"
+    + "console.log(JSON.stringify({{reproduced:_cj_reproduced,check_passed:_cj_passed,severity:'crash',oracle_kind:'runtime_contract',category:'exception'}}));\n";
   const payload = {{
     function: functionName,
     line,
-    arguments: args.map(_cjNativeValue),
+    protocol_version: 2,
+    argument_snapshots: args,
+    replay_snippet: snippet,
     input: Array.from(input, (byte) => byte.toString(16).padStart(2, "0")).join(""),
     error_type: error instanceof Error ? error.constructor.name : typeof error,
     message: error instanceof Error ? error.message : String(error),
@@ -4709,11 +4773,12 @@ export async function fuzz(data: Uint8Array): Promise<void> {{
             .collect::<Vec<_>>();
         let arg_refs = arg_names.iter().map(String::as_str).collect::<Vec<_>>();
         let call = ts_call_with_args(func, &arg_refs);
+        let replay_call = serde_json::to_string(&call).unwrap();
         let function_label =
             serde_json::to_string(&func.name).unwrap_or_else(|_| "\"unknown\"".into());
         let _ = writeln!(
             code,
-            "  {branch} (_cj_target === {index}) {{\n    const _cj_args: unknown[] = [{}];\n    try {{\n      await {call};\n    }} catch (_cj_error: unknown) {{\n      _cjNativeEmit({function_label}, {}, _cj_args, _cj_error, data);\n      throw _cj_error;\n    }}\n  }}",
+            "  {branch} (_cj_target === {index}) {{\n    const _cj_args: unknown[] = [{}];\n    const _cj_snapshots = _cj_args.map(_cjNativeValue);\n    try {{\n      await {call};\n    }} catch (_cj_error: unknown) {{\n      _cjNativeEmit({function_label}, {}, _cj_snapshots, _cj_error, data, {replay_call});\n      throw _cj_error;\n    }}\n  }}",
             arguments.join(", "),
             func.line,
         );

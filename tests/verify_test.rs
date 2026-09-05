@@ -10038,13 +10038,13 @@ fn assert_native_observation_refuses_unproven_repair(
         .unwrap();
     assert_eq!(
         replay.status.code(),
-        Some(3),
+        Some(0),
         "{}",
         String::from_utf8_lossy(&replay.stderr)
     );
     let result: serde_json::Value = serde_json::from_slice(&replay.stdout).unwrap();
-    assert_eq!(result["outcome"], "inconclusive");
-    assert!(result["check_passed"].is_null());
+    assert_eq!(result["outcome"], "reproduced");
+    assert_eq!(result["check_passed"], false);
     let bundle = root.join("native-regression");
     let export = std::process::Command::new(env!("CARGO_BIN_EXE_court-jester"))
         .args([

@@ -5824,6 +5824,7 @@ pub async fn verify(
             &verification_plan,
         );
         let coverage_ms = synth_start.elapsed().as_millis() as u64;
+        let native_config = native_fuzz_config();
         let mut module_load_blocked = false;
         let execution_plans = surface_execution_plans(
             &analysis.functions,
@@ -5889,7 +5890,7 @@ pub async fn verify(
                 "project_runner_selected",
                 "Generated execution skipped because the Nuxt project runner owns this surface",
             ));
-        } else if !fuzz_plan.code.is_empty() {
+        } else if !fuzz_plan.code.is_empty() || native_config.engine != NativeFuzzEngine::Off {
             let full_code = generated_verifier_source(
                 &verification_context.candidate,
                 code,
@@ -5905,17 +5906,37 @@ pub async fn verify(
             let (_, runtime_name, _) =
                 generated_harness_runtime(verification_context.candidate.target_source.mode);
             let mut exec_runtime = Some(runtime_name.to_string());
-            let harness_execution = execute_generated_harness(
-                &verification_context.candidate,
-                full_code,
-                HarnessKind::GeneratedVerifier,
-                &opts,
-                language,
-                execute_timeout,
-                Some(candidate_project_dir_owned.as_str()),
-                candidate_source_file_owned.as_deref(),
-            )
-            .await;
+            let harness_execution = if fuzz_plan.code.is_empty() {
+                // Native engines own their input decoders. A missing ordinary
+                // campaign must not prevent an independently requested engine
+                // from running, nor count as a successful generated invocation.
+                exec_runtime = None;
+                HarnessExecution {
+                    process: ExecutionResult {
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        exit_code: None,
+                        duration_ms: 0,
+                        timed_out: false,
+                        memory_error: false,
+                        termination: None,
+                        diagnostics: Vec::new(),
+                    },
+                    diagnostics: Vec::new(),
+                }
+            } else {
+                execute_generated_harness(
+                    &verification_context.candidate,
+                    full_code,
+                    HarnessKind::GeneratedVerifier,
+                    &opts,
+                    language,
+                    execute_timeout,
+                    Some(candidate_project_dir_owned.as_str()),
+                    candidate_source_file_owned.as_deref(),
+                )
+                .await
+            };
             let mut harness_diagnostics = harness_execution.diagnostics;
             let mut exec_result = harness_execution.process;
             let mut generated_failures = parse_findings(&exec_result.stdout).unwrap_or_default();
@@ -6409,7 +6430,6 @@ pub async fn verify(
                 }
             }
 
-            let native_config = native_fuzz_config();
             let mut native_findings = Vec::new();
             if native_config.engine != NativeFuzzEngine::Off {
                 let selected_refs = functions_to_fuzz.iter().collect::<Vec<_>>();
@@ -6830,6 +6850,7 @@ pub async fn verify(
             });
             let mut detail = serde_json::json!({
                 "execution": exec_result,
+                "generated_campaign_ran": !fuzz_plan.code.is_empty(),
                 "runtime": exec_runtime,
                 "module_load_blocked": module_load_blocked,
                 "environment_setup": environment_setup,
@@ -7179,6 +7200,12 @@ const NATIVE_FINDING_MARKER: &str = "__COURT_JESTER_NATIVE_FINDING__";
 
 #[derive(Debug, Deserialize)]
 struct NativeFindingRecord {
+    #[serde(default)]
+    protocol_version: Option<u32>,
+    #[serde(default)]
+    argument_snapshots: Option<Vec<ReproValue>>,
+    #[serde(default)]
+    replay_snippet: Option<String>,
     function: String,
     line: usize,
     #[serde(default)]
@@ -7196,15 +7223,25 @@ fn parse_native_findings(output: &str, language: &Language) -> Vec<VerificationF
         .filter_map(|line| {
             serde_json::from_str::<NativeFindingRecord>(&line[NATIVE_FINDING_MARKER.len()..]).ok()
         })
-        .map(|record| {
-            let arguments = record
+        .filter_map(|record| {
+            let arguments = match record.protocol_version {
+                Some(2) => {
+                    let snapshots = record.argument_snapshots?;
+                    if snapshots.iter().any(|value| value.expression.trim().is_empty()) {
+                        return None;
+                    }
+                    snapshots
+                }
+                None | Some(1) => record
                 .arguments
                 .iter()
                 .map(|value| ReproValue {
                     expression: serde_json::to_string(value).unwrap_or_else(|_| "null".into()),
                     json_value: Some(value.clone()),
                 })
-                .collect::<Vec<_>>();
+                .collect::<Vec<_>>(),
+                Some(_) => return None,
+            };
             let original = ReproCase {
                 arguments: arguments.clone(),
                 input_text: Some(record.input.clone()),
@@ -7214,7 +7251,7 @@ fn parse_native_findings(output: &str, language: &Language) -> Vec<VerificationF
                 oracle_kind: OracleKind::RuntimeContract,
                 category: FindingCategory::Exception,
             };
-            VerificationFinding {
+            Some(VerificationFinding {
                 id: format!("native:{}", record.function),
                 severity: FindingSeverity::Crash,
                 confidence: FindingConfidence::Low,
@@ -7242,10 +7279,10 @@ fn parse_native_findings(output: &str, language: &Language) -> Vec<VerificationF
                     arguments,
                     input_text: Some(record.input),
                     case_label: Some("native_coverage_guided".into()),
-                    snippet: match language {
+                    snippet: record.replay_snippet.filter(|snippet| record.protocol_version == Some(2) && !snippet.trim().is_empty()).unwrap_or_else(|| match language {
                         Language::Python => "raise RuntimeError('Court Jester native observation has no recorded replay contract')".into(),
                         Language::TypeScript => "throw new Error('Court Jester native observation has no recorded replay contract');".into(),
-                    },
+                    }),
                     command: None,
                     expectation,
                     differential: None,
@@ -7262,7 +7299,7 @@ fn parse_native_findings(output: &str, language: &Language) -> Vec<VerificationF
                 classification: Some("native_coverage_guided".into()),
                 suggestion: None,
                 suppressed: false,
-            }
+            })
         })
         .collect()
 }
@@ -7419,6 +7456,56 @@ pub fn repair_summary(report: &VerificationReport, language: &Language) -> Repai
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_protocol_requires_versioned_snapshots_before_accepting_replay() {
+        let legacy = serde_json::json!({
+            "function": "inspect", "line": 1, "arguments": [3], "input": "00",
+            "error_type": "ValueError", "message": "failure",
+            "replay_snippet": "unversioned replay must not run"
+        });
+        let parse = |record: &serde_json::Value| {
+            parse_native_findings(
+                &format!("{NATIVE_FINDING_MARKER}{record}"),
+                &Language::Python,
+            )
+        };
+        let findings = parse(&legacy);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0]
+            .repro
+            .snippet
+            .contains("no recorded replay contract"));
+        assert_eq!(
+            findings[0].input_classification,
+            InputClassification::Unknown
+        );
+
+        let mut versioned = legacy.clone();
+        versioned["protocol_version"] = 2.into();
+        assert!(parse(&versioned).is_empty());
+        versioned["argument_snapshots"] = serde_json::json!([{"expression": "bytearray(b'abc')"}]);
+        versioned["replay_snippet"] = "recorded replay".into();
+        let findings = parse(&versioned);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].repro.arguments[0].expression,
+            "bytearray(b'abc')"
+        );
+        assert!(findings[0].repro.arguments[0].json_value.is_none());
+        assert_eq!(findings[0].repro.snippet, "recorded replay");
+        assert_eq!(
+            findings[0].input_classification,
+            InputClassification::Unknown
+        );
+        versioned["protocol_version"] = 99.into();
+        assert!(parse(&versioned).is_empty());
+        versioned["protocol_version"] = 2.into();
+        versioned["argument_snapshots"][0]["expression"] = " ".into();
+        assert!(parse(&versioned).is_empty());
+        versioned["argument_snapshots"][0]["expression"] = 3.into();
+        assert!(parse(&versioned).is_empty());
+    }
 
     #[test]
     fn candidate_count_uses_runtime_surface_eligibility() {
