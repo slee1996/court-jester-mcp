@@ -3342,6 +3342,117 @@ export function parseQueryString(input: string, setting: QueryParserSetting): un
 }
 
 #[tokio::test]
+async fn http_semantic_replay_repeats_mutated_object_observations() {
+    for (property, name, signature, setup, variants) in [
+        ("http_request_metadata", "decorateRequest", "request: RequestLike", r#"
+if (!(request.app.__settings instanceof Map)) throw new Error('request settings were not reconstructed');
+request.get = (name: string) => Object.entries(request.headers).find(([key]) => key.toLowerCase() === name.toLowerCase())?.[1];
+request.header = request.get;
+request.xhr = true; request.protocol = 'https'; request.secure = true;
+request.query = { user: { name: 'tj', roles: ['admin'] } };
+"#, vec![
+            ("header lookup", "request.get = () => 'wrong';"),
+            ("header alias and xhr", "request.xhr = false;"),
+            ("trusted forwarded protocol", "request.protocol = 'http'; request.secure = false;"),
+            ("extended query decoration", "request.query = {};"),
+        ]),
+        ("http_response_helpers", "decorateResponse", "response: ResponseLike, request: RequestLike", r#"
+if (request.headers.referer !== '/from') throw new Error('request argument was not reconstructed');
+const headers = new Map<string, string>();
+response.getHeader = (name: string) => headers.get(name.toLowerCase());
+response.location = (path: string) => headers.set('location', encodeURI(path));
+response.vary = (value: string) => {
+  const values = (headers.get('vary') || '').split(',').concat(value.split(',')).map(x => x.trim()).filter(Boolean);
+  headers.set('vary', values.filter((item, index) => values.findIndex(other => other.toLowerCase() === item.toLowerCase()) === index).join(', '));
+};
+response.sendStatus = (status: number) => { response.statusCode = status; response.__body = ''; };
+"#, vec![
+            ("location encodes spaces", "response.location = (path: string) => headers.set('location', path);"),
+            ("vary merges case-insensitively", "response.vary = (value: string) => headers.set('vary', value);"),
+            ("sendStatus 204 empty body", "response.sendStatus = (status: number) => { response.statusCode = status; response.__body = 'unexpected'; };"),
+        ]),
+    ] {
+        for (label, mutation) in variants {
+            let project = tempfile::tempdir().unwrap();
+            let source = project.path().join("target.ts");
+            let prefix = format!("type RequestLike = {{ headers?: Record<string, string>; app?: {{ __settings: Map<string, unknown> }}; [key: string]: any }}; type ResponseLike = {{ statusCode?: number; [key: string]: any }};\n// court-jester-properties {property}\nexport function {name}({signature}): void");
+            let code = format!("{prefix} {{ {setup} {mutation} }}");
+            fs::write(&source, &code).unwrap();
+            let mut opts = default_opts(None);
+            opts.source_file = source.to_str();
+            opts.project_dir = project.path().to_str();
+            let report = verify(&code, &Language::TypeScript, opts).await;
+            let repair = repair_summary(&report, &Language::TypeScript);
+            let finding = repair.findings.iter().find(|finding| finding.oracle.kind == OracleKind::InferredSemantic && finding.repro.case_label.as_ref().is_some_and(|value| value.contains(label))).unwrap_or_else(|| panic!("{name}/{label}: {}", report_human_summary(&report)));
+            let report_path = project.path().join("repair.json");
+            fs::write(&report_path, serde_json::to_vec(&repair).unwrap()).unwrap();
+            let replay = replay_report(report_path.to_str().unwrap(), &finding.id, None, RuntimeProfile::LocalTrusted, DEFAULT_PYTHON_DOCKER_IMAGE, DEFAULT_TYPESCRIPT_DOCKER_IMAGE).await.unwrap();
+            assert_eq!(replay.outcome, ReplayOutcome::Reproduced, "{name}/{label}: {replay:?}");
+            assert_eq!(finding.repro.arguments.len(), if name == "decorateRequest" { 1 } else { 2 });
+            assert_eq!(finding.confidence, FindingConfidence::Low);
+            fs::write(&source, format!("{prefix} {{ {setup} }}")).unwrap();
+            let replay = replay_report(report_path.to_str().unwrap(), &finding.id, None, RuntimeProfile::LocalTrusted, DEFAULT_PYTHON_DOCKER_IMAGE, DEFAULT_TYPESCRIPT_DOCKER_IMAGE).await.unwrap();
+            assert_eq!(replay.outcome, ReplayOutcome::NotReproduced, "{name}/{label}: {replay:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn http_projection_replay_preserves_the_failing_method_step() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("target.ts");
+    let prefix = "type ResponseLike = { statusCode?: number; [key: string]: any };\n// court-jester-properties http_response_helpers\nexport function decorateResponse(response: ResponseLike): void";
+    let code = format!("{prefix} {{ response.vary = (value: string) => {{ throw new Error('same method failure'); }}; }}");
+    fs::write(&source, &code).unwrap();
+    let mut opts = default_opts(None);
+    opts.source_file = source.to_str();
+    opts.project_dir = project.path().to_str();
+    let report = verify(&code, &Language::TypeScript, opts).await;
+    let repair = repair_summary(&report, &Language::TypeScript);
+    let finding = repair
+        .findings
+        .iter()
+        .find(|finding| {
+            finding.oracle.kind == OracleKind::InferredSemantic
+                && finding
+                    .repro
+                    .case_label
+                    .as_ref()
+                    .is_some_and(|label| label.contains("vary merges"))
+        })
+        .unwrap();
+    let report_path = project.path().join("repair.json");
+    fs::write(&report_path, serde_json::to_vec(&repair).unwrap()).unwrap();
+    let replay = replay_report(
+        report_path.to_str().unwrap(),
+        &finding.id,
+        None,
+        RuntimeProfile::LocalTrusted,
+        DEFAULT_PYTHON_DOCKER_IMAGE,
+        DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay.outcome, ReplayOutcome::Reproduced, "{replay:?}");
+    fs::write(&source, format!("{prefix} {{ response.vary = (value: string) => {{ if (value.includes(',')) throw new Error('same method failure'); }}; }}")).unwrap();
+    let replay = replay_report(
+        report_path.to_str().unwrap(),
+        &finding.id,
+        None,
+        RuntimeProfile::LocalTrusted,
+        DEFAULT_PYTHON_DOCKER_IMAGE,
+        DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        replay.outcome,
+        ReplayOutcome::NotReproduced,
+        "a failure on another method step is a different observation: {replay:?}"
+    );
+}
+
+#[tokio::test]
 async fn typescript_request_metadata_context_enables_side_effect_semantics() {
     let dir = tempfile::tempdir().unwrap();
     let source_path = dir.path().join("http.ts");

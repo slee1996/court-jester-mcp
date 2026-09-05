@@ -548,7 +548,8 @@ function _emitFinding(name: string, args: unknown[], error: unknown, severity = 
   _fuzzResults.push(record);
   _cjEvent("finding", { finding: record });
 }
-function _semanticProject(value: unknown, projection: string | { property: string }): unknown {
+function _semanticProject(value: unknown, projection: string | { property: string } | ((value: any, step: (label: string) => void) => unknown), step: (label: string) => void): unknown {
+  if (typeof projection === "function") return projection(value, step);
   if (typeof projection !== "string") return (value as Record<string, unknown>)[projection.property];
   switch (projection) {
     case "sign": return _cmpSign(value);
@@ -562,7 +563,7 @@ function _semanticProject(value: unknown, projection: string | { property: strin
     default: throw new Error(`Unknown semantic projection: ${projection}`);
   }
 }
-function _observeSemantic(invoke: (args: unknown[]) => unknown, args: unknown[], expected: unknown, projection: string | { property: string }, sequence: boolean) {
+function _observeSemantic(invoke: (args: unknown[]) => unknown, args: unknown[], expected: unknown, projection: string | { property: string } | ((value: any, step: (label: string) => void) => unknown), sequence: boolean) {
   let actual: unknown;
   let error: unknown;
   let threw = false;
@@ -581,16 +582,17 @@ function _observeSemantic(invoke: (args: unknown[]) => unknown, args: unknown[],
       value = invoke(args);
     }
     phase = "project";
-    actual = _semanticProject(value, projection);
+    actual = _semanticProject(value, projection, (label) => { phase = "project:" + label; });
     phase = "compare";
     matched = _nanSafeEq(actual, expected);
   } catch (caught) { threw = true; error = caught; }
   return { actual, error, threw, phase, matched };
 }
-function _semanticCase(name: string, invoke: (args: unknown[]) => unknown, args: unknown[] | (() => unknown[]), expected: unknown, projection: string | { property: string }, label: string, sequence = false): void {
+function _semanticCase(name: string, invoke: (args: unknown[]) => unknown, args: unknown[] | (() => unknown[]), expected: unknown, projection: string | { property: string } | ((value: any, step: (label: string) => void) => unknown), label: string, sequence = false): void {
   if (projection === "sign") expected = _cmpSign(expected);
   const recipe = typeof args === "function" ? args : null;
   const original = recipe ? recipe() : _cloneSeed(args as unknown[]);
+  const projectionSource = typeof projection === "function" ? projection.toString() : JSON.stringify(projection);
   const createSource = recipe ? recipe.toString() : `() => (${_reproExpression(original)})`;
   const recordedCase = recipe ? { arguments: original.map((_, index) => ({ expression: `(${createSource})()[${index}]` })), input_text: label } : null;
   const { actual, error, threw, phase, matched } = _observeSemantic(invoke, recipe ? recipe() : _cloneSeed(original), expected, projection, sequence);
@@ -600,7 +602,7 @@ function _semanticCase(name: string, invoke: (args: unknown[]) => unknown, args:
     ? `_error instanceof Error && _error.constructor.name === ${JSON.stringify(error.constructor.name)} && _error.message === ${JSON.stringify(error.message)}`
     : primitiveException ? `Object.is(_error, ${_reproExpression(error)})` : null;
   const snippet = replayMatch === null ? `throw new Error("Court Jester cannot replay this runtime-only thrown value");`
-    : `((_semanticInvoke, _semanticArguments) => {\n${_PropertyFailure.toString()}\n${_cmpSign.toString()}\n${_nanSafeEq.toString()}\n${_semanticProject.toString()}\n${_observeSemantic.toString()}\nconst _observation = _observeSemantic(_semanticInvoke, _semanticArguments(), ${_reproExpression(expected)}, ${JSON.stringify(projection)}, ${sequence});\nconst _error = _observation.error;\nconst _reproduced = ${threw ? `_observation.threw && _observation.phase === ${JSON.stringify(phase)} && (${replayMatch})` : "!_observation.threw && !_observation.matched"};\nconsole.log("__COURT_JESTER_REPLAY_JSON__");\nconsole.log(JSON.stringify({reproduced: _reproduced, severity: "property_violation", oracle_kind: "inferred_semantic", category: "property"}));\n})(${invoke.toString()}, ${createSource});`;
+    : `((_semanticInvoke, _semanticArguments, _semanticProjection) => {\n${_PropertyFailure.toString()}\n${_cmpSign.toString()}\n${_nanSafeEq.toString()}\n${_semanticProject.toString()}\n${_observeSemantic.toString()}\nconst _observation = _observeSemantic(_semanticInvoke, _semanticArguments(), ${_reproExpression(expected)}, _semanticProjection, ${sequence});\nconst _error = _observation.error;\nconst _reproduced = ${threw ? `_observation.threw && _observation.phase === ${JSON.stringify(phase)} && (${replayMatch})` : "!_observation.threw && !_observation.matched"};\nconsole.log("__COURT_JESTER_REPLAY_JSON__");\nconsole.log(JSON.stringify({reproduced: _reproduced, severity: "property_violation", oracle_kind: "inferred_semantic", category: "property"}));\n})(${invoke.toString()}, ${createSource}, ${projectionSource});`;
   const failure = threw ? error : new Error(`${label}: ${JSON.stringify(actual)} !== ${JSON.stringify(expected)}`);
   _emitFinding(name, original, failure, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", null, "direct", label, 0, snippet, "valid", JSON.stringify(expected), sequence ? "semantic_case" : "function_call", recordedCase);
   console.log(`  CRASH ${name}(${label}): ${_clipText(failure instanceof Error ? failure.message : String(failure))}`);

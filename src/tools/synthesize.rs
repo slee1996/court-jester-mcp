@@ -3532,48 +3532,32 @@ fn ts_http_request_metadata_semantic_check(func: &FunctionInfo, param_types: &[S
     if !first.contains("request") && !first.contains("req") {
         return String::new();
     }
-    let request_call = ts_call_with_args(func, &["_request"]);
-
+    let request_call = ts_call_with_args(func, &["_args[0]"]);
     format!(
         r#"  {{
-    let _requestMetaLabel = "header lookup";
-    try {{
-      const _request: any = {{
-        method: "GET",
-        url: "/?user[name]=tj&user[roles][0]=admin",
-        headers: {{
-          Host: "example.test",
-          "X-Requested-With": "XMLHttpRequest",
-          "X-Forwarded-Proto": "https, http",
-        }},
-        app: {{ __settings: new Map<string, unknown>([["query parser", "extended"], ["trust proxy", true]]) }},
-      }};
-      {request_call};
-      if (typeof _request.get !== "function" || _request.get("host") !== "example.test") {{
-        throw new Error(`HTTP request metadata (${{_requestMetaLabel}}): host lookup failed`);
-      }}
-      _requestMetaLabel = "header alias and xhr";
-      if (typeof _request.header !== "function" || _request.header("x-requested-with") !== "XMLHttpRequest" || _request.xhr !== true) {{
-        throw new Error(`HTTP request metadata (${{_requestMetaLabel}}): ${{JSON.stringify({{ via: typeof _request.header === "function" ? _request.header("x-requested-with") : undefined, xhr: _request.xhr }})}}`);
-      }}
-      _requestMetaLabel = "trusted forwarded protocol";
-      if (_request.protocol !== "https" || _request.secure !== true) {{
-        throw new Error(`HTTP request metadata (${{_requestMetaLabel}}): ${{JSON.stringify({{ protocol: _request.protocol, secure: _request.secure }})}}`);
-      }}
-      _requestMetaLabel = "extended query decoration";
-      const _expectedQuery = {{ user: {{ name: "tj", roles: ["admin"] }} }};
-      if (!_nanSafeEq(_request.query, _expectedQuery)) {{
-        throw new Error(`HTTP request metadata (${{_requestMetaLabel}}): ${{JSON.stringify(_request.query)}} !== ${{JSON.stringify(_expectedQuery)}}`);
-      }}
-    }} catch (_e: unknown) {{
-      _emitFinding("{name}", [], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", null, "direct", _requestMetaLabel);
-      console.log(`  CRASH {name}(http request metadata): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
-      _fuzzTotalFailures++;
+    const _requestArgs = () => [{{
+      method: "GET",
+      url: "/?user[name]=tj&user[roles][0]=admin",
+      headers: {{
+        Host: "example.test",
+        "X-Requested-With": "XMLHttpRequest",
+        "X-Forwarded-Proto": "https, http",
+      }},
+      app: {{ __settings: new globalThis.Map<string, unknown>([["query parser", "extended"], ["trust proxy", true]]) }},
+    }}];
+    const _cases: Array<[string, unknown, (_request: any) => unknown]> = [
+      ["header lookup", "example.test", (_request: any) => _request.get("host")],
+      ["header alias and xhr", ["XMLHttpRequest", true], (_request: any) => [_request.header("x-requested-with"), _request.xhr]],
+      ["trusted forwarded protocol", ["https", true], (_request: any) => [_request.protocol, _request.secure]],
+      ["extended query decoration", {{ user: {{ name: "tj", roles: ["admin"] }} }}, (_request: any) => _request.query],
+    ];
+    for (const [_label, _expected, _project] of _cases) {{
+      _semanticCase("{name}", (_args: unknown[]) => {{ {request_call}; return _args[0]; }},
+        _requestArgs, _expected, _project, "HTTP request metadata (" + _label + ")");
     }}
   }}
 "#,
         name = func.name,
-        request_call = request_call,
     )
 }
 
@@ -3586,49 +3570,41 @@ fn ts_http_response_helpers_semantic_check(func: &FunctionInfo, param_types: &[S
         return String::new();
     }
     let args: Vec<&str> = if param_types.len() > 1 {
-        vec!["_response", "_request"]
+        vec!["_args[0]", "_args[1]"]
     } else {
-        vec!["_response"]
+        vec!["_args[0]"]
     };
     let response_call = ts_call_with_args(func, &args);
-
+    let recipe = if param_types.len() > 1 {
+        r#"() => [{}, { method: "GET", headers: { referer: "/from" } }]"#
+    } else {
+        "() => [{}]"
+    };
     format!(
         r#"  {{
-    let _responseHelperLabel = "location encodes spaces";
-    try {{
-      const _request: any = {{
-        method: "GET",
-        headers: {{ referer: "/from" }},
-      }};
-      const _response: any = {{}};
-      {response_call};
-      if (typeof _response.location !== "function" || typeof _response.getHeader !== "function") {{
-        throw new Error(`HTTP response helpers (${{_responseHelperLabel}}): response helper methods missing`);
-      }}
-      _response.location("/a path/with spaces");
-      if (_response.getHeader("Location") !== "/a%20path/with%20spaces") {{
-        throw new Error(`HTTP response helpers (${{_responseHelperLabel}}): ${{JSON.stringify(_response.getHeader("Location"))}}`);
-      }}
-      _responseHelperLabel = "vary merges case-insensitively";
-      _response.vary("Accept-Encoding");
-      _response.vary("accept-encoding, Accept");
-      if (_response.getHeader("Vary") !== "Accept-Encoding, Accept") {{
-        throw new Error(`HTTP response helpers (${{_responseHelperLabel}}): ${{JSON.stringify(_response.getHeader("Vary"))}}`);
-      }}
-      _responseHelperLabel = "sendStatus 204 empty body";
-      _response.sendStatus(204);
-      if (_response.statusCode !== 204 || String(_response.__body ?? "") !== "") {{
-        throw new Error(`HTTP response helpers (${{_responseHelperLabel}}): ${{JSON.stringify({{ statusCode: _response.statusCode, body: _response.__body }})}}`);
-      }}
-    }} catch (_e: unknown) {{
-      _emitFinding("{name}", [], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", null, "direct", _responseHelperLabel);
-      console.log(`  CRASH {name}(http response helpers): ${{_clipText(_e instanceof Error ? _e.message : String(_e))}}`);
-      _fuzzTotalFailures++;
+    const _responseArgs = {recipe};
+    const _cases: Array<[string, unknown, (_response: any, _step: (label: string) => void) => unknown]> = [
+      ["location encodes spaces", "/a%20path/with%20spaces", (_response: any, _step: (label: string) => void) => {{
+        _step("location"); _response.location("/a path/with spaces");
+        _step("getHeader"); return _response.getHeader("Location");
+      }}],
+      ["vary merges case-insensitively", "Accept-Encoding, Accept", (_response: any, _step: (label: string) => void) => {{
+        _step("vary:0"); _response.vary("Accept-Encoding");
+        _step("vary:1"); _response.vary("accept-encoding, Accept");
+        _step("getHeader"); return _response.getHeader("Vary");
+      }}],
+      ["sendStatus 204 empty body", [204, ""], (_response: any, _step: (label: string) => void) => {{
+        _step("sendStatus"); _response.sendStatus(204);
+        _step("read_status_body"); return [_response.statusCode, String(_response.__body ?? "")];
+      }}],
+    ];
+    for (const [_label, _expected, _project] of _cases) {{
+      _semanticCase("{name}", (_args: unknown[]) => {{ {response_call}; return _args[0]; }},
+        _responseArgs, _expected, _project, "HTTP response helpers (" + _label + ")");
     }}
   }}
 "#,
         name = func.name,
-        response_call = response_call,
     )
 }
 
