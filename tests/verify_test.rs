@@ -10891,6 +10891,39 @@ fn test_quality_classifies_direct_weak_and_boundary_asserting_tests() {
 }
 
 #[test]
+fn test_quality_node_tap_retains_actual_target_entry_evidence() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("target.ts");
+    let tests = project.path().join("checks.test.ts");
+    fs::write(
+        &source,
+        "export function eligible(total: number): boolean { return total >= 100; }\n",
+    )
+    .unwrap();
+    for (check, outcome) in [
+        ("target.eligible(100);", "survived"),
+        ("assert.equal(target.eligible(100), true);", "killed"),
+    ] {
+        fs::write(&tests, format!("import assert from 'node:assert/strict';\nimport * as target from './target.ts';\n{check}\n")).unwrap();
+        let report = run_cli_test_quality(
+            &source,
+            &tests,
+            project.path(),
+            "typescript",
+            Some("node"),
+            1,
+        );
+        let quality = test_quality_stage(&report);
+        assert_eq!(quality["detail"]["baseline_eligible"], true);
+        assert_eq!(quality["detail"]["mutants"][0]["outcome"], outcome);
+        assert_eq!(
+            quality["detail"]["mutants"][0]["entered_mutated_surface"],
+            true
+        );
+    }
+}
+
+#[test]
 fn test_quality_coupling_findings_are_scoped_to_the_selected_target() {
     let project = tempfile::tempdir().unwrap();
     let source = project.path().join("target.py");

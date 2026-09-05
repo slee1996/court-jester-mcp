@@ -20,6 +20,10 @@ The harness is intentionally separate from the Rust CLI. `court-jester` stays fo
 
 The evaluator requires declared finding fields and consistent CLI verdict/exit codes (pass/0, fail/1, inconclusive/3). Inconclusive is not automatically an infrastructure failure. These small seeded cases are regression evidence, not a general accuracy estimate.
 
+## Advisory test-quality classification corpus
+
+`python3 -m bench.test_quality_corpus --binary target/release/court-jester` runs ten manifest-declared Python/TypeScript runtime cases for kills, reached survivors, policy blockers, missing coverage, and coupling. It records binary/manifest-bound evidence without an adequacy score. The separate invalid-candidate tier remains unfinished; see [corpus scope and contracts](../docs/test-quality-corpus.md).
+
 ## Recent Writeups
 
 Benchmark writeups:

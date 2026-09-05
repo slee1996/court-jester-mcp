@@ -929,9 +929,23 @@ fn err_execution_result(message: &str) -> ExecutionResult {
 }
 
 fn parse_target_entered_events(stderr: &str) -> HashSet<String> {
+    parse_target_entered_lines(stderr.lines().map(str::trim))
+}
+
+fn authoritative_output_line<'a>(
+    line: &'a str,
+    language: &Language,
+    runner: TestRunner,
+) -> &'a str {
+    let adapter = (*language == Language::TypeScript && runner == TestRunner::Node)
+        .then_some(TestAdapter::NodeTap);
+    sandbox::test_output_line(line, adapter)
+}
+
+fn parse_target_entered_lines<'a>(lines: impl Iterator<Item = &'a str>) -> HashSet<String> {
     let mut entered = HashSet::new();
-    for line in stderr.lines() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+    for line in lines {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
         if value.get("event").and_then(|v| v.as_str()) == Some("target_entered") {
@@ -4767,11 +4781,9 @@ pub async fn probe_authoritative_entrypoint(
         probe.timeout_seconds,
     )
     .await;
-    let loaded = outcome
-        .result
-        .stdout
-        .lines()
-        .any(|line| line.trim().strip_prefix("# ").unwrap_or(line.trim()) == marker);
+    let loaded = outcome.result.stdout.lines().any(|line| {
+        authoritative_output_line(line, language, outcome.selected_test_runner) == marker
+    });
     let mut stage = authoritative_test_stage(&outcome, &opts);
     let detail = stage.detail.as_mut().unwrap();
     detail["target_module_loaded"] = serde_json::Value::Bool(loaded);
@@ -4974,7 +4986,11 @@ async fn run_authoritative_test(
     };
     let duration_ms = start.elapsed().as_millis() as u64;
     let test_output = format!("{}\n{}", result.stdout, result.stderr);
-    let entered_surfaces = parse_target_entered_events(&test_output);
+    let entered_surfaces = parse_target_entered_lines(
+        test_output
+            .lines()
+            .map(|line| authoritative_output_line(line, language, selected_test_runner)),
+    );
     let has_non_target_blocker = has_non_target_blocking_diagnostic(&result.diagnostics);
     let has_assertion_failure = !has_non_target_blocker
         && (test_output.contains("Assertion failed")
@@ -7781,6 +7797,32 @@ pub fn repair_summary(report: &VerificationReport, language: &Language) -> Repai
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn surface_event_transport_decoding_is_adapter_scoped() {
+        let event = r#"{"event":"target_entered","surface_id":"eligible:1"}"#;
+        let tap = format!("  # {event}");
+        assert!(parse_target_entered_events(&tap).is_empty());
+        for (language, runner, expected) in [
+            (Language::TypeScript, TestRunner::Node, 1),
+            (Language::TypeScript, TestRunner::Bun, 0),
+            (Language::Python, TestRunner::Auto, 0),
+        ] {
+            let decoded = authoritative_output_line(&tap, &language, runner);
+            assert_eq!(
+                parse_target_entered_lines(std::iter::once(decoded)).len(),
+                expected
+            );
+        }
+        for line in [
+            format!("ok 1 - {event}"),
+            format!("log {event}"),
+            "# {\"event\":\"target_entered\",\"surface_id\":42}".into(),
+        ] {
+            let decoded = authoritative_output_line(&line, &Language::TypeScript, TestRunner::Node);
+            assert!(parse_target_entered_lines(std::iter::once(decoded)).is_empty());
+        }
+    }
 
     #[test]
     fn native_admission_requires_complete_matching_bound_values() {

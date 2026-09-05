@@ -66,6 +66,9 @@ jobs:
       - name: Test onboarding evidence gate
         run: python3 -m unittest discover -s tests -p 'onboarding_test.py'
 
+      - name: Test quality-corpus evidence gate
+        run: python3 -m unittest bench.test_test_quality_corpus
+
       - name: Build release binary
         run: cargo build --locked --release --bin court-jester
 
@@ -77,6 +80,17 @@ jobs:
 
       - name: Verify fresh-project onboarding
         run: python3 scripts/check_onboarding.py --binary target/release/court-jester --output target/onboarding-contract.json
+
+      - name: Verify advisory test-quality classifications
+        run: python3 -m bench.test_quality_corpus --binary target/release/court-jester --output target/test-quality-corpus.json
+
+      - name: Upload test-quality corpus evidence
+        if: ${{ !cancelled() && hashFiles('target/test-quality-corpus.json') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-quality-corpus-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/test-quality-corpus.json
+          if-no-files-found: error
 
       - name: Upload onboarding evidence
         if: ${{ !cancelled() && hashFiles('target/onboarding-contract.json') != '' }}

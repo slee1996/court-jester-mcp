@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "suite": "test-quality-runtime-classification-v1",
+  "scope": "Deterministic runtime classifications, not a score or general test adequacy benchmark. Invalid-candidate validation is a separate, unfinished tier.",
+  "cases": [
+    {
+      "id": "python-killed",
+      "language": "python",
+      "source": "def eligible(total: int) -> bool:\n    return total >= 100\n",
+      "tests": "import target\nassert target.eligible(100) is True\n",
+      "expected": {
+        "outcome": "killed",
+        "coupling": [],
+        "entered_mutated_surface": true
+      }
+    },
+    {
+      "id": "python-survived",
+      "language": "python",
+      "source": "def eligible(total: int) -> bool:\n    return total >= 100\n",
+      "tests": "import target\ntarget.eligible(100)\n",
+      "expected": {
+        "outcome": "survived",
+        "coupling": [],
+        "entered_mutated_surface": true
+      }
+    },
+    {
+      "id": "python-blocked",
+      "language": "python",
+      "source": "def enabled() -> bool:\n    return True\n",
+      "tests": "import subprocess\nimport target\nvalue = target.enabled()\nif not value:\n    subprocess.run(['echo', 'blocked'], check=True)\nassert value is True\n",
+      "expected": {
+        "outcome": "blocked",
+        "coupling": [],
+        "entered_mutated_surface": true
+      }
+    },
+    {
+      "id": "python-no_coverage",
+      "language": "python",
+      "source": "def enabled() -> bool:\n    return True\n",
+      "tests": "from pathlib import Path\nimport target\nstate = Path({state_path})\nif not state.exists():\n    target.enabled()\n    state.touch()\n",
+      "expected": {
+        "outcome": "no_coverage",
+        "coupling": [],
+        "entered_mutated_surface": false
+      }
+    },
+    {
+      "id": "python-coupling",
+      "language": "python",
+      "source": "_RATE = 0.9\ndef eligible(total: int) -> bool:\n    return total >= 100\n",
+      "tests": "import target\nassert target._RATE == 0.9\nassert target.eligible(100) is True\n",
+      "expected": {
+        "outcome": "killed",
+        "coupling": [
+          "private_target_access"
+        ],
+        "entered_mutated_surface": true
+      }
+    },
+    {
+      "id": "typescript-killed",
+      "language": "typescript",
+      "source": "export function eligible(total: number): boolean { return total >= 100; }\n",
+      "tests": "import assert from 'node:assert/strict';\nimport * as target from './target.ts';\nassert.equal(target.eligible(100), true);\n",
+      "expected": {
+        "outcome": "killed",
+        "coupling": [],
+        "entered_mutated_surface": true
+      }
+    },
+    {
+      "id": "typescript-survived",
+      "language": "typescript",
+      "source": "export function eligible(total: number): boolean { return total >= 100; }\n",
+      "tests": "import * as target from './target.ts';\ntarget.eligible(100);\n",
+      "expected": {
+        "outcome": "survived",
+        "coupling": [],
+        "entered_mutated_surface": true
+      }
+    },
+    {
+      "id": "typescript-blocked",
+      "language": "typescript",
+      "source": "export function enabled(): boolean { return true; }\n",
+      "tests": "import assert from 'node:assert/strict';\nimport { spawnSync } from 'node:child_process';\nimport * as target from './target.ts';\nconst value = target.enabled();\nif (!value) spawnSync('echo', ['blocked']);\nassert.equal(value, true);\n",
+      "expected": {
+        "outcome": "blocked",
+        "coupling": [],
+        "entered_mutated_surface": true
+      }
+    },
+    {
+      "id": "typescript-no_coverage",
+      "language": "typescript",
+      "source": "export function enabled(): boolean { return true; }\n",
+      "tests": "import { existsSync, writeFileSync } from 'node:fs';\nimport * as target from './target.ts';\nconst state = {state_path};\nif (!existsSync(state)) { target.enabled(); writeFileSync(state, 'visited'); }\n",
+      "expected": {
+        "outcome": "no_coverage",
+        "coupling": [],
+        "entered_mutated_surface": false
+      }
+    },
+    {
+      "id": "typescript-coupling",
+      "language": "typescript",
+      "source": "export const _RATE = 0.9;\nexport function eligible(total: number): boolean { return total >= 100; }\n",
+      "tests": "import assert from 'node:assert/strict';\nimport * as target from './target.ts';\nassert.equal(target._RATE, 0.9);\nassert.equal(target.eligible(100), true);\n",
+      "expected": {
+        "outcome": "killed",
+        "coupling": [
+          "private_target_access"
+        ],
+        "entered_mutated_surface": true
+      }
+    }
+  ]
+}

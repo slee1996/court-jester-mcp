@@ -3464,11 +3464,38 @@ fn structured_test_failure(
     None
 }
 
+/// Decode a reporter's line envelope without interpreting its payload.
+pub fn test_output_line(line: &str, adapter: Option<TestAdapter>) -> &str {
+    let line = line.trim();
+    if adapter == Some(TestAdapter::NodeTap) {
+        line.strip_prefix("# ").unwrap_or(line)
+    } else {
+        line
+    }
+}
+
 fn harness_diagnostics(
     adapter: Option<TestAdapter>,
     process: &ExecutionResult,
     limits: &ExecutionLimits,
 ) -> Vec<FailureDiagnostic> {
+    // Node TAP moves child stdout/stderr into comment records. Preserve those
+    // child diagnostics for the same classification rules used on raw stderr.
+    let mut transported;
+    let process = if adapter == Some(TestAdapter::NodeTap) {
+        transported = process.clone();
+        for line in process
+            .stdout
+            .lines()
+            .filter(|line| line.trim().starts_with("# "))
+        {
+            transported.stderr.push('\n');
+            transported.stderr.push_str(test_output_line(line, adapter));
+        }
+        &transported
+    } else {
+        process
+    };
     let mut diagnostics = Vec::new();
     if let Some(termination) = process.termination.as_ref() {
         let (domain, kind, message) = match termination.kind {
@@ -3632,6 +3659,9 @@ fn harness_diagnostics(
     match adapter.unwrap_or(TestAdapter::Opaque) {
         TestAdapter::Opaque => {}
         TestAdapter::NodeTap => {
+            if has_non_target_blocker {
+                return diagnostics;
+            }
             if process.stdout.contains("not ok") || process.stderr.contains("not ok") {
                 diagnostics.push(FailureDiagnostic {
                     domain: FailureDomain::TargetCode,
@@ -5716,6 +5746,54 @@ mod tests {
         assert_eq!(assertion[0].domain, FailureDomain::TargetCode);
         assert_eq!(assertion[0].kind, FailureKind::AssertionFailure);
         assert_eq!(assertion[0].impact, DiagnosticImpact::Gating);
+    }
+
+    #[test]
+    fn node_tap_preserves_child_policy_diagnostics_without_assertion_promotion() {
+        let limits = ExecutionLimits {
+            timeout_seconds: 1.0,
+            memory_mb: 128,
+            runtime_profile: RuntimeProfile::LocalTrusted,
+            network_policy: NetworkPolicy::Deny,
+        };
+        for (message, expected) in [
+            (
+                "court-jester process spawn denied",
+                FailureKind::ProcessSpawnDenied,
+            ),
+            (
+                "court-jester network access denied",
+                FailureKind::NetworkDenied,
+            ),
+            ("ordinary assertion failure", FailureKind::AssertionFailure),
+        ] {
+            let process = ExecutionResult {
+                stdout: format!("TAP version 13\n# Error: {message}\nnot ok 1 - entrypoint\n"),
+                stderr: String::new(),
+                exit_code: Some(1),
+                duration_ms: 1,
+                timed_out: false,
+                memory_error: false,
+                termination: None,
+                diagnostics: vec![],
+            };
+            let diagnostics = harness_diagnostics(Some(TestAdapter::NodeTap), &process, &limits);
+            assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+            assert_eq!(diagnostics[0].kind, expected);
+            assert_eq!(
+                diagnostics[0].impact,
+                if expected == FailureKind::AssertionFailure {
+                    DiagnosticImpact::Gating
+                } else {
+                    DiagnosticImpact::Blocking
+                }
+            );
+            assert!(harness_diagnostics(Some(TestAdapter::Opaque), &process, &limits).is_empty());
+            assert!(
+                process.stderr.is_empty(),
+                "transport decoding must not rewrite recorded raw streams"
+            );
+        }
     }
 
     #[test]

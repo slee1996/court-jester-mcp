@@ -59,6 +59,10 @@ repair-check: build
 onboarding-check: build
     python3 scripts/check_onboarding.py --binary target/release/court-jester
 
+# Runtime classification corpus for advisory test quality (no adequacy score).
+test-quality-corpus: build
+    python3 -m bench.test_quality_corpus --binary target/release/court-jester
+
 # Format Rust sources.
 fmt:
     cargo fmt
@@ -77,10 +81,12 @@ release-check:
     python3 -m unittest discover -s tests -p 'release_test.py'
     python3 -m unittest discover -s tests -p 'repair_contract_test.py'
     python3 -m unittest discover -s tests -p 'onboarding_test.py'
+    python3 -m unittest bench.test_test_quality_corpus
     cargo build --locked --release --bin court-jester
     python3 scripts/smoke_cli.py --binary target/release/court-jester --verify-sample
     python3 scripts/check_repair_loop.py --binary target/release/court-jester
     python3 scripts/check_onboarding.py --binary target/release/court-jester
+    python3 -m bench.test_quality_corpus --binary target/release/court-jester
     python3 -m bench.fuzz_effectiveness --binary target/release/court-jester
     python3 scripts/prepare_release.py --binary target/release/court-jester --bundle-dir target/release-check/staged
     python3 -m bench.run_matrix --task-set swebench-lite-pilot --models noop --policies baseline --dry-run --enforce-heldout-lock --output-dir target/release-check/heldout-dry
