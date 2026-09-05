@@ -210,6 +210,9 @@ fn ci_uses_configured_authoritative_tests_without_requiring_mutation_testing() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["base_commit"], base);
+    assert_eq!(report["head_commit"], git(&["rev-parse", "HEAD"]));
+    assert_eq!(report["candidate_state"], "working_tree");
     let files = report["files"].as_array().unwrap();
     let target = files
         .iter()

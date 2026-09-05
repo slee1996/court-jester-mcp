@@ -14,6 +14,7 @@ mod ci;
 mod config;
 mod doctor;
 mod environment;
+mod revisions;
 use args::{
     parse_flags, parse_replay_flags, read_file, read_optional_file, require_file, require_language,
     resolve_cli_context, resolve_complexity_threshold, validate_base_pair,
@@ -915,6 +916,8 @@ mod tests {
         let result = CiRunResult {
             base: "base".into(),
             head: "head".into(),
+            base_commit: "base-commit".into(),
+            head_commit: "head-commit".into(),
             gates: vec!["test".into()],
             changed_files: 0,
             checked_files: 0,

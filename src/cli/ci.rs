@@ -8,10 +8,8 @@ use court_jester::types::{
     DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
 };
 use std::collections::BTreeSet;
-use std::io::Cursor;
 use std::path::Path;
 use std::process::Command;
-use tar::Archive;
 use tempfile::TempDir;
 
 const CI_ALL_GATES: [&str; 7] = [
@@ -97,6 +95,8 @@ pub(super) fn ci_test_quality_summary(
 pub(super) struct CiRunResult {
     pub(super) base: String,
     pub(super) head: String,
+    pub(super) base_commit: String,
+    pub(super) head_commit: String,
     pub(super) gates: Vec<String>,
     pub(super) changed_files: usize,
     pub(super) checked_files: usize,
@@ -336,6 +336,7 @@ pub(super) fn ci_quality_allocations(max_mutants: usize, candidate_counts: &[usi
 
 fn git_output(repo_dir: &Path, args: &[String]) -> Result<String, String> {
     let output = Command::new("git")
+        .arg("--no-replace-objects")
         .args(args)
         .current_dir(repo_dir)
         .output()
@@ -390,24 +391,9 @@ fn ci_unified_diff(repo_dir: &Path, base: &str, head: &str) -> Result<String, St
 }
 
 fn archive_baseline_tree(repo_dir: &Path, revision: &str) -> Result<TempDir, String> {
-    let output = Command::new("git")
-        .current_dir(repo_dir)
-        .args(["archive", "--format=tar", revision])
-        .output()
-        .map_err(|e| format!("failed to run git archive: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "git archive failed for {revision}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    let temp =
-        tempfile::tempdir().map_err(|e| format!("failed to create baseline tempdir: {e}"))?;
-    Archive::new(Cursor::new(output.stdout))
-        .unpack(temp.path())
-        .map_err(|e| format!("failed to unpack baseline archive: {e}"))?;
-    Ok(temp)
+    super::revisions::materialize(repo_dir, revision)
 }
+
 pub(super) async fn run_ci_for_repo(
     repo_dir: &Path,
     args: &CliArgs,
@@ -428,11 +414,13 @@ pub(super) async fn run_ci_for_repo(
     }
     let base = require_base(args)?.to_string();
     let head = args.head.clone().unwrap_or_else(|| "HEAD".into());
+    let base_commit = super::revisions::resolve_revision(repo_dir, &base)?;
+    let head_commit = super::revisions::resolve_revision(repo_dir, &head)?;
     let suppressions = super::args::read_suppressions(args.suppressions_file.as_deref())?;
     let test_entrypoints = ci_test_entrypoints(repo_dir, &args.test_files)?;
-    let baseline_temp = archive_baseline_tree(repo_dir, &base)?;
+    let baseline_temp = archive_baseline_tree(repo_dir, &base_commit)?;
     let gates = parse_ci_gates(args.gate.as_deref())?;
-    let changed_files = ci_changed_source_files(repo_dir, &base, &head)?;
+    let changed_files = ci_changed_source_files(repo_dir, &base_commit, &head_commit)?;
     if args.harness_args_explicit && changed_files.len() != 1 {
         return Err(
             "`ci` accepts --harness-args-json only when exactly one changed target is selected"
@@ -442,7 +430,7 @@ pub(super) async fn run_ci_for_repo(
     let diff = if changed_files.is_empty() {
         String::new()
     } else {
-        ci_unified_diff(repo_dir, &base, &head)?
+        ci_unified_diff(repo_dir, &base_commit, &head_commit)?
     };
     let diff = (!diff.is_empty()).then_some(diff);
     let complexity_threshold = resolve_complexity_threshold(args)?;
@@ -589,6 +577,8 @@ pub(super) async fn run_ci_for_repo(
     Ok(CiRunResult {
         base,
         head,
+        base_commit,
+        head_commit,
         gates,
         changed_files: changed_files.len(),
         checked_files: files.len(),
@@ -899,6 +889,9 @@ pub(super) fn ci_json_value(result: &CiRunResult, report_level: ReportLevel) -> 
     let mut value = serde_json::json!({
         "base": result.base,
         "head": result.head,
+        "base_commit": result.base_commit,
+        "head_commit": result.head_commit,
+        "candidate_state": "working_tree",
         "gates": result.gates,
         "verdict": result.verdict,
         "changed_files": result.changed_files,
@@ -917,4 +910,55 @@ pub(super) fn ci_json_value(result: &CiRunResult, report_level: ReportLevel) -> 
             serde_json::to_value(summary).expect("test-quality summary serialization cannot fail");
     }
     value
+}
+
+#[cfg(test)]
+mod revision_tests {
+    use super::*;
+
+    #[test]
+    fn baseline_retains_tracked_files_and_bytes_despite_export_attributes() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["config", "user.name", "Tests"],
+            vec!["config", "user.email", "tests@example.com"],
+        ] {
+            assert!(Command::new("git")
+                .current_dir(root)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::write(
+            root.join(".gitattributes"),
+            "hidden.py export-ignore\nexpanded.py export-subst\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("hidden.py"), "hidden = True\n").unwrap();
+        std::fs::write(root.join("expanded.py"), "value = '$Format:%H$'\n").unwrap();
+        assert!(Command::new("git")
+            .current_dir(root)
+            .args(["add", "."])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .current_dir(root)
+            .args(["commit", "--quiet", "-m", "base"])
+            .status()
+            .unwrap()
+            .success());
+        let snapshot = archive_baseline_tree(root, "HEAD").unwrap();
+        assert_eq!(
+            std::fs::read(snapshot.path().join("hidden.py")).unwrap(),
+            b"hidden = True\n"
+        );
+        assert_eq!(
+            std::fs::read(snapshot.path().join("expanded.py")).unwrap(),
+            b"value = '$Format:%H$'\n"
+        );
+    }
 }
