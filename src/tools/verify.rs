@@ -4678,6 +4678,157 @@ struct AuthoritativeTestOutcome {
     selected_test_runner: TestRunner,
 }
 
+pub struct EntrypointProbeOptions<'a> {
+    pub source_file: &'a str,
+    pub test_source_file: &'a str,
+    pub project_dir: Option<&'a str>,
+    pub test_runner: TestRunner,
+    pub timeout_seconds: f64,
+    pub memory_mb: u64,
+}
+
+/// Execute only the selected authoritative entrypoint through the normal local
+/// test adapter. This is an opt-in readiness probe, not fuzzing or a coverage claim.
+pub async fn probe_authoritative_entrypoint(
+    code: &str,
+    tests: &str,
+    language: &Language,
+    probe: EntrypointProbeOptions<'_>,
+) -> Result<VerificationStage, String> {
+    if !probe.timeout_seconds.is_finite() || probe.timeout_seconds <= 0.0 || probe.memory_mb == 0 {
+        return Err("entrypoint probe requires finite positive timeout and memory limits".into());
+    }
+    let opts = VerifyOptions {
+        test_code: Some(tests),
+        test_source_file: Some(probe.test_source_file),
+        test_runner: probe.test_runner,
+        tests_only: true,
+        test_quality_max_mutants: None,
+        complexity_threshold: None,
+        complexity_metric: ComplexityMetric::Cyclomatic,
+        project_dir: probe.project_dir,
+        lint_config_path: None,
+        lint_virtual_file_path: None,
+        diff: None,
+        suppressions: None,
+        suppression_source: None,
+        auto_seed: false,
+        source_file: Some(probe.source_file),
+        base_code: None,
+        base_source_file: None,
+        base_project_dir: None,
+        output_dir: None,
+        report_level: ReportLevel::Full,
+        execute_gate: ExecuteGate::None,
+        coverage_gate: CoverageGate::None,
+        inferred_oracle_gate: InferredOracleGate::Advisory,
+        runtime_profile: RuntimeProfile::LocalTrusted,
+        memory_mb: probe.memory_mb,
+        network: NetworkPolicy::Deny,
+        harness_args: vec![],
+        python_docker_image: DEFAULT_PYTHON_DOCKER_IMAGE,
+        typescript_docker_image: DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+    };
+    let context = resolve_verification_contexts(&opts, language)?;
+    let nonce = tempfile::Builder::new()
+        .prefix("doctor-probe-")
+        .tempfile()
+        .map_err(|error| error.to_string())?;
+    let marker = format!(
+        "__COURT_JESTER_ENTRYPOINT_LOADED__:{}",
+        nonce.path().file_name().unwrap().to_string_lossy()
+    );
+    let literal = serde_json::to_string(&marker).map_err(|error| error.to_string())?;
+    let instrumented = match language {
+        Language::Python => format!("{code}\nimport builtins as _court_jester_probe_builtins\n_court_jester_probe_builtins.print({literal})\n"),
+        Language::TypeScript => format!("{code}\nglobalThis.console.log({literal});\n"),
+    };
+    let source = context
+        .candidate
+        .target_source
+        .source_file
+        .as_ref()
+        .and_then(|path| path.to_str());
+    let test = context
+        .candidate
+        .test_source
+        .as_ref()
+        .and_then(|source| source.source_file.as_ref())
+        .and_then(|path| path.to_str());
+    let outcome = run_authoritative_test(
+        &instrumented,
+        tests,
+        &[],
+        language,
+        &context,
+        &opts,
+        source,
+        test,
+        probe.timeout_seconds,
+    )
+    .await;
+    let loaded = outcome
+        .result
+        .stdout
+        .lines()
+        .any(|line| line.trim().strip_prefix("# ").unwrap_or(line.trim()) == marker);
+    let mut stage = authoritative_test_stage(&outcome, &opts);
+    let detail = stage.detail.as_mut().unwrap();
+    detail["target_module_loaded"] = serde_json::Value::Bool(loaded);
+    if stage.status == StageStatus::Passed && !loaded {
+        stage.status = StageStatus::Inconclusive;
+        let message = "Entrypoint exited successfully without evidence that the selected target module loaded";
+        stage.message = Some(message.into());
+        detail["diagnostic"] = serde_json::to_value(FailureDiagnostic {
+            domain: FailureDomain::VerifierHarness,
+            kind: FailureKind::Instrumentation,
+            component: DiagnosticComponent::Instrumentation,
+            impact: DiagnosticImpact::Blocking,
+            message: message.into(),
+            process: None,
+            limits: None,
+        })
+        .unwrap();
+    }
+    Ok(stage)
+}
+
+fn authoritative_test_stage(
+    outcome: &AuthoritativeTestOutcome,
+    opts: &VerifyOptions<'_>,
+) -> VerificationStage {
+    let mut detail = serde_json::to_value(&outcome.result).unwrap();
+    detail["assertion_failure"] = serde_json::Value::Bool(outcome.has_assertion_failure);
+    detail["non_target_blocking"] = serde_json::Value::Bool(outcome.has_non_target_blocker);
+    detail["instrumentation_overlay"] = serde_json::to_value(&outcome.overlay).unwrap();
+    detail["target_entered_surfaces"] = serde_json::to_value(&outcome.entered_surfaces).unwrap();
+    detail["authoritative_test_covered_surfaces"] =
+        serde_json::Value::from(outcome.covered_required);
+    detail["tests_only"] = serde_json::Value::Bool(opts.tests_only);
+    detail["test_runner_requested"] = serde_json::to_value(opts.test_runner).unwrap();
+    detail["test_runner_selected"] = serde_json::to_value(outcome.selected_test_runner).unwrap();
+    sanitize_report_value(&mut detail);
+    VerificationStage {
+        name: "test".into(),
+        status: if !outcome.overlay.supported || outcome.has_non_target_blocker {
+            StageStatus::Inconclusive
+        } else if outcome.test_ok {
+            StageStatus::Passed
+        } else {
+            StageStatus::Failed
+        },
+        duration_ms: outcome.duration_ms,
+        detail: Some(detail),
+        message: if !outcome.overlay.supported {
+            outcome.overlay.reason.clone()
+        } else if outcome.test_ok {
+            None
+        } else {
+            Some(sanitize_report_text(&outcome.result.stderr))
+        },
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_authoritative_test(
     code: &str,
@@ -4688,6 +4839,7 @@ async fn run_authoritative_test(
     opts: &VerifyOptions<'_>,
     candidate_source_file: Option<&str>,
     candidate_test_source_file: Option<&str>,
+    timeout_seconds: f64,
 ) -> AuthoritativeTestOutcome {
     let runner_probe = if test_code_has_imports(tests, language) {
         tests.to_string()
@@ -4794,7 +4946,7 @@ async fn run_authoritative_test(
         let mut limits = sandbox_options(
             opts,
             language,
-            test_timeout(),
+            timeout_seconds,
             opts.memory_mb,
             execution_project,
             execution_source,
@@ -5208,6 +5360,7 @@ async fn run_test_quality_stage(
             opts,
             candidate_source_file,
             candidate_test_source_file,
+            test_timeout(),
         )
         .await;
         let entered_mutated_surface = outcome.entered_surfaces.contains(&candidate.surface_id);
@@ -7100,47 +7253,14 @@ pub async fn verify(
             &opts,
             candidate_source_file_owned.as_deref(),
             candidate_test_source_file_owned.as_deref(),
+            test_timeout(),
         )
         .await;
-        let test_result = &baseline_test.result;
         let entered_surfaces = &baseline_test.entered_surfaces;
-        let has_non_target_blocker = baseline_test.has_non_target_blocker;
-        let has_assertion_failure = baseline_test.has_assertion_failure;
         let test_ok = baseline_test.test_ok;
         let covered_required = baseline_test.covered_required;
 
-        let mut test_detail = serde_json::to_value(test_result).unwrap();
-        test_detail["assertion_failure"] = serde_json::Value::Bool(has_assertion_failure);
-        test_detail["non_target_blocking"] = serde_json::Value::Bool(has_non_target_blocker);
-        test_detail["instrumentation_overlay"] =
-            serde_json::to_value(&baseline_test.overlay).unwrap();
-        test_detail["target_entered_surfaces"] = serde_json::to_value(entered_surfaces).unwrap();
-        test_detail["authoritative_test_covered_surfaces"] =
-            serde_json::Value::from(covered_required);
-        test_detail["tests_only"] = serde_json::Value::Bool(opts.tests_only);
-        test_detail["test_runner_requested"] = serde_json::to_value(opts.test_runner).unwrap();
-        test_detail["test_runner_selected"] =
-            serde_json::to_value(baseline_test.selected_test_runner).unwrap();
-        sanitize_report_value(&mut test_detail);
-        stages.push(VerificationStage {
-            name: "test".into(),
-            status: if !baseline_test.overlay.supported || has_non_target_blocker {
-                StageStatus::Inconclusive
-            } else if test_ok {
-                StageStatus::Passed
-            } else {
-                StageStatus::Failed
-            },
-            duration_ms: baseline_test.duration_ms,
-            detail: Some(test_detail),
-            message: if !baseline_test.overlay.supported {
-                baseline_test.overlay.reason.clone()
-            } else if test_ok {
-                None
-            } else {
-                Some(sanitize_report_text(&test_result.stderr))
-            },
-        });
+        stages.push(authoritative_test_stage(&baseline_test, &opts));
 
         if !opts.tests_only
             && baseline_test.overlay.supported

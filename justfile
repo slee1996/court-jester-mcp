@@ -55,6 +55,10 @@ bench-summarize dir:
 repair-check: build
     python3 scripts/check_repair_loop.py --binary target/release/court-jester
 
+# Fresh Python project config/readiness/entrypoint onboarding contract.
+onboarding-check: build
+    python3 scripts/check_onboarding.py --binary target/release/court-jester
+
 # Format Rust sources.
 fmt:
     cargo fmt
@@ -72,9 +76,11 @@ release-check:
     python3 -m unittest bench.test_run_matrix bench.test_runner bench.test_summarize_runs bench.test_agent_trace bench.test_evidence bench.test_materialize_mutation bench.test_fuzz_effectiveness
     python3 -m unittest discover -s tests -p 'release_test.py'
     python3 -m unittest discover -s tests -p 'repair_contract_test.py'
+    python3 -m unittest discover -s tests -p 'onboarding_test.py'
     cargo build --locked --release --bin court-jester
     python3 scripts/smoke_cli.py --binary target/release/court-jester --verify-sample
     python3 scripts/check_repair_loop.py --binary target/release/court-jester
+    python3 scripts/check_onboarding.py --binary target/release/court-jester
     python3 -m bench.fuzz_effectiveness --binary target/release/court-jester
     python3 scripts/prepare_release.py --binary target/release/court-jester --bundle-dir target/release-check/staged
     python3 -m bench.run_matrix --task-set swebench-lite-pilot --models noop --policies baseline --dry-run --enforce-heldout-lock --output-dir target/release-check/heldout-dry

@@ -63,6 +63,9 @@ jobs:
       - name: Test repair evidence gate
         run: python3 -m unittest discover -s tests -p 'repair_contract_test.py'
 
+      - name: Test onboarding evidence gate
+        run: python3 -m unittest discover -s tests -p 'onboarding_test.py'
+
       - name: Build release binary
         run: cargo build --locked --release --bin court-jester
 
@@ -71,6 +74,16 @@ jobs:
 
       - name: Verify release-binary repair contract
         run: python3 scripts/check_repair_loop.py --binary target/release/court-jester --output target/repair-contract.json
+
+      - name: Verify fresh-project onboarding
+        run: python3 scripts/check_onboarding.py --binary target/release/court-jester --output target/onboarding-contract.json
+
+      - name: Upload onboarding evidence
+        if: ${{ !cancelled() && hashFiles('target/onboarding-contract.json') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: onboarding-contract-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/onboarding-contract.json
 
       - name: Upload repair contract evidence
         if: ${{ !cancelled() && hashFiles('target/repair-contract.json') != '' }}

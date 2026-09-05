@@ -34,6 +34,176 @@ fn check<'a>(report: &'a Value, name: &str) -> &'a Value {
 }
 
 #[test]
+fn doctor_entrypoint_probe_is_opt_in_and_preserves_test_outcomes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let target = root.join("target.py");
+    let tests = root.join("checks.py");
+    let marker = root.join("entrypoint-ran");
+    std::fs::write(&target, "def inspect(value: bool):\n    return value\n").unwrap();
+    std::fs::write(&tests, format!("from pathlib import Path\nfrom target import inspect\nPath({:?}).touch()\nassert inspect(False) is False\n", marker.to_str().unwrap())).unwrap();
+    std::fs::write(root.join(".court-jester.json"), serde_json::json!({"schema_version":1,"defaults":{"memory_mb":256},"targets":[{"source":"target.py","test_files":["checks.py"]}]}).to_string()).unwrap();
+    let (_, report) = doctor(root, &["--file", target.to_str().unwrap()]);
+    assert!(!marker.exists());
+    assert!(report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|check| check["name"] != "entrypoint_probe"));
+    let (output, report) = doctor(
+        root,
+        &["--file", target.to_str().unwrap(), "--probe-entrypoint"],
+    );
+    assert!(output.status.success(), "{report:#}");
+    assert!(marker.exists());
+    let probe = check(&report, "entrypoint_probe");
+    assert_eq!(probe["status"], "passed", "{probe:#}");
+    assert_eq!(probe["detail"]["coverage_checked"], false);
+    assert_eq!(probe["detail"]["fuzzing_started"], false);
+    assert_eq!(probe["detail"]["memory_mb"], 256);
+    for code in [
+        "import missing_doctor_probe_dependency\n",
+        "def inspect(value: bool):\n    return True\n",
+    ] {
+        std::fs::write(&target, code).unwrap();
+        let (output, report) = doctor(
+            root,
+            &["--file", target.to_str().unwrap(), "--probe-entrypoint"],
+        );
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(check(&report, "entrypoint_probe")["status"], "failed");
+    }
+    std::fs::write(&target, "def inspect(value: bool):\n    return value\n").unwrap();
+    std::fs::write(&tests, "import time\ntime.sleep(3)\n").unwrap();
+    let (output, report) = doctor(
+        root,
+        &[
+            "--file",
+            target.to_str().unwrap(),
+            "--probe-entrypoint",
+            "--timeout-seconds",
+            "0.2",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let probe = check(&report, "entrypoint_probe");
+    assert_eq!(
+        probe["detail"]["test_stage"]["detail"]["timed_out"], true,
+        "{probe:#}"
+    );
+}
+
+#[test]
+fn doctor_probe_requires_an_unambiguous_entrypoint_and_inspection_never_executes_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let target = root.join("target.py");
+    std::fs::write(&target, "raise RuntimeError('must not run')\n").unwrap();
+    for args in [
+        vec!["doctor", "--probe-entrypoint"],
+        vec![
+            "doctor",
+            "--probe-entrypoint",
+            "--file",
+            target.to_str().unwrap(),
+            "--language",
+            "python",
+        ],
+        vec!["verify", "--probe-entrypoint", "--show-config"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_court-jester"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("--probe-entrypoint"));
+    }
+    let (output, config) = doctor(
+        root,
+        &[
+            "--file",
+            target.to_str().unwrap(),
+            "--probe-entrypoint",
+            "--show-config",
+        ],
+    );
+    assert!(output.status.success());
+    assert_eq!(config["execution_started"], false);
+}
+
+#[test]
+fn doctor_typescript_probe_uses_the_configured_node_test_adapter() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let source = root.join("target.ts");
+    let tests = root.join("checks.test.ts");
+    std::fs::write(&tests, "import { test } from 'node:test';\nimport assert from 'node:assert/strict';\nimport { inspect } from './target.ts';\ntest('entrypoint', () => assert.equal(inspect(false), false));\n").unwrap();
+    for (code, expected) in [
+        (
+            "export function inspect(value: boolean): boolean { return value; }",
+            "passed",
+        ),
+        (
+            "export function inspect(value: boolean): boolean { return true; }",
+            "failed",
+        ),
+    ] {
+        std::fs::write(&source, code).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_court-jester"))
+            .args([
+                "doctor",
+                "--language",
+                "typescript",
+                "--project-dir",
+                root.to_str().unwrap(),
+                "--file",
+                source.to_str().unwrap(),
+                "--test-file",
+                tests.to_str().unwrap(),
+                "--test-runner",
+                "node",
+                "--probe-entrypoint",
+            ])
+            .output()
+            .unwrap();
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let probe = check(&report, "entrypoint_probe");
+        assert_eq!(probe["status"], expected, "{probe:#}");
+        assert_eq!(
+            probe["detail"]["test_stage"]["detail"]["test_runner_selected"],
+            "node"
+        );
+    }
+}
+
+#[test]
+fn doctor_probe_does_not_accept_zero_exit_without_loading_the_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let source = root.join("target.py");
+    let tests = root.join("checks.py");
+    std::fs::write(&source, "def inspect(value: bool):\n    return value\n").unwrap();
+    std::fs::write(
+        &tests,
+        "import target\nassert target.inspect(False) is False\n",
+    )
+    .unwrap();
+    executable(&root.join(".venv/bin/python3"), "#!/bin/sh\necho '__COURT_JESTER_DOCTOR__{\"version\":\"3.12.0\",\"executable\":\"fake-python\"}'\nexit 0\n");
+    let (_, report) = doctor(
+        root,
+        &[
+            "--file",
+            source.to_str().unwrap(),
+            "--test-file",
+            tests.to_str().unwrap(),
+            "--probe-entrypoint",
+        ],
+    );
+    assert_eq!(check(&report, "runtime")["status"], "passed");
+    assert_eq!(check(&report, "entrypoint_probe")["status"], "failed");
+}
+
+#[test]
 fn doctor_resolves_configured_tests_without_executing_them() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

@@ -86,6 +86,22 @@ court-jester ci --show-config
 
 Doctor resolves the same defaults and source/test mappings. Its `repository_config` check shows the selected verification settings, while `configured_entrypoints` checks that selected tests are readable regular files. Missing tests fail with guidance to restore the file or update `test_files`. These checks do not import the target or run the tests. Runtime smoke probes use configured memory when supplied, otherwise their existing 128 MB default; the displayed ordinary verification memory default remains 512 MB.
 
-Use `doctor --show-config` to skip even the runtime/linter readiness probes. Configured-import and actual entrypoint-execution probes, as well as project-aware isolated doctor support, remain unfinished.
+Use `doctor --show-config` to skip even the runtime/linter readiness probes. It remains execution-free when `--probe-entrypoint` is also present.
+
+### Opt-in entrypoint readiness
+
+```sh
+court-jester doctor --file src/profile.py --language python --probe-entrypoint
+court-jester doctor --file src/profile.ts --language typescript \
+  --test-file tests/profile.test.ts --test-runner node --probe-entrypoint
+```
+
+`--probe-entrypoint` explicitly runs the selected authoritative test entrypoint and its imports. It requires one source file, one language, and exactly one configured or explicit test file. Only use it for code you trust to execute. Without this flag, doctor does not run target imports or tests. Project-aware probes currently require `local-trusted`; isolated doctor still checks image readiness only.
+
+The probe uses verification's normal test adapter and context resolution, but runs neither fuzzing nor mutation tests. It requires successful test execution and per-run evidence that the selected target module finished loading. Exit zero without that evidence is inconclusive in the nested test stage and fails the doctor readiness check. A passed probe does not prove function coverage or application correctness. Broken imports, assertions, unavailable adapters, resource limits, and instrumentation failures remain visible in `entrypoint_probe.detail.test_stage`; read errors appear in `error`.
+
+Timeout defaults to doctor's 10 seconds per probe. Entrypoint memory defaults to ordinary verification's 512 MB, while lightweight runtime smoke remains 128 MB. Explicit/configured limits override both. For a timeout or memory failure, inspect the structured execution details and repair the cause or explicitly adjust `--timeout-seconds`/`--memory-mb`. For missing imports, restore the dependency or repair project/runtime selection before retrying.
+
+`just onboarding-check` runs a temporary Python-project acceptance sequence: inspect settings, check default readiness without entrypoint execution, detect a missing import, repair it, then detect a failing test. It installs nothing and records binary-bound evidence; it is not participant research or proof that every framework is supported. The quality/release gate runs the same script and preserves its artifact.
 
 Replay does not read repository configuration: persisted replay context remains authoritative, with the existing explicit replay overrides. There is no configuration inheritance or executable configuration hook.

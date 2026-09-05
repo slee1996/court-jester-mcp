@@ -27,6 +27,7 @@ pub(super) struct CliArgs {
     pub(super) repo_config: Option<String>,
     pub(super) no_repo_config: bool,
     pub(super) show_config: bool,
+    pub(super) probe_entrypoint: bool,
     pub(super) config_targets: Vec<super::config::TargetTests>,
     pub(super) virtual_file_path: Option<String>,
     pub(super) test_files: Vec<String>,
@@ -156,6 +157,7 @@ pub(super) fn parse_flags_indexed(rest: &[String]) -> Result<(CliArgs, Vec<usize
             "--repo-config" => out.repo_config = Some(take_value(&mut i)?),
             "--no-repo-config" => out.no_repo_config = true,
             "--show-config" => out.show_config = true,
+            "--probe-entrypoint" => out.probe_entrypoint = true,
             "--virtual-file-path" => out.virtual_file_path = Some(take_value(&mut i)?),
             "--test-file" => out.test_files.push(take_value(&mut i)?),
             "--test-runner" => {
@@ -565,6 +567,9 @@ pub(super) fn validate_harness_args_in_context(
 }
 
 pub(super) fn validate_policy_flags(cmd: &str, args: &CliArgs) -> Result<(), String> {
+    if args.probe_entrypoint && cmd != "doctor" {
+        return Err("--probe-entrypoint supports doctor only".into());
+    }
     let unsupported = matches!(cmd, "analyze" | "lint");
     if unsupported
         && (args.memory_mb.is_some() || args.network_explicit || args.harness_args_explicit)

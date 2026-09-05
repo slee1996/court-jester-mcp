@@ -106,6 +106,9 @@ async fn local_runtime_check(
 pub(super) async fn run_doctor(
     args: &CliArgs,
 ) -> Result<court_jester::types::DoctorReport, String> {
+    if args.probe_entrypoint && (args.file.is_none() || args.test_files.len() != 1) {
+        return Err("doctor --probe-entrypoint requires --file, one explicit language, and exactly one configured or explicit --test-file".into());
+    }
     if args.file.is_some()
         && args
             .language
@@ -345,6 +348,42 @@ pub(super) async fn run_doctor(
                     .is_some_and(|v| v < 24);
             checks.push(doctor_check("runtime_smoke", Some(*language), if smoke_ok && !node_bad { StageStatus::Passed } else { StageStatus::Failed }, serde_json::json!({"image": image, "stdout": result.stdout, "stderr": result.stderr, "network": "none", "read_only": true, "memory_mb": args.memory_mb.unwrap_or(128)}), (!smoke_ok).then(|| "isolated runtime smoke failed".into()).or_else(|| node_bad.then(|| "Node.js >=24 is required".into()))));
         }
+    }
+    if args.probe_entrypoint {
+        let language = selected[0];
+        let source = args.file.as_deref().unwrap();
+        let test = &args.test_files[0];
+        let code = super::args::read_file(source);
+        let tests = super::args::read_file(test);
+        let result = match (code, tests) {
+            (Ok(code), Ok(tests)) => {
+                tools::verify::probe_authoritative_entrypoint(
+                    &code,
+                    &tests,
+                    &language,
+                    tools::verify::EntrypointProbeOptions {
+                        source_file: source,
+                        test_source_file: test,
+                        project_dir: args.project_dir.as_deref(),
+                        test_runner: args.test_runner,
+                        timeout_seconds: args.timeout_seconds.unwrap_or(10.0),
+                        memory_mb: args.verification_memory_mb(),
+                    },
+                )
+                .await
+            }
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        };
+        let passed = result
+            .as_ref()
+            .is_ok_and(|stage| stage.status == StageStatus::Passed);
+        checks.push(doctor_check("entrypoint_probe", Some(language), if passed { StageStatus::Passed } else { StageStatus::Failed },
+            serde_json::json!({"execution_opt_in": true, "source_file": source, "test_file": test,
+                "test_stage": result.as_ref().ok(), "error": result.as_ref().err(),
+                "timeout_seconds": args.timeout_seconds.unwrap_or(10.0), "memory_mb": args.verification_memory_mb(),
+                "coverage_checked": false, "fuzzing_started": false}),
+            Some(if passed { "Selected test entrypoint completed; this does not prove complete target coverage or application correctness".into() }
+                else { "Selected entrypoint did not complete successfully; inspect test_stage/error, repair imports or dependencies, or fix failing tests, then rerun doctor --probe-entrypoint".into() })));
     }
     let verdict = if checks
         .iter()
