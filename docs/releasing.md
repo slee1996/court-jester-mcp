@@ -26,13 +26,27 @@ git push origin v0.2.16
 
 Pushing the tag starts `.github/workflows/release.yml`. The workflow:
 
-1. runs the reusable Ubuntu quality workflow against the tag; this overlaps with much of `just release-check` but does not repeat the complete local recipe or its sample verification and package-staging steps;
+1. runs the reusable Ubuntu quality workflow against the tag, including sample verification and the release-binary repair contract; it does not repeat the complete local package-staging recipe;
 2. independently checks that the tag exactly matches the Cargo package version and dated release notes in each platform build;
 3. builds macOS and Linux archives for Arm64 and AMD64;
 4. emits a SHA-256 file beside every archive and verifies every checksum;
 5. creates one GitHub release from `docs/release-notes-0.2.16.md` and uploads all eight files.
 
 Do not create the tag until the intended commit is on `main`. The workflow uses `--verify-tag` and will reject a missing or mismatched tag.
+
+## Current-build repair evidence
+
+Quality runs on pull requests, direct pushes to `main`, and release workflow calls. It installs Node 24 explicitly, runs the Rust suite and maintained Python contract/benchmark tests, builds the release binary, and exercises sample verification plus the deterministic repair contract.
+
+Use `just repair-check`, or:
+
+```bash
+python3 scripts/check_repair_loop.py --binary target/release/court-jester
+```
+
+An optional `--output <new-file>` writes artifact-v1 JSON without overwriting an existing file. The four cases cover Python/TypeScript runtime and declared-property failures. Each checks original detection/replay, rejection of a different error or skipped oracle, replay after a supplied repair, and exported-test behavior against the repair, false repair, and original bug. The artifact records phase timings, fixture digest, binary version and SHA-256 before/after, and separate contract/protocol/inconclusive/launch/timeout failure causes. Changing the binary mid-run or supplying an empty suite cannot produce success.
+
+CI uploads `target/repair-contract.json` when produced, including failed-case evidence, under a run/attempt-specific artifact name. This is a current-binary contract check using deterministic repairs, **not** an agent benchmark, precision/recall estimate, or proof for every release platform. Hosted CI execution, platform-specific binaries, broader held-out evidence, and real user outcomes remain separate acceptance requirements. No release is published merely by running this check or pushing to `main`.
 
 ## Verify the published release
 

@@ -15,7 +15,7 @@ This is a single-owner Plan-mode execution record. The completed historical rele
 | P5 | Repository configuration makes daily verification predictable | P1–P3 | Validated config, documented precedence, explicit source/test mappings, budgets and suppressions; committed vs working-tree selection tests | Pending |
 | P6 | Project-aware doctor and onboarding support the real configured entrypoint | P5 | Missing/broken/ready project probes, copyable recovery actions, fresh-user scripted acceptance | In progress (local readiness foundation; configured entrypoint pending) |
 | P7 | Advisory test-quality claims have a reproducible classification corpus | P3 | Reached survivor, killed, invalid, blocked, no-coverage and coupling cases in Python/TypeScript; current-build evidence bundle | Pending |
-| P8 | Every release is gated by current-build trustworthy evidence | P3–P7 | Main/PR workflow coverage, regression/replay checks, build-bound benchmark artifacts, cause-separated abstentions, latency and cost measurement | Pending |
+| P8 | Every release is gated by current-build trustworthy evidence | P3–P7 | Main/PR workflow coverage, regression/replay checks, build-bound benchmark artifacts, cause-separated abstentions, latency and cost measurement | In progress (deterministic current-build repair gate; broader evidence pending) |
 | P9 | Design-partner rollout validates useful repairs and tolerable friction | P4–P8 | Consent-based rollout materials and measured participant repair outcomes, setup friction and continued usage; actual recruitment coordinated with user | Pending |
 
 ## Product decisions
@@ -291,6 +291,15 @@ This is a single-owner Plan-mode execution record. The completed historical rele
 - Replay validates per-oracle witnesses for declared, generic, and type-property violations. Legacy snippets without witnesses retain their reproduction outcome but do not supply `check_passed`; malformed witnesses and positive claims supported only by unrelated checks abstain. Old property bundles must be regenerated from the failing revision, not silently upgraded. README and report-schema documentation describe this compatibility limit.
 - Final-source `cargo test --locked --tests --no-fail-fast -- --test-threads=1`: 655 passed and the two known filesystem-restricted Docker-shared directory tests failed. Both pass outside that restriction with `cargo test --locked --lib temporary_directories_use_docker_shared_home -- --test-threads=1`. Verifier: 225 passed; synthesis: 115; regression export: nine. Strict Clippy, formatting, whitespace checks, release build, rebuilt sample/extended smoke, all nine effectiveness-v2 expectations, 82 benchmark unit tests, and two release-contract tests pass.
 - This strengthens P2/P4 evidence; it does not complete the product objective. Input-validity/lifecycle gaps, live-candidate differential export, configuration, complete onboarding, release evidence, and real design-partner outcomes remain required.
+
+### Increment 28: current-build repair evidence in Quality
+
+- Quality now runs on direct main pushes as well as PRs and reusable release calls, explicitly selects Node 24, includes all seven maintained benchmark unit modules, and enables sample verification in release-binary smoke checks.
+- Added `scripts/check_repair_loop.py` and `just repair-check`. Four deterministic Python/TypeScript runtime/property cases each exercise nine phases: detection, original replay, rejection of a false repair, repaired replay, export, three exported-test outcomes, and restored-original replay. This is not an agent benchmark or an estimate of general accuracy.
+- Artifact-v1 evidence records binary hashes before/after, version, fixture digest, runtime metadata, phase timings, and distinct failure causes. Empty suites and changed binaries cannot pass. Output creation refuses overwrite. CI uploads produced evidence even when cases fail; main pushes do not publish releases.
+- The workflow contract test failed before the workflow update and all six repair-contract unit tests now pass. Two release-contract tests and 82 benchmark tests pass; the locked held-out dry-run completes (not an agent success). Ruby parses the workflow YAML and whitespace checks pass.
+- The current release binary passes all four cases/nine phases locally with unchanged SHA-256 `a503b04974f59c99d9ea57cbc981d99a8517d7d7fe02221cf4580c91d311730f`. Local evidence uses Python 3.14.5 and Node 23.3.0 on macOS; hosted Node 24/Ubuntu execution remains to be checked after push. Rust source is unchanged from increment 27; its full Rust-suite result is not represented as a fresh run here.
+- P8 remains incomplete: deterministic contract evidence is only a foundation. Hosted/platform evidence, broader held-out paired repair outcomes, cost measurements, and P1–P7/P9 acceptance remain required. The full product objective stays active.
 
 ## Completion audit
 
