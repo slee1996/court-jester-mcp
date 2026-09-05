@@ -70,7 +70,7 @@ jobs:
         run: python3 -m unittest bench.test_test_quality_corpus
 
       - name: Build release binary
-        run: cargo build --locked --release --bin court-jester
+        run: cargo build --locked --release --bin court-jester --example test_quality_validation
 
       - name: Run release CLI smoke test
         run: python3 scripts/smoke_cli.py --binary target/release/court-jester --verify-sample
@@ -82,7 +82,7 @@ jobs:
         run: python3 scripts/check_onboarding.py --binary target/release/court-jester --output target/onboarding-contract.json
 
       - name: Verify advisory test-quality classifications
-        run: python3 -m bench.test_quality_corpus --binary target/release/court-jester --output target/test-quality-corpus.json
+        run: python3 -m bench.test_quality_corpus --binary target/release/court-jester --validation-binary target/release/examples/test_quality_validation --output target/test-quality-corpus.json
 
       - name: Upload test-quality corpus evidence
         if: ${{ !cancelled() && hashFiles('target/test-quality-corpus.json') != '' }}

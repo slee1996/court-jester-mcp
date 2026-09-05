@@ -5320,53 +5320,26 @@ async fn run_test_quality_stage(
     let mut no_coverage = 0usize;
     let mut observations = Vec::with_capacity(planned_count);
     for candidate in planned {
-        let mutated_code = match test_quality::apply_mutation(code, &candidate) {
-            Ok(mutated) => mutated,
+        let validated = match test_quality::validate_mutation(
+            code,
+            &candidate,
+            &verification_context.candidate.target_source,
+            required_functions,
+        ) {
+            Ok(validated) => validated,
             Err(error) => {
                 invalid += 1;
                 observations.push(serde_json::json!({
                     "mutation": candidate,
                     "outcome": "invalid",
-                    "reason": error,
+                    "validation_kind": error.kind,
+                    "reason": sanitize_report_text(&error.message),
                 }));
                 continue;
             }
         };
-        let mutant_analysis = analyze::analyze_with_context(
-            &mutated_code,
-            &verification_context.candidate.target_source,
-        );
-        if mutant_analysis.parse_error {
-            invalid += 1;
-            let reason = mutant_analysis
-                .parse_diagnostics
-                .first()
-                .map(|diagnostic| sanitize_report_text(&diagnostic.message))
-                .unwrap_or_else(|| "mutant did not parse".into());
-            observations.push(serde_json::json!({
-                "mutation": candidate,
-                "outcome": "invalid",
-                "reason": reason,
-            }));
-            continue;
-        }
-        let mutant_functions = required_functions
-            .iter()
-            .filter_map(|required| {
-                mutant_analysis.functions.iter().find(|function| {
-                    function.name == required.name && function.line == required.line
-                })
-            })
-            .collect::<Vec<_>>();
-        if mutant_functions.len() != required_functions.len() {
-            invalid += 1;
-            observations.push(serde_json::json!({
-                "mutation": candidate,
-                "outcome": "invalid",
-                "reason": "mutant changed the required callable surface",
-            }));
-            continue;
-        }
+        let mutated_code = validated.code;
+        let mutant_functions = validated.required_functions.iter().collect::<Vec<_>>();
         let outcome = run_authoritative_test(
             &mutated_code,
             tests,

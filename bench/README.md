@@ -22,7 +22,7 @@ The evaluator requires declared finding fields and consistent CLI verdict/exit c
 
 ## Advisory test-quality classification corpus
 
-`python3 -m bench.test_quality_corpus --binary target/release/court-jester` runs ten manifest-declared Python/TypeScript runtime cases for kills, reached survivors, policy blockers, missing coverage, and coupling. It records binary/manifest-bound evidence without an adequacy score. The separate invalid-candidate tier remains unfinished; see [corpus scope and contracts](../docs/test-quality-corpus.md).
+`just test-quality-corpus` builds and runs ten manifest-declared Python/TypeScript runtime cases for kills, reached survivors, policy blockers, missing coverage, and coupling, plus a separate 12-case fault-injected validation tier. It records binary/manifest-bound evidence without an adequacy score. Direct Python invocations without `--validation-binary` remain explicitly runtime-only; see [corpus scope and contracts](../docs/test-quality-corpus.md).
 
 ## Recent Writeups
 

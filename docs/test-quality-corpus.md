@@ -3,7 +3,9 @@
 Run `just test-quality-corpus`, or:
 
 ```sh
+cargo build --locked --release --bin court-jester --example test_quality_validation
 python3 -m bench.test_quality_corpus --binary target/release/court-jester \
+  --validation-binary target/release/examples/test_quality_validation \
   --output target/test-quality-corpus.json
 ```
 
@@ -23,6 +25,10 @@ Artifacts include the exact binary and manifest SHA-256 digests, per-case report
 
 The corpus exposed Node TAP moving target-entry records and child diagnostics into `# ...` comment envelopes. Decoding now follows the selected test adapter: raw JSON remains raw, Node TAP comments are decoded for Node, and non-target policy/resource blockers take precedence over a generic failed TAP test. The recorded process streams remain unchanged.
 
-## Remaining invalid-candidate tier
+## Separate invalid-candidate tier
 
-Invalid mutants are not interchangeable with blocked or skipped campaigns. The normal planner already filters candidates that fail application or syntax validation, so the ten runtime fixtures do not claim to exercise an emitted `invalid` outcome. A separate, explicitly fault-injected validation-boundary tier is still required to prove invalid-candidate handling for both languages. The broader P7 corpus acceptance remains unfinished until that tier has reproducible evidence; these ten passing cases do not substitute for it.
+Invalid mutants are not interchangeable with blocked or skipped campaigns. The normal planner already filters candidates that fail application or syntax validation, so the ten runtime fixtures do not claim to exercise an emitted `invalid` outcome.
+
+The `test_quality_validation` helper calls the same pre-execution validator as production verification. For each language it checks a valid planned edit, stale source text, an out-of-range edit, a split UTF-8 boundary, invalid syntax, and a renamed required function. These 12 fault-injection/control rows execute no mutants and remain separate from runtime counts. Production invalid observations now retain a typed `validation_kind` alongside their reason.
+
+The checker requires the complete unique matrix, exact classifications, no execution, and matching verifier/helper hashes. The helper also records compiled source digests. Build both executables together as shown above: binary hashes identify artifacts, but do not independently prove that two executables were compiled from the same checkout. CI uses a single build invocation. `classification_evidence_complete` is true only when both tiers pass and the verifier remains unchanged. Omitting `--validation-binary` allows an explicitly incomplete runtime-only run; canonical quality/release gates always supply it. This bounded corpus does not prove general mutation adequacy or product usefulness.

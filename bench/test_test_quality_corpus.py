@@ -1,8 +1,12 @@
 import copy
 import json
 import unittest
+from unittest.mock import patch
+from pathlib import Path
+import tempfile
+from types import SimpleNamespace
 
-from bench.test_quality_corpus import MANIFEST, OUTCOMES, check_case
+from bench.test_quality_corpus import MANIFEST, OUTCOMES, VALIDATION_FAULTS, check_case, check_validation, run
 
 
 def report_for(case):
@@ -16,6 +20,54 @@ def report_for(case):
 
 
 class TestQualityCorpusTests(unittest.TestCase):
+    def test_runtime_only_is_incomplete_and_failed_validation_fails_combined_gate(self):
+        case = json.loads(MANIFEST.read_text())["cases"][0]
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "verifier"
+            binary.write_bytes(b"test binary")
+            manifest = Path(directory) / "manifest.json"
+            manifest.write_text(json.dumps({"schema_version": 1, "suite": "test", "scope": "test", "cases": [case]}))
+            with patch("bench.test_quality_corpus.subprocess.run", return_value=SimpleNamespace(
+                    returncode=0, stdout=json.dumps(report_for(case)))):
+                result = run(binary, manifest)
+                self.assertEqual(result["status"], "passed")
+                self.assertEqual(result["validation"]["status"], "not_run")
+                self.assertFalse(result["classification_evidence_complete"])
+                for status in ("passed", "failed"):
+                    with patch("bench.test_quality_corpus.run_validation", return_value={"status": status}):
+                        result = run(binary, manifest, binary)
+                    self.assertEqual(result["status"], status)
+                    self.assertEqual(result["classification_evidence_complete"], status == "passed")
+                    self.assertEqual(result["summary"], {"cases": 1, "matched": 1})
+
+    def test_validation_matrix_and_identity_contract(self):
+        report = {"artifact_schema_version": 1, "suite": "test-quality-validation-v1",
+                  "evidence_kind": "fault_injected_validation_boundary_not_generated_runtime_mutants",
+                  "status": "passed", "verifier_binary_sha256": "a" * 64, "validator_binary_sha256": "b" * 64,
+                  "validation_source_sha256": "c" * 64, "fixture_source_sha256": "d" * 64,
+                  "cases": [{"id": f"{language}-{fault}", "language": language, "fault": fault,
+                             "expected": expected, "observed": expected, "matched": True,
+                             "classification": "valid" if expected == "valid" else "invalid",
+                             "mutant_execution_started": False}
+                            for language in ("python", "typescript") for fault, expected in VALIDATION_FAULTS.items()]}
+        self.assertEqual(check_validation(report, "a" * 64, "b" * 64), [])
+        for mutate in [
+            lambda r: r.pop("verifier_binary_sha256"),
+            lambda r: r.update(validator_binary_sha256="e" * 64),
+            lambda r: r.update(validation_source_sha256="wrong"),
+            lambda r: r["cases"].pop(),
+            lambda r: r["cases"].append(r["cases"][0]),
+            lambda r: r["cases"][1].update(observed="valid"),
+            lambda r: r["cases"][1].update(classification="valid"),
+            lambda r: r["cases"][0].update(mutant_execution_started=True),
+            lambda r: r["cases"][0].update(matched=1),
+            lambda r: r.update(cases=[None]),
+            lambda r: r.update(artifact_schema_version=True),
+        ]:
+            bad = copy.deepcopy(report)
+            mutate(bad)
+            self.assertTrue(check_validation(bad, "a" * 64, "b" * 64))
+
     def setUp(self):
         self.cases = json.loads(MANIFEST.read_text())["cases"]
 

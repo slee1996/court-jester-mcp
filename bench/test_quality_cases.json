@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "suite": "test-quality-runtime-classification-v1",
-  "scope": "Deterministic runtime classifications, not a score or general test adequacy benchmark. Invalid-candidate validation is a separate, unfinished tier.",
+  "scope": "Deterministic runtime classifications, not a score or general test adequacy benchmark. Invalid-candidate validation is a separate fault-injection tier, never included in runtime counts.",
   "cases": [
     {
       "id": "python-killed",

@@ -4,7 +4,7 @@ use std::path::Path;
 use serde::Serialize;
 use tree_sitter::{Node, Parser};
 
-use crate::types::{FunctionInfo, Language, SourceMode};
+use crate::types::{FunctionInfo, Language, SourceContext, SourceMode};
 
 pub const DEFAULT_MAX_MUTANTS: usize = 8;
 pub const MAX_MUTANTS: usize = 32;
@@ -491,6 +491,71 @@ pub fn apply_mutation(code: &str, candidate: &MutationCandidate) -> Result<Strin
     mutated.push_str(&candidate.replacement);
     mutated.push_str(&code[candidate.end_byte..]);
     Ok(mutated)
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationValidationKind {
+    InvalidEdit,
+    InvalidSyntax,
+    ChangedSurface,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MutationValidationError {
+    pub kind: MutationValidationKind,
+    pub message: String,
+}
+
+#[derive(Debug)]
+pub struct ValidatedMutation {
+    pub code: String,
+    pub required_functions: Vec<FunctionInfo>,
+}
+
+/// Admit an edit to the mutation runner only after source identity, parsing,
+/// and required callable identity have been validated. This never executes code.
+pub fn validate_mutation(
+    code: &str,
+    candidate: &MutationCandidate,
+    context: &SourceContext,
+    required_functions: &[&FunctionInfo],
+) -> Result<ValidatedMutation, MutationValidationError> {
+    let code = apply_mutation(code, candidate).map_err(|message| MutationValidationError {
+        kind: MutationValidationKind::InvalidEdit,
+        message,
+    })?;
+    let analysis = super::analyze::analyze_with_context(&code, context);
+    if analysis.parse_error {
+        return Err(MutationValidationError {
+            kind: MutationValidationKind::InvalidSyntax,
+            message: analysis
+                .parse_diagnostics
+                .first()
+                .map(|diagnostic| diagnostic.message.clone())
+                .unwrap_or_else(|| "mutant did not parse".into()),
+        });
+    }
+    let functions = required_functions
+        .iter()
+        .filter_map(|required| {
+            analysis
+                .functions
+                .iter()
+                .find(|function| function.name == required.name && function.line == required.line)
+                .cloned()
+        })
+        .collect::<Vec<_>>();
+    if functions.len() != required_functions.len() {
+        return Err(MutationValidationError {
+            kind: MutationValidationKind::ChangedSurface,
+            message: "mutant changed the required callable surface".into(),
+        });
+    }
+    Ok(ValidatedMutation {
+        code,
+        required_functions: functions,
+    })
 }
 
 fn identifier_tokens(text: &str) -> Vec<String> {
