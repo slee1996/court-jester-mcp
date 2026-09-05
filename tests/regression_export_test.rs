@@ -97,6 +97,24 @@ fn run_test(bundle: &Path, language: &str, binary: &str) -> Output {
 }
 
 #[test]
+fn live_candidate_selection_is_not_silently_ignored_for_ordinary_replay() {
+    let root = tempfile::tempdir().unwrap();
+    let (_, report, id) = fixture(root.path(), "python",
+        "from typing import Literal\ndef first_character(value: Literal['', 'a']) -> str:\n    return value[0]\n", Some("runtime_contract"));
+    let output = cli(&[
+        "replay",
+        "--report",
+        report.to_str().unwrap(),
+        "--finding",
+        &id,
+        "--candidate-project-dir",
+        root.path().to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("requires a differential finding"));
+}
+
+#[test]
 fn exported_regressions_require_positive_completion_and_current_source() {
     for (language, bug, other_bug, fixed) in [
         ("python", "from typing import Literal\ndef first_character(value: Literal['', 'a']) -> str:\n    return value[0]\n",

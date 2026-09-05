@@ -105,6 +105,7 @@ REPLAY OPTIONS:
   --report <PATH>            Persisted schema-v3 report to replay
   --finding <ID>             Finding id to replay (must be unique)
   --export-regression <DIR>  Write new CLI-backed test bundle inside dependency project
+  --candidate-project-dir <DIR>  Differential replay against current project sources
   --accept-inferred          Explicitly accept an inferred expectation for export
   --dependency-project-dir <PATH>  Dependency project root for replay
   --timeout-seconds <F>      Replay timeout override
@@ -275,7 +276,7 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
                     .flatten()
             })
             .unwrap_or(DEFAULT_TYPESCRIPT_DOCKER_IMAGE);
-        let report = tools::verify::replay_report_with_options(
+        let report = tools::verify::replay_report_with_candidate_options(
             report_path,
             finding_id,
             args.dependency_project_dir.as_deref(),
@@ -287,6 +288,7 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
             args.network_explicit.then_some(args.network),
             args.harness_args_explicit
                 .then_some(args.harness_args.as_slice()),
+            args.replay_candidate_project_dir.as_deref(),
         )
         .await?;
         if let Some(plan) = export_plan {

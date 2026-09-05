@@ -25,7 +25,8 @@ mod report_text;
 mod reporting;
 use provenance::{stable_digest, tree_digest};
 pub use replay::{
-    load_persisted_report, replay_launch_context, replay_report, replay_report_with_options,
+    load_persisted_report, replay_launch_context, replay_report,
+    replay_report_with_candidate_options, replay_report_with_options,
 };
 
 use reporting::write_report;

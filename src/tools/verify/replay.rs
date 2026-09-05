@@ -184,6 +184,37 @@ fn materialize_embedded_tree(
     }
 }
 
+fn live_candidate_tree(
+    project: &str,
+    relative_entry: &str,
+) -> Result<(PathBuf, String, String), String> {
+    let relative = Path::new(relative_entry);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err("live candidate entry must be a normalized project-relative path".into());
+    }
+    let root = std::fs::canonicalize(project)
+        .map_err(|error| format!("live candidate project unavailable: {error}"))?;
+    if !root.is_dir() {
+        return Err("live candidate project must be a directory".into());
+    }
+    let entry = std::fs::canonicalize(root.join(relative))
+        .map_err(|error| format!("live candidate source unavailable: {error}"))?;
+    if !entry.starts_with(&root) || !entry.is_file() {
+        return Err("live candidate source must be a file inside the candidate project".into());
+    }
+    let source = std::fs::read_to_string(&entry)
+        .map_err(|error| format!("live candidate source unreadable: {error}"))?;
+    let entry = entry
+        .to_str()
+        .ok_or("live candidate source path must be UTF-8")?
+        .to_string();
+    Ok((root, source, entry))
+}
+
 pub async fn replay_report(
     report_path: &str,
     finding_id: &str,
@@ -220,6 +251,38 @@ pub async fn replay_report_with_options(
     network: Option<NetworkPolicy>,
     harness_args: Option<&[HarnessArg]>,
 ) -> Result<ReplayReport, String> {
+    replay_report_with_candidate_options(
+        report_path,
+        finding_id,
+        dependency_project_dir,
+        runtime_profile,
+        python_docker_image,
+        typescript_docker_image,
+        timeout_seconds,
+        memory_mb,
+        network,
+        harness_args,
+        None,
+    )
+    .await
+}
+
+/// Explicit live-candidate differential replay; the baseline remains embedded.
+/// Omitting the candidate directory preserves historical snapshot replay.
+#[allow(clippy::too_many_arguments)]
+pub async fn replay_report_with_candidate_options(
+    report_path: &str,
+    finding_id: &str,
+    dependency_project_dir: Option<&str>,
+    runtime_profile: RuntimeProfile,
+    python_docker_image: &str,
+    typescript_docker_image: &str,
+    timeout_seconds: Option<f64>,
+    memory_mb: Option<u64>,
+    network: Option<NetworkPolicy>,
+    harness_args: Option<&[HarnessArg]>,
+    candidate_project_dir: Option<&str>,
+) -> Result<ReplayReport, String> {
     let report = load_persisted_report(report_path)?;
     let mut matches = persisted_findings(&report)
         .into_iter()
@@ -229,6 +292,9 @@ pub async fn replay_report_with_options(
         .ok_or_else(|| format!("finding '{finding_id}' was not found in report"))?;
     if matches.next().is_some() {
         return Err(format!("finding id '{finding_id}' is duplicated"));
+    }
+    if candidate_project_dir.is_some() && finding.repro.differential.is_none() {
+        return Err("--candidate-project-dir requires a differential finding; ordinary replay already checks current source".into());
     }
     let language = Language::parse(&report.meta.language).ok_or_else(|| {
         format!(
@@ -257,7 +323,15 @@ pub async fn replay_report_with_options(
             .unwrap_or(&[])
     });
     if let Some(differential) = finding.repro.differential.as_ref() {
-        if let Err(reason) = validate_differential_repro(differential, dependency_project_dir) {
+        if let Err(reason) = validate_differential_repro(differential, dependency_project_dir)
+            .and_then(|()| {
+                if let Some(project) = candidate_project_dir {
+                    validate_differential_repro(differential, Some(project))
+                } else {
+                    Ok(())
+                }
+            })
+        {
             return Ok(ReplayReport {
                 check_passed: None,
                 schema_version: REPORT_SCHEMA_VERSION,
@@ -282,22 +356,33 @@ pub async fn replay_report_with_options(
                 })
             }
         };
-        let (candidate_root, candidate_source, candidate_entry) = match materialize_embedded_tree(
-            &differential.candidate_files,
-            &differential.relative_entry,
-            "candidate",
-        ) {
-            Ok(materialized) => materialized,
-            Err(reason) => {
-                return Ok(ReplayReport {
-                    check_passed: None,
-                    schema_version: REPORT_SCHEMA_VERSION,
-                    finding_id: finding.id,
-                    outcome: ReplayOutcome::Inconclusive,
-                    execution: err_execution_result(&reason),
-                })
-            }
+        let candidate_tree = if let Some(project) = candidate_project_dir {
+            live_candidate_tree(project, &differential.relative_entry)
+                .map(|(root, source, entry)| (None, root, source, entry))
+        } else {
+            materialize_embedded_tree(
+                &differential.candidate_files,
+                &differential.relative_entry,
+                "candidate",
+            )
+            .map(|(lease, source, entry)| {
+                let root = lease.path().to_path_buf();
+                (Some(lease), root, source, entry)
+            })
         };
+        let (_candidate_lease, candidate_root, candidate_source, candidate_entry) =
+            match candidate_tree {
+                Ok(materialized) => materialized,
+                Err(reason) => {
+                    return Ok(ReplayReport {
+                        check_passed: None,
+                        schema_version: REPORT_SCHEMA_VERSION,
+                        finding_id: finding.id,
+                        outcome: ReplayOutcome::Inconclusive,
+                        execution: err_execution_result(&reason),
+                    })
+                }
+            };
         let Some(symbol) = finding.repro.function.as_deref() else {
             return Ok(ReplayReport {
                 check_passed: None,
@@ -329,8 +414,8 @@ pub async fn replay_report_with_options(
             }
         };
         let candidate_context = match crate::resolve_execution_context(ContextRequest {
-            invocation_dir: candidate_root.path(),
-            explicit_project_dir: Some(candidate_root.path()),
+            invocation_dir: &candidate_root,
+            explicit_project_dir: Some(&candidate_root),
             target_file: Some(Path::new(&candidate_entry)),
             test_file: None,
             language,
@@ -369,7 +454,7 @@ pub async fn replay_report_with_options(
                 finding_id: finding.id,
                 outcome: ReplayOutcome::Inconclusive,
                 execution: err_execution_result(
-                    "differential replay surface is absent from an embedded tree",
+                    "differential replay surface is absent from the selected source tree",
                 ),
             });
         };
@@ -379,9 +464,7 @@ pub async fn replay_report_with_options(
                 schema_version: REPORT_SCHEMA_VERSION,
                 finding_id: finding.id,
                 outcome: ReplayOutcome::Inconclusive,
-                execution: err_execution_result(
-                    "embedded differential surface signatures are incompatible",
-                ),
+                execution: err_execution_result("differential surface signatures are incompatible"),
             });
         }
         let Some(differential_case) = differential_case_from_arguments(
@@ -426,7 +509,7 @@ pub async fn replay_report_with_options(
             network_policy: replay_network,
             harness_args: replay_harness_args,
             docker_image: (runtime_profile == RuntimeProfile::Isolated).then_some(docker_image),
-            project_dir: candidate_root.path().to_str(),
+            project_dir: candidate_root.to_str(),
             source_file: Some(&candidate_entry),
             instrumentation_target: None,
             instrumented_source: None,
@@ -479,8 +562,18 @@ pub async fn replay_report_with_options(
             });
         }
         let reproduced = base_snapshot != candidate_snapshot;
+        let check_passed = candidate_project_dir.map(|_| {
+            !reproduced
+                && base_snapshot.exception_type.is_none()
+                && candidate_snapshot.exception_type.is_none()
+        });
         let payload = serde_json::json!({
             "reproduced": reproduced,
+            "candidate_mode": if candidate_project_dir.is_some() { "live" } else { "embedded" },
+            "candidate_entry": candidate_entry,
+            "candidate_source_sha256": stable_digest(&candidate_source),
+            "base_tree_sha256": differential.base_tree_sha256,
+            "check_passed": check_passed,
             "severity": finding.repro.expectation.severity,
             "oracle_kind": finding.repro.expectation.oracle_kind,
             "category": finding.repro.expectation.category,
@@ -506,7 +599,7 @@ pub async fn replay_report_with_options(
             diagnostics: vec![],
         };
         return Ok(ReplayReport {
-            check_passed: None,
+            check_passed,
             schema_version: REPORT_SCHEMA_VERSION,
             finding_id: finding.id,
             outcome: if reproduced {

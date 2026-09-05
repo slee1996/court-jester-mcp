@@ -64,6 +64,7 @@ pub(super) struct CliArgs {
     pub(super) regression_output: Option<String>,
     pub(super) accept_inferred: bool,
     pub(super) dependency_project_dir: Option<String>,
+    pub(super) replay_candidate_project_dir: Option<String>,
 }
 
 impl CliArgs {
@@ -419,6 +420,7 @@ pub(super) fn parse_replay_flags(rest: &[String]) -> Result<CliArgs, String> {
             "--export-regression" => out.regression_output = Some(value(&mut i)?),
             "--accept-inferred" => out.accept_inferred = true,
             "--dependency-project-dir" => out.dependency_project_dir = Some(value(&mut i)?),
+            "--candidate-project-dir" => out.replay_candidate_project_dir = Some(value(&mut i)?),
             "--runtime-profile" => {
                 out.runtime_profile = RuntimeProfile::parse(&value(&mut i)?).ok_or_else(|| {
                     "--runtime-profile must be one of: local-trusted, isolated".to_string()
