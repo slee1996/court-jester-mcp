@@ -22,6 +22,10 @@ pub(super) struct CliArgs {
     pub(super) ci_report_format: CiReportFormat,
     pub(super) project_dir: Option<String>,
     pub(super) config_path: Option<String>,
+    pub(super) repo_config: Option<String>,
+    pub(super) no_repo_config: bool,
+    pub(super) show_config: bool,
+    pub(super) config_targets: Vec<super::config::TargetTests>,
     pub(super) virtual_file_path: Option<String>,
     pub(super) test_files: Vec<String>,
     pub(super) test_runner: TestRunner,
@@ -57,6 +61,12 @@ pub(super) struct CliArgs {
     pub(super) regression_output: Option<String>,
     pub(super) accept_inferred: bool,
     pub(super) dependency_project_dir: Option<String>,
+}
+
+impl CliArgs {
+    pub(super) fn verification_memory_mb(&self) -> u64 {
+        self.memory_mb.unwrap_or(512)
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum CiReportFormat {
@@ -120,6 +130,9 @@ pub(super) fn parse_flags(rest: &[String]) -> Result<CliArgs, String> {
             }
             "--project-dir" => out.project_dir = Some(take_value(&mut i)?),
             "--config-path" => out.config_path = Some(take_value(&mut i)?),
+            "--repo-config" => out.repo_config = Some(take_value(&mut i)?),
+            "--no-repo-config" => out.no_repo_config = true,
+            "--show-config" => out.show_config = true,
             "--virtual-file-path" => out.virtual_file_path = Some(take_value(&mut i)?),
             "--test-file" => out.test_files.push(take_value(&mut i)?),
             "--test-runner" => {
@@ -529,13 +542,16 @@ pub(super) fn validate_harness_args_in_context(
 }
 
 pub(super) fn validate_policy_flags(cmd: &str, args: &CliArgs) -> Result<(), String> {
-    let unsupported = matches!(cmd, "analyze" | "lint" | "doctor");
+    let unsupported = matches!(cmd, "analyze" | "lint");
     if unsupported
         && (args.memory_mb.is_some() || args.network_explicit || args.harness_args_explicit)
     {
         return Err(format!(
             "memory, network, and harness-args flags are not supported for `{cmd}`"
         ));
+    }
+    if cmd == "doctor" && (args.network_explicit || args.harness_args_explicit) {
+        return Err("doctor does not accept network or harness-args overrides".into());
     }
     if cmd == "execute" && (args.network_explicit || args.harness_args_explicit) {
         return Err("`execute` does not accept --network or --harness-args-json".into());

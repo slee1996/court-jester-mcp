@@ -10,6 +10,7 @@ Court Jester has two independent entrypoints: the Rust CLI verifies source code,
 | --- | --- |
 | `mod.rs` | Help, command dispatch, output selection, and process exit codes |
 | `args.rs` | Parsed configuration, flag validation, and source/base input validation |
+| `config.rs` | Versioned repository defaults, bounded discovery, config-relative paths, and CLI precedence |
 | `environment.rs` | Scoped CLI overrides for verification timeouts and optional fuzz engines |
 | `ci.rs` | Changed-file selection, baseline materialization, global mutation allocation, and CI output |
 | `doctor.rs` | Runtime and isolated-profile readiness checks |

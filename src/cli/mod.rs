@@ -11,6 +11,7 @@ use std::path::Path;
 use std::process::ExitCode;
 mod args;
 mod ci;
+mod config;
 mod doctor;
 mod environment;
 use args::{
@@ -41,6 +42,9 @@ COMMON OPTIONS:
   --language <LANG>          python | typescript (doctor: all; required otherwise)
   --project-dir <PATH>       venv / node_modules root (auto-detected if omitted)
   --config-path <PATH>       Explicit Ruff/Biome config path for lint + verify
+  --repo-config <PATH>       Repository defaults for verify/ci/doctor (CLI overrides)
+  --no-repo-config           Disable automatic .court-jester.json discovery
+  --show-config             Print selected verify/ci/doctor settings without execution
   --virtual-file-path <PATH> Virtual lint path for temp or generated source files
   --runtime-profile <PROFILE> local-trusted | isolated (default local-trusted)
   --python-docker-image <IMAGE> Python isolated image (default python:3.12-slim)
@@ -79,7 +83,7 @@ CI OPTIONS:
   --memory-mb <N>            Memory cap MB (default 512)
   --network <POLICY>         deny | allow (isolated requires deny)
   --harness-args-json <JSON> Ordered arguments (only one changed target)
-  --test-file <PATH>         Quality-test entrypoint (repeat once per target language)
+  --test-file <PATH>         Authoritative test entrypoint (repeat once per target language)
   --test-runner <MODE>       auto | node | bun | repo-native (default auto)
   --test-quality [N]         Run up to N mutants globally across changed files (default 8)
 
@@ -87,6 +91,8 @@ DOCTOR OPTIONS:
   --file <PATH>             Local source context only; requires one explicit language
   --project-dir <PATH>      Local dependency/runtime root (isolated: unsupported)
   --timeout-seconds <F>     Per runtime/linter probe timeout (default 10)
+  --memory-mb <N>           Runtime smoke memory cap MB (default 128)
+  --show-config             Inspect settings without running readiness probes
 
 EXECUTE OPTIONS:
   --timeout-seconds <F>      Sandbox timeout (default 10)
@@ -170,11 +176,22 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
     let args = if cmd == "replay" {
         parse_replay_flags(rest)?
     } else {
-        parse_flags(rest)?
+        config::apply(cmd, rest, parse_flags(rest)?)?
     };
     validate_test_quality_flag(cmd, &args)?;
     validate_runtime_flags(cmd, &args)?;
     validate_policy_flags(cmd, &args)?;
+    if args.show_config {
+        if !matches!(cmd, "verify" | "ci" | "doctor") {
+            return Err("--show-config supports verify, ci, and doctor".into());
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&config::selected_settings(cmd, &args))
+                .map_err(|error| error.to_string())?
+        );
+        return Ok(());
+    }
     if cmd == "replay" {
         if args.accept_inferred && args.regression_output.is_none() {
             return Err("--accept-inferred requires --export-regression".into());
@@ -421,7 +438,7 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
                 coverage_gate: args.coverage_gate,
                 inferred_oracle_gate: args.inferred_oracle_gate,
                 runtime_profile: args.runtime_profile,
-                memory_mb: args.memory_mb.unwrap_or(512),
+                memory_mb: args.verification_memory_mb(),
                 network: args.network,
                 harness_args: args.harness_args.clone(),
                 python_docker_image: args

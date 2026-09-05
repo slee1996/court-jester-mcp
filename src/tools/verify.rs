@@ -143,6 +143,23 @@ fn test_timeout() -> f64 {
     )
 }
 
+/// Effective ordinary verification timeouts after process environment overrides.
+/// Native engines and specialized adapters may apply their own minimum budgets.
+#[derive(Debug, serde::Serialize)]
+pub struct VerificationTimeouts {
+    pub python_seconds: f64,
+    pub typescript_seconds: f64,
+    pub test_seconds: f64,
+}
+
+pub fn verification_timeouts() -> VerificationTimeouts {
+    VerificationTimeouts {
+        python_seconds: execute_timeout_for(&Language::Python),
+        typescript_seconds: execute_timeout_for(&Language::TypeScript),
+        test_seconds: test_timeout(),
+    }
+}
+
 const DEFAULT_NATIVE_FUZZ_RUNS: usize = 1_000;
 
 #[derive(Debug, Clone, Copy)]

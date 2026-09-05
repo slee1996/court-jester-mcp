@@ -34,6 +34,44 @@ fn check<'a>(report: &'a Value, name: &str) -> &'a Value {
 }
 
 #[test]
+fn doctor_resolves_configured_tests_without_executing_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let target = root.join("target.py");
+    std::fs::write(&target, "raise RuntimeError('must not import target')\n").unwrap();
+    std::fs::write(
+        root.join(".court-jester.json"),
+        serde_json::json!({
+            "schema_version": 1, "defaults": {"memory_mb": 256},
+            "targets": [{"source": "target.py", "test_files": ["checks.py"]}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let tests = root.join("checks.py");
+    std::fs::write(&tests, "from pathlib import Path\nPath('unexpected-doctor-test').write_text('ran')\nraise RuntimeError('must not execute tests')\n").unwrap();
+    let (_, report) = doctor(root, &["--file", target.to_str().unwrap()]);
+    assert_eq!(
+        check(&report, "repository_config")["detail"]["limits"]["memory_mb"],
+        256
+    );
+    assert_eq!(check(&report, "configured_entrypoints")["status"], "passed");
+    assert_eq!(
+        check(&report, "configured_entrypoints")["detail"]["executed"],
+        false
+    );
+    assert!(!root.join("unexpected-doctor-test").exists());
+    std::fs::remove_file(&tests).unwrap();
+    let (output, report) = doctor(root, &["--file", target.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(check(&report, "configured_entrypoints")["status"], "failed");
+    assert!(check(&report, "configured_entrypoints")["message"]
+        .as_str()
+        .unwrap()
+        .contains("test_files"));
+}
+
+#[test]
 fn doctor_uses_project_tools_without_running_target() {
     let root = tempfile::tempdir().unwrap();
     let python = Command::new("python3")

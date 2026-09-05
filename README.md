@@ -134,6 +134,8 @@ court-jester verify \
 
 ## Use It Directly
 
+Save repeatable project defaults with `--repo-config .court-jester.json`. Explicit CLI options override configured values. See [repository configuration](docs/repository-config.md) for the versioned schema, path rules, and current scope.
+
 Python:
 
 ```bash
@@ -237,7 +239,7 @@ court-jester ci \
   --report-level minimal
 ```
 
-In `ci`, `--test-file` is repeatable with at most one Python entrypoint and at most one TypeScript/TSX entrypoint. Court Jester selects the matching entrypoint for each changed target by language; it does not infer source-to-test mappings. The `--test-quality N` cap is global for the entire CI command, not per file. Candidate allocation is deterministic across changed files and their required public surfaces, never exceeds `N`, and may explicitly underfill when candidates or matching tests are unavailable. `--tests-only` remains unsupported in CI. Per-file and aggregate output reports planned, killed, survived, unjudged, and coupling counts without a score.
+In `ci`, `--test-file` is repeatable with at most one Python entrypoint and at most one TypeScript/TSX entrypoint. Authoritative tests run without requiring `--test-quality`; mutation testing is opt-in. Court Jester selects the matching entrypoint for each changed target by language; it does not infer source-to-test mappings. The `--test-quality N` cap is global for the entire CI command, not per file. Candidate allocation is deterministic across changed files and their required public surfaces, never exceeds `N`, and may explicitly underfill when candidates or matching tests are unavailable. `--tests-only` remains unsupported in CI. Per-file and aggregate output reports planned, killed, survived, unjudged, and coupling counts without a score.
 
 ## What `verify` Does
 

@@ -11940,9 +11940,9 @@ fn test_quality_cli_cardinality_and_mode_errors_precede_input_lookup() {
             vec!["ci", "--test-quality", "requires", "--test-file"],
         ),
         (
-            "CI test without quality mode",
+            "CI authoritative test without a base",
             vec!["ci", "--test-file", "a.py"],
-            vec!["ci", "--test-file", "requires", "--test-quality"],
+            vec!["ci", "--base", "required"],
         ),
         (
             "CI tests-only",

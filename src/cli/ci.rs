@@ -39,6 +39,7 @@ struct CiPreparedFile {
     pub(super) absolute_string: String,
     pub(super) code: String,
     pub(super) candidate_count: usize,
+    test_entrypoint: Option<CiTestEntrypoint>,
 }
 
 #[derive(Debug, Clone)]
@@ -417,17 +418,17 @@ pub(super) async fn run_ci_for_repo(
     if args.tests_only {
         return Err("`court-jester ci` does not support --tests-only".into());
     }
-    if args.test_quality_max_mutants.is_none() && !args.test_files.is_empty() {
-        return Err("`court-jester ci --test-file` requires --test-quality".into());
-    }
-    if args.test_quality_max_mutants.is_some() && args.test_files.is_empty() {
+    if args.test_quality_max_mutants.is_some()
+        && args.test_files.is_empty()
+        && args.config_targets.is_empty()
+    {
         return Err(
             "`court-jester ci --test-quality` requires an authoritative --test-file".into(),
         );
     }
-    let test_entrypoints = ci_test_entrypoints(repo_dir, &args.test_files)?;
     let base = require_base(args)?.to_string();
     let head = args.head.clone().unwrap_or_else(|| "HEAD".into());
+    let test_entrypoints = ci_test_entrypoints(repo_dir, &args.test_files)?;
     let baseline_temp = archive_baseline_tree(repo_dir, &base)?;
     let gates = parse_ci_gates(args.gate.as_deref())?;
     let changed_files = ci_changed_source_files(repo_dir, &base, &head)?;
@@ -454,25 +455,38 @@ pub(super) async fn run_ci_for_repo(
         }
         let absolute_string = absolute.to_string_lossy().into_owned();
         let code = read_file(&absolute_string)?;
-        let candidate_count = if test_entrypoints.for_language(*language).is_some() {
-            tools::verify::test_quality_candidate_count(
-                &code,
-                language,
-                ci_source_mode(relative_path, *language),
-                Some(absolute_string.as_str()),
-                diff.as_deref(),
-            )
-            // Allocation is advisory; the per-file stage owns and reports planning errors.
-            .unwrap_or(0)
-        } else {
-            0
-        };
+        let test_entrypoint =
+            if let Some(tests) = super::config::mapped_tests(&args.config_targets, &absolute)? {
+                let mapped = ci_test_entrypoints(repo_dir, tests)?;
+                Some(
+                    mapped.for_language(*language).cloned().ok_or(
+                        "configured source mapping has no test entrypoint for its language",
+                    )?,
+                )
+            } else {
+                test_entrypoints.for_language(*language).cloned()
+            };
+        let candidate_count =
+            if args.test_quality_max_mutants.is_some() && test_entrypoint.is_some() {
+                tools::verify::test_quality_candidate_count(
+                    &code,
+                    language,
+                    ci_source_mode(relative_path, *language),
+                    Some(absolute_string.as_str()),
+                    diff.as_deref(),
+                )
+                // Allocation is advisory; the per-file stage owns and reports planning errors.
+                .unwrap_or(0)
+            } else {
+                0
+            };
         prepared_files.push(CiPreparedFile {
             relative_path: relative_path.clone(),
             language: *language,
             absolute_string,
             code,
             candidate_count,
+            test_entrypoint,
         });
     }
     let quality_allocations = args
@@ -500,7 +514,7 @@ pub(super) async fn run_ci_for_repo(
             .is_file()
             .then(|| read_file(&baseline_path.to_string_lossy()))
             .transpose()?;
-        let test_entrypoint = test_entrypoints.for_language(prepared.language);
+        let test_entrypoint = prepared.test_entrypoint.as_ref();
         let test_quality_max_mutants = args.test_quality_max_mutants.map(|_| {
             test_entrypoint
                 .map(|_| quality_allocations[file_index])
@@ -533,7 +547,7 @@ pub(super) async fn run_ci_for_repo(
                 coverage_gate: args.coverage_gate,
                 inferred_oracle_gate: args.inferred_oracle_gate,
                 runtime_profile: args.runtime_profile,
-                memory_mb: args.memory_mb.unwrap_or(512),
+                memory_mb: args.verification_memory_mb(),
                 network: args.network,
                 harness_args: args.harness_args.clone(),
                 python_docker_image: args

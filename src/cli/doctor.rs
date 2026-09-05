@@ -54,7 +54,7 @@ async fn local_runtime_check(
         },
         SandboxOptions {
             timeout_seconds: args.timeout_seconds.unwrap_or(10.0),
-            memory_mb: 128,
+            memory_mb: args.memory_mb.unwrap_or(128),
             runtime_profile: RuntimeProfile::LocalTrusted,
             network_policy: NetworkPolicy::Deny,
             harness_args: &[],
@@ -136,6 +136,36 @@ pub(super) async fn run_doctor(
         }
     };
     let mut checks = Vec::new();
+    if args.repo_config.is_some() {
+        checks.push(doctor_check("repository_config", None, StageStatus::Passed,
+            super::config::selected_settings("doctor", args),
+            Some("Repository settings resolved; target imports and test behavior have not been checked".into())));
+    }
+    if !args.test_files.is_empty() {
+        let entrypoints = args
+            .test_files
+            .iter()
+            .map(|path| {
+                let error = std::fs::metadata(path)
+                    .and_then(|metadata| {
+                        if metadata.is_file() {
+                            std::fs::File::open(path).map(|_| ())
+                        } else {
+                            Err(std::io::Error::other("not a regular file"))
+                        }
+                    })
+                    .err()
+                    .map(|error| error.to_string());
+                serde_json::json!({"path": path, "readable": error.is_none(), "error": error})
+            })
+            .collect::<Vec<_>>();
+        let ready = entrypoints.iter().all(|entry| entry["readable"] == true);
+        checks.push(doctor_check("configured_entrypoints", None,
+            if ready { StageStatus::Passed } else { StageStatus::Failed },
+            serde_json::json!({"files": entrypoints, "executed": false}),
+            Some(if ready { "Configured test files are readable; imports and test behavior were not executed".into() }
+                else { "Restore missing test files or update test_files in the repository config/CLI selection".into() })));
+    }
     if args.runtime_profile == RuntimeProfile::LocalTrusted {
         let invocation = std::env::current_dir().map_err(|error| error.to_string())?;
         let explicit_project = args
@@ -257,7 +287,7 @@ pub(super) async fn run_doctor(
             let project_dir_owned = project_path.to_string_lossy().into_owned();
             let options = court_jester::types::SandboxOptions {
                 timeout_seconds: args.timeout_seconds.unwrap_or(10.0),
-                memory_mb: 128,
+                memory_mb: args.memory_mb.unwrap_or(128),
                 runtime_profile: RuntimeProfile::Isolated,
                 network_policy: NetworkPolicy::Deny,
                 harness_args: &[],
@@ -313,7 +343,7 @@ pub(super) async fn run_doctor(
                     .next()
                     .and_then(|v| v.parse::<u32>().ok())
                     .is_some_and(|v| v < 24);
-            checks.push(doctor_check("runtime_smoke", Some(*language), if smoke_ok && !node_bad { StageStatus::Passed } else { StageStatus::Failed }, serde_json::json!({"image": image, "stdout": result.stdout, "stderr": result.stderr, "network": "none", "read_only": true, "memory_mb": 128}), (!smoke_ok).then(|| "isolated runtime smoke failed".into()).or_else(|| node_bad.then(|| "Node.js >=24 is required".into()))));
+            checks.push(doctor_check("runtime_smoke", Some(*language), if smoke_ok && !node_bad { StageStatus::Passed } else { StageStatus::Failed }, serde_json::json!({"image": image, "stdout": result.stdout, "stderr": result.stderr, "network": "none", "read_only": true, "memory_mb": args.memory_mb.unwrap_or(128)}), (!smoke_ok).then(|| "isolated runtime smoke failed".into()).or_else(|| node_bad.then(|| "Node.js >=24 is required".into()))));
         }
     }
     let verdict = if checks
