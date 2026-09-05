@@ -2161,12 +2161,14 @@ fn coverage_entry_for_verify(
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SuppressionsFile {
     #[serde(default)]
     rules: Vec<SuppressionRule>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SuppressionRule {
     #[serde(default)]
     path: Option<String>,
@@ -2192,9 +2194,45 @@ struct SuppressionContext<'a> {
     reason: Option<&'a str>,
 }
 
-fn parse_suppressions(raw: Option<&str>) -> SuppressionsFile {
-    raw.and_then(|value| serde_json::from_str::<SuppressionsFile>(value).ok())
-        .unwrap_or_default()
+fn parse_suppressions(raw: Option<&str>) -> Result<SuppressionsFile, String> {
+    let Some(raw) = raw else {
+        return Ok(SuppressionsFile::default());
+    };
+    let file: SuppressionsFile = serde_json::from_str(raw).map_err(|error| error.to_string())?;
+    for (index, rule) in file.rules.iter().enumerate() {
+        let selectors = [
+            rule.path.as_deref(),
+            rule.stage.as_deref(),
+            rule.function.as_deref(),
+            rule.error_type.as_deref(),
+            rule.reason.as_deref(),
+        ];
+        if selectors.iter().all(Option::is_none) && rule.severity.is_none() {
+            return Err(format!("rules[{index}] requires at least one selector"));
+        }
+        if selectors
+            .iter()
+            .flatten()
+            .any(|value| value.trim().is_empty())
+        {
+            return Err(format!("rules[{index}] selectors must not be empty"));
+        }
+        if rule
+            .stage
+            .as_deref()
+            .is_some_and(|stage| !matches!(stage, "execute" | "complexity" | "portability"))
+        {
+            return Err(format!(
+                "rules[{index}].stage must be execute, complexity, or portability"
+            ));
+        }
+    }
+    Ok(file)
+}
+
+/// Validate suppression data using the same schema and selectors as verification.
+pub fn validate_suppressions(raw: &str) -> Result<(), String> {
+    parse_suppressions(Some(raw)).map(|_| ())
 }
 
 fn normalize_path(path: &str) -> String {
@@ -5292,7 +5330,48 @@ pub async fn verify(
     opts: VerifyOptions<'_>,
 ) -> VerificationReport {
     let mut stages = vec![];
-    let suppressions = parse_suppressions(opts.suppressions);
+    let suppressions = match parse_suppressions(opts.suppressions) {
+        Ok(suppressions) => suppressions,
+        Err(error) => {
+            stages.push(VerificationStage {
+                name: "configuration".into(),
+                status: StageStatus::Inconclusive,
+                duration_ms: 0,
+                detail: Some(serde_json::json!({
+                    "diagnostic": FailureDiagnostic {
+                        domain: FailureDomain::Environment,
+                        kind: FailureKind::InvalidConfiguration,
+                        component: DiagnosticComponent::Configuration,
+                        impact: DiagnosticImpact::Blocking,
+                        message: error,
+                        process: None,
+                        limits: None,
+                    },
+                    "configuration_kind": "suppressions",
+                    "suppression_source": opts.suppression_source,
+                })),
+                message: Some("Invalid suppression configuration; verification did not run".into()),
+            });
+            if !opts.tests_only {
+                stages.push(skipped_execute_stage(
+                    "invalid_suppressions",
+                    "Execution skipped because suppression configuration is invalid",
+                ));
+            }
+            ensure_test_quality_stage(
+                &mut stages,
+                opts.test_quality_max_mutants,
+                "Mutation campaign skipped because suppression configuration is invalid",
+            );
+            return finalize_report(
+                build_report(stages, opts.coverage_gate, code, opts.source_file),
+                opts.output_dir,
+                opts.source_file,
+                language,
+                opts.report_level,
+            );
+        }
+    };
     let verification_context = match resolve_verification_contexts(&opts, language) {
         Ok(context) => context,
         Err(error) => {

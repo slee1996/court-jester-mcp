@@ -663,7 +663,7 @@ pub(super) fn read_optional_file(path: Option<&str>) -> Result<Option<String>, S
 pub(super) fn read_suppressions(path: Option<&str>) -> Result<Option<String>, String> {
     let contents = read_optional_file(path)?;
     if let Some(raw) = contents.as_deref() {
-        serde_json::from_str::<serde_json::Value>(raw).map_err(|error| {
+        court_jester::tools::verify::validate_suppressions(raw).map_err(|error| {
             format!(
                 "invalid suppressions file '{}': {error}",
                 path.unwrap_or("<inline>")

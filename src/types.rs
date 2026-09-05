@@ -181,6 +181,7 @@ pub enum FailureDomain {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureKind {
+    InvalidConfiguration,
     SyntaxError,
     ComplexityThreshold,
     TargetException,
@@ -208,6 +209,7 @@ pub enum FailureKind {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticComponent {
+    Configuration,
     Target,
     FuzzHarness,
     Sandbox,

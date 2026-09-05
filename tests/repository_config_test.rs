@@ -33,7 +33,19 @@ fn ci_validates_configured_suppressions_even_without_changed_sources() {
             .to_string(),
     )
     .unwrap();
-    for contents in [None, Some("not json")] {
+    fs::write(
+        root.join("target.py"),
+        "raise RuntimeError('must not execute')\n",
+    )
+    .unwrap();
+    for contents in [
+        None,
+        Some("not json"),
+        Some(r#"{"rules":null}"#),
+        Some(r#"{"rule":[]}"#),
+        Some(r#"{"rules":[{"functoin":"inspect"}]}"#),
+        Some(r#"{"rules":[{"severity":"typo"}]}"#),
+    ] {
         if let Some(contents) = contents {
             fs::write(root.join("suppression.json"), contents).unwrap();
         }
@@ -49,6 +61,13 @@ fn ci_validates_configured_suppressions_even_without_changed_sources() {
             String::from_utf8_lossy(&output.stdout)
         );
         assert!(String::from_utf8_lossy(&output.stderr).contains("suppression.json"));
+        let direct = Command::new(env!("CARGO_BIN_EXE_court-jester"))
+            .current_dir(root)
+            .args(["verify", "--file", "target.py", "--language", "python"])
+            .output()
+            .unwrap();
+        assert_eq!(direct.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&direct.stderr).contains("suppression.json"));
     }
 }
 

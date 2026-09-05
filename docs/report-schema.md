@@ -90,6 +90,9 @@ Each stage has this shape:
 - `execute`
 - `test`
 - `test_quality` (present when the stable advisory opt-in is requested)
+- `configuration` (invalid library-supplied configuration prevents verification)
+
+Invalid suppression data produces an inconclusive `configuration` stage before source/test execution. Its typed diagnostic has domain `environment`, kind `invalid_configuration`, component `configuration`, and impact `blocking`; `configuration_kind` identifies `suppressions`. CLI callers receive a usage error instead, using the same validation schema.
 
 Lint is advisory by design. Portability is advisory after a successful repository-native fallback and inconclusive when loading prevents behavioral execution.
 

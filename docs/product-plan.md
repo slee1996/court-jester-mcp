@@ -371,6 +371,14 @@ This is a single-owner Plan-mode execution record. The completed historical rele
 - Regression coverage checks missing and malformed files, an actual configured complexity suppression with retained suppressed evidence/provenance, and the unsuppressed failing control with config disabled. Ten repository-configuration tests, six existing CI verifier tests, three existing suppression tests, strict Clippy, formatting, and whitespace checks pass. This increment has targeted verification, not a new full-suite/release evidence claim.
 - Push of preceding commit `79a05f3` remains blocked by the active GitHub account's repository permissions; account switching awaits user direction. Local work continues. Committed-versus-working-tree selection and all remaining P1–P9 outcomes remain unfinished.
 
+### Increment 35: reject invalid suppression schemas at the owning boundary
+
+- Reproduced CI accepting syntactically valid but malformed suppression data. The verifier silently replaced deserialization failures with an empty rule set, while unknown selector fields could unintentionally broaden a rule.
+- One shared parser now validates both CLI and library suppression inputs: unknown fields/types, empty selectors, selector-free rules, and unsupported stages are rejected. Empty files (`{}`) and empty rule lists remain supported; deliberate broad rules can explicitly select a stage. Existing matching behavior is unchanged for valid rules.
+- Invalid library input returns an inconclusive configuration stage before source, lint, tests, or mutation execution. A typed blocking `invalid_configuration` diagnostic with component `configuration` is retained for report consumers. CLI validation uses the same parser and returns a usage error, including zero-source CI runs.
+- Nine invalid-input variants are covered through the library in ordinary and tests-only modes with a side-effect marker, plus valid controls and direct/CI CLI regressions. Final-source Rust tests: 678 passed, two known filesystem-restricted temporary-directory tests failed; both pass in the exact unrestricted rerun. All 227 verifier tests pass. Strict Clippy, formatting/whitespace checks, release build, sample/extended smoke, four repair-contract cases, all 13 effectiveness cases, 83 benchmark unit tests, six repair-contract unit tests, and two release tests pass. Repair evidence binary SHA-256: `86d1c9dcf3c4b833494764750ce820fabc29a25581cbd2f6fd6c62cec8ecf07d`.
+- Revision-state selection, the remaining product acceptance, and account-authorized pushing are still unfinished. No full-goal completion is claimed.
+
 ## Completion audit
 
 All P1–P9 remain required. Local gates do not substitute for actual design-partner results or current-build paired repair evidence. Record missing authority/data explicitly; do not call the full product objective complete on implementation alone.
