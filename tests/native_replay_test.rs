@@ -51,6 +51,52 @@ fn native_snapshots_preserve_mutable_runtime_inputs() {
 }
 
 #[test]
+fn admitted_native_findings_export_regressions_for_current_source() {
+    for (language, extension, engine, buggy, fixed, runtime, wrapper) in [
+        ("python", "py", "atheris", "def inspect(*, value: bool) -> int:\n    raise ValueError('native admitted failure')\n", "def inspect(*, value: bool) -> int:\n    return 0\n", "python3", "test_regression.py"),
+        ("typescript", "ts", "jazzer", "export async function inspect(value: boolean): Promise<number> { throw new Error('native admitted failure'); }", "export async function inspect(value: boolean): Promise<number> { return 0; }", "node", "regression.test.mjs"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let source = root.join(format!("target.{extension}"));
+        let reports = root.join("reports");
+        let bundle = root.join("regression");
+        fs::write(&source, buggy).unwrap();
+        if language == "python" {
+            fs::write(root.join("atheris.py"), "class FuzzedDataProvider:\n    def __init__(self, data): pass\n    def ConsumeIntInRange(self, lower, upper): return lower\n    def ConsumeBool(self): return False\ndef instrument_all(): pass\ndef Setup(argv, callback):\n    global _callback\n    _callback = callback\ndef Fuzz(): _callback(b'input')\n").unwrap();
+        } else {
+            executable(&root.join("node_modules/.bin/jazzer"), r#"#!/bin/sh
+exec node --experimental-transform-types --input-type=module -e 'import {pathToFileURL} from "node:url"; const target = await import(pathToFileURL(process.argv[1]).href); try { await target.fuzz(new Uint8Array([0,0])); } catch { process.exitCode = 1; }' "$1"
+"#);
+        }
+        let output = cli(&["verify", "--file", source.to_str().unwrap(), "--language", language,
+            "--project-dir", root.to_str().unwrap(), "--native-fuzz-engine", engine,
+            "--native-fuzz-runs", "1", "--output-dir", reports.to_str().unwrap()]);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let stages = report["stages"].as_array().unwrap();
+        let native = stages.iter().find(|stage| stage["name"] == "native_fuzz").unwrap();
+        assert_eq!(native["status"], "failed");
+        let execute = stages.iter().find(|stage| stage["name"] == "execute").unwrap();
+        let finding = execute["detail"]["findings"].as_array().unwrap().iter()
+            .find(|finding| finding["classification"] == "native_coverage_guided").unwrap();
+        assert_eq!(finding["input_classification"], "valid");
+        let id = finding["id"].as_str().unwrap();
+        let persisted = Path::new(report["report_path"].as_str().unwrap());
+        replay(persisted, root, id, "reproduced", false);
+        let exported = cli(&["replay", "--report", persisted.to_str().unwrap(), "--finding", id,
+            "--dependency-project-dir", root.to_str().unwrap(), "--export-regression", bundle.to_str().unwrap()]);
+        assert_eq!(exported.status.code(), Some(0), "{}", String::from_utf8_lossy(&exported.stderr));
+        for (implementation, success) in [(buggy, false), (fixed, true)] {
+            fs::write(&source, implementation).unwrap();
+            let output = Command::new(runtime).arg(bundle.join(wrapper))
+                .env("COURT_JESTER_BINARY", env!("CARGO_BIN_EXE_court-jester"))
+                .current_dir(root).output().unwrap();
+            assert_eq!(output.status.success(), success, "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        }
+    }
+}
+
+#[test]
 fn native_typescript_replay_preserves_primitive_throw_identity() {
     for (thrown, different, supported) in [
         ("NaN", "null", true),

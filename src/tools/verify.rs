@@ -6485,7 +6485,40 @@ pub async fn verify(
                             "{}\n{}",
                             native_execution.process.stdout, native_execution.process.stderr
                         );
-                        native_findings = parse_native_findings(&native_output, language);
+                        native_findings = parse_native_findings_with_plan(
+                            &native_output,
+                            language,
+                            Some(&verification_plan),
+                        );
+                        // Stage reduction and aggregate reduction must use the
+                        // same suppression contract. Keep the observations for
+                        // reporting, but never count suppressed ones as blockers.
+                        let (active_native, suppressed_native) = split_findings(
+                            native_findings,
+                            &suppressions,
+                            candidate_source_file_owned.as_deref(),
+                        );
+                        let native_suppressed_count = suppressed_native.len();
+                        native_findings =
+                            active_native.into_iter().chain(suppressed_native).collect();
+                        let native_gating_count = native_findings
+                            .iter()
+                            .filter(|finding| !finding.suppressed)
+                            .filter(|finding| {
+                                finding_fails_execute_gate(
+                                    opts.execute_gate,
+                                    finding,
+                                    opts.inferred_oracle_gate,
+                                )
+                            })
+                            .count();
+                        let native_unknown_count = native_findings
+                            .iter()
+                            .filter(|finding| {
+                                !finding.suppressed
+                                    && finding.input_classification == InputClassification::Unknown
+                            })
+                            .count();
                         let unavailable = native_engine_unavailable(&native_output);
                         let succeeded = native_execution.process.exit_code == Some(0)
                             && !native_execution.process.timed_out
@@ -6505,7 +6538,9 @@ pub async fn verify(
                                     native_plan.engine
                                 )),
                             )
-                        } else if !native_findings.is_empty() {
+                        } else if native_gating_count > 0 {
+                            (StageStatus::Failed, Some(format!("Native engine observed {native_gating_count} admitted-input failure(s)")))
+                        } else if native_unknown_count > 0 {
                             (
                                 StageStatus::Inconclusive,
                                 Some(format!(
@@ -6517,8 +6552,21 @@ pub async fn verify(
                                             "Native engine"
                                         }
                                     },
-                                    native_findings.len()
+                                    native_unknown_count
                                 )),
+                            )
+                        } else if native_suppressed_count > 0
+                            && native_suppressed_count == native_findings.len()
+                            && !native_execution.process.timed_out
+                            && !native_execution.process.memory_error
+                            && native_execution.process.exit_code.is_some()
+                        {
+                            (
+                                StageStatus::Advisory,
+                                Some(
+                                    "Native observations retained under execute suppressions"
+                                        .into(),
+                                ),
                             )
                         } else if succeeded {
                             (StageStatus::Passed, None)
@@ -6540,7 +6588,9 @@ pub async fn verify(
                                 "target_count": native_plan.target_count,
                                 "execution": native_execution.process,
                                 "native_findings": &native_findings,
-                                "unknown_finding_count": native_findings.len(),
+                                "unknown_finding_count": native_unknown_count,
+                                "suppressed_finding_count": native_suppressed_count,
+                                "gating_finding_count": native_gating_count,
                                 "diagnostics": native_execution.diagnostics,
                             })),
                             message,
@@ -7216,7 +7266,62 @@ struct NativeFindingRecord {
     message: String,
 }
 
+#[cfg(test)]
 fn parse_native_findings(output: &str, language: &Language) -> Vec<VerificationFinding> {
+    parse_native_findings_with_plan(output, language, None)
+}
+
+fn native_input_classification(
+    function: &str,
+    line: usize,
+    arguments: &[ReproValue],
+    plan: &VerificationPlan,
+) -> InputClassification {
+    let surfaces = plan
+        .surfaces
+        .iter()
+        .filter(|surface| surface.symbol == function && surface.line == line)
+        .collect::<Vec<_>>();
+    let [surface] = surfaces.as_slice() else {
+        return InputClassification::Unknown;
+    };
+    let domains = plan
+        .parameter_domains
+        .iter()
+        .filter(|domain| domain.surface_id == surface.id)
+        .cloned()
+        .collect::<Vec<_>>();
+    if domains.is_empty()
+        || domains
+            .iter()
+            .any(|domain| !domain.closed || domain.variadic.is_some())
+    {
+        return InputClassification::Unknown;
+    }
+    let Some(slots) = arguments
+        .iter()
+        .map(|value| {
+            Some(PlannedArgumentSlot::Single(DomainLiteral {
+                expression: value.expression.clone(),
+                json_value: Some(value.json_value.clone()?),
+            }))
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return InputClassification::Unknown;
+    };
+    let Ok(arguments) = domain::bind_argument_slots(&domains, PlannedArgumentSlots { slots })
+    else {
+        return InputClassification::Unknown;
+    };
+    domain::classify_input(&arguments, &domains)
+}
+
+fn parse_native_findings_with_plan(
+    output: &str,
+    language: &Language,
+    plan: Option<&VerificationPlan>,
+) -> Vec<VerificationFinding> {
     output
         .lines()
         .filter_map(|line| line.find(NATIVE_FINDING_MARKER).map(|index| &line[index..]))
@@ -7246,6 +7351,10 @@ fn parse_native_findings(output: &str, language: &Language) -> Vec<VerificationF
                 arguments: arguments.clone(),
                 input_text: Some(record.input.clone()),
             };
+            let input_classification = if record.protocol_version == Some(2) {
+                plan.map(|plan| native_input_classification(&record.function, record.line, &arguments, plan)).unwrap_or(InputClassification::Unknown)
+            } else { InputClassification::Unknown };
+            let confidence = if input_classification == InputClassification::Valid { FindingConfidence::High } else { FindingConfidence::Low };
             let expectation = ReplayExpectation {
                 severity: FindingSeverity::Crash,
                 oracle_kind: OracleKind::RuntimeContract,
@@ -7254,7 +7363,7 @@ fn parse_native_findings(output: &str, language: &Language) -> Vec<VerificationF
             Some(VerificationFinding {
                 id: format!("native:{}", record.function),
                 severity: FindingSeverity::Crash,
-                confidence: FindingConfidence::Low,
+                confidence,
                 category: FindingCategory::Exception,
                 occurrences: 1,
                 sample_inputs: vec![original.clone()],
@@ -7268,11 +7377,11 @@ fn parse_native_findings(output: &str, language: &Language) -> Vec<VerificationF
                     id: format!("native_runtime:{}", record.function),
                     kind: OracleKind::RuntimeContract,
                     provenance: OracleProvenance::ObservedCall,
-                    confidence: FindingConfidence::Low,
+                    confidence,
                     expected: None,
                     actual: Some(record.message.clone()),
                 },
-                input_classification: InputClassification::Unknown,
+                input_classification,
                 repro: StructuredRepro {
                     kind: ReproKind::FunctionCall,
                     function: Some(record.function.clone()),
@@ -7456,6 +7565,59 @@ pub fn repair_summary(report: &VerificationReport, language: &Language) -> Repai
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_admission_requires_complete_matching_bound_values() {
+        let analysis = analyze::analyze(
+            "def inspect(*, value: bool):\n    return value\n",
+            &Language::Python,
+        );
+        let plan = domain::build_verification_plan(
+            &analysis.functions,
+            &analysis.classes,
+            &analysis.aliases,
+            &Language::Python,
+            &[],
+            &[],
+            &[],
+        );
+        let argument = ReproValue {
+            expression: "False".into(),
+            json_value: Some(serde_json::json!(false)),
+        };
+        assert_eq!(
+            native_input_classification("inspect", 1, std::slice::from_ref(&argument), &plan),
+            InputClassification::Valid
+        );
+        assert_eq!(
+            native_input_classification("inspect", 2, std::slice::from_ref(&argument), &plan),
+            InputClassification::Unknown
+        );
+        assert_eq!(
+            native_input_classification("inspect", 1, &[], &plan),
+            InputClassification::Unknown
+        );
+        assert_eq!(
+            native_input_classification("inspect", 1, &[argument.clone(), argument.clone()], &plan),
+            InputClassification::Unknown
+        );
+        let absent = ReproValue {
+            expression: "False".into(),
+            json_value: None,
+        };
+        assert_eq!(
+            native_input_classification("inspect", 1, &[absent], &plan),
+            InputClassification::Unknown
+        );
+        let invalid = ReproValue {
+            expression: "'false'".into(),
+            json_value: Some(serde_json::json!("false")),
+        };
+        assert_eq!(
+            native_input_classification("inspect", 1, &[invalid], &plan),
+            InputClassification::Invalid
+        );
+    }
 
     #[test]
     fn native_protocol_requires_versioned_snapshots_before_accepting_replay() {

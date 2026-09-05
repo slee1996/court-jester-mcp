@@ -289,7 +289,7 @@ Useful `verify` flags:
 - `--base-file <PATH>` with `--base-project-dir <PATH>`: compare the candidate against a complete read-only baseline tree; both options are required together.
 - `--summary json|human|repair-json`: select machine, human, or repair-loop output.
 
-Native-engine exceptions currently provide observations, not proven bugs: they remain unknown-input/low-confidence and make the native stage inconclusive. New native records preserve supported runtime arguments before mutation and replay against current source, distinguishing the original exception from a different failure or successful completion. Legacy records and unsupported thrown values still abstain. Native minimization and input admission remain unsupported; regression export refuses these observations.
+Native-engine exceptions are admitted only when versioned snapshots bind successfully to the verification plan's closed parameter domains. Otherwise they remain unknown-input/low-confidence observations and make the native stage inconclusive. New native records preserve supported runtime arguments before mutation and replay against current source, distinguishing the original exception from a different failure or successful completion. Legacy records and unsupported thrown values still abstain. Native minimization remains unsupported; regression export requires valid input and conclusive replay evidence.
 
 Runtime and evidence controls:
 
