@@ -5460,10 +5460,34 @@ export function createReorderer() {
 
 #[tokio::test]
 async fn typescript_factory_sequence_replay_preserves_setup_and_action_history() {
-    for returned in ["{ push }", "push"] {
+    for (returned, factory_async, action_async) in [
+        ("{ push }", "", ""),
+        ("push", "", ""),
+        ("{ push }", "async ", ""),
+        ("push", "async ", ""),
+        ("{ push }", "", "async "),
+        ("push", "", "async "),
+        ("{ push }", "async ", "async "),
+        ("push", "async ", "async "),
+    ] {
         let project = tempfile::tempdir().unwrap();
         let source = project.path().join("target.ts");
-        let code = format!("export function createCounter(start: number) {{ let calls = start; function push(value: number): number {{ calls += 1; if (calls === start + 2) throw new ReferenceError('sequence failure: original'); return value; }} return {returned}; }}");
+        let return_type = if action_async.is_empty() {
+            "number"
+        } else {
+            "Promise<number>"
+        };
+        let action_wait = if action_async.is_empty() {
+            ""
+        } else {
+            "await new Promise(resolve => setTimeout(resolve, 1));"
+        };
+        let factory_wait = if factory_async.is_empty() {
+            ""
+        } else {
+            "await Promise.resolve();"
+        };
+        let code = format!("export {factory_async}function createCounter(start: number) {{ {factory_wait} let calls = start; {action_async}function push(value: number): {return_type} {{ {action_wait} calls += 1; if (calls === start + 2) throw new ReferenceError('sequence failure: original'); return value; }} return {returned}; }}");
         fs::write(&source, &code).unwrap();
         let mut opts = default_opts(None);
         opts.source_file = source.to_str();
@@ -5492,10 +5516,15 @@ async fn typescript_factory_sequence_replay_preserves_setup_and_action_history()
             ReplayOutcome::Reproduced,
             "{returned}: {replay:?}"
         );
+        assert_eq!(finding.input_classification, InputClassification::Unknown);
         for (original, replacement) in [
             ("calls === start + 2", "calls === start + 1"),
             ("calls === start + 2", "false"),
             ("failure: original", "failure: different"),
+            (
+                "let calls = start;",
+                "throw new ReferenceError('sequence failure: original'); let calls = start;",
+            ),
         ] {
             fs::write(&source, code.replace(original, replacement)).unwrap();
             let replay = replay_report(
@@ -5513,20 +5542,38 @@ async fn typescript_factory_sequence_replay_preserves_setup_and_action_history()
                 ReplayOutcome::NotReproduced,
                 "{returned}/{replacement}: {replay:?}"
             );
+            assert_eq!(replay.check_passed, Some(replacement == "false"));
         }
     }
 }
 
 #[tokio::test]
 async fn typescript_factory_replay_preserves_receiver_and_uncertain_throw_identity() {
-    for (thrown, expected) in [
-        ("new Error('receiver failure')", ReplayOutcome::Reproduced),
-        ("NaN", ReplayOutcome::Reproduced),
-        ("Symbol('runtime-only')", ReplayOutcome::Inconclusive),
+    for (thrown, expected, asynchronous) in [
+        (
+            "new Error('receiver failure')",
+            ReplayOutcome::Reproduced,
+            false,
+        ),
+        ("NaN", ReplayOutcome::Reproduced, false),
+        ("Symbol('runtime-only')", ReplayOutcome::Inconclusive, false),
+        (
+            "new Error('receiver failure')",
+            ReplayOutcome::Reproduced,
+            true,
+        ),
+        ("NaN", ReplayOutcome::Reproduced, true),
+        ("Symbol('runtime-only')", ReplayOutcome::Inconclusive, true),
     ] {
         let project = tempfile::tempdir().unwrap();
         let source = project.path().join("target.ts");
-        let code = format!("export function createCounter() {{ function push(value: number): number {{ this.calls += 1; if (this.calls === 2) throw {thrown}; return value; }} return {{calls: 0, push}}; }}");
+        let action = if asynchronous {
+            format!("function push(value: number): Promise<number> {{ return new Promise((resolve, reject) => setTimeout(() => {{ this.calls += 1; if (this.calls === 2) reject({thrown}); else resolve(value); }}, 1)); }}")
+        } else {
+            format!("function push(value: number): number {{ this.calls += 1; if (this.calls === 2) throw {thrown}; return value; }}")
+        };
+        let code =
+            format!("export function createCounter() {{ {action} return {{calls: 0, push}}; }}");
         fs::write(&source, &code).unwrap();
         let mut opts = default_opts(None);
         opts.source_file = source.to_str();

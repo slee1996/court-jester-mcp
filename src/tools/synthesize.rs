@@ -2720,7 +2720,7 @@ fn synthesize_typescript_factory_exercise(
       const _setupArgs = [{factory_args}];
       _setupExpression = _factoryArgumentExpression(_setupArgs);
       _factoryPhase = "factory";
-      const _factory = _factoryInvoke(_setupArgs);
+      const _factory = await _factoryInvoke(_setupArgs);
       const _actionPlan = [..._actionKeys];
       for (let _step = 0; _step < _fuzzIntRange(2, 5); _step++) {{
         _actionPlan.push(_actionKeys[_fuzzIntRange(0, _actionKeys.length - 1)]);
@@ -2741,7 +2741,7 @@ fn synthesize_typescript_factory_exercise(
         _entry.expression = _factoryArgumentExpression(_activeFactoryArgs);
         _targetEntered(_activeFactorySurface);
         _factoryPhase = "action:" + _index;
-        (_candidate as Function).apply(_factory, _activeFactoryArgs);
+        await (_candidate as Function).apply(_factory, _activeFactoryArgs);
       }}
       _factoryPass++;
     }} catch (_e: unknown) {{

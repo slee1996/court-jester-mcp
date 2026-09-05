@@ -261,6 +261,7 @@ The important stage is `execute`: Court Jester synthesizes a language-specific h
 - Python generates direct calls and adversarial inputs from the function surface. TypeScript additionally resolves supported aliases, interfaces, classes, and imported types to generate structured inputs.
 - Both runtimes report admitted-input exceptions and observed property violations, including return-type, consistency, idempotency, boundedness, symmetry, comparator, and inferred roundtrip checks. Confidence and gate policy still apply; inferred expectations are not silently authoritative.
 - An exception class or engine-like message does not prove a bug. Without input/contract evidence, exceptions remain low-confidence, unknown-input observations and may make verification inconclusive. Generated factory sequences currently have no lifecycle admission contract, so their exception observations are replayable but not exportable as regression expectations.
+- TypeScript factory sequences await setup and each returned action in order, including promise-returning functions without an `async` declaration. Replay preserves the receiver, action history, and failure phase; successful replay checks require the recorded sequence to finish.
 
 ## Common Flags
 
