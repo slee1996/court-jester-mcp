@@ -2999,24 +2999,8 @@ async fn docker_readiness_output(
     if !timeout.is_finite() || timeout <= 0.0 || memory_mb == 0 {
         return Err("Docker readiness requires finite positive timeout and memory limits".into());
     }
-    let mut command = Command::new("docker");
-    command
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    let result = run_command_with_limits(
-        command,
-        timeout,
-        memory_mb,
-        RuntimeProfile::LocalTrusted,
-        NetworkPolicy::Deny,
-        true,
-        "docker unavailable",
-    )
-    .await;
-    if result.exit_code != Some(0) || result.timed_out || result.memory_error {
+    let result = docker_output(args, timeout, memory_mb).await;
+    if !docker_command_succeeded(&result) {
         return Err(format!(
             "Docker {} readiness probe failed (exit {:?}): {}",
             args.join(" "),
@@ -3027,12 +3011,71 @@ async fn docker_readiness_output(
     Ok(result.stdout)
 }
 
-async fn docker_output(args: &[&str]) -> Result<std::process::Output, String> {
-    Command::new("docker")
+fn docker_command_succeeded(result: &ExecutionResult) -> bool {
+    result.exit_code == Some(0) && !result.timed_out && !result.memory_error
+}
+
+fn docker_lifecycle_failure(
+    operation: &str,
+    result: ExecutionResult,
+    cleanup: Option<&ExecutionResult>,
+) -> ExecutionResult {
+    let mut failure = launch_failure(format!(
+        "Docker {operation} failed (client exit {:?}): {}",
+        result.exit_code,
+        result.stderr.trim()
+    ));
+    failure.timed_out = result.timed_out;
+    failure.memory_error = result.memory_error;
+    failure.duration_ms = result.duration_ms;
+    if result.timed_out || result.memory_error {
+        failure.termination = result.termination;
+        for diagnostic in &mut failure.diagnostics {
+            diagnostic.kind = if result.memory_error {
+                FailureKind::MemoryLimit
+            } else {
+                FailureKind::Timeout
+            };
+            diagnostic.process = failure.termination.clone();
+        }
+    }
+    if let Some(cleanup) = cleanup.filter(|output| !docker_command_succeeded(output)) {
+        let message = format!(
+            "Container cleanup could not be confirmed: {}",
+            cleanup.stderr.trim()
+        );
+        failure.stderr.push_str(&format!("\n{message}"));
+        for diagnostic in &mut failure.diagnostics {
+            diagnostic.message.push_str(&format!("; {message}"));
+        }
+    }
+    failure
+}
+
+async fn docker_output(args: &[&str], timeout: f64, memory_mb: u64) -> ExecutionResult {
+    if timeout <= 0.0 {
+        let mut result = launch_failure("Docker lifecycle deadline exhausted");
+        result.timed_out = true;
+        result.termination = Some(termination(ProcessTerminationKind::TimedOut, None, None));
+        return result;
+    }
+    let mut command = Command::new("docker");
+    command
         .args(args)
-        .output()
-        .await
-        .map_err(|e| format!("docker unavailable: {e}"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    run_command_with_limits(
+        command,
+        timeout,
+        memory_mb,
+        RuntimeProfile::LocalTrusted,
+        NetworkPolicy::Deny,
+        true,
+        "docker unavailable",
+    )
+    .await
 }
 
 /// Execute code using the shared context, materialization, and harness launcher.
@@ -4059,15 +4102,11 @@ async fn run_harness_in_docker(
 ) -> ExecutionResult {
     let image = docker_image_for_harness(limits.docker_image.unwrap_or_default(), &harness.runtime);
     let started = Instant::now();
-    match docker_output(&["image", "inspect", image]).await {
-        Ok(output) if output.status.success() => {}
-        Ok(output) => {
-            return launch_failure(format!(
-                "docker image inspect failed for {image}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        Err(error) => return launch_failure(format!("docker setup failed: {error}")),
+    let remaining = || (limits.timeout_seconds - started.elapsed().as_secs_f64()).max(0.0);
+    let image_check =
+        docker_output(&["image", "inspect", image], remaining(), limits.memory_mb).await;
+    if !docker_command_succeeded(&image_check) {
+        return docker_lifecycle_failure("image inspect", image_check, None);
     }
 
     let mirror = if root.is_none() {
@@ -4579,98 +4618,88 @@ async fn run_harness_in_docker(
     }
     create.extend(command);
     let create_args: Vec<&str> = create.iter().map(String::as_str).collect();
-    match docker_output(&create_args).await {
-        Ok(output) if output.status.success() => {}
-        Ok(output) => {
-            return launch_failure(format!(
-                "docker create failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        Err(error) => return launch_failure(format!("docker create failed: {error}")),
-    }
+    // Teardown has a separate bounded allowance so an exhausted execution
+    // deadline cannot prevent an attempt to remove this uniquely named container.
+    let cleanup_timeout = limits.timeout_seconds.min(5.0);
     let cleanup = || async {
-        let _ = docker_output(&["rm", "-f", &container]).await;
+        let mut result =
+            docker_output(&["rm", "-f", &container], cleanup_timeout, limits.memory_mb).await;
+        if !docker_command_succeeded(&result) {
+            result.stderr = format!("container {container}: {}", result.stderr);
+        }
+        result
     };
-    match docker_output(&["start", &container]).await {
-        Ok(output) if output.status.success() => {}
-        Ok(output) => {
-            cleanup().await;
-            return launch_failure(format!(
-                "docker start failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        Err(error) => {
-            cleanup().await;
-            return launch_failure(format!("docker start failed: {error}"));
-        }
+    let created = docker_output(&create_args, remaining(), limits.memory_mb).await;
+    if !docker_command_succeeded(&created) {
+        let cleaned = cleanup().await;
+        return docker_lifecycle_failure("create", created, Some(&cleaned));
     }
-    let wait_result = tokio::time::timeout(
-        std::time::Duration::from_secs_f64(limits.timeout_seconds),
-        docker_output(&["wait", &container]),
+    let launched = docker_output(&["start", &container], remaining(), limits.memory_mb).await;
+    if !docker_command_succeeded(&launched) {
+        let cleaned = cleanup().await;
+        return docker_lifecycle_failure("start", launched, Some(&cleaned));
+    }
+    let wait_result = docker_output(&["wait", &container], remaining(), limits.memory_mb).await;
+    if !docker_command_succeeded(&wait_result) {
+        let cleaned = cleanup().await;
+        return docker_lifecycle_failure("wait", wait_result, Some(&cleaned));
+    }
+    let inspected = docker_output(
+        &["inspect", "--format", "{{json .State}}", &container],
+        remaining(),
+        limits.memory_mb,
     )
     .await;
-    let timed_out = wait_result.is_err();
-    if timed_out {
-        let _ = docker_output(&["kill", &container]).await;
+    if !docker_command_succeeded(&inspected) {
+        let cleaned = cleanup().await;
+        return docker_lifecycle_failure("inspect", inspected, Some(&cleaned));
     }
-    let state_output = docker_output(&["inspect", "--format", "{{json .State}}", &container])
-        .await
-        .ok();
-    let logs = docker_output(&["logs", &container]).await.ok();
-    let state = state_output
+    let logs = docker_output(&["logs", &container], remaining(), limits.memory_mb).await;
+    let cleaned = cleanup().await;
+    if !docker_command_succeeded(&logs) {
+        return docker_lifecycle_failure("logs", logs, Some(&cleaned));
+    }
+    if !docker_command_succeeded(&cleaned) {
+        return docker_lifecycle_failure("cleanup", cleaned, None);
+    }
+    let state = serde_json::from_str::<serde_json::Value>(&inspected.stdout).ok();
+    if state
         .as_ref()
-        .and_then(|output| serde_json::from_slice::<serde_json::Value>(&output.stdout).ok());
+        .and_then(|value| value.get("Running"))
+        .and_then(serde_json::Value::as_bool)
+        != Some(false)
+    {
+        return launch_failure("Docker inspect did not confirm that the container stopped");
+    }
     let memory_limited = state
         .as_ref()
         .and_then(|value| value.get("OOMKilled"))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+        .and_then(serde_json::Value::as_bool);
     let exit_code = state
         .as_ref()
         .and_then(|value| value.get("ExitCode"))
         .and_then(serde_json::Value::as_i64)
-        .map(|value| value as i32);
-    let stdout = logs
-        .as_ref()
-        .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
-        .unwrap_or_default();
-    let stderr = logs
-        .as_ref()
-        .map(|output| String::from_utf8_lossy(&output.stderr).to_string())
-        .unwrap_or_default();
-    cleanup().await;
-    let wait_failed = match &wait_result {
-        Ok(Ok(output)) => !output.status.success(),
-        Ok(Err(_)) | Err(_) => true,
-    } || state.is_none();
-    let kind = if timed_out {
-        ProcessTerminationKind::TimedOut
-    } else if memory_limited {
+        .and_then(|value| i32::try_from(value).ok());
+    let (Some(memory_limited), Some(exit_code)) = (memory_limited, exit_code) else {
+        return launch_failure("Docker inspect returned incomplete container termination evidence");
+    };
+    let kind = if memory_limited {
         ProcessTerminationKind::MemoryLimit
-    } else if wait_failed {
-        ProcessTerminationKind::WaitFailed
     } else {
         ProcessTerminationKind::Exited
     };
-    let termination = termination(kind, if timed_out { None } else { exit_code }, None);
     let mut process = ExecutionResult {
-        stdout,
-        stderr: if timed_out {
-            "Process timed out".into()
-        } else if memory_limited {
+        stdout: logs.stdout,
+        stderr: if memory_limited {
             format!("Killed: memory limit exceeded ({} MB)", limits.memory_mb)
-        } else if wait_failed && stderr.is_empty() {
-            "docker wait or inspect failed".into()
         } else {
-            stderr
+            logs.stderr
         },
-        exit_code: if timed_out { None } else { exit_code },
+        exit_code: Some(exit_code),
         duration_ms: started.elapsed().as_millis() as u64,
-        timed_out,
+        timed_out: false,
         memory_error: memory_limited,
-        termination: Some(termination),
+        termination: Some(termination(kind, Some(exit_code), None)),
         diagnostics: Vec::new(),
     };
     let execution_limits = crate::types::ExecutionLimits {

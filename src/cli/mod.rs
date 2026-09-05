@@ -91,9 +91,9 @@ CI OPTIONS:
   --test-quality [N]         Run up to N mutants globally across changed files (default 8)
 
 DOCTOR OPTIONS:
-  --file <PATH>             Local source context only; requires one explicit language
-  --project-dir <PATH>      Local dependency/runtime root (isolated: unsupported)
-  --timeout-seconds <F>     Per runtime/linter probe timeout (default 10)
+  --file <PATH>             Source context; requires one explicit language
+  --project-dir <PATH>      Project root for local or isolated readiness
+  --timeout-seconds <F>     Per readiness probe budget (default 10)
   --memory-mb <N>           Memory cap MB (smoke default 128; entrypoint default 512)
   --show-config             Inspect settings without running readiness probes
   --probe-entrypoint        Opt in to running one selected test entrypoint against --file

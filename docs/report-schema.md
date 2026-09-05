@@ -96,6 +96,8 @@ Invalid suppression data produces an inconclusive `configuration` stage before s
 
 Lint is advisory by design. Portability is advisory after a successful repository-native fallback and inconclusive when loading prevents behavioral execution.
 
+Docker control-plane failures (including create/start/wait/state/log collection and unconfirmed cleanup) remain blocking infrastructure evidence, not target exceptions. Container completion requires successful state inspection with an explicit stopped state, exit code, and OOM flag. Managed output collection shares the process deadline even when the parent has exited and descendants still hold the pipes; bytes already captured are retained on timeout.
+
 ### Stable advisory test-quality detail
 
 `--test-quality [N]` adds the non-gating `test_quality` stage after authoritative baseline-test and coverage eligibility are established. Direct `verify` requires exactly one `--test-file`. In `ci`, `--test-file` is repeatable with at most one Python and one TypeScript/TSX entrypoint; the matching entrypoint is selected for each target language. The default budget is 8 and the valid range is 1 through 32.

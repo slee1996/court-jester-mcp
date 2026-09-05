@@ -46,6 +46,38 @@ fn status_signal(status: &std::process::ExitStatus) -> Option<i32> {
     }
 }
 
+#[cfg(test)]
+#[tokio::test]
+async fn descendant_pipe_timeout_preserves_captured_output() {
+    let root = tempfile::tempdir().unwrap();
+    let marker = root.path().join("orphan");
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg(format!(
+            "printf observed; printf diagnostic >&2; (sleep 1.5; echo leaked > '{}') & exit 0",
+            marker.display()
+        ))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let result = run_command_with_limits(
+        command,
+        0.5,
+        128,
+        RuntimeProfile::LocalTrusted,
+        NetworkPolicy::Deny,
+        true,
+        "fixture",
+    )
+    .await;
+    assert!(result.timed_out, "{result:?}");
+    assert_eq!(result.stdout, "observed");
+    assert_eq!(result.stderr, "diagnostic");
+    std::thread::sleep(std::time::Duration::from_millis(1600));
+    assert!(!marker.exists());
+}
+
 #[cfg(target_os = "macos")]
 fn get_rss_bytes(pid: u32) -> u64 {
     use std::mem;
@@ -253,19 +285,37 @@ pub(crate) async fn run_command_with_limits(
     let pid = child.id().unwrap_or_default();
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
+    let stdout_bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured_stdout = stdout_bytes.clone();
     let stdout_task = tokio::spawn(async move {
-        let mut bytes = Vec::new();
         if let Some(mut pipe) = stdout_pipe {
-            let _ = tokio::io::AsyncReadExt::read_to_end(&mut pipe, &mut bytes).await;
+            let mut chunk = [0; 8192];
+            while let Ok(size) = tokio::io::AsyncReadExt::read(&mut pipe, &mut chunk).await {
+                if size == 0 {
+                    break;
+                }
+                captured_stdout
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(&chunk[..size]);
+            }
         }
-        bytes
     });
+    let stderr_bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured_stderr = stderr_bytes.clone();
     let stderr_task = tokio::spawn(async move {
-        let mut bytes = Vec::new();
         if let Some(mut pipe) = stderr_pipe {
-            let _ = tokio::io::AsyncReadExt::read_to_end(&mut pipe, &mut bytes).await;
+            let mut chunk = [0; 8192];
+            while let Ok(size) = tokio::io::AsyncReadExt::read(&mut pipe, &mut chunk).await {
+                if size == 0 {
+                    break;
+                }
+                captured_stderr
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(&chunk[..size]);
+            }
         }
-        bytes
     });
     let memory_killed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let memory_killed_clone = memory_killed.clone();
@@ -303,12 +353,41 @@ pub(crate) async fn run_command_with_limits(
             wait.await
         }
     };
+    // A reaped parent does not close pipes inherited by its descendants. Keep
+    // pipe collection inside the same deadline instead of waiting indefinitely.
+    let stdout_abort = stdout_task.abort_handle();
+    let stderr_abort = stderr_task.abort_handle();
+    let mut collected = tokio::spawn(async move {
+        (
+            stdout_task.await.unwrap_or_default(),
+            stderr_task.await.unwrap_or_default(),
+        )
+    });
+    let remaining = (timeout_seconds - started.elapsed().as_secs_f64()).max(0.0);
+    match tokio::time::timeout(
+        std::time::Duration::from_secs_f64(remaining),
+        &mut collected,
+    )
+    .await
+    {
+        Ok(result) => result.unwrap_or_default(),
+        Err(_) => {
+            timed_out = true;
+            if pid > 0 {
+                unsafe {
+                    libc::kill(-(pid as i32), libc::SIGKILL);
+                }
+            }
+            stdout_abort.abort();
+            stderr_abort.abort();
+            collected.await.unwrap_or_default()
+        }
+    };
     if let Some(handle) = monitor {
         handle.abort();
     }
-
-    let stdout = String::from_utf8_lossy(&stdout_task.await.unwrap_or_default()).to_string();
-    let mut stderr = String::from_utf8_lossy(&stderr_task.await.unwrap_or_default()).to_string();
+    let stdout = String::from_utf8_lossy(&stdout_bytes.lock().unwrap()).to_string();
+    let mut stderr = String::from_utf8_lossy(&stderr_bytes.lock().unwrap()).to_string();
     let duration_ms = started.elapsed().as_millis() as u64;
     let (status, wait_error) = match wait_result {
         Ok(status) => (Some(status), None),
