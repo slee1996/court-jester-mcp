@@ -16,9 +16,13 @@ test('Court Jester recorded check', () => {
   const source = realpathSync(join(root, manifest.source_file));
   const within = relative(root, source);
   assert.ok(statSync(source).isFile() && within.split(sep)[0] !== '..' && !isAbsolute(within), 'current regression source is unavailable');
+  const mode = manifest.replay_mode ?? 'current_source';
+  assert.ok(['current_source', 'differential_live'].includes(mode), 'unsupported replay mode');
+  const candidateArgs = mode === 'differential_live' ? ['--candidate-project-dir', root] : [];
   const result = spawnSync(process.env.COURT_JESTER_BINARY || 'court-jester', [
     'replay', '--report', join(bundle, 'report.json'), '--finding', manifest.finding_id,
     '--dependency-project-dir', root,
+    ...candidateArgs,
   ], { cwd: root, encoding: 'utf8' });
   assert.ifError(result.error);
   assert.equal(result.status, 1, String(result.stdout) + String(result.stderr));

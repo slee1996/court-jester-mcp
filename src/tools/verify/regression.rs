@@ -12,6 +12,7 @@ pub struct RegressionExportPlan {
     report: PersistedReport,
     finding: VerificationFinding,
     accepted_inferred: bool,
+    live_candidate: bool,
 }
 
 /// Validate authority and paths before executing the persisted repro or writing anything.
@@ -21,6 +22,24 @@ pub fn prepare_regression_export(
     project_dir: &str,
     output_dir: &str,
     accept_inferred: bool,
+) -> Result<RegressionExportPlan, String> {
+    prepare_regression_export_with_candidate(
+        report_path,
+        finding_id,
+        project_dir,
+        output_dir,
+        accept_inferred,
+        None,
+    )
+}
+
+pub fn prepare_regression_export_with_candidate(
+    report_path: &str,
+    finding_id: &str,
+    project_dir: &str,
+    output_dir: &str,
+    accept_inferred: bool,
+    candidate_project_dir: Option<&str>,
 ) -> Result<RegressionExportPlan, String> {
     let report = load_persisted_report(report_path)?;
     let mut findings = findings_from_stages(&report.stages)
@@ -35,19 +54,29 @@ pub fn prepare_regression_export(
             "regression export requires an unsuppressed finding with valid input evidence".into(),
         );
     }
-    if finding.repro.differential.is_some() || finding.repro.kind == ReproKind::Differential {
-        return Err("differential regression export requires a live-candidate check contract and is not supported yet".into());
+    let live_candidate = finding.repro.differential.is_some();
+    if finding.repro.kind == ReproKind::Differential && !live_candidate {
+        return Err("differential regression export requires embedded baseline evidence".into());
+    }
+    if live_candidate && candidate_project_dir.is_none() {
+        return Err("differential regression export requires explicit --candidate-project-dir; historical snapshots cannot authorize a current-source test".into());
+    }
+    if !live_candidate && candidate_project_dir.is_some() {
+        return Err("--candidate-project-dir requires a differential finding".into());
     }
     if finding.launch_context.is_none() {
         return Err("regression export requires recorded launch context; reverify first".into());
     }
-    let inferred = matches!(
-        finding.confidence,
-        FindingConfidence::Low | FindingConfidence::Medium
-    ) || matches!(
-        finding.oracle.confidence,
-        FindingConfidence::Low | FindingConfidence::Medium
-    ) || finding.oracle.provenance == OracleProvenance::NameHeuristic
+    let inferred = live_candidate
+        || matches!(
+            finding.confidence,
+            FindingConfidence::Low | FindingConfidence::Medium
+        )
+        || matches!(
+            finding.oracle.confidence,
+            FindingConfidence::Low | FindingConfidence::Medium
+        )
+        || finding.oracle.provenance == OracleProvenance::NameHeuristic
         || matches!(
             finding.oracle.kind,
             OracleKind::InferredSemantic | OracleKind::GenericProperty
@@ -60,11 +89,32 @@ pub fn prepare_regression_export(
     if !project.is_dir() {
         return Err("regression project must be a directory".into());
     }
-    let source = report
-        .meta
-        .source_file
-        .as_deref()
-        .ok_or("regression export requires a source file")?;
+    if let Some(candidate) = candidate_project_dir {
+        let candidate = std::fs::canonicalize(candidate)
+            .map_err(|error| format!("invalid live regression project: {error}"))?;
+        if candidate != project {
+            return Err(
+                "regression candidate and dependency project must be the same directory".into(),
+            );
+        }
+    }
+    let source = if let Some(differential) = &finding.repro.differential {
+        let entry = Path::new(&differential.relative_entry);
+        if entry.is_absolute()
+            || entry
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err("differential regression entry must be project-relative".into());
+        }
+        differential.relative_entry.as_str()
+    } else {
+        report
+            .meta
+            .source_file
+            .as_deref()
+            .ok_or("regression export requires a source file")?
+    };
     let source = std::fs::canonicalize(project.join(source))
         .map_err(|error| format!("regression source unavailable: {error}"))?;
     if !source.is_file() {
@@ -103,6 +153,7 @@ pub fn prepare_regression_export(
         report,
         finding,
         accepted_inferred: inferred && accept_inferred,
+        live_candidate,
     })
 }
 
@@ -115,8 +166,38 @@ pub fn write_regression_export(
     if replay.finding_id != plan.finding.id
         || replay.outcome == ReplayOutcome::Inconclusive
         || replay.check_passed.is_none()
+        || replay.execution.exit_code != Some(0)
+        || replay.execution.timed_out
+        || replay.execution.memory_error
+        || (replay.outcome == ReplayOutcome::Reproduced && replay.check_passed == Some(true))
     {
         return Err("regression export requires conclusive positive-check evidence; reverify with a current build or resolve the replay blocker".into());
+    }
+    if plan.live_candidate {
+        let payload = replay
+            .execution
+            .stdout
+            .strip_prefix("__COURT_JESTER_REPLAY_JSON__")
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw.trim()).ok())
+            .ok_or("differential export requires structured live-candidate comparison evidence")?;
+        let expected_entry = plan.project.join(&plan.source);
+        if payload["candidate_mode"] != "live"
+            || payload["check_passed"].as_bool() != replay.check_passed
+            || payload["reproduced"].as_bool() != Some(replay.outcome == ReplayOutcome::Reproduced)
+            || payload["candidate_entry"].as_str() != expected_entry.to_str()
+            || payload["base_tree_sha256"].as_str()
+                != plan
+                    .finding
+                    .repro
+                    .differential
+                    .as_ref()
+                    .map(|value| value.base_tree_sha256.as_str())
+        {
+            return Err(
+                "differential export replay did not check the selected live candidate and baseline"
+                    .into(),
+            );
+        }
     }
     let language =
         Language::parse(&plan.report.meta.language).ok_or("unsupported regression language")?;
@@ -161,6 +242,7 @@ pub fn write_regression_export(
         "finding_id": replay.finding_id, "source_file": plan.source,
         "project_levels": levels, "accepted_inferred": plan.accepted_inferred,
         "export_replay": replay.outcome, "export_check_passed": replay.check_passed,
+        "replay_mode": if plan.live_candidate { "differential_live" } else { "current_source" },
         "test_file": filename, "requires": "court-jester with replay check_passed support",
     });
     // Atomic directory claim prevents concurrent exports and never overwrites user files.
@@ -182,6 +264,9 @@ pub fn write_regression_export(
     )?;
     write(filename, template.as_bytes())?;
     write("README.md", b"# Court Jester regression\n\nThis test requires Court Jester on PATH (or COURT_JESTER_BINARY pointing to the binary). Run `python3 test_regression.py` for Python or `node --test regression.test.mjs` for TypeScript. It checks the current project source, not an embedded snapshot. Keep this directory at the same relative location when moving the checkout.\n\nThe report retains the finding's original confidence and candidate digest. Explicit acceptance of an inferred expectation is recorded separately; it does not rewrite the finding as authoritative. Runtime profile, limits, and harness arguments are preserved. Repro snippets execute code: review this bundle before running it. Local-trusted is host execution, not isolation.\n\nA pass requires positive completion of the recorded check. A different error, inconclusive replay, missing source/tool, or older replay without check evidence fails the test. This one check is not a specification of the whole API.\n")?;
+    if plan.live_candidate {
+        write("BASELINE.md", b"# Accepted baseline comparison\n\nThis bundle compares current project code and imports with the embedded historical baseline for one recorded input. The embedded candidate is retained as historical evidence, but is not the candidate executed by this test. Baseline agreement is an explicitly accepted expectation, not proof that the baseline is correct or that every input is supported. The finding's original confidence is unchanged.\n\nA pass requires equal supported non-exception observations. Review the baseline source in report.json before execution; it runs code too. Current imports are live, not an atomic dependency snapshot. The candidate and dependency project roots are the relocated bundle's project root.\n")?;
+    }
     write(
         "regression.json",
         &serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?,

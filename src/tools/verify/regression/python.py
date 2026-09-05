@@ -18,10 +18,14 @@ class CourtJesterRegression(unittest.TestCase):
         source = (root / manifest["source_file"]).resolve()
         self.assertTrue(source.is_file(), "current regression source is unavailable")
         source.relative_to(root)  # Fail if a source symlink escapes the checkout.
+        mode = manifest.get("replay_mode", "current_source")
+        self.assertIn(mode, ("current_source", "differential_live"))
+        candidate_args = ["--candidate-project-dir", str(root)] if mode == "differential_live" else []
         result = subprocess.run([
             os.environ.get("COURT_JESTER_BINARY", "court-jester"), "replay",
             "--report", str(bundle / "report.json"), "--finding", manifest["finding_id"],
             "--dependency-project-dir", str(root),
+            *candidate_args,
         ], cwd=root, capture_output=True, text=True)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         replay = json.loads(result.stdout)

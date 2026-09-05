@@ -316,7 +316,9 @@ court-jester replay --report <report.json> --finding <finding-id> \
   --export-regression tests/first-character-regression
 ```
 
-This command replays the finding before writing. Inferred expectations require explicit `--accept-inferred`; acceptance is recorded without changing the finding's confidence. Export rejects unknown/invalid inputs, suppressed findings, differential snapshots, and older or unsupported repros without positive-check evidence. Reverify older findings with the current binary first.
+This command replays the finding before writing. Inferred expectations require explicit `--accept-inferred`; acceptance is recorded without changing the finding's confidence. Export rejects unknown/invalid inputs, suppressed findings, historical-only differential replay, and older or unsupported repros without positive-check evidence. Reverify older findings with the current binary first.
+
+For a differential finding, also pass `--candidate-project-dir . --accept-inferred`. The candidate and dependency roots must refer to the same project. The resulting test compares current code/imports with the embedded baseline for the recorded input. Accepting that baseline expectation does not assert that the baseline is generally correct. The bundle includes `BASELINE.md` explaining this contract; review the saved baseline code before running it.
 
 Run `python3 tests/first-character-regression/test_regression.py` for Python, or `node --test tests/first-character-regression/regression.test.mjs` for TypeScript. These standard-library test wrappers **require Court Jester** on PATH; `COURT_JESTER_BINARY` can select its executable. They are not standalone translations of the check. Keep the bundle at the same relative location when moving the checkout.
 

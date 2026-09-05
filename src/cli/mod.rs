@@ -231,12 +231,13 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
                     .dependency_project_dir
                     .as_deref()
                     .ok_or("--export-regression requires --dependency-project-dir")?;
-                tools::verify::prepare_regression_export(
+                tools::verify::prepare_regression_export_with_candidate(
                     report_path,
                     finding_id,
                     project,
                     output,
                     args.accept_inferred,
+                    args.replay_candidate_project_dir.as_deref(),
                 )
             })
             .transpose()?;

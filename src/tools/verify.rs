@@ -20,7 +20,10 @@ pub use decisions::{final_verdict, stage_diagnostics};
 mod provenance;
 mod regression;
 mod replay;
-pub use regression::{prepare_regression_export, write_regression_export, RegressionExportPlan};
+pub use regression::{
+    prepare_regression_export, prepare_regression_export_with_candidate, write_regression_export,
+    RegressionExportPlan,
+};
 mod report_text;
 mod reporting;
 use provenance::{stable_digest, tree_digest};
