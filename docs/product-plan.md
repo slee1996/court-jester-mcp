@@ -16,7 +16,7 @@ This is a single-owner Plan-mode execution record. The completed historical rele
 | P6 | Project-aware doctor and onboarding support the real configured entrypoint | P5 | Missing/broken/ready project probes, copyable recovery actions, fresh-user scripted acceptance | In progress (local/isolated opt-in probes and fresh Python-project acceptance implemented; broader onboarding and hosted evidence pending) |
 | P7 | Advisory test-quality claims have a reproducible classification corpus | P3 | Reached survivor, killed, invalid, blocked, no-coverage and coupling cases in Python/TypeScript; current-build evidence bundle | Local corpus implemented (ten runtime cases plus twelve separate validation cases; hosted evidence pending) |
 | P8 | Every release is gated by current-build trustworthy evidence | P3–P7 | Main/PR workflow coverage, regression/replay checks, build-bound benchmark artifacts, cause-separated abstentions, latency and cost measurement | In progress (deterministic current-build repair gate; broader evidence pending) |
-| P9 | Design-partner rollout validates useful repairs and tolerable friction | P4–P8 | Consent-based rollout materials and measured participant repair outcomes, setup friction and continued usage; actual recruitment coordinated with user | Pending |
+| P9 | Design-partner rollout validates useful repairs and tolerable friction | P4–P8 | Consent-based rollout materials and measured participant repair outcomes, setup friction and continued usage; actual recruitment coordinated with user | Draft protocol and templates prepared; launch authorization, participants, and outcomes pending |
 
 ## Product decisions
 
@@ -440,6 +440,13 @@ This is a single-owner Plan-mode execution record. The completed historical rele
 - Both property repairs now sort the supplied values without mutating their inputs. All four runtime/property repair fixtures have three independently specified public examples. The gate executes those examples before replaying the repaired candidate and retains expected/observed outputs and post-call inputs in the evidence artifact. These examples are separate from replay's positive-check evidence, not inferred from it.
 - Nine repair-gate unit tests pass, including real Python/TypeScript repair execution, rejection of constant sorted stand-ins, wrong output/input-preservation evidence, malformed output, and process failure. The actual current-binary repair gate passes all four complete detection/replay/export sequences and all 12 independent examples. Evidence binds to binary SHA-256 `3089a7a144ccc64589ee3b9fbf4416c48e00e612255c0b72aea7d0e3c1003725`; Rust implementation is unchanged in this increment. Whitespace validation passes.
 - These are public deterministic fixture checks, not a held-out benchmark or participant outcomes. Native minimization, live-candidate differential export, broader acceptance evidence, and the rest of the P1–P9 objective remain required. The pending account authorization still prevents pushing.
+
+### Increment 44: prepare consent-based design-partner pilot
+
+- Added an explicitly unlaunched pilot protocol, participant guide, and blank private-session template. Launch requires maintainer approval of participants, distribution build, support owner, time budget, storage, and deletion date. No invitation, enrollment, recording, upload, incentive, or participant outcome is claimed or authorized by these files.
+- The protocol separates observation consent from raw-artifact sharing, keeps completed forms outside the repository, and preserves the existing private-beta benchmark and 5–10-user requirements. Outcome definitions distinguish assisted/unassisted setup, independently adjudicated defects, attempted/accepted repairs, export success/adoption, and intended/actual repeat use. Unknowns, abandonments, and unanswered follow-ups stay visible in denominators.
+- Added stop criteria, per-build tracking, private evidence references, and an exit-review structure. The participant workflow uses existing configuration inspection, opt-in entrypoint probing, repair-json verification, replay, and optional export; it explains profile selection and positive-check limitations. Local links and whitespace validation pass. This is documentation-only preparation, not experimental evidence or P9 completion.
+- Actual launch and collection require user coordination. Other implementation and evidence requirements in P1–P8 remain active, so this authority gap is not a whole-goal impasse.
 
 ## Completion audit
 
