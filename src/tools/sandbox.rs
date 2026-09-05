@@ -2,7 +2,10 @@ use std::collections::{BTreeMap, HashSet};
 
 use crate::types::{FailureDiagnostic, FailureDomain, FailureKind, ProcessTerminationKind};
 
+mod docker_lifecycle;
 mod events;
+pub use docker_lifecycle::wait_for_docker_cleanup;
+use docker_lifecycle::{supervise_docker_lifecycle, DockerLifecycle};
 mod process;
 pub(crate) use process::run_command_with_limits;
 use process::{launch_failure, run_launch_command, termination};
@@ -3053,13 +3056,22 @@ fn docker_lifecycle_failure(
 }
 
 async fn docker_output(args: &[&str], timeout: f64, memory_mb: u64) -> ExecutionResult {
+    docker_program_output(std::path::Path::new("docker"), args, timeout, memory_mb).await
+}
+
+async fn docker_program_output(
+    program: &std::path::Path,
+    args: &[&str],
+    timeout: f64,
+    memory_mb: u64,
+) -> ExecutionResult {
     if timeout <= 0.0 {
         let mut result = launch_failure("Docker lifecycle deadline exhausted");
         result.timed_out = true;
         result.termination = Some(termination(ProcessTerminationKind::TimedOut, None, None));
         return result;
     }
-    let mut command = Command::new("docker");
+    let mut command = Command::new(program);
     command
         .args(args)
         .stdin(std::process::Stdio::null())
@@ -4091,15 +4103,17 @@ fn native_dependency_load_failed(process: &ExecutionResult) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_harness_in_docker(
-    root: Option<&std::path::Path>,
+    temporary_lease: Option<std::sync::Arc<tempfile::TempDir>>,
     host_artifact: &std::path::Path,
     launch_cwd: &std::path::Path,
     context: &crate::types::ExecutionContext,
     harness: &crate::types::HarnessSpec,
-    network_guard: Option<&NetworkGuard>,
+    network_guard_lease: Option<std::sync::Arc<NetworkGuard>>,
     limits: crate::types::SandboxOptions<'_>,
     isolated_type_import: Option<&str>,
 ) -> ExecutionResult {
+    let root = temporary_lease.as_ref().map(|directory| directory.path());
+    let network_guard = network_guard_lease.as_deref();
     let image = docker_image_for_harness(limits.docker_image.unwrap_or_default(), &harness.runtime);
     let started = Instant::now();
     let remaining = || (limits.timeout_seconds - started.elapsed().as_secs_f64()).max(0.0);
@@ -4617,99 +4631,26 @@ async fn run_harness_in_docker(
         }
     }
     create.extend(command);
-    let create_args: Vec<&str> = create.iter().map(String::as_str).collect();
-    // Teardown has a separate bounded allowance so an exhausted execution
-    // deadline cannot prevent an attempt to remove this uniquely named container.
-    let cleanup_timeout = limits.timeout_seconds.min(5.0);
-    let cleanup = || async {
-        let mut result =
-            docker_output(&["rm", "-f", &container], cleanup_timeout, limits.memory_mb).await;
-        if !docker_command_succeeded(&result) {
-            result.stderr = format!("container {container}: {}", result.stderr);
-        }
-        result
-    };
-    let created = docker_output(&create_args, remaining(), limits.memory_mb).await;
-    if !docker_command_succeeded(&created) {
-        let cleaned = cleanup().await;
-        return docker_lifecycle_failure("create", created, Some(&cleaned));
-    }
-    let launched = docker_output(&["start", &container], remaining(), limits.memory_mb).await;
-    if !docker_command_succeeded(&launched) {
-        let cleaned = cleanup().await;
-        return docker_lifecycle_failure("start", launched, Some(&cleaned));
-    }
-    let wait_result = docker_output(&["wait", &container], remaining(), limits.memory_mb).await;
-    if !docker_command_succeeded(&wait_result) {
-        let cleaned = cleanup().await;
-        return docker_lifecycle_failure("wait", wait_result, Some(&cleaned));
-    }
-    let inspected = docker_output(
-        &["inspect", "--format", "{{json .State}}", &container],
-        remaining(),
-        limits.memory_mb,
-    )
-    .await;
-    if !docker_command_succeeded(&inspected) {
-        let cleaned = cleanup().await;
-        return docker_lifecycle_failure("inspect", inspected, Some(&cleaned));
-    }
-    let logs = docker_output(&["logs", &container], remaining(), limits.memory_mb).await;
-    let cleaned = cleanup().await;
-    if !docker_command_succeeded(&logs) {
-        return docker_lifecycle_failure("logs", logs, Some(&cleaned));
-    }
-    if !docker_command_succeeded(&cleaned) {
-        return docker_lifecycle_failure("cleanup", cleaned, None);
-    }
-    let state = serde_json::from_str::<serde_json::Value>(&inspected.stdout).ok();
-    if state
-        .as_ref()
-        .and_then(|value| value.get("Running"))
-        .and_then(serde_json::Value::as_bool)
-        != Some(false)
-    {
-        return launch_failure("Docker inspect did not confirm that the container stopped");
-    }
-    let memory_limited = state
-        .as_ref()
-        .and_then(|value| value.get("OOMKilled"))
-        .and_then(serde_json::Value::as_bool);
-    let exit_code = state
-        .as_ref()
-        .and_then(|value| value.get("ExitCode"))
-        .and_then(serde_json::Value::as_i64)
-        .and_then(|value| i32::try_from(value).ok());
-    let (Some(memory_limited), Some(exit_code)) = (memory_limited, exit_code) else {
-        return launch_failure("Docker inspect returned incomplete container termination evidence");
-    };
-    let kind = if memory_limited {
-        ProcessTerminationKind::MemoryLimit
-    } else {
-        ProcessTerminationKind::Exited
-    };
-    let mut process = ExecutionResult {
-        stdout: logs.stdout,
-        stderr: if memory_limited {
-            format!("Killed: memory limit exceeded ({} MB)", limits.memory_mb)
-        } else {
-            logs.stderr
+    let lifecycle = DockerLifecycle {
+        program: which_binary(&std::env::var("PATH").unwrap_or_default(), "docker")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| "docker".into()),
+        create,
+        container,
+        started,
+        limits: ExecutionLimits {
+            timeout_seconds: limits.timeout_seconds,
+            memory_mb: limits.memory_mb,
+            runtime_profile: limits.runtime_profile,
+            network_policy: NetworkPolicy::Deny,
         },
-        exit_code: Some(exit_code),
-        duration_ms: started.elapsed().as_millis() as u64,
-        timed_out: false,
-        memory_error: memory_limited,
-        termination: Some(termination(kind, Some(exit_code), None)),
-        diagnostics: Vec::new(),
+        adapter: harness.test_adapter,
+        _workspace: mirror,
+        _generated_workspace: temporary_lease,
+        _runtime_guard: network_guard_lease,
+        _resolver: node_package_resolver,
     };
-    let execution_limits = crate::types::ExecutionLimits {
-        timeout_seconds: limits.timeout_seconds,
-        memory_mb: limits.memory_mb,
-        runtime_profile: limits.runtime_profile,
-        network_policy: NetworkPolicy::Deny,
-    };
-    process.diagnostics = harness_diagnostics(harness.test_adapter, &process, &execution_limits);
-    process
+    supervise_docker_lifecycle(lifecycle).await
 }
 
 fn virtual_env_bin(virtual_env: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
@@ -4923,7 +4864,11 @@ pub async fn execute_harness(
                     process,
                 };
             }
-            (Some(temporary), host_artifact, launch_cwd)
+            (
+                Some(std::sync::Arc::new(temporary)),
+                host_artifact,
+                launch_cwd,
+            )
         }
         HarnessArtifact::Existing { relative_path } => {
             let relative_path = match normalize_harness_path(&relative_path) {
@@ -5182,7 +5127,7 @@ pub async fn execute_harness(
     let runtime_guard =
         if effective_network == NetworkPolicy::Deny || limits.instrumented_source.is_some() {
             match create_network_guard(limits.runtime_profile, limits.instrumented_source) {
-                Ok(guard) => Some(guard),
+                Ok(guard) => Some(std::sync::Arc::new(guard)),
                 Err(error) => {
                     let process = launch_failure(error);
                     return HarnessExecution {
@@ -5343,12 +5288,12 @@ pub async fn execute_harness(
     let is_typescript = !matches!(harness.source_mode, SourceMode::Python);
     let mut process = if limits.runtime_profile == RuntimeProfile::Isolated {
         let mut isolated = run_harness_in_docker(
-            temporary.as_ref().map(|directory| directory.path()),
+            temporary.clone(),
             &plan.host_artifact,
             &plan.cwd,
             context,
             &harness,
-            runtime_guard.as_ref(),
+            runtime_guard.clone(),
             limits,
             None,
         )
@@ -5407,12 +5352,12 @@ pub async fn execute_harness(
                         break;
                     };
                     let retry = run_harness_in_docker(
-                        temporary.as_ref().map(|directory| directory.path()),
+                        temporary.clone(),
                         &plan.host_artifact,
                         &plan.cwd,
                         context,
                         &harness,
-                        runtime_guard.as_ref(),
+                        runtime_guard.clone(),
                         limits,
                         Some(&serialized),
                     )

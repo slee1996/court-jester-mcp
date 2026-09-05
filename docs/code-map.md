@@ -43,6 +43,7 @@ Parsing and callable discovery remain in `analyze.rs`; input-domain planning is 
 
 - `sandbox/events.rs`: the versioned generated-harness event protocol, including lifecycle ordering and bounds.
 - `sandbox/process.rs`: subprocess launch, process-group memory monitoring, timeout handling, output collection, and termination diagnostics.
+- `sandbox/docker_lifecycle.rs`: owned container workers, cancellation signaling, retained workspace leases, bounded teardown, and cleanup draining for CLI interruption.
 
 Public sandbox APIs and event constants remain re-exported through `court_jester::tools::sandbox`.
 

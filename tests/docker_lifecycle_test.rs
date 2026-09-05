@@ -3,6 +3,65 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 #[test]
+fn cli_interrupt_waits_for_its_container_cleanup() {
+    for (signal, exit_code) in [(libc::SIGINT, 130), (libc::SIGTERM, 143)] {
+        let root = tempfile::tempdir().unwrap();
+        let ready = root.path().join("ready");
+        let created = root.path().join("created");
+        let removed = root.path().join("removed");
+        let program = root.path().join("docker");
+        std::fs::write(&program, format!("#!/bin/sh\ncase \"$1\" in\ncreate) echo \"$3\" > '{}' ;;\nwait) echo ready > '{}'; /bin/sleep 10 ;;\nrm) echo \"$3\" > '{}' ;;\nesac\nexit 0\n", created.display(), ready.display(), removed.display())).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let source = root.path().join("target.py");
+        std::fs::write(&source, "print('fixture')\n").unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_court-jester"))
+            .args([
+                "execute",
+                "--language",
+                "python",
+                "--runtime-profile",
+                "isolated",
+                "--file",
+            ])
+            .arg(&source)
+            .env("PATH", root.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !ready.exists() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("CLI did not start container wait");
+        }
+        unsafe {
+            libc::kill(child.id() as i32, signal);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("interrupted CLI did not finish bounded cleanup");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(status.code(), Some(exit_code));
+        assert_eq!(
+            std::fs::read_to_string(&removed).unwrap(),
+            std::fs::read_to_string(&created).unwrap()
+        );
+    }
+}
+
+#[test]
 fn timed_out_docker_wait_does_not_leave_client_descendants() {
     check_delayed_operation("wait", false);
 }

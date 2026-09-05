@@ -62,6 +62,9 @@ jobs:
       - name: Check isolated project readiness and concurrent mutation evidence
         run: cargo test --locked --test doctor_test -- --ignored --test-threads=1
 
+      - name: Check cancelled container ownership
+        run: cargo test --locked --lib cancelled_real_container_worker -- --ignored --test-threads=1
+
       - name: Run benchmark unit tests
         run: python3 -m unittest bench.test_run_matrix bench.test_runner bench.test_summarize_runs bench.test_agent_trace bench.test_evidence bench.test_materialize_mutation bench.test_fuzz_effectiveness
 
