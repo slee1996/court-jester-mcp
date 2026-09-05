@@ -4380,6 +4380,21 @@ fn synthesize_python_involution_checks(
     for (enc, dec) in &pairs {
         let param = enc.params.iter().find(|p| !p.is_variadic()).unwrap();
         let gen = python_generator(param.type_annotation.as_deref(), type_defs);
+        let bind = |function: &FunctionInfo| {
+            let parameter = function
+                .params
+                .iter()
+                .find(|parameter| !parameter.is_variadic())
+                .unwrap();
+            let argument = if parameter.keyword_only {
+                format!("{}=_value", parameter.name)
+            } else {
+                "_value".into()
+            };
+            format!("lambda _value: {}({argument})", function.name)
+        };
+        let pair_source =
+            serde_json::to_string(&format!("({}, {})", bind(enc), bind(dec))).unwrap();
         let pair_label = serde_json::to_string(&format!("{}<->{}", enc.name, dec.name))
             .unwrap_or_else(|_| "\"roundtrip\"".into());
         let corpus_key = serde_json::to_string(&format!("{}:{}", enc.name, enc.line))
@@ -4391,21 +4406,9 @@ fn synthesize_python_involution_checks(
 _inv_inputs = [{gen} for _ in range(30)]
 _inv_inputs.extend(_copy.deepcopy(_row[0]) for _row in _CJ_CORPORA.get({corpus_key}, []) if _row)
 for _inv_input in _inv_inputs:
-    try:
-        _inv_encoded = {enc_name}(_copy.deepcopy(_inv_input))
-        _inv_decoded = {dec_name}(_copy.deepcopy(_inv_encoded))
-        if not _nan_eq(_inv_input, _inv_decoded):
-            _roundtrip_error = AssertionError(f"Roundtrip failed: {{repr(_inv_input)}} -> {{repr(_inv_encoded)}} -> {{repr(_inv_decoded)}}")
-            _emit_finding({pair_label}, [_inv_input], _roundtrip_error, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", case_label="roundtrip")
-            print(f"  ROUNDTRIP FAIL {enc_name} <-> {dec_name}: {{_short_repr(_inv_input)}} -> {{_short_repr(_inv_encoded)}} -> {{_short_repr(_inv_decoded)}}")
-            _fuzz_failures += 1
-            break
-    except Exception as _e:
-        if _is_crash(_e):
-            _emit_finding({pair_label}, [_inv_input], _e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", case_label="roundtrip")
-            print(f"  ROUNDTRIP CRASH {enc_name} <-> {dec_name}: {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
-            _fuzz_failures += 1
-            break
+    if _roundtrip_case({pair_label}, {pair_source}, _inv_input):
+        _fuzz_failures += 1
+        break
 "#,
             enc_name = enc.name,
             dec_name = dec.name,
@@ -4431,7 +4434,7 @@ fn synthesize_typescript_involution_checks(
             .unwrap_or_else(|_| "\"roundtrip\"".into());
         let corpus_key = serde_json::to_string(&format!("{}:{}", enc.name, enc.line))
             .unwrap_or_else(|_| "\"\"".into());
-        let encode_call = ts_call_with_args(enc, &["input"]);
+        let encode_call = ts_call_with_args(enc, &["_args[0]"]);
         let decode_call = ts_call_with_args(dec, &["encoded"]);
 
         code.push_str(&format!(
@@ -4444,25 +4447,11 @@ fn synthesize_typescript_involution_checks(
     if (row.length > 0) _invInputs.push(_cloneSeed(row[0]));
   }}
   for (const input of _invInputs) {{
-    try {{
-      const encoded = {encode_call};
-      const decoded = {decode_call};
-      if (!_nanSafeEq(input, decoded)) {{
-        const failure = new Error(`Roundtrip failed: ${{_shortJson(input)}} -> ${{_shortJson(encoded)}} -> ${{_shortJson(decoded)}}`);
-        _emitFinding({pair_label}, [input], failure, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", null, "direct", "roundtrip", {source_line});
-        console.log(`  ROUNDTRIP FAIL {enc_name} <-> {dec_name}: ${{_shortJson(input)}} -> ${{_shortJson(encoded)}} -> ${{_shortJson(decoded)}}`);
-        _fuzzTotalFailures++;
-        _invFail = true;
-        break;
-      }}
-    }} catch (e: unknown) {{
-      if (_isCrash(e)) {{
-        _emitFinding({pair_label}, [input], e, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", null, "direct", "roundtrip", {source_line});
-        console.log(`  ROUNDTRIP CRASH {enc_name} <-> {dec_name}: ${{_clipText(e)}}`);
-        _fuzzTotalFailures++;
-        _invFail = true;
-        break;
-      }}
+    if (_semanticCase({pair_label}, (_args: unknown[]) => {encode_call}, [input], input,
+        (encoded: unknown, _step: (label: string) => void) => {{ _step("decode"); return {decode_call}; }}, "Roundtrip failed", false, "unknown", {source_line})) {{
+      console.log("  ROUNDTRIP FAIL {enc_name} <-> {dec_name}");
+      _invFail = true;
+      break;
     }}
   }}
   if (!_invFail) console.log("FUZZ {enc_name} <-> {dec_name} roundtrip: passed");

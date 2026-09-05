@@ -310,6 +310,43 @@ def _semantic_check(name, target, args, expected, projection, label):
                   expected=_json.dumps(expected, ensure_ascii=False), actual=_clip_text(repr(actual)) if target_error is None else _clip_text(target_error),
                   case_label=label, replay_snippet=snippet)
     return 1
+def _observe_roundtrip(encode, decode, value):
+    phase = "copy_input"
+    try:
+        argument = _copy.deepcopy(value)
+        phase = "encode"
+        encoded = encode(argument)
+        phase = "copy_encoded"
+        argument = _copy.deepcopy(encoded)
+        phase = "decode"
+        decoded = decode(argument)
+        phase = "compare"
+        return bool(_nan_eq(value, decoded)), None, phase, decoded
+    except Exception as error:
+        return False, error, phase, None
+
+def _roundtrip_case(name, source, value):
+    encode, decode = eval(source)
+    original = _copy.deepcopy(value)
+    matched, error, phase, actual = _observe_roundtrip(encode, decode, original)
+    if matched: return False
+    import inspect as _inspect
+    definitions = "\n".join(_inspect.getsource(helper) for helper in (_materialize_if_iterator, _nan_eq, _observe_roundtrip))
+    try:
+        argument = _repro_expression(original)
+        match = "_error is None and not _matched" if error is None else f"_error is not None and _phase == {phase!r} and (type(_error).__name__, str(_error)) == {(type(error).__name__, str(error))!r}"
+        body = ("import copy as _copy\nimport json as _json\n" + definitions
+                + f"\n_matched, _error, _phase, _actual = _observe_roundtrip(_encode, _decode, {argument})\n"
+                + "print('__COURT_JESTER_REPLAY_JSON__')\n"
+                + f"print(_json.dumps(dict(reproduced=bool({match}), severity='property_violation', oracle_kind='inferred_semantic', category='property')))\n")
+        snippet = "def _cj_roundtrip_replay(_encode, _decode):\n" + "\n".join("    " + line for line in body.splitlines()) + f"\n_cj_roundtrip_replay(*{source})\n"
+    except ValueError:
+        snippet = "raise RuntimeError('Court Jester cannot replay this runtime-only roundtrip input')"
+    failure = error if error is not None else AssertionError(f"Roundtrip failed: {original!r} -> {actual!r}")
+    _emit_finding(name, [original], failure, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", input_classification="unknown" if error is not None else "valid", case_label="roundtrip", replay_snippet=snippet)
+    print(f"  ROUNDTRIP FAIL {name}: {_clip_text(failure)}")
+    return True
+
 def _is_generated_collaborator_mismatch(error):
     if not isinstance(error, AttributeError):
         return False

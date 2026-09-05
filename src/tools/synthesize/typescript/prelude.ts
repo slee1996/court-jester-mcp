@@ -624,7 +624,7 @@ function _observeSemantic(invoke: (args: unknown[]) => unknown, args: unknown[],
   } catch (caught) { threw = true; error = caught; }
   return { actual, error, threw, phase, matched };
 }
-function _semanticCase(name: string, invoke: (args: unknown[]) => unknown, args: unknown[] | (() => unknown[]), expected: unknown, projection: string | { property: string } | ((value: any, step: (label: string) => void) => unknown), label: string, sequence = false): void {
+function _semanticCase(name: string, invoke: (args: unknown[]) => unknown, args: unknown[] | (() => unknown[]), expected: unknown, projection: string | { property: string } | ((value: any, step: (label: string) => void) => unknown), label: string, sequence = false, exceptionInputClassification = "valid", sourceLine = 0): boolean {
   if (projection === "sign") expected = _cmpSign(expected);
   const recipe = typeof args === "function" ? args : null;
   const original = recipe ? recipe() : _cloneSeed(args as unknown[]);
@@ -632,7 +632,7 @@ function _semanticCase(name: string, invoke: (args: unknown[]) => unknown, args:
   const createSource = recipe ? recipe.toString() : `() => (${_reproExpression(original)})`;
   const recordedCase = recipe ? { arguments: original.map((_, index) => ({ expression: `(${createSource})()[${index}]` })), input_text: label } : null;
   const { actual, error, threw, phase, matched } = _observeSemantic(invoke, recipe ? recipe() : _cloneSeed(original), expected, projection, sequence);
-  if (!threw && matched) return;
+  if (!threw && matched) return false;
   const primitiveException = error === null || ["undefined", "string", "number", "boolean", "bigint"].includes(typeof error);
   const replayMatch = error instanceof Error
     ? `_error instanceof Error && _error.constructor.name === ${JSON.stringify(error.constructor.name)} && _error.message === ${JSON.stringify(error.message)}`
@@ -640,9 +640,10 @@ function _semanticCase(name: string, invoke: (args: unknown[]) => unknown, args:
   const snippet = replayMatch === null ? `throw new Error("Court Jester cannot replay this runtime-only thrown value");`
     : `((_semanticInvoke, _semanticArguments, _semanticProjection) => {\n${_PropertyFailure.toString()}\n${_cmpSign.toString()}\n${_nanSafeEq.toString()}\n${_semanticProject.toString()}\n${_observeSemantic.toString()}\nconst _observation = _observeSemantic(_semanticInvoke, _semanticArguments(), ${_reproExpression(expected)}, _semanticProjection, ${sequence});\nconst _error = _observation.error;\nconst _reproduced = ${threw ? `_observation.threw && _observation.phase === ${JSON.stringify(phase)} && (${replayMatch})` : "!_observation.threw && !_observation.matched"};\nconsole.log("__COURT_JESTER_REPLAY_JSON__");\nconsole.log(JSON.stringify({reproduced: _reproduced, severity: "property_violation", oracle_kind: "inferred_semantic", category: "property"}));\n})(${invoke.toString()}, ${createSource}, ${projectionSource});`;
   const failure = threw ? error : new Error(`${label}: ${JSON.stringify(actual)} !== ${JSON.stringify(expected)}`);
-  _emitFinding(name, original, failure, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", null, "direct", label, 0, snippet, "valid", JSON.stringify(expected), sequence ? "semantic_case" : "function_call", recordedCase);
+  _emitFinding(name, original, failure, "property_violation", "inferred_semantic", "name_heuristic", "low", "property", null, "direct", label, sourceLine, snippet, threw ? exceptionInputClassification : "valid", JSON.stringify(expected), sequence ? "semantic_case" : "function_call", recordedCase);
   console.log(`  CRASH ${name}(${label}): ${_clipText(failure instanceof Error ? failure.message : String(failure))}`);
   _fuzzTotalFailures++;
+  return true;
 }
 function _declaredPropertyForFailure(error: unknown): string | null {
   if (!(error instanceof _PropertyFailure)) return null;

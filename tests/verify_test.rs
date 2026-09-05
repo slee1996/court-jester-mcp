@@ -5002,6 +5002,71 @@ def increment(value: int) -> int:
 }
 
 #[tokio::test]
+async fn paired_function_replay_repeats_both_calls_and_the_comparison() {
+    for (language, template, identity, mismatch, thrown) in [
+        (Language::Python, "def encode(value: str) -> str:\n    __ENC__\ndef decode(value: str) -> str:\n    __DEC__\n", "return value", "return value + 'x'", "raise ValueError('pair failure')"),
+        (Language::Python, "def encode(*, value: str) -> str:\n    __ENC__\ndef decode(*, value: str) -> str:\n    __DEC__\n", "return value", "return value + 'x'", "raise ValueError('pair failure')"),
+        (Language::TypeScript, "export function encode(value: string): string { __ENC__ }\nexport function decode(value: string): string { __DEC__ }\n", "return value;", "return value + 'x';", "throw new ReferenceError('pair failure');"),
+    ] {
+        for decode in [mismatch, thrown] {
+            let project = tempfile::tempdir().unwrap();
+            let source = project.path().join(if language == Language::Python { "target.py" } else { "target.ts" });
+            let code = template.replace("__ENC__", identity).replace("__DEC__", decode);
+            fs::write(&source, &code).unwrap();
+            let mut opts = default_opts(None);
+            opts.source_file = source.to_str();
+            opts.project_dir = project.path().to_str();
+            let report = verify(&code, &language, opts).await;
+            let repair = repair_summary(&report, &language);
+            let finding = repair.findings.iter().find(|finding| finding.oracle.kind == OracleKind::InferredSemantic && finding.location.function == "encode<->decode").unwrap_or_else(|| panic!("{language:?}/{decode}: {}", report_human_summary(&report)));
+            assert_eq!(finding.confidence, FindingConfidence::Low);
+            if decode == thrown {
+                assert_eq!(serde_json::to_value(finding).unwrap()["input_classification"], "unknown");
+            }
+            if language == Language::TypeScript {
+                assert_eq!(finding.location.line, 1);
+            }
+            let report_path = project.path().join("repair.json");
+            fs::write(&report_path, serde_json::to_vec(&repair).unwrap()).unwrap();
+            let replay = replay_report(report_path.to_str().unwrap(), &finding.id, None, RuntimeProfile::LocalTrusted, DEFAULT_PYTHON_DOCKER_IMAGE, DEFAULT_TYPESCRIPT_DOCKER_IMAGE).await.unwrap();
+            assert_eq!(replay.outcome, ReplayOutcome::Reproduced, "{language:?}/{decode}: {replay:?}");
+            for encode in [identity, thrown] {
+                fs::write(&source, template.replace("__ENC__", encode).replace("__DEC__", identity)).unwrap();
+                let replay = replay_report(report_path.to_str().unwrap(), &finding.id, None, RuntimeProfile::LocalTrusted, DEFAULT_PYTHON_DOCKER_IMAGE, DEFAULT_TYPESCRIPT_DOCKER_IMAGE).await.unwrap();
+                assert_eq!(replay.outcome, ReplayOutcome::NotReproduced, "{language:?}/{decode}/{encode}: {replay:?}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn paired_function_replay_preserves_inputs_before_encoder_mutation() {
+    for (language, code, repair_code) in [
+        (Language::Python, "def encode(value: list[int]) -> list[int]:\n    value.append(987654321)\n    return value\ndef decode(value: list[int]) -> list[int]:\n    return value\n", "def encode(value: list[int]) -> list[int]:\n    value.append(987654321)\n    return value\ndef decode(value: list[int]) -> list[int]:\n    return value[:-1]\n"),
+        (Language::TypeScript, "export function encode(value: number[]): number[] { value.push(987654321); return value; }\nexport function decode(value: number[]): number[] { return value; }\n", "export function encode(value: number[]): number[] { value.push(987654321); return value; }\nexport function decode(value: number[]): number[] { return value.slice(0, -1); }\n"),
+    ] {
+        let project = tempfile::tempdir().unwrap();
+        let source = project.path().join(if language == Language::Python { "target.py" } else { "target.ts" });
+        fs::write(&source, code).unwrap();
+        let mut opts = default_opts(None);
+        opts.source_file = source.to_str();
+        opts.project_dir = project.path().to_str();
+        let report = verify(code, &language, opts).await;
+        let repair = repair_summary(&report, &language);
+        let finding = repair.findings.iter().find(|finding| finding.oracle.kind == OracleKind::InferredSemantic && finding.location.function == "encode<->decode").unwrap_or_else(|| panic!("{language:?}: {}", report_human_summary(&report)));
+        let recorded = serde_json::to_value(&finding.repro).unwrap();
+        assert!(!recorded["arguments"][0]["json_value"].as_array().unwrap().contains(&serde_json::json!(987654321)));
+        let report_path = project.path().join("repair.json");
+        fs::write(&report_path, serde_json::to_vec(&repair).unwrap()).unwrap();
+        let replay = replay_report(report_path.to_str().unwrap(), &finding.id, None, RuntimeProfile::LocalTrusted, DEFAULT_PYTHON_DOCKER_IMAGE, DEFAULT_TYPESCRIPT_DOCKER_IMAGE).await.unwrap();
+        assert_eq!(replay.outcome, ReplayOutcome::Reproduced, "{language:?}: {replay:?}");
+        fs::write(&source, repair_code).unwrap();
+        let replay = replay_report(report_path.to_str().unwrap(), &finding.id, None, RuntimeProfile::LocalTrusted, DEFAULT_PYTHON_DOCKER_IMAGE, DEFAULT_TYPESCRIPT_DOCKER_IMAGE).await.unwrap();
+        assert_eq!(replay.outcome, ReplayOutcome::NotReproduced, "{language:?}: {replay:?}");
+    }
+}
+
+#[tokio::test]
 async fn inferred_roundtrip_failure_emits_structured_advisory() {
     let code = r#"
 export function encode(value: string): string {
