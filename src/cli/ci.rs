@@ -97,6 +97,8 @@ pub(super) struct CiRunResult {
     pub(super) head: String,
     pub(super) base_commit: String,
     pub(super) head_commit: String,
+    pub(super) candidate_state: super::args::CandidateState,
+    pub(super) candidate_workspace: Option<String>,
     pub(super) gates: Vec<String>,
     pub(super) changed_files: usize,
     pub(super) checked_files: usize,
@@ -414,10 +416,18 @@ pub(super) async fn run_ci_for_repo(
     }
     let base = require_base(args)?.to_string();
     let head = args.head.clone().unwrap_or_else(|| "HEAD".into());
+    let invocation_dir = repo_dir;
+    let root = super::candidate::repo_root(repo_dir)?;
+    let repo_dir = root.as_path();
+    let candidate_root = args
+        .candidate_root
+        .as_deref()
+        .map(Path::new)
+        .unwrap_or(repo_dir);
     let base_commit = super::revisions::resolve_revision(repo_dir, &base)?;
     let head_commit = super::revisions::resolve_revision(repo_dir, &head)?;
     let suppressions = super::args::read_suppressions(args.suppressions_file.as_deref())?;
-    let test_entrypoints = ci_test_entrypoints(repo_dir, &args.test_files)?;
+    let test_entrypoints = ci_test_entrypoints(invocation_dir, &args.test_files)?;
     let baseline_temp = archive_baseline_tree(repo_dir, &base_commit)?;
     let gates = parse_ci_gates(args.gate.as_deref())?;
     let changed_files = ci_changed_source_files(repo_dir, &base_commit, &head_commit)?;
@@ -437,7 +447,7 @@ pub(super) async fn run_ci_for_repo(
     let mut prepared_files = Vec::new();
     let mut skipped_files = Vec::new();
     for (relative_path, language) in &changed_files {
-        let absolute = repo_dir.join(relative_path);
+        let absolute = candidate_root.join(relative_path);
         if !absolute.is_file() {
             skipped_files.push(relative_path.clone());
             continue;
@@ -494,7 +504,7 @@ pub(super) async fn run_ci_for_repo(
     let project_dir = args
         .project_dir
         .clone()
-        .or_else(|| Some(repo_dir.to_string_lossy().into_owned()));
+        .or_else(|| Some(candidate_root.to_string_lossy().into_owned()));
     let mut files = Vec::new();
     let mut verdict = VerificationVerdict::Pass;
     for (file_index, prepared) in prepared_files.into_iter().enumerate() {
@@ -579,6 +589,8 @@ pub(super) async fn run_ci_for_repo(
         head,
         base_commit,
         head_commit,
+        candidate_state: args.candidate_state,
+        candidate_workspace: args.candidate_root.clone(),
         gates,
         changed_files: changed_files.len(),
         checked_files: files.len(),
@@ -660,6 +672,10 @@ pub(super) fn render_ci_human(result: &CiRunResult) -> String {
     let mut out = String::new();
     out.push_str(&format!("CI: {}\n", verdict_label(&result.verdict)));
     out.push_str(&format!("Range: {}...{}\n", result.base, result.head));
+    out.push_str(&format!("Candidate state: {:?}\n", result.candidate_state));
+    if let Some(workspace) = &result.candidate_workspace {
+        out.push_str(&format!("Retained candidate workspace: {workspace}\n"));
+    }
     out.push_str(&format!(
         "Files: {} changed, {} checked, {} skipped\n",
         result.changed_files,
@@ -891,7 +907,8 @@ pub(super) fn ci_json_value(result: &CiRunResult, report_level: ReportLevel) -> 
         "head": result.head,
         "base_commit": result.base_commit,
         "head_commit": result.head_commit,
-        "candidate_state": "working_tree",
+        "candidate_state": result.candidate_state,
+        "candidate_workspace": result.candidate_workspace,
         "gates": result.gates,
         "verdict": result.verdict,
         "changed_files": result.changed_files,

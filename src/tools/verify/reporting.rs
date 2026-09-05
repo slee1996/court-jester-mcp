@@ -614,21 +614,29 @@ pub(super) fn write_report(
         })
         .unwrap_or_else(|| "inline".to_string());
 
-    let filename = format!("{file_timestamp}-{basename}.json");
+    // Claim an independent staging file, then publish without clobbering another
+    // run's evidence. Timestamps and source basenames are not unique identities.
+    let mut staging = tempfile::Builder::new()
+        .prefix(".report-")
+        .suffix(".tmp")
+        .tempfile_in(output_dir)
+        .ok()?;
+    let nonce = staging
+        .path()
+        .file_stem()?
+        .to_str()?
+        .strip_prefix(".report-")?;
+    let filename = format!("{file_timestamp}-{basename}-{nonce}.json");
     let path = std::path::Path::new(output_dir).join(&filename);
 
     let mut json_value = serde_json::to_value(&persisted).ok()?;
     set_repro_commands(&mut json_value, path.to_string_lossy().as_ref());
     sanitize_report_value(&mut json_value);
 
-    match serde_json::to_string_pretty(&json_value) {
-        Ok(json) => {
-            if std::fs::write(&path, &json).is_ok() {
-                Some(path.to_string_lossy().to_string())
-            } else {
-                None
-            }
-        }
-        Err(_) => None,
-    }
+    use std::io::Write;
+    let json = serde_json::to_string_pretty(&json_value).ok()?;
+    staging.write_all(json.as_bytes()).ok()?;
+    staging.as_file().sync_all().ok()?;
+    staging.persist_noclobber(&path).ok()?;
+    Some(path.to_string_lossy().into_owned())
 }

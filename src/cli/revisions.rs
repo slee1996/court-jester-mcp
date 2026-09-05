@@ -118,9 +118,23 @@ fn safe_link(path: &Path, target: &Path) -> bool {
 }
 
 pub(super) fn materialize(repo: &Path, revision: &str) -> Result<TempDir, String> {
+    materialize_at(repo, revision, None)
+}
+
+pub(super) fn materialize_at(
+    repo: &Path,
+    revision: &str,
+    parent: Option<&Path>,
+) -> Result<TempDir, String> {
     let revision = resolve_revision(repo, revision)?;
     let entries = entries(repo, &revision)?;
-    let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let directory = match parent {
+        Some(parent) => tempfile::Builder::new()
+            .prefix("candidate-")
+            .tempdir_in(parent),
+        None => tempfile::tempdir(),
+    }
+    .map_err(|error| error.to_string())?;
     let mut child = git(repo)
         .args(["cat-file", "--batch"])
         .stdin(Stdio::piped())

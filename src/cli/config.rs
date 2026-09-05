@@ -34,7 +34,9 @@ pub(super) fn selected_settings(cmd: &str, args: &CliArgs) -> serde_json::Value 
         "command": cmd,
         "execution_started": false,
         "config_path": args.repo_config,
-        "config_state": "working_tree",
+        "config_state": args.candidate_state,
+        "candidate_workspace": args.candidate_root,
+        "selected_head": args.head,
         "discovery_disabled": args.no_repo_config,
         "source_file": args.file,
         "language": args.language,
@@ -71,6 +73,23 @@ pub(super) fn mapped_tests<'a>(
         .iter()
         .find(|target| target.source == source)
         .map(|target| target.tests.as_slice()))
+}
+
+pub(super) fn validate_target_boundary(targets: &[TargetTests], root: &Path) -> Result<(), String> {
+    for target in targets {
+        for path in
+            std::iter::once(target.source.as_path()).chain(target.tests.iter().map(Path::new))
+        {
+            let path = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
+            if !path.starts_with(root) {
+                return Err(
+                    "committed source/test mappings must stay inside the candidate workspace"
+                        .into(),
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Default, Deserialize)]

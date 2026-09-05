@@ -281,6 +281,7 @@ Useful `verify` flags:
 - `--output-dir <PATH>`: persist JSON reports
 - `--report-level full|minimal`: choose full debug output or CI-sized reports
 - `--suppressions-file <PATH>`: JSON suppression rules for known findings
+- CI `--candidate-state committed --output-dir <PATH>`: select candidate source/tests/configuration from `--head` and retain its workspace for replay; default state is `working-tree`. See [repository configuration](docs/repository-config.md).
 - `--no-auto-seed`: disable automatic seed extraction from nearby tests and simple literal call sites
 - `--native-fuzz-engine off|auto|atheris|jazzer` with `--native-fuzz-runs <N>`: opt into an installed coverage-guided engine after the deterministic campaign. `auto` selects Atheris for Python or Jazzer.js for TypeScript and reports unavailable engines explicitly instead of silently falling back.
 - `--llm-plateau-command <PATH>`: opt into an external JSON seed proposer only after the retained deterministic corpus stops growing; accepted seeds still run through the normal sandbox, finding, minimization, and replay pipeline.

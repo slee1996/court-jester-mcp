@@ -43,9 +43,27 @@ Mapping paths are relative to the config directory. Sources must exist and resol
 
 Configured test and suppression paths are relative to the configuration file's directory. Unless explicitly overridden with `--project-dir`, that directory is also the dependency/runtime project root. CLI paths retain their ordinary invocation-directory semantics. CI still selects its Git repository from the invocation directory. Configured tests run as authoritative checks in CI without requiring `--test-quality`; mutation testing remains opt-in, with at most one test entrypoint per language.
 
-Configuration is currently read from the working tree, even when CI uses `--head` to select a revision's diff. Committed-configuration selection remains unfinished; do not interpret a revision label as proof that configuration was loaded from that commit.
+By default, configuration and candidate files are read from the working tree, even when CI uses `--head` to select a revision's diff. A revision label alone does not identify the candidate's source state.
 
-CI resolves base/head commit IDs once for its Git reads and includes `base_commit`, `head_commit`, and `candidate_state: "working_tree"` in JSON reports. Its baseline workspace reads committed Git blobs directly: export-ignore/export-subst attributes, checkout filters, dirty files, and untracked files do not change baseline bytes. Executable modes and internal symlinks are retained. Submodules and escaping, unresolved, or cyclic symlinks currently produce explicit materialization errors; dependencies are not installed automatically. This baseline guarantee does not yet apply to candidate source, candidate tests, or repository configuration.
+CI resolves base/head commit IDs once for its Git reads and includes `base_commit`, `head_commit`, and `candidate_state` in JSON reports. Committed workspaces read Git blobs directly: export-ignore/export-subst attributes, checkout filters, dirty files, and untracked files do not change initial snapshot bytes. Executable modes and internal symlinks are retained. Submodules and escaping, unresolved, or cyclic symlinks currently produce explicit materialization errors; dependencies are not installed automatically.
+
+## Committed candidates
+
+```sh
+court-jester ci --base origin/main --head HEAD --candidate-state committed \
+  --output-dir .court-jester/reports --report json
+court-jester ci --head HEAD --candidate-state committed --show-config
+```
+
+Committed mode materializes the selected head before discovering repository configuration. Candidate source, imported tracked siblings, configured tests, suppression files, and configuration come from that workspace together. CLI input paths retain their invocation-directory meaning but are mapped into the selected commit; inputs outside the repository are rejected. Configured paths and source/test mappings must stay within the committed workspace. CLI scalar overrides still win. Missing committed files are errors, not fallbacks to dirty or untracked files.
+
+Discovery starts at the snapshot counterpart of the invocation directory, walks to the snapshot root, and preserves the explicit-project-directory hard boundary. CI invoked from a nested directory still selects repository-relative changed source paths. `--no-repo-config` disables discovery in the selected state; `--repo-config` selects its committed counterpart. Use `--candidate-state working-tree` for ordinary checkout inputs, including external dependency roots.
+
+Execution in committed mode requires `--output-dir`. A uniquely named snapshot is retained under its `candidate-workspaces/` directory so saved findings can replay after CI exits. JSON and human reports identify this workspace. Replay targets the retained source, not the original checkout; edit the retained candidate to test a repair, or explicitly select a different replay dependency context. Retention is not immutability: runtime code or later edits may change the snapshot. Archive or remove these generated artifacts when no longer needed, and keep the output directory out of version control. Existing snapshots are not reused or overwritten.
+
+Persisted verification reports also receive unique filenames and are published without overwriting existing reports. Use the returned `report_path` rather than constructing a filename from the timestamp/source basename. This applies to ordinary verification as well as committed CI runs.
+
+`--show-config` needs no output directory and does not retain its temporary workspace or run source/tests. Its paths describe that inspection snapshot and disappear afterward. Snapshot selection is not a hermetic dependency or environment guarantee: host runtimes, installed packages, and explicit runtime/environment settings still affect execution. Dependency installation and external project roots in committed mode are not supported automatically.
 
 CI and direct verification both load the selected suppression file, reject missing files or invalid rules, and pass its rules and source path to verification. CI validates the file even when no changed sources are selected. Suppression matching and retained suppressed evidence use the same verifier rules in both commands.
 

@@ -10,6 +10,7 @@ use std::env;
 use std::path::Path;
 use std::process::ExitCode;
 mod args;
+mod candidate;
 mod ci;
 mod config;
 mod doctor;
@@ -78,6 +79,7 @@ VERIFY OPTIONS:
 CI OPTIONS:
   --base <REV>               Base revision for changed-file diffing (required for `ci`)
   --head <REV>               Head revision for changed-file diffing (default HEAD)
+  --candidate-state <STATE>  working-tree (default) | committed (requires --output-dir)
   --gate <LIST>              Comma-separated stage gates or all (default parse,lint,coverage,portability,execute,test)
   --report <FORMAT>          human | github | json (default human)
   --timeout-seconds <F>      Stage timeout override
@@ -174,7 +176,16 @@ fn exit_for_verdict(verdict: &VerificationVerdict) {
 }
 
 async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
-    let args = if cmd == "replay" {
+    let mut candidate = if cmd == "replay" {
+        None
+    } else {
+        candidate::prepare(cmd, rest, &parse_flags(rest)?)?
+    };
+    let rest = candidate
+        .as_ref()
+        .map(|candidate| candidate.flags.as_slice())
+        .unwrap_or(rest);
+    let mut args = if cmd == "replay" {
         parse_replay_flags(rest)?
     } else {
         config::apply(cmd, rest, parse_flags(rest)?)?
@@ -182,6 +193,10 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
     validate_test_quality_flag(cmd, &args)?;
     validate_runtime_flags(cmd, &args)?;
     validate_policy_flags(cmd, &args)?;
+    if let Some(candidate) = &candidate {
+        candidate.validate(&args)?;
+        args.candidate_root = Some(candidate.root.to_string_lossy().into_owned());
+    }
     if args.show_config {
         if !matches!(cmd, "verify" | "ci" | "doctor") {
             return Err("--show-config supports verify, ci, and doctor".into());
@@ -365,6 +380,9 @@ async fn run_subcommand(cmd: &str, rest: &[String]) -> Result<(), String> {
             let _verify_llm_plateau_env =
                 VerifyLlmPlateauEnv::install(args.llm_plateau_command.as_deref());
             let result = run_ci_for_repo(&repo_dir, &args).await?;
+            if let Some(candidate) = &mut candidate {
+                candidate.persist();
+            }
             match args.ci_report_format {
                 CiReportFormat::Human => {
                     println!("{}", render_ci_human(&result));
@@ -918,6 +936,8 @@ mod tests {
             head: "head".into(),
             base_commit: "base-commit".into(),
             head_commit: "head-commit".into(),
+            candidate_state: super::args::CandidateState::WorkingTree,
+            candidate_workspace: None,
             gates: vec!["test".into()],
             changed_files: 0,
             checked_files: 0,

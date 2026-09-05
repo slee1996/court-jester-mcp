@@ -18,6 +18,8 @@ pub(super) struct CliArgs {
     pub(super) language: Option<String>,
     pub(super) base: Option<String>,
     pub(super) head: Option<String>,
+    pub(super) candidate_state: CandidateState,
+    pub(super) candidate_root: Option<String>,
     pub(super) gate: Option<String>,
     pub(super) ci_report_format: CiReportFormat,
     pub(super) project_dir: Option<String>,
@@ -68,6 +70,14 @@ impl CliArgs {
         self.memory_mb.unwrap_or(512)
     }
 }
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum CandidateState {
+    #[default]
+    WorkingTree,
+    Committed,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum CiReportFormat {
     #[default]
@@ -88,9 +98,15 @@ impl CiReportFormat {
 }
 
 pub(super) fn parse_flags(rest: &[String]) -> Result<CliArgs, String> {
+    parse_flags_indexed(rest).map(|(args, _)| args)
+}
+
+pub(super) fn parse_flags_indexed(rest: &[String]) -> Result<(CliArgs, Vec<usize>), String> {
     let mut out = CliArgs::default();
+    let mut positions = Vec::new();
     let mut i = 0;
     while i < rest.len() {
+        positions.push(i);
         let flag = rest[i].as_str();
         let take_value = |i: &mut usize| -> Result<String, String> {
             if *i + 1 >= rest.len() {
@@ -118,6 +134,13 @@ pub(super) fn parse_flags(rest: &[String]) -> Result<CliArgs, String> {
             "--language" => out.language = Some(take_value(&mut i)?),
             "--base" => out.base = Some(take_value(&mut i)?),
             "--head" => out.head = Some(take_value(&mut i)?),
+            "--candidate-state" => {
+                out.candidate_state = match take_value(&mut i)?.as_str() {
+                    "working-tree" => CandidateState::WorkingTree,
+                    "committed" => CandidateState::Committed,
+                    _ => return Err("--candidate-state must be working-tree or committed".into()),
+                }
+            }
             "--gate" => out.gate = Some(take_value(&mut i)?),
             "--report" => {
                 let raw = take_value(&mut i)?;
@@ -315,7 +338,7 @@ pub(super) fn parse_flags(rest: &[String]) -> Result<CliArgs, String> {
         }
         i += 1;
     }
-    Ok(out)
+    Ok((out, positions))
 }
 
 fn parse_harness_args(raw: &str) -> Result<Vec<HarnessArg>, String> {
