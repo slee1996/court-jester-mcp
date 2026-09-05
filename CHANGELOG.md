@@ -4,6 +4,10 @@ This changelog tracks user-visible verifier semantics, report-shape changes, and
 
 ## Unreleased
 
+## 0.2.17 - 2026-09-05
+
+Counterexample and repair reliability release. Input admission and completed-check evidence now govern findings and verdicts more conservatively; exception names alone do not establish bugs. Replay preserves failure identity, semantic observations, and factory action history, supports live differential candidates, and offers opt-in regression export with positive check evidence. Native findings retain pre-call runtime snapshots and receive bounded fresh-process minimization. TypeScript factory sequences await setup and actions. Repository configuration, exact committed-source selection, project-aware doctor probes, and process/container cancellation ownership improve daily use. See [release notes](docs/release-notes-0.2.17.md) for compatibility changes, evidence, and limitations.
+
 ## 0.2.16 - 2026-08-30
 
 Stable advisory test-quality analysis is now available through `--test-quality [N]` for direct `verify` and changed-file `ci`. Bounded behavior-sensitive mutants run through authoritative tests and report `killed`, `survived`, `invalid`, `blocked`, and `no_coverage` outcomes without changing the verifier verdict, strength, process exit, or CI gate. CI applies one deterministic global mutant cap across changed files, while target-aware coupling findings remain separate from mutation outcomes and retain the normalized authoritative `test_source_file`. See [docs/release-notes-0.2.16.md](docs/release-notes-0.2.16.md) for the complete behavior, limitations, and verification commands.

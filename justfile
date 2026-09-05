@@ -81,7 +81,7 @@ clippy:
 # Validate every local gate required before creating a release tag.
 # Requires Docker and the default Python/Node images already installed.
 release-check:
-    python3 scripts/check_release.py --tag v0.2.16
+    python3 scripts/check_release.py --tag v0.2.17
     cargo fmt --all -- --check
     cargo clippy --locked --all-targets -- -D warnings
     cargo test --locked --tests -- --test-threads=1
