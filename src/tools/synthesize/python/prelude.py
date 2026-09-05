@@ -200,18 +200,6 @@ def _minimize_failure(original, reproduce, severity, oracle_id):
     try: preserved = bool(reproduce(current))
     except Exception: preserved = False
     return ("preserved" if preserved else "failed", attempts, current if preserved else original)
-def _replay_snippet(function, args, severity, oracle_kind, category, error_type):
-    try:
-        rendered = ", ".join(_repro_expression(value) for value in (args if isinstance(args, (list, tuple)) else [args]))
-    except ValueError:
-        return "raise RuntimeError('Court Jester cannot replay this runtime-only input')"
-    payload = {"severity": severity, "oracle_kind": oracle_kind, "category": category}
-    return ("import json as _replay_json\n_reproduced = False\ntry:\n"
-            + f"    {function}({rendered})\n"
-            + "except Exception as _replay_error:\n"
-            + f"    _reproduced = type(_replay_error).__name__ == {error_type!r}\n"
-            + "print('__COURT_JESTER_REPLAY_JSON__')\n"
-            + f"print(_replay_json.dumps(dict({payload!r}, reproduced=_reproduced), ensure_ascii=False))")
 def _invocation_replay_snippet(source, args, error, severity, oracle_kind, category, evaluate):
     try: arguments = _repro_expression(args)
     except ValueError: return "raise RuntimeError('Court Jester cannot replay this runtime-only input')"
@@ -266,48 +254,57 @@ def _emit_finding(function, args, error, severity="crash", oracle_kind="runtime_
     status, attempts, minimized = ("not_needed", 0, args) if minimize is None else minimize
     original_case = _repro_case(args, case_label)
     minimized_case = None if status in ("not_needed", "failed") else _repro_case(minimized, case_label)
-    repro_args = minimized if minimized_case is not None else args
     expectation = {"severity": severity, "oracle_kind": oracle_kind, "category": category}
-    repro = {"kind": repro_kind, "function": str(function), "arguments": original_case["arguments"], "input_text": original_case["input_text"], "case_label": case_label, "snippet": replay_snippet if replay_snippet is not None else _replay_snippet(function, repro_args, severity, oracle_kind, category, type(error).__name__), "command": None, "expectation": expectation}
+    repro = {"kind": repro_kind, "function": str(function), "arguments": original_case["arguments"], "input_text": original_case["input_text"], "case_label": case_label, "snippet": replay_snippet if replay_snippet is not None else "raise RuntimeError('Court Jester has no invocation replay contract for this finding')", "command": None, "expectation": expectation}
     record = {"id": _finding_id(function), "severity": severity, "confidence": confidence, "category": category, "location": {"source_file": "", "function": str(function), "line": 0, "invocation_path": invocation_path}, "oracle": {"id": oracle_id, "kind": oracle_kind, "provenance": oracle_provenance, "confidence": confidence, "expected": expected, "actual": actual if actual is not None else _clip_text(error)}, "input_classification": input_classification, "repro": repro, "minimization": {"status": status, "attempts": attempts, "original": original_case, "minimized": minimized_case}, "error_type": type(error).__name__, "message": _clip_text(error), "suppressed": False}
     _FUZZ_RESULTS.append(record)
     _cj_event("finding", {"finding": record})
 
-def _semantic_check(name, target, args, expected, projection, label):
-    """Own one immutable semantic case from invocation through persisted replay."""
-    projections = {
-        "identity": (lambda value: value, "_value"),
-        "sign": (lambda value: 1 if value > 0 else (-1 if value < 0 else 0), "(1 if _value > 0 else (-1 if _value < 0 else 0))"),
-        "bool": (bool, "bool(_value)"),
-        "list": (list, "list(_value)"),
-        "query_pairs": (lambda value: _parse_qsl(value, keep_blank_values=True), "_parse_qsl(_value, keep_blank_values=True)"),
-    }
-    project, expression = projections[projection]
-    original = _copy.deepcopy(args)
+def _semantic_project(value, projection):
+    if projection == "identity": return value
+    if projection == "sign": return 1 if value > 0 else (-1 if value < 0 else 0)
+    if projection == "bool": return bool(value)
+    if projection == "list": return list(value)
+    if projection == "query_pairs": return _parse_qsl(value, keep_blank_values=True)
+    raise ValueError("Unknown semantic projection: " + projection)
+
+def _observe_semantic(target, args, expected, projection):
     actual = None
-    target_error = None
+    phase = "copy_input"
     try:
-        _value = target(*_copy.deepcopy(original))
-        actual = project(_value)
+        arguments = _copy.deepcopy(args)
+        phase = "invoke"
+        value = target(*arguments)
+        phase = "project"
+        actual = _semantic_project(value, projection)
+        phase = "compare"
+        return bool(actual == expected), actual, None, phase
     except Exception as error:
-        target_error = error
-    if target_error is None and actual == expected:
-        return 0
-    error = target_error or AssertionError(f"{label}: {actual!r} != {expected!r}")
-    payload = {"severity": "property_violation", "oracle_kind": "inferred_semantic", "category": "property"}
-    # Re-execute the same observation, not merely a call that is expected to
-    # throw. Literal case data is complete; display truncation is never code.
-    snippet = ("import json as _replay_json\nfrom urllib.parse import parse_qsl as _parse_qsl\n"
-               + "_reproduced = False\ntry:\n"
-               + f"    _value = {name}(*{original!r})\n"
-               + f"    _observed = {expression}\n"
-               + (f"    _reproduced = _observed != {expected!r}\n" if target_error is None else "")
-               + "except Exception as _error:\n"
-               + (f"    _reproduced = type(_error).__name__ == {type(target_error).__name__!r}\n" if target_error is not None else "    pass\n")
-               + "print('__COURT_JESTER_REPLAY_JSON__')\n"
-               + f"print(_replay_json.dumps(dict({payload!r}, reproduced=_reproduced)))")
+        return False, actual, error, phase
+
+def _semantic_check(name, target_source, args, expected, projection, label):
+    """Own one immutable semantic case from invocation through persisted replay."""
+    target = eval(target_source)
+    original = _copy.deepcopy(args)
+    matched, actual, observed_error, phase = _observe_semantic(target, original, expected, projection)
+    if matched: return 0
+    error = observed_error if observed_error is not None else AssertionError(f"{label}: {actual!r} != {expected!r}")
+    import inspect as _inspect
+    definitions = "\n".join(_inspect.getsource(helper) for helper in (_semantic_project, _observe_semantic))
+    try:
+        arguments = _repro_expression(original)
+        expectation = _repro_expression(expected)
+        match = "_error is None and not _matched" if observed_error is None else f"_error is not None and _phase == {phase!r} and (type(_error).__name__, str(_error)) == {(type(observed_error).__name__, str(observed_error))!r}"
+        body = ("import copy as _copy\nimport json as _json\nfrom urllib.parse import parse_qsl as _parse_qsl\n"
+                + definitions
+                + f"\n_matched, _actual, _error, _phase = _observe_semantic(_target, {arguments}, {expectation}, {projection!r})\n"
+                + "print('__COURT_JESTER_REPLAY_JSON__')\n"
+                + f"print(_json.dumps(dict(reproduced=bool({match}), severity='property_violation', oracle_kind='inferred_semantic', category='property')))\n")
+        snippet = "def _cj_semantic_replay(_target):\n" + "\n".join("    " + line for line in body.splitlines()) + f"\n_cj_semantic_replay({target_source})\n"
+    except ValueError:
+        snippet = "raise RuntimeError('Court Jester cannot replay this runtime-only semantic input')"
     _emit_finding(name, original, error, "property_violation", "inferred_semantic", "name_heuristic", "low", "property",
-                  expected=_json.dumps(expected, ensure_ascii=False), actual=_clip_text(repr(actual)) if target_error is None else _clip_text(target_error),
+                  expected=_json.dumps(expected, ensure_ascii=False), actual=_clip_text(repr(actual)) if observed_error is None else _clip_text(observed_error),
                   case_label=label, replay_snippet=snippet)
     return 1
 def _observe_roundtrip(encode, decode, value):

@@ -1090,6 +1090,146 @@ async fn typescript_semantic_replay_preserves_projection_phase_and_runtime_limit
 }
 
 #[tokio::test]
+async fn python_semantic_replay_preserves_exception_phase_and_full_message() {
+    for keyword in ["", "*, "] {
+        let project = tempfile::tempdir().unwrap();
+        let source = project.path().join("target.py");
+        let prefix = format!("# court-jester-properties pep440_version_ordering\ndef compare_versions({keyword}left: str, right: str) -> int:\n    ");
+        let code = format!("{prefix}return None\n");
+        fs::write(&source, &code).unwrap();
+        let mut opts = default_opts(None);
+        opts.source_file = source.to_str();
+        opts.project_dir = project.path().to_str();
+        let report = verify(&code, &Language::Python, opts).await;
+        let repair = repair_summary(&report, &Language::Python);
+        let finding = repair
+            .findings
+            .iter()
+            .find(|finding| finding.oracle.kind == OracleKind::InferredSemantic)
+            .unwrap();
+        let report_path = project.path().join("repair.json");
+        fs::write(&report_path, serde_json::to_vec(&repair).unwrap()).unwrap();
+        let replay = replay_report(
+            report_path.to_str().unwrap(),
+            &finding.id,
+            None,
+            RuntimeProfile::LocalTrusted,
+            DEFAULT_PYTHON_DOCKER_IMAGE,
+            DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            replay.outcome,
+            ReplayOutcome::Reproduced,
+            "{keyword}: {replay:?}"
+        );
+        fs::write(
+            &source,
+            format!(
+                "{prefix}raise TypeError({})\n",
+                serde_json::to_string(&finding.message).unwrap()
+            ),
+        )
+        .unwrap();
+        let replay = replay_report(
+            report_path.to_str().unwrap(),
+            &finding.id,
+            None,
+            RuntimeProfile::LocalTrusted,
+            DEFAULT_PYTHON_DOCKER_IMAGE,
+            DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            replay.outcome,
+            ReplayOutcome::NotReproduced,
+            "an initial exception cannot impersonate projection failure: {replay:?}"
+        );
+        fs::write(
+            &source,
+            format!(
+                "{prefix}return {}\n",
+                finding.oracle.expected.as_ref().unwrap()
+            ),
+        )
+        .unwrap();
+        let replay = replay_report(
+            report_path.to_str().unwrap(),
+            &finding.id,
+            None,
+            RuntimeProfile::LocalTrusted,
+            DEFAULT_PYTHON_DOCKER_IMAGE,
+            DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            replay.outcome,
+            ReplayOutcome::NotReproduced,
+            "recorded expectation satisfied: {replay:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn python_semantic_comparison_errors_replay_with_exact_identity() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("target.py");
+    let prefix = "class Comparison:\n    def __eq__(self, other):\n        raise ValueError('comparison: original')\n# court-jester-properties cookie_value_quote\ndef format_cookie_value(value: str) -> str:\n    ";
+    let code = format!("{prefix}return Comparison()\n");
+    fs::write(&source, &code).unwrap();
+    let mut opts = default_opts(None);
+    opts.source_file = source.to_str();
+    opts.project_dir = project.path().to_str();
+    let report = verify(&code, &Language::Python, opts).await;
+    let repair = repair_summary(&report, &Language::Python);
+    let finding = repair
+        .findings
+        .iter()
+        .find(|finding| {
+            finding.oracle.kind == OracleKind::InferredSemantic
+                && finding.message == "comparison: original"
+        })
+        .unwrap_or_else(|| panic!("{}", report_human_summary(&report)));
+    let report_path = project.path().join("repair.json");
+    fs::write(&report_path, serde_json::to_vec(&repair).unwrap()).unwrap();
+    let replay = replay_report(
+        report_path.to_str().unwrap(),
+        &finding.id,
+        None,
+        RuntimeProfile::LocalTrusted,
+        DEFAULT_PYTHON_DOCKER_IMAGE,
+        DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay.outcome, ReplayOutcome::Reproduced, "{replay:?}");
+    for replacement in [
+        code.replace("comparison: original", "comparison: different"),
+        format!("{prefix}raise ValueError('comparison: original')\n"),
+        format!(
+            "{prefix}return {}\n",
+            finding.oracle.expected.as_ref().unwrap()
+        ),
+    ] {
+        fs::write(&source, replacement).unwrap();
+        let replay = replay_report(
+            report_path.to_str().unwrap(),
+            &finding.id,
+            None,
+            RuntimeProfile::LocalTrusted,
+            DEFAULT_PYTHON_DOCKER_IMAGE,
+            DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay.outcome, ReplayOutcome::NotReproduced, "{replay:?}");
+    }
+}
+
+#[tokio::test]
 async fn semantic_observation_replays_and_stops_when_recorded_expectation_is_met() {
     let cases = [
         (

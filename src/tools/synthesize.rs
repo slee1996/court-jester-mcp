@@ -1977,6 +1977,24 @@ fn python_nullish_string_leak_check(func: &FunctionInfo, params: &[&ParamInfo]) 
     }
 }
 
+fn python_callable_source(func: &FunctionInfo) -> String {
+    let arguments = func
+        .params
+        .iter()
+        .filter(|parameter| !parameter.is_variadic())
+        .enumerate()
+        .map(|(index, parameter)| {
+            if parameter.keyword_only {
+                format!("{}=_args[{index}]", parameter.name)
+            } else {
+                format!("_args[{index}]")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("lambda *_args, _target={}: _target({arguments})", func.name)
+}
+
 fn python_query_string_semantic_check(func: &FunctionInfo, params: &[&ParamInfo]) -> String {
     if infer_python_contract(func, params) != Some(ContractKind::QueryStringSerializer) {
         return String::new();
@@ -1990,9 +2008,10 @@ fn python_query_string_semantic_check(func: &FunctionInfo, params: &[&ParamInfo]
     ("nested non-scalars", {{"filters": [{{"label": "pro"}}, None, " beta "]}}, [("filters", "beta")]),
 ]
 for _query_label, _query_input, _expected_pairs in _query_cases:
-    _crash += _semantic_check("{name}", {name}, [_query_input], _expected_pairs, "query_pairs", "Query semantics (" + _query_label + ")")
+    _crash += _semantic_check("{name}", {target}, [_query_input], _expected_pairs, "query_pairs", "Query semantics (" + _query_label + ")")
 "#,
         name = func.name,
+        target = serde_json::to_string(&python_callable_source(func)).unwrap(),
     )
 }
 
@@ -2024,10 +2043,11 @@ fn python_pep440_version_ordering_check(func: &FunctionInfo, params: &[&ParamInf
     ("equivalent release forms", "1.0", "1.0.0", 0),
 ]
 for _pep440_label, _left, _right, _expected in _pep440_cases:
-    _crash += _semantic_check("{name}", {name}, [_left, _right], _expected, "sign", "PEP 440 version ordering (" + _pep440_label + ")")
-    _crash += _semantic_check("{name}", {name}, [_right, _left], -_expected, "sign", "PEP 440 version ordering reverse (" + _pep440_label + ")")
+    _crash += _semantic_check("{name}", {target}, [_left, _right], _expected, "sign", "PEP 440 version ordering (" + _pep440_label + ")")
+    _crash += _semantic_check("{name}", {target}, [_right, _left], -_expected, "sign", "PEP 440 version ordering reverse (" + _pep440_label + ")")
 "#,
         name = func.name,
+        target = serde_json::to_string(&python_callable_source(func)).unwrap(),
     )
 }
 
@@ -2054,9 +2074,10 @@ fn python_pep440_specifier_membership_check(func: &FunctionInfo, params: &[&Para
     ("prerelease excluded by default", "1.0a1", ">=1.0", False),
 ]
 for _specifier_label, _version, _specifier, _expected in _specifier_cases:
-    _crash += _semantic_check("{name}", {name}, [_version, _specifier], _expected, "bool", "PEP 440 specifier membership (" + _specifier_label + ")")
+    _crash += _semantic_check("{name}", {target}, [_version, _specifier], _expected, "bool", "PEP 440 specifier membership (" + _specifier_label + ")")
 "#,
         name = func.name,
+        target = serde_json::to_string(&python_callable_source(func)).unwrap(),
     )
 }
 
@@ -2084,9 +2105,10 @@ fn python_pep440_filter_prerelease_check(func: &FunctionInfo, params: &[&ParamIn
     ("stable match suppresses prerelease fallback", ["1.5a1", "1.5"], ">=1.5", ["1.5"]),
 ]
 for _filter_label, _candidates, _specifier, _expected in _filter_cases:
-    _crash += _semantic_check("{name}", {name}, [_candidates, _specifier], _expected, "list", "PEP 440 prerelease filter (" + _filter_label + ")")
+    _crash += _semantic_check("{name}", {target}, [_candidates, _specifier], _expected, "list", "PEP 440 prerelease filter (" + _filter_label + ")")
 "#,
         name = func.name,
+        target = serde_json::to_string(&python_callable_source(func)).unwrap(),
     )
 }
 
@@ -2105,9 +2127,10 @@ fn python_cookie_value_quote_check(func: &FunctionInfo, params: &[&ParamInfo]) -
     ("unquoted value is trimmed", "  dark  ", "dark"),
 ]
 for _cookie_value_label, _cookie_value, _expected in _cookie_value_cases:
-    _crash += _semantic_check("{name}", {name}, [_cookie_value], _expected, "identity", "Cookie value quoting (" + _cookie_value_label + ")")
+    _crash += _semantic_check("{name}", {target}, [_cookie_value], _expected, "identity", "Cookie value quoting (" + _cookie_value_label + ")")
 "#,
         name = func.name,
+        target = serde_json::to_string(&python_callable_source(func)).unwrap(),
     )
 }
 
@@ -2129,9 +2152,10 @@ fn python_cookie_header_quote_check(func: &FunctionInfo, params: &[&ParamInfo]) 
     ("none values are skipped", {{"theme": "dark", "empty": None}}, "theme=dark"),
 ]
 for _cookie_header_label, _cookies, _expected in _cookie_header_cases:
-    _crash += _semantic_check("{name}", {name}, [_cookies], _expected, "identity", "Cookie header quoting (" + _cookie_header_label + ")")
+    _crash += _semantic_check("{name}", {target}, [_cookies], _expected, "identity", "Cookie header quoting (" + _cookie_header_label + ")")
 "#,
         name = func.name,
+        target = serde_json::to_string(&python_callable_source(func)).unwrap(),
     )
 }
 
@@ -4380,21 +4404,12 @@ fn synthesize_python_involution_checks(
     for (enc, dec) in &pairs {
         let param = enc.params.iter().find(|p| !p.is_variadic()).unwrap();
         let gen = python_generator(param.type_annotation.as_deref(), type_defs);
-        let bind = |function: &FunctionInfo| {
-            let parameter = function
-                .params
-                .iter()
-                .find(|parameter| !parameter.is_variadic())
-                .unwrap();
-            let argument = if parameter.keyword_only {
-                format!("{}=_value", parameter.name)
-            } else {
-                "_value".into()
-            };
-            format!("lambda _value: {}({argument})", function.name)
-        };
-        let pair_source =
-            serde_json::to_string(&format!("({}, {})", bind(enc), bind(dec))).unwrap();
+        let pair_source = serde_json::to_string(&format!(
+            "({}, {})",
+            python_callable_source(enc),
+            python_callable_source(dec)
+        ))
+        .unwrap();
         let pair_label = serde_json::to_string(&format!("{}<->{}", enc.name, dec.name))
             .unwrap_or_else(|_| "\"roundtrip\"".into());
         let corpus_key = serde_json::to_string(&format!("{}:{}", enc.name, enc.line))
