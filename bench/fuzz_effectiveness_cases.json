@@ -1,16 +1,23 @@
 {
   "schema_version": 1,
-  "suite": "fuzz-effectiveness-v2",
+  "suite": "fuzz-effectiveness-v3",
   "cases": [
     {
       "id": "python-predicate-seed-crash",
-      "kind": "mutation",
+      "kind": "observation",
       "technique": "predicate_aware_seed",
       "source": "repos/fuzz_effectiveness/python_predicate_crash.py",
       "language": "python",
-      "expected_verdict": "fail",
-      "expected_stage": {"name": "execute", "status": "failed"},
-      "expected_finding": {"function": "decode_mode", "category": "exception"}
+      "expected_verdict": "inconclusive",
+      "expected_stage": {
+        "name": "execute",
+        "status": "inconclusive"
+      },
+      "expected_finding": {
+        "function": "decode_mode",
+        "category": "exception",
+        "input_classification": "unknown"
+      }
     },
     {
       "id": "typescript-predicate-seed-crash",
@@ -19,28 +26,49 @@
       "source": "repos/fuzz_effectiveness/typescript_predicate_crash.ts",
       "language": "typescript",
       "expected_verdict": "inconclusive",
-      "expected_stage": {"name": "execute", "status": "inconclusive"},
-      "expected_finding": {"function": "routeJob", "category": "exception", "input_classification": "unknown"}
+      "expected_stage": {
+        "name": "execute",
+        "status": "inconclusive"
+      },
+      "expected_finding": {
+        "function": "routeJob",
+        "category": "exception",
+        "input_classification": "unknown"
+      }
     },
     {
       "id": "python-stateful-second-step-crash",
-      "kind": "mutation",
+      "kind": "observation",
       "technique": "stateful_action_sequence",
       "source": "repos/fuzz_effectiveness/python_stateful_crash.py",
       "language": "python",
-      "expected_verdict": "fail",
-      "expected_stage": {"name": "execute", "status": "failed"},
-      "expected_finding": {"function": "create_counter().push", "category": "exception"}
+      "expected_verdict": "inconclusive",
+      "expected_stage": {
+        "name": "execute",
+        "status": "inconclusive"
+      },
+      "expected_finding": {
+        "function": "create_counter().push",
+        "category": "exception",
+        "input_classification": "unknown"
+      }
     },
     {
       "id": "typescript-stateful-second-step-crash",
-      "kind": "mutation",
+      "kind": "observation",
       "technique": "stateful_action_sequence",
       "source": "repos/fuzz_effectiveness/typescript_stateful_crash.ts",
       "language": "typescript",
-      "expected_verdict": "fail",
-      "expected_stage": {"name": "execute", "status": "failed"},
-      "expected_finding": {"function": "createCounter().push", "category": "exception"}
+      "expected_verdict": "inconclusive",
+      "expected_stage": {
+        "name": "execute",
+        "status": "inconclusive"
+      },
+      "expected_finding": {
+        "function": "createCounter().push",
+        "category": "exception",
+        "input_classification": "unknown"
+      }
     },
     {
       "id": "python-declared-involution-violation",
@@ -49,8 +77,14 @@
       "source": "repos/fuzz_effectiveness/python_involution_bug.py",
       "language": "python",
       "expected_verdict": "fail",
-      "expected_stage": {"name": "execute", "status": "failed"},
-      "expected_finding": {"function": "reverse_text", "category": "property"}
+      "expected_stage": {
+        "name": "execute",
+        "status": "failed"
+      },
+      "expected_finding": {
+        "function": "reverse_text",
+        "category": "property"
+      }
     },
     {
       "id": "python-differential-regression",
@@ -60,21 +94,39 @@
       "base_source": "repos/fuzz_effectiveness/differential_base/normalize.py",
       "language": "python",
       "expected_verdict": "pass",
-      "expected_stage": {"name": "execute", "status": "passed"},
-      "expected_finding": {"function": "normalize_limit", "category": "differential"}
+      "expected_stage": {
+        "name": "execute",
+        "status": "passed"
+      },
+      "expected_finding": {
+        "function": "normalize_limit",
+        "category": "differential"
+      }
     },
     {
       "id": "python-llm-plateau-escape",
-      "kind": "mutation",
+      "kind": "observation",
       "technique": "llm_plateau_escape",
       "source": "repos/fuzz_effectiveness/python_llm_plateau_crash.py",
       "language": "python",
       "llm_seeds": [
-        {"function": "explode", "arguments": ["llm-secret"]}
+        {
+          "function": "explode",
+          "arguments": [
+            "llm-secret"
+          ]
+        }
       ],
-      "expected_verdict": "fail",
-      "expected_stage": {"name": "llm_plateau_escape", "status": "failed"},
-      "expected_finding": {"function": "explode", "category": "exception"}
+      "expected_verdict": "inconclusive",
+      "expected_stage": {
+        "name": "llm_plateau_escape",
+        "status": "inconclusive"
+      },
+      "expected_finding": {
+        "function": "explode",
+        "category": "exception",
+        "input_classification": "unknown"
+      }
     },
     {
       "id": "python-clean-specificity-control",
@@ -83,7 +135,10 @@
       "source": "repos/fuzz_effectiveness/python_clean_control.py",
       "language": "python",
       "expected_verdict": "pass",
-      "expected_stage": {"name": "execute", "status": "passed"}
+      "expected_stage": {
+        "name": "execute",
+        "status": "passed"
+      }
     },
     {
       "id": "typescript-clean-specificity-control",
@@ -92,7 +147,68 @@
       "source": "repos/fuzz_effectiveness/typescript_clean_control.ts",
       "language": "typescript",
       "expected_verdict": "pass",
-      "expected_stage": {"name": "execute", "status": "passed"}
+      "expected_stage": {
+        "name": "execute",
+        "status": "passed"
+      }
+    },
+    {
+      "id": "python-admitted-runtime-bug",
+      "kind": "mutation",
+      "technique": "closed_domain_runtime_contract",
+      "source": "repos/fuzz_effectiveness/python-admitted-runtime-bug.py",
+      "language": "python",
+      "expected_verdict": "fail",
+      "expected_stage": {
+        "name": "execute",
+        "status": "failed"
+      },
+      "expected_finding": {
+        "function": "first_character",
+        "category": "exception",
+        "input_classification": "valid"
+      }
+    },
+    {
+      "id": "python-admitted-runtime-control",
+      "kind": "control",
+      "technique": "closed_domain_runtime_contract",
+      "source": "repos/fuzz_effectiveness/python-admitted-runtime-control.py",
+      "language": "python",
+      "expected_verdict": "pass",
+      "expected_stage": {
+        "name": "execute",
+        "status": "passed"
+      }
+    },
+    {
+      "id": "typescript-admitted-runtime-bug",
+      "kind": "mutation",
+      "technique": "closed_domain_runtime_contract",
+      "source": "repos/fuzz_effectiveness/typescript-admitted-runtime-bug.ts",
+      "language": "typescript",
+      "expected_verdict": "fail",
+      "expected_stage": {
+        "name": "execute",
+        "status": "failed"
+      },
+      "expected_finding": {
+        "function": "first_character",
+        "category": "exception",
+        "input_classification": "valid"
+      }
+    },
+    {
+      "id": "typescript-admitted-runtime-control",
+      "kind": "control",
+      "technique": "closed_domain_runtime_contract",
+      "source": "repos/fuzz_effectiveness/typescript-admitted-runtime-control.ts",
+      "language": "typescript",
+      "expected_verdict": "pass",
+      "expected_stage": {
+        "name": "execute",
+        "status": "passed"
+      }
     }
   ]
 }

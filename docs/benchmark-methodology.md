@@ -4,6 +4,12 @@ This document explains how the Court Jester benchmark is designed, what each sui
 
 It is intentionally a methodology writeup, not a single-run results page.
 
+## Deterministic effectiveness corpus versions
+
+`python3 -m bench.fuzz_effectiveness --binary target/release/court-jester` uses `fuzz-effectiveness-v3`: 13 cases comprising four mutation cases, four clean controls, and five uncertain exception observations. The observations require inconclusive verdicts and unknown input classification; discovery alone does not establish that an exception violates an application contract. Explicit closed-domain Python/TypeScript bug/control pairs separately require valid-input failures and clean repairs.
+
+The original nine-case v2 manifest is retained at `bench/fuzz_effectiveness_cases_v2.json` with unchanged fixture sources. Run it explicitly with `--manifest bench/fuzz_effectiveness_cases_v2.json` to reproduce the historical expectation set. V3 reclassifies predicate/stateful/LLM exception observations whose admission was previously inferred from exception classes or finding counts. Its categories and denominators differ: do not compare its `mutation_recall` to v2 or advertise either small fixture suite as general accuracy or agent repair utility. Historical v2 failures remain evidence, not results to overwrite.
+
 ## Goal
 
 The benchmark is trying to answer one product question:

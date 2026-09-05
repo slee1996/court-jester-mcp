@@ -217,8 +217,8 @@ fn python_generates_fuzz_harness() {
         "should track failures, got: {code}"
     );
     assert!(
-        code.contains("_is_crash"),
-        "should have crash detection, got: {code}"
+        code.contains("_exception_outcome"),
+        "should classify exception evidence, got: {code}"
     );
     assert!(
         code.contains("_reject"),

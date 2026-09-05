@@ -6351,12 +6351,35 @@ pub async fn verify(
                                 let execution_ok = plateau_process.exit_code == Some(0)
                                     && !plateau_process.timed_out
                                     && !plateau_process.memory_error;
-                                let status = if !plateau_findings.is_empty() {
+                                let gating_finding_count = plateau_findings
+                                    .iter()
+                                    .filter(|finding| {
+                                        finding_fails_execute_gate(
+                                            opts.execute_gate,
+                                            finding,
+                                            opts.inferred_oracle_gate,
+                                        )
+                                    })
+                                    .count();
+                                let unknown_finding_count = plateau_findings
+                                    .iter()
+                                    .filter(|finding| {
+                                        finding.input_classification == InputClassification::Unknown
+                                    })
+                                    .count();
+                                let status = if gating_finding_count > 0 {
                                     StageStatus::Failed
-                                } else if execution_ok {
+                                } else if execute_stage_ok(
+                                    &plateau_process,
+                                    opts.execute_gate,
+                                    opts.inferred_oracle_gate,
+                                    &plateau_findings,
+                                    &[],
+                                    false,
+                                ) {
                                     StageStatus::Passed
                                 } else {
-                                    StageStatus::Advisory
+                                    StageStatus::Inconclusive
                                 };
                                 let finding_count = plateau_findings.len();
                                 generated_failures.extend(plateau_findings);
@@ -6369,6 +6392,8 @@ pub async fn verify(
                                         "accepted": accepted_count,
                                         "invalid": proposal.invalid_count,
                                         "finding_count": finding_count,
+                                        "gating_finding_count": gating_finding_count,
+                                        "unknown_finding_count": unknown_finding_count,
                                         "corpus_retained": corpus_retained_count,
                                         "stderr": proposal.stderr,
                                         "execution": plateau_process,

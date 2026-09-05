@@ -394,9 +394,6 @@ def _reproduces_python(candidate, original, invoke):
         return type(error) is type(original) and _python_failure_identity(error) == _python_failure_identity(original)
     return False
 
-# Crash detection: these exception types indicate real bugs, not validation.
-_CRASH_TYPES = (TypeError, AttributeError, KeyError, IndexError, RecursionError, MemoryError, ZeroDivisionError, UnicodeError)
-
 _FUZZ_TEXT_LIMIT = 240
 def _clip_text(value, limit=_FUZZ_TEXT_LIMIT):
     # Python strings can contain lone surrogates, which neither UTF-8 nor the
@@ -415,13 +412,13 @@ def _materialize_if_iterator(value):
         return list(value)
     return value
 
-def _is_crash(e):
-    """Distinguish intentional validation errors from real bugs."""
-    if isinstance(e, _CRASH_TYPES):
-        return True
-    if isinstance(e, _PropertyFailure):
-        return True  # property violation (type check, idempotency, consistency)
-    return False
+def _exception_outcome(error, admitted=False, outside=False, checking=False):
+    """Admission/check evidence owns classification, never exception spelling."""
+    if outside:
+        return "rejected"
+    if admitted or (checking and isinstance(error, _PropertyFailure)):
+        return "target_exception"
+    return "unclassified_exception"
 
 def _fuzz_int(): return _rng.randint(-1000, 1000)
 def _fuzz_int_range(lo, hi): return _rng.randint(lo, hi)

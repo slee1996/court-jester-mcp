@@ -576,6 +576,9 @@ async fn unclassified_typescript_exceptions_remain_observations_under_strict_gat
         "new RangeError('unspecified contract')",
         "'plain thrown value'",
         "new Error('Return type mismatch: copied diagnostic')",
+        "new TypeError('Cannot read properties of undefined (reading value)')",
+        "new RangeError('Maximum call stack size exceeded')",
+        "new ReferenceError('missing is not defined')",
     ] {
         let code =
             format!("export function inspect(value: string): string {{ throw {exception}; }}");
@@ -648,7 +651,14 @@ async fn admitted_python_failure_is_not_hidden_by_an_unclassified_exception() {
 
 #[tokio::test]
 async fn unclassified_python_exceptions_remain_observations_under_strict_gating() {
-    for error in ["ValueError", "RuntimeError", "DomainFailure"] {
+    for error in [
+        "ValueError",
+        "RuntimeError",
+        "DomainFailure",
+        "TypeError",
+        "IndexError",
+        "AttributeError",
+    ] {
         let code = format!("class DomainFailure(Exception):\n    pass\ndef inspect(value: str) -> str:\n    raise {error}('unspecified input contract')\n");
         let mut opts = default_opts(None);
         opts.inferred_oracle_gate = InferredOracleGate::Fail;
@@ -5656,6 +5666,9 @@ export function createCounter() {
         })
         .unwrap_or_else(|| panic!("stateful TypeScript finding missing: {report:#?}"));
 
+    assert_eq!(finding["input_classification"], "unknown");
+    assert_eq!(finding["confidence"], "low");
+    assert_eq!(report.summary.findings.gating, 0);
     assert_eq!(
         finding["location"]["function"].as_str(),
         Some("createCounter().push")
@@ -5812,6 +5825,9 @@ def create_counter():
         })
         .unwrap_or_else(|| panic!("stateful Python finding missing: {report:#?}"));
 
+    assert_eq!(finding["input_classification"], "unknown");
+    assert_eq!(finding["confidence"], "low");
+    assert_eq!(report.summary.findings.gating, 0);
     assert!(finding["repro"]["case_label"]
         .as_str()
         .is_some_and(|label| label.contains("push")));
@@ -6006,7 +6022,9 @@ class Reader {
             .unwrap_or("")
     };
 
-    assert_eq!(status_for("verifyRequest"), "checked_direct");
+    // A generated Request-shaped value reaching a throwing invocation is not
+    // evidence that the function's behavior was checked.
+    assert_eq!(status_for("verifyRequest"), "reached_direct");
     assert_eq!(status_for("parseSignatureHeader"), "checked_direct");
     assert_eq!(status_for("encodePair"), "skipped_internal_helper");
     assert_eq!(status_for("unresolved"), "skipped_unsupported_type");
@@ -8614,7 +8632,7 @@ async fn equivalent_findings_are_coalesced_and_minimal_reports_are_bounded() {
 
 #[tokio::test]
 async fn nonbreaking_space_failure_has_structured_minimized_replay() {
-    let code = "def normalize_display_name(value: str) -> str:\n    if value.isspace() and '\\xa0' in value:\n        return value.strip()[0]\n    return value";
+    let code = "from typing import Literal\ndef normalize_display_name(value: Literal['\\xa0', 'name']) -> str:\n    if value.isspace() and '\\xa0' in value:\n        return value.strip()[0]\n    return value";
     let report = verify(code, &Language::Python, default_opts(None)).await;
     let execute = report
         .stages
@@ -9629,7 +9647,7 @@ export function readExternal(context: ExternalContext): string {
     );
 }
 #[tokio::test]
-async fn ordinary_reference_error_remains_a_target_crash_outside_nuxt() {
+async fn ordinary_reference_error_remains_an_uncertain_target_observation_outside_nuxt() {
     let code = r#"
 export function brokenReference(value: number): number {
   return missingOrdinaryGlobal + value;
@@ -9643,7 +9661,7 @@ export function brokenReference(value: number): number {
         .iter()
         .find(|stage| stage.name == "execute")
         .expect("execute stage");
-    assert_eq!(execute.status, StageStatus::Failed);
+    assert_eq!(execute.status, StageStatus::Inconclusive);
     let detail = execute.detail.as_ref().expect("execute detail");
     assert!(
         detail["environment_setup"].is_null(),
@@ -9782,7 +9800,7 @@ export function addToCounter(value: number): number {
 }
 
 #[tokio::test]
-async fn nuxt_disabled_auto_import_reference_error_remains_a_target_crash() {
+async fn nuxt_disabled_auto_import_reference_error_remains_an_uncertain_target_observation() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("package.json"),
@@ -9807,13 +9825,13 @@ export function useCounter() {
     opts.source_file = Some(source_path.to_str().unwrap());
     let report = verify(code, &Language::TypeScript, opts).await;
 
-    assert_eq!(report.verdict, VerificationVerdict::Fail);
+    assert_eq!(report.verdict, VerificationVerdict::Inconclusive);
     let execute = report
         .stages
         .iter()
         .find(|stage| stage.name == "execute")
         .expect("execute stage");
-    assert_eq!(execute.status, StageStatus::Failed);
+    assert_eq!(execute.status, StageStatus::Inconclusive);
     let detail = execute.detail.as_ref().expect("execute detail");
     assert!(
         detail["environment_setup"].is_null(),
@@ -9824,9 +9842,10 @@ export function useCounter() {
             findings.iter().any(|finding| {
                 finding["error_type"] == "ReferenceError"
                     && finding["message"] == "ref is not defined"
+                    && finding["input_classification"] == "unknown"
             })
         }),
-        "the unresolved ref must remain a target crash: {detail:#?}"
+        "the unresolved ref must remain a target observation: {detail:#?}"
     );
 }
 
@@ -9889,14 +9908,14 @@ async fn feedback_corpus_persists_and_is_reused_across_verification_runs() {
 }
 
 #[tokio::test]
-async fn typescript_shrinking_reaches_an_oracle_preserving_fixed_point() {
+async fn typescript_property_shrinking_reaches_an_oracle_preserving_fixed_point() {
     let code = r#"export function explode(input: {
   token: string;
   noiseA?: string;
   noiseB?: string;
 }): string {
   if (input.token === "boom") {
-    throw new ReferenceError("stable crash");
+    return 1 as unknown as string;
   }
   return "ok";
 }
@@ -9927,6 +9946,53 @@ function caller(): string {
             "token": "boom"
         }),
         "fixed-point shrinking must discard both independent noise fields: {finding:#?}"
+    );
+}
+
+#[tokio::test]
+async fn typescript_shrinking_large_nested_inputs_stays_within_the_campaign_budget() {
+    let long = "a".repeat(10_000);
+    let code = format!(
+        "export function inspect(value: {{ token: string; data: string[] }}): string {{ return null as unknown as string; }}\ninspect({{ token: {0:?}, data: [{0:?}] }});",
+        long
+    );
+    let report = verify(&code, &Language::TypeScript, default_opts(None)).await;
+    assert_eq!(
+        report.verdict,
+        VerificationVerdict::Fail,
+        "{}",
+        report_human_summary(&report)
+    );
+    assert!(!report
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.domain == FailureDomain::Resource));
+    let stage = report
+        .stages
+        .iter()
+        .find(|stage| stage.name == "execute")
+        .unwrap();
+    let findings = stage.detail.as_ref().unwrap()["findings"]
+        .as_array()
+        .unwrap();
+    let finding = findings
+        .iter()
+        .find(|finding| {
+            finding["location"]["function"] == "inspect"
+                && finding["minimization"]["original"]["arguments"][0]["json_value"]["token"]
+                    .as_str()
+                    .is_some_and(|value| value.len() == 10_000)
+        })
+        .expect("large original counterexample must remain recorded");
+    assert_eq!(finding["minimization"]["status"], "preserved");
+    assert!(finding["minimization"]["attempts"].as_u64().unwrap() <= 100);
+    assert_eq!(
+        finding["minimization"]["minimized"]["arguments"][0]["json_value"]["token"],
+        ""
+    );
+    assert_eq!(
+        finding["minimization"]["minimized"]["arguments"][0]["json_value"]["data"][0],
+        ""
     );
 }
 
@@ -10013,57 +10079,67 @@ def Fuzz():
 }
 
 #[test]
-fn cli_llm_plateau_escape_executes_novel_seed_after_corpus_stalls() {
-    let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("target.py");
-    let output_dir = dir.path().join("reports");
-    fs::write(
+fn cli_llm_plateau_escape_preserves_observation_and_property_evidence() {
+    for (body, exit_code, verdict, stage_status, gating) in [
+        (
+            "raise IndexError('plateau crash')",
+            3,
+            "inconclusive",
+            "inconclusive",
+            0,
+        ),
+        ("return 123", 1, "fail", "failed", 1),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("target.py");
+        let output_dir = dir.path().join("reports");
+        fs::write(
         &source,
-        "def explode(value: str) -> str:\n    normalized = str(value)\n    score = sum((index + 1) * ord(char) for index, char in enumerate(normalized))\n    if len(normalized) == 10 and score == 5686:\n        raise IndexError('plateau crash')\n    return 'ok'\n",
+        format!("def explode(value: str) -> str:\n    normalized = str(value)\n    score = sum((index + 1) * ord(char) for index, char in enumerate(normalized))\n    if len(normalized) == 10 and score == 5686:\n        {body}\n    return 'ok'\n"),
     )
     .unwrap();
-    let initial = std::process::Command::new(env!("CARGO_BIN_EXE_court-jester"))
-        .args([
-            "verify",
-            "--file",
-            source.to_str().unwrap(),
-            "--language",
-            "python",
-            "--project-dir",
-            dir.path().to_str().unwrap(),
-            "--output-dir",
-            output_dir.to_str().unwrap(),
-            "--timeout-seconds",
-            "10",
-        ])
-        .env_remove("COURT_JESTER_LLM_PLATEAU_COMMAND")
-        .output()
-        .unwrap();
-    let initial_report: serde_json::Value =
-        serde_json::from_slice(&initial.stdout).unwrap_or_else(|error| {
-            panic!(
-                "initial report must be JSON ({error}); stdout={}; stderr={}",
-                String::from_utf8_lossy(&initial.stdout),
-                String::from_utf8_lossy(&initial.stderr)
-            )
-        });
-    let retained = initial_report["stages"]
-        .as_array()
-        .and_then(|stages| {
-            stages
-                .iter()
-                .find(|stage| stage["name"].as_str() == Some("coverage"))
-        })
-        .and_then(|stage| stage["detail"]["corpus_retained"].as_u64())
-        .unwrap_or(0);
-    assert!(
-        retained > 0,
-        "initial run must retain corpus history: {initial_report:#?}"
-    );
+        let initial = std::process::Command::new(env!("CARGO_BIN_EXE_court-jester"))
+            .args([
+                "verify",
+                "--file",
+                source.to_str().unwrap(),
+                "--language",
+                "python",
+                "--project-dir",
+                dir.path().to_str().unwrap(),
+                "--output-dir",
+                output_dir.to_str().unwrap(),
+                "--timeout-seconds",
+                "10",
+            ])
+            .env_remove("COURT_JESTER_LLM_PLATEAU_COMMAND")
+            .output()
+            .unwrap();
+        let initial_report: serde_json::Value = serde_json::from_slice(&initial.stdout)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "initial report must be JSON ({error}); stdout={}; stderr={}",
+                    String::from_utf8_lossy(&initial.stdout),
+                    String::from_utf8_lossy(&initial.stderr)
+                )
+            });
+        let retained = initial_report["stages"]
+            .as_array()
+            .and_then(|stages| {
+                stages
+                    .iter()
+                    .find(|stage| stage["name"].as_str() == Some("coverage"))
+            })
+            .and_then(|stage| stage["detail"]["corpus_retained"].as_u64())
+            .unwrap_or(0);
+        assert!(
+            retained > 0,
+            "initial run must retain corpus history: {initial_report:#?}"
+        );
 
-    let prompt_path = dir.path().join("llm-prompt.json");
-    let command = dir.path().join("propose-seeds");
-    fs::write(
+        let prompt_path = dir.path().join("llm-prompt.json");
+        let command = dir.path().join("propose-seeds");
+        fs::write(
         &command,
         format!(
             "#!/bin/sh\ncat > '{}'\nprintf '%s\\n' '{{\"seeds\":[{{\"function\":\"explode\",\"arguments\":[\"llm-secret\"]}}]}}'\n",
@@ -10071,89 +10147,91 @@ fn cli_llm_plateau_escape_executes_novel_seed_after_corpus_stalls() {
         ),
     )
     .unwrap();
-    make_executable(&command);
-    let escaped = std::process::Command::new(env!("CARGO_BIN_EXE_court-jester"))
-        .args([
-            "verify",
-            "--file",
-            source.to_str().unwrap(),
-            "--language",
-            "python",
-            "--project-dir",
-            dir.path().to_str().unwrap(),
-            "--output-dir",
-            output_dir.to_str().unwrap(),
-            "--llm-plateau-command",
-            command.to_str().unwrap(),
-            "--timeout-seconds",
-            "10",
-        ])
-        .output()
-        .unwrap();
-    let report: serde_json::Value =
-        serde_json::from_slice(&escaped.stdout).unwrap_or_else(|error| {
-            panic!(
-                "plateau report must be JSON ({error}); stdout={}; stderr={}",
-                String::from_utf8_lossy(&escaped.stdout),
-                String::from_utf8_lossy(&escaped.stderr)
-            )
-        });
-    assert_eq!(
-        escaped.status.code(),
-        Some(1),
-        "a discovered plateau crash is a target failure, not an infrastructure error"
-    );
-    assert_eq!(
-        report["verdict"].as_str(),
-        Some("fail"),
-        "authoritative plateau findings must fail verification: {report:#?}"
-    );
-    let plateau = report["stages"]
-        .as_array()
-        .and_then(|stages| {
-            stages
-                .iter()
-                .find(|stage| stage["name"].as_str() == Some("llm_plateau_escape"))
-        })
-        .unwrap_or_else(|| panic!("llm_plateau_escape stage missing: {report:#?}"));
-
-    assert_eq!(
-        plateau["status"].as_str(),
-        Some("failed"),
-        "plateau stage: {plateau:#?}"
-    );
-    assert_eq!(plateau["detail"]["accepted"].as_u64(), Some(1));
-    assert!(
-        plateau["detail"]["finding_count"].as_u64().unwrap_or(0) > 0,
-        "plateau seed must produce an authoritative finding: {plateau:#?}"
-    );
-    let escaped_seed_found = report["stages"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|stage| stage["name"].as_str() == Some("execute"))
-        .and_then(|stage| stage["detail"]["findings"].as_array())
-        .is_some_and(|findings| {
-            findings.iter().any(|finding| {
-                ["original", "minimized"].iter().any(|case| {
-                    finding["minimization"][case]["arguments"][0]["json_value"].as_str()
-                        == Some("llm-secret")
-                })
+        make_executable(&command);
+        let escaped = std::process::Command::new(env!("CARGO_BIN_EXE_court-jester"))
+            .args([
+                "verify",
+                "--file",
+                source.to_str().unwrap(),
+                "--language",
+                "python",
+                "--project-dir",
+                dir.path().to_str().unwrap(),
+                "--output-dir",
+                output_dir.to_str().unwrap(),
+                "--llm-plateau-command",
+                command.to_str().unwrap(),
+                "--timeout-seconds",
+                "10",
+            ])
+            .output()
+            .unwrap();
+        let report: serde_json::Value =
+            serde_json::from_slice(&escaped.stdout).unwrap_or_else(|error| {
+                panic!(
+                    "plateau report must be JSON ({error}); stdout={}; stderr={}",
+                    String::from_utf8_lossy(&escaped.stdout),
+                    String::from_utf8_lossy(&escaped.stderr)
+                )
+            });
+        assert_eq!(
+            escaped.status.code(),
+            Some(exit_code),
+            "a proposed seed must preserve the observed evidence: {body}"
+        );
+        assert_eq!(
+            report["verdict"].as_str(),
+            Some(verdict),
+            "plateau findings must obey the shared gate: {report:#?}"
+        );
+        let plateau = report["stages"]
+            .as_array()
+            .and_then(|stages| {
+                stages
+                    .iter()
+                    .find(|stage| stage["name"].as_str() == Some("llm_plateau_escape"))
             })
-        });
-    assert!(
-        escaped_seed_found,
-        "LLM-proposed seed must reach the reported crash: {report:#?}"
-    );
-    let prompt: serde_json::Value =
-        serde_json::from_slice(&fs::read(prompt_path).unwrap()).unwrap();
-    assert_eq!(prompt["protocol_version"].as_u64(), Some(1));
-    assert_eq!(
-        prompt["retained_corpus"]
-            .as_object()
-            .map(serde_json::Map::len),
-        Some(1)
-    );
+            .unwrap_or_else(|| panic!("llm_plateau_escape stage missing: {report:#?}"));
+
+        assert_eq!(
+            plateau["status"].as_str(),
+            Some(stage_status),
+            "plateau stage: {plateau:#?}"
+        );
+        assert_eq!(plateau["detail"]["accepted"].as_u64(), Some(1));
+        assert!(
+            plateau["detail"]["finding_count"].as_u64().unwrap_or(0) > 0,
+            "plateau seed must preserve the observation: {plateau:#?}"
+        );
+        assert_eq!(report["summary"]["findings"]["gating"], gating);
+        let escaped_seed_found = report["stages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|stage| stage["name"].as_str() == Some("execute"))
+            .and_then(|stage| stage["detail"]["findings"].as_array())
+            .is_some_and(|findings| {
+                findings.iter().any(|finding| {
+                    ["original", "minimized"].iter().any(|case| {
+                        finding["minimization"][case]["arguments"][0]["json_value"].as_str()
+                            == Some("llm-secret")
+                    })
+                })
+            });
+        assert!(
+            escaped_seed_found,
+            "LLM-proposed seed must reach the reported crash: {report:#?}"
+        );
+        let prompt: serde_json::Value =
+            serde_json::from_slice(&fs::read(prompt_path).unwrap()).unwrap();
+        assert_eq!(prompt["protocol_version"].as_u64(), Some(1));
+        assert_eq!(
+            prompt["retained_corpus"]
+                .as_object()
+                .map(serde_json::Map::len),
+            Some(1)
+        );
+    }
 }
 
 #[tokio::test]

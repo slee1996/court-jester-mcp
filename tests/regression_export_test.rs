@@ -15,6 +15,16 @@ fn fixture(
     code: &str,
     oracle: Option<&str>,
 ) -> (PathBuf, PathBuf, String) {
+    fixture_classified(root, language, code, oracle, "valid")
+}
+
+fn fixture_classified(
+    root: &Path,
+    language: &str,
+    code: &str,
+    oracle: Option<&str>,
+    classification: &str,
+) -> (PathBuf, PathBuf, String) {
     let source = root.join(if language == "python" {
         "target.py"
     } else {
@@ -39,7 +49,7 @@ fn fixture(
         .unwrap()
         .iter()
         .find(|finding| {
-            finding["input_classification"] == "valid"
+            finding["input_classification"] == classification
                 && oracle.is_none_or(|oracle| finding["oracle"]["kind"] == oracle)
         })
         .unwrap_or_else(|| panic!("no eligible finding: {report}"))
@@ -89,12 +99,12 @@ fn run_test(bundle: &Path, language: &str, binary: &str) -> Output {
 #[test]
 fn exported_regressions_require_positive_completion_and_current_source() {
     for (language, bug, other_bug, fixed) in [
-        ("python", "def first_character(value: str) -> str:\n    return value[0]\n",
-         "def first_character(value: str) -> str:\n    raise ValueError('different failure')\n",
-         "def first_character(value: str) -> str:\n    return value[0] if value else ''\n"),
-        ("typescript", "export function firstCharacter(value: string): string { return value[0].toUpperCase(); }",
-         "export function firstCharacter(value: string): string { throw new Error('different failure'); }",
-         "export function firstCharacter(value: string): string { return value[0]?.toUpperCase() ?? ''; }"),
+        ("python", "from typing import Literal\ndef first_character(value: Literal['', 'a']) -> str:\n    return value[0]\n",
+         "from typing import Literal\ndef first_character(value: Literal['', 'a']) -> str:\n    raise ValueError('different failure')\n",
+         "from typing import Literal\ndef first_character(value: Literal['', 'a']) -> str:\n    return value[0] if value else ''\n"),
+        ("typescript", "export function firstCharacter(value: '' | 'a'): string { return value[0].toUpperCase(); }",
+         "export function firstCharacter(value: '' | 'a'): string { throw new Error('different failure'); }",
+         "export function firstCharacter(value: '' | 'a'): string { return value[0]?.toUpperCase() ?? ''; }"),
     ] {
         let root = tempfile::tempdir().unwrap();
         let (source, report, id) = fixture(root.path(), language, bug, Some("runtime_contract"));
@@ -168,7 +178,7 @@ fn replay_requires_well_formed_evidence_and_successful_process() {
     let (_, path, id) = fixture(
         root.path(),
         "python",
-        "def first_character(value: str) -> str:\n    return value[0]\n",
+        "from typing import Literal\ndef first_character(value: Literal['', 'a']) -> str:\n    return value[0]\n",
         None,
     );
     let original: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -222,7 +232,7 @@ fn regression_export_is_relocatable_and_never_overwrites_existing_output() {
     let (source, report, id) = fixture(
         &root,
         "python",
-        "def first_character(value: str) -> str:\n    return value[0]\n",
+        "from typing import Literal\ndef first_character(value: Literal['', 'a']) -> str:\n    return value[0]\n",
         None,
     );
     let bundle = root.join("regression");
@@ -246,7 +256,7 @@ fn regression_export_is_relocatable_and_never_overwrites_existing_output() {
     );
     std::fs::write(
         &source,
-        "def first_character(value: str) -> str:\n    return value[0] if value else ''\n",
+        "from typing import Literal\ndef first_character(value: Literal['', 'a']) -> str:\n    return value[0] if value else ''\n",
     )
     .unwrap();
     let moved = container.path().join("moved project");
@@ -269,7 +279,7 @@ fn export_preserves_effective_replay_limits_and_refuses_unknown_inputs() {
     let (_, report, id) = fixture(
         root.path(),
         "python",
-        "def first_character(value: str) -> str:\n    return value[0]\n",
+        "from typing import Literal\ndef first_character(value: Literal['', 'a']) -> str:\n    return value[0]\n",
         None,
     );
     let bundle = root.path().join("regression");
@@ -317,7 +327,7 @@ fn export_preserves_effective_replay_limits_and_refuses_unknown_inputs() {
 }
 
 #[test]
-fn property_pair_and_factory_exports_fail_before_and_pass_after_repair() {
+fn property_pair_exports_and_uncertain_factory_observations_preserve_admission() {
     for (language, oracle, bug, fixed) in [
         ("typescript", "declared_property", "// court-jester-properties clamped\nexport function clampValue(value: number, low: number, high: number): number { const lo = Math.min(low, high), hi = Math.max(low, high); return value >= lo && value <= hi ? lo : hi + 1; }\nclampValue(5, 0, 10);", "export function clampValue(value: number, low: number, high: number): number { return Math.max(Math.min(low, high), Math.min(Math.max(low, high), value)); }"),
         ("python", "declared_property", "# court-jester-properties antisymmetric\ndef compare(left: int, right: int):\n    return None\n", "def compare(left: int, right: int):\n    return left - right\n"),
@@ -330,6 +340,22 @@ fn property_pair_and_factory_exports_fail_before_and_pass_after_repair() {
         ("typescript", "runtime_contract", "export function createCounter() { let calls = 0; function push(value: number): number { calls++; if (calls === 2) throw new ReferenceError('second step'); return value; } return { push }; }", "export function createCounter() { function push(value: number): number { return value; } return { push }; }"),
     ] {
         let root = tempfile::tempdir().unwrap();
+        if oracle == "runtime_contract" {
+            // No declaration currently admits the generated action sequence.
+            // Replay remains useful, but inference acceptance cannot invent admission.
+            let (source, report, id) = fixture_classified(root.path(), language, bug, Some(oracle), "unknown");
+            let bundle = root.path().join("regression");
+            let result = export(root.path(), &report, &id, &bundle, true);
+            assert_eq!(result.status.code(), Some(2));
+            assert!(String::from_utf8_lossy(&result.stderr).contains("valid input evidence"));
+            assert!(!bundle.exists());
+            let replay_args = ["replay", "--report", report.to_str().unwrap(), "--finding", &id,
+                "--dependency-project-dir", root.path().to_str().unwrap()];
+            assert_eq!(cli(&replay_args).status.code(), Some(0));
+            std::fs::write(&source, fixed).unwrap();
+            assert_eq!(cli(&replay_args).status.code(), Some(1));
+            continue;
+        }
         let (source, report, id) = fixture(root.path(), language, bug, Some(oracle));
         let bundle = root.path().join("regression");
         let result = export(root.path(), &report, &id, &bundle, true);
@@ -342,12 +368,6 @@ fn property_pair_and_factory_exports_fail_before_and_pass_after_repair() {
             assert_eq!(payload["required_oracle"], "clamped:passthrough", "minimization must retain the seeded failing subcheck");
         }
         assert!(!run_test(&bundle, language, env!("CARGO_BIN_EXE_court-jester")).status.success());
-        if oracle == "runtime_contract" {
-            let missing = if language == "python" { "def create_counter():\n    return {}\n" }
-                else { "export function createCounter() { return {}; }" };
-            std::fs::write(&source, missing).unwrap();
-            assert!(!run_test(&bundle, language, env!("CARGO_BIN_EXE_court-jester")).status.success(), "missing recorded action must not pass");
-        }
         std::fs::write(&source, fixed).unwrap();
         let result = run_test(&bundle, language, env!("CARGO_BIN_EXE_court-jester"));
         assert!(result.status.success(), "{language}/{oracle}: {}{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
@@ -361,12 +381,12 @@ fn relative_replay_source_belongs_to_explicit_project_not_callers_directory() {
     let (_, report, id) = fixture(
         root.path(),
         "python",
-        "def first_character(value: str) -> str:\n    return value[0]\n",
+        "from typing import Literal\ndef first_character(value: Literal['', 'a']) -> str:\n    return value[0]\n",
         None,
     );
     std::fs::write(
         decoy.path().join("target.py"),
-        "def first_character(value: str) -> str:\n    return ''\n",
+        "from typing import Literal\ndef first_character(value: Literal['', 'a']) -> str:\n    return ''\n",
     )
     .unwrap();
     let mut data: Value = serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();

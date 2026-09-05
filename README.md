@@ -256,8 +256,9 @@ In `ci`, `--test-file` is repeatable with at most one Python entrypoint and at m
 
 The important stage is `execute`: Court Jester synthesizes a language-specific harness from the AST, runs it in a sandbox, and reports the concrete repro when something breaks.
 
-- Python: generates direct calls and adversarial edge cases from the function surface, then treats both runtime exceptions and contract violations as execute-stage failures. That includes crashes like `TypeError`, `AttributeError`, `KeyError`, `IndexError`, `RecursionError`, `MemoryError`, `ValueError`, `ZeroDivisionError`, and `UnicodeError`, plus return-type mismatches, inconsistency, failed idempotency or boundedness checks, non-negative violations, nullish-string leaks, symmetry violations, comparator violations, and roundtrip failures for inferred encode/decode pairs.
-- TypeScript: resolves local aliases, interfaces, classes, and imported types where it can, generates structured values for unions, arrays, records, nullable branches, and inline object shapes, then treats both runtime crashes and contract violations as execute-stage failures. That includes crashes like `TypeError`, `RangeError`, `ReferenceError`, `URIError`, and stack overflows, plus return-type mismatches, inconsistency, failed idempotency or boundedness checks, blank string outputs, nullish-string leaks, symmetry violations, comparator violations, and roundtrip failures for inferred encode/decode pairs.
+- Python generates direct calls and adversarial inputs from the function surface. TypeScript additionally resolves supported aliases, interfaces, classes, and imported types to generate structured inputs.
+- Both runtimes report admitted-input exceptions and observed property violations, including return-type, consistency, idempotency, boundedness, symmetry, comparator, and inferred roundtrip checks. Confidence and gate policy still apply; inferred expectations are not silently authoritative.
+- An exception class or engine-like message does not prove a bug. Without input/contract evidence, exceptions remain low-confidence, unknown-input observations and may make verification inconclusive. Generated factory sequences currently have no lifecycle admission contract, so their exception observations are replayable but not exportable as regression expectations.
 
 ## Common Flags
 

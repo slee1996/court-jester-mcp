@@ -320,21 +320,38 @@ fn diagnostic_from_stage(
             DiagnosticComponent::DifferentialRunner,
             DiagnosticImpact::Advisory,
         )),
-        "llm_plateau_escape" => Some(if detail_has_target_finding(detail) {
-            simple(
-                FailureDomain::TargetCode,
-                FailureKind::TargetException,
-                DiagnosticComponent::Target,
-                DiagnosticImpact::Gating,
-            )
-        } else {
-            simple(
-                FailureDomain::Environment,
-                FailureKind::ToolFailure,
-                DiagnosticComponent::Sandbox,
-                DiagnosticImpact::Blocking,
-            )
-        }),
+        "llm_plateau_escape" => Some(
+            if detail
+                .and_then(|value| value.get("gating_finding_count"))
+                .and_then(|value| value.as_u64())
+                .is_some_and(|count| count > 0)
+            {
+                simple(
+                    FailureDomain::TargetCode,
+                    FailureKind::TargetException,
+                    DiagnosticComponent::Target,
+                    DiagnosticImpact::Gating,
+                )
+            } else if detail
+                .and_then(|value| value.get("unknown_finding_count"))
+                .and_then(|value| value.as_u64())
+                .is_some_and(|count| count > 0)
+            {
+                simple(
+                    FailureDomain::VerifierHarness,
+                    FailureKind::AmbiguousGeneratedInput,
+                    DiagnosticComponent::FuzzHarness,
+                    DiagnosticImpact::Blocking,
+                )
+            } else {
+                simple(
+                    FailureDomain::Environment,
+                    FailureKind::ToolFailure,
+                    DiagnosticComponent::Sandbox,
+                    DiagnosticImpact::Blocking,
+                )
+            },
+        ),
         "execute" | "test" => {
             let is_test = stage.name == "test";
             let non_target_blocked = detail_has_non_target_blocker(detail);

@@ -15,11 +15,11 @@ import time
 
 CASES = (
     dict(id="python-runtime", language="python", oracle="runtime_contract",
-         bug="def first_character(value: str) -> str:\n    return value[0]\n",
+         bug="from typing import Literal\ndef first_character(value: Literal['', 'a']) -> str:\n    return value[0]\n",
          other="def first_character(value: str) -> str:\n    raise ValueError('different failure')\n",
          fixed="def first_character(value: str) -> str:\n    return value[0] if value else ''\n"),
     dict(id="typescript-runtime", language="typescript", oracle="runtime_contract",
-         bug="export function firstCharacter(value: string): string { return value[0].toUpperCase(); }",
+         bug="export function firstCharacter(value: '' | 'a'): string { return value[0].toUpperCase(); }",
          other="export function firstCharacter(value: string): string { throw new Error('different failure'); }",
          fixed="export function firstCharacter(value: string): string { return value[0]?.toUpperCase() ?? ''; }"),
     dict(id="python-property", language="python", oracle="declared_property",

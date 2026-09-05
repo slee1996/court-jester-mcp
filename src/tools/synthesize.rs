@@ -1028,7 +1028,7 @@ for _iteration, _args in enumerate(_all_inputs):
         _cj_unit_completed("{name}:{line}", _iteration, "passed")
     except Exception as _e:
         _outside_contract = _outside_closed_domain(_args, _rejection_domains)
-        _target_exception = not _outside_contract and (_contract_target_exception or _is_crash(_e))
+        _target_exception = _exception_outcome(_e, _contract_target_exception, _outside_contract, _checking_properties) == "target_exception"
         if _retain_corpus_input(_corpus, _behavior_signatures, _behavior_signature("crash" if _target_exception else "rejected", _e), _args) and len(_all_inputs) < _max_campaign_inputs:
             _all_inputs.append(_mutate_corpus_row(_args))
         if _target_exception:
@@ -1216,15 +1216,10 @@ for _fi in range({iters}):
         _factory_snippet = _factory_replay_snippet("{name}", _factory_setup, _action_trace, len(_action_keys) == 1, _factory_phase, _e)
         _factory_case = [{{"factory": _factory_setup, "actions": _action_trace}}]
         if _active_factory_unit is not None:
-            _cj_unit_completed(_active_factory_surface, _active_factory_unit, "target_exception" if _is_crash(_e) else "unclassified_exception")
-        if _is_crash(_e):
-            _factory_crash += 1
-            _emit_finding(_active_factory_surface, _factory_case, _e, "crash", "runtime_contract", "observed_call", "high", "exception", case_label=_clip_text(_action_trace), invocation_path={{"factory": {{"factory": "{name}", "callable": _active_factory_callable}}}}, replay_snippet=_factory_snippet, repro_kind="semantic_case")
-            if _factory_crash == 1:
-                print(f"  CRASH {{_active_factory_surface}} after actions {{_clip_text(_action_trace)}}: {{type(_e).__name__}}: {{_clip_text(str(_e))}}")
-        else:
-            _factory_unknown += 1
-            _emit_uncertain_exception(_active_factory_surface, _factory_case, _e, case_label=_clip_text(_action_trace), invocation_path={{"factory": {{"factory": "{name}", "callable": _active_factory_callable}}}}, replay_snippet=_factory_snippet, repro_kind="semantic_case")
+            _cj_unit_completed(_active_factory_surface, _active_factory_unit, _exception_outcome(_e))
+        # Generated action sequences have no lifecycle admission contract.
+        _factory_unknown += 1
+        _emit_uncertain_exception(_active_factory_surface, _factory_case, _e, case_label=_clip_text(_action_trace), invocation_path={{"factory": {{"factory": "{name}", "callable": _active_factory_callable}}}}, replay_snippet=_factory_snippet, repro_kind="semantic_case")
 _factory_total = _factory_pass + _factory_crash + _factory_unknown
 if _factory_crash > 0:
     print(f"FUZZ {name} (factory state machine): {{_factory_pass}} passed, {{_factory_crash}} CRASHED (of {{_factory_total}}) [actions: {nested_names}]")
@@ -2755,12 +2750,9 @@ fn synthesize_typescript_factory_exercise(
           "{{action:" + JSON.stringify(entry.action) + ",args:" + entry.expression + ",callable:" + String(entry.callable) + "}}").join(",") + "]}}";
       const _snippet = _factoryReplaySnippet(_factoryInvoke, _caseSource, _actionKeys.length === 1, _factoryPhase, _e);
       const _originalCase = {{ arguments: [{{ expression: _caseSource ?? "undefined" }}], input_text: _clipText(_shortJson(_actionTrace)) }};
-      const _crash = _isCrash(_e);
-      _emitFinding(_activeFactorySurface, [], _e, "crash", "runtime_contract", "observed_call", _crash ? "high" : "low", "exception", null, {{factory: {{factory: "{name}", callable: _activeFactoryCallable}}}}, _clipText(_shortJson(_actionTrace)), _activeFactoryLine, _snippet, _crash ? "valid" : "unknown", null, "semantic_case", _originalCase);
-      if (_crash) {{
-        _factoryCrash++;
-        if (_factoryCrash === 1) console.log(`  CRASH ${{_activeFactorySurface}} after actions ${{_clipText(_shortJson(_actionTrace))}}: ${{_clipText(_e)}}`);
-      }} else {{ _factoryUnknown++; }}
+      // Generated action sequences have no lifecycle admission contract.
+      _emitFinding(_activeFactorySurface, [], _e, "crash", "runtime_contract", "observed_call", "low", "exception", null, {{factory: {{factory: "{name}", callable: _activeFactoryCallable}}}}, _clipText(_shortJson(_actionTrace)), _activeFactoryLine, _snippet, "unknown", null, "semantic_case", _originalCase);
+      _factoryUnknown++;
     }}
   }}
   const _ftotal = _factoryPass + _factoryCrash + _factoryUnknown;

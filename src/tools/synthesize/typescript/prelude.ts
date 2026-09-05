@@ -429,31 +429,13 @@ function _retainCorpusInput(
   return true;
 }
 
-// Crash detection: real bugs vs intentional validation errors
-function _isMalformedUriError(e: unknown): boolean {
-  return e instanceof URIError && /malformed uri|uri malformed/i.test(e.message);
-}
-
-function _isEngineTypeError(e: TypeError): boolean {
-  return /Cannot (read|set) propert(y|ies) of |Cannot convert undefined or null to object| is not a function| is not iterable| is not a constructor|Cannot destructure property|Cannot use 'in' operator|Assignment to constant variable|Cannot assign to read only property|cannot be invoked without 'new'|Right-hand side of 'instanceof' is not|Reduce of empty array with no initial value/i.test(e.message);
-}
-
-function _isEngineRangeError(e: RangeError): boolean {
-  return /Maximum call stack|Invalid array length|Array buffer allocation failed|Invalid typed array length/i.test(e.message);
-}
-
 class _PropertyFailure extends Error {}
 
-function _isCrash(e: unknown): boolean {
-  if (e instanceof _PropertyFailure) return true;
-  if (_isMalformedUriError(e)) return false;
-  if (e instanceof TypeError) return _isEngineTypeError(e);
-  if (e instanceof RangeError) return _isEngineRangeError(e);
-  if (e instanceof ReferenceError) return true;
-  if (e instanceof URIError) return true;
-  // Stack overflow
-  if (e instanceof Error && e.message.includes("Maximum call stack")) return true;
-  return false;
+function _exceptionOutcome(error: unknown, admitted = false, outside = false, checking = false): string {
+  // Admission/check evidence owns classification, never exception spelling.
+  if (outside) return "rejected";
+  if (admitted || (checking && error instanceof _PropertyFailure)) return "target_exception";
+  return "unclassified_exception";
 }
 
 let _fuzzTotalFailures = 0;
@@ -473,32 +455,45 @@ function _reproCase(args: unknown[], inputText: string | null = null): Record<st
     input_text: inputText,
   };
 }
-function _shrinkCandidates(value: unknown): unknown[] {
-  const out: unknown[] = []; const seen = new Set<string>();
-  const add = (candidate: unknown): void => { let key: string; try { key = JSON.stringify(_reproJsonValue(candidate)); } catch { key = String(candidate); } if (!seen.has(key)) { seen.add(key); out.push(candidate); } };
-  if (value instanceof URL) { add(new URL("https://example.test/")); }
-  else if (typeof value === "string") { add(""); add(value.slice(0, 1)); add(value.trim()); for (let step = Math.floor(value.length / 2); step > 0; step = Math.floor(step / 2)) for (let start = 0; start < value.length; start += step) add(value.slice(0, start) + value.slice(start + step)); }
-  else if (typeof value === "number") { if (Number.isNaN(value) || !Number.isFinite(value)) add(value); else { add(0); add(1); add(-1); for (let current = value; current && Math.abs(current) > Number.EPSILON; current /= 2) add(current); } }
-  else if (typeof value === "boolean") { add(false); }
-  else if (Array.isArray(value)) {
-    value.forEach((item, index) => {
-      _shrinkCandidates(item).forEach((shrunk) => {
-        const copy = value.slice();
-        copy[index] = shrunk;
-        add(copy);
-      });
-    });
-  }
-  else if (value && typeof value === "object"
-      && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null)) {
-    const objectValue = value as Record<string, unknown>;
-    for (const key of Object.keys(objectValue)) {
-      _shrinkCandidates(objectValue[key]).forEach((shrunk) => {
-        add({ ...objectValue, [key]: shrunk });
-      });
+function* _shrinkCandidates(value: unknown, deadline: number, depth = 0): Generator<unknown> {
+  if (depth > 32 || Date.now() >= deadline) return;
+  // Generate only the candidates the consumer requests. Eager recursive lists
+  // can exhaust the campaign before the minimizer gets to check its deadline.
+  function* candidates(): Generator<unknown> {
+    if (value instanceof URL) { yield new URL("https://example.test/"); }
+    else if (typeof value === "string") {
+      yield ""; yield value.slice(0, 1); yield value.trim();
+      for (let step = Math.floor(value.length / 2); step > 0; step = Math.floor(step / 2))
+        for (let start = 0; start < value.length; start += step)
+          yield value.slice(0, start) + value.slice(start + step);
+    } else if (typeof value === "number") {
+      if (Number.isNaN(value) || !Number.isFinite(value)) yield value;
+      else {
+        yield 0; yield 1; yield -1;
+        for (let current = value; current && Math.abs(current) > Number.EPSILON; current /= 2) yield current;
+      }
+    } else if (typeof value === "boolean") { yield false; }
+    else if (Array.isArray(value)) {
+      for (const [index, item] of value.entries()) {
+        for (const shrunk of _shrinkCandidates(item, deadline, depth + 1)) {
+          const copy = value.slice(); copy[index] = shrunk; yield copy;
+        }
+      }
+    } else if (value && typeof value === "object"
+        && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null)) {
+      const objectValue = value as Record<string, unknown>;
+      for (const key of Object.keys(objectValue))
+        for (const shrunk of _shrinkCandidates(objectValue[key], deadline, depth + 1))
+          yield { ...objectValue, [key]: shrunk };
     }
   }
-  return out;
+  const seen = new Set<string>();
+  for (const candidate of candidates()) {
+    if (Date.now() >= deadline) return;
+    let key: string;
+    try { key = JSON.stringify(_reproJsonValue(candidate)); } catch { key = String(candidate); }
+    if (!seen.has(key)) { seen.add(key); yield candidate; }
+  }
 }
 function _shrinkRank(value: unknown): [number, string] {
   let rendered: string;
@@ -522,7 +517,7 @@ function _minimizeFailure(original: unknown[], reproduce: (candidate: unknown[])
   let current = _cloneSeed(original); let attempts = 0; const deadline = Date.now() + 250;
   while (attempts < 100 && Date.now() < deadline) {
     let improved = false;
-    for (const candidateValue of _shrinkCandidates(current)) {
+    for (const candidateValue of _shrinkCandidates(current, deadline)) {
       if (attempts >= 100 || Date.now() >= deadline) break;
       const candidate = Array.isArray(candidateValue) ? candidateValue : [candidateValue];
       if (!_rankLess(candidate, current)) continue;
@@ -870,7 +865,7 @@ function _fuzzOne(
       pass++;
     } catch (e: unknown) {
       const outsideContract = rejectionDomains.some(([index, values]) => index < args.length && !values.some((value) => _sameInput(args[index], value)));
-      const targetException = !outsideContract && (_isCrash(e) || contractTargetException);
+      const targetException = _exceptionOutcome(e, contractTargetException, outsideContract, checkingProperties) === "target_exception";
       if (_retainCorpusInput(corpus, behaviorSignatures, _behaviorSignature(targetException ? "crash" : "rejected", e), args)
           && allInputs.length < maxCampaignInputs) {
         allInputs.push({ args: _mutateCorpusRow(args), contractValid: false });
@@ -898,7 +893,7 @@ function _fuzzOne(
             if (checkingProperties) _evaluateProperties(fn, candidate, candidateResult, expectedType, properties, (oracleId, passed) => { if (!passed) candidateFailedOracle = oracleId; });
             return false;
           } catch (candidateError) {
-            return failureIdentity !== null && (!propertyFailure || (failedOracle !== null && candidateFailedOracle === failedOracle)) && (!checkingProperties || candidateChecking) && (contractTargetException || _isCrash(candidateError)) && _failureIdentity(candidateError) === failureIdentity;
+            return failureIdentity !== null && (!propertyFailure || (failedOracle !== null && candidateFailedOracle === failedOracle)) && (!checkingProperties || candidateChecking) && _exceptionOutcome(candidateError, contractTargetException, false, candidateChecking) === "target_exception" && _failureIdentity(candidateError) === failureIdentity;
           }
         });
         const replayArgs = minimized[0] === "preserved" ? minimized[2] : args;

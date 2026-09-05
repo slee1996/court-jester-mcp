@@ -7,6 +7,24 @@ from bench.fuzz_effectiveness import DEFAULT_MANIFEST, evaluate_case, load_manif
 
 
 class FuzzEffectivenessTest(unittest.TestCase):
+    def test_v3_separates_admission_from_observation_without_rewriting_v2(self) -> None:
+        legacy = load_manifest(DEFAULT_MANIFEST.with_name("fuzz_effectiveness_cases_v2.json"))
+        current = load_manifest(DEFAULT_MANIFEST)
+        self.assertEqual(legacy["suite"], "fuzz-effectiveness-v2")
+        self.assertEqual(current["suite"], "fuzz-effectiveness-v3")
+        self.assertEqual(len(legacy["cases"]), 9)
+        self.assertEqual(len(current["cases"]), 13)
+        self.assertEqual(sum(case["kind"] == "mutation" for case in legacy["cases"]), 6)
+        self.assertEqual(sum(case["kind"] == "observation" for case in current["cases"]), 5)
+        for case in current["cases"]:
+            if case["kind"] == "observation":
+                self.assertEqual(case["expected_verdict"], "inconclusive")
+                self.assertEqual(case["expected_finding"]["input_classification"], "unknown")
+        for language in ("python", "typescript"):
+            pair = [case for case in current["cases"]
+                    if case["language"] == language and case["technique"] == "closed_domain_runtime_contract"]
+            self.assertEqual({case["kind"] for case in pair}, {"mutation", "control"})
+
     def test_observation_requires_unknown_input_evidence_and_consistent_exit(self) -> None:
         case = {
             "id": "uncertain", "kind": "observation",

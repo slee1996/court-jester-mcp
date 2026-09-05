@@ -1,11 +1,10 @@
-//! False negative tests: verify the fuzzer catches known bugs.
-//! Each test writes a buggy function, runs verify, and asserts the fuzz stage fails.
+//! Detection tests: preserve exceptions as observations and gate admitted failures.
 
 use court_jester::tools::verify::{verify, VerifyOptions};
 use court_jester::types::{
     ComplexityMetric, CoverageGate, ExecuteGate, InferredOracleGate, Language, NetworkPolicy,
-    ReportLevel, RuntimeProfile, StageStatus, TestRunner, DEFAULT_PYTHON_DOCKER_IMAGE,
-    DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
+    ReportLevel, RuntimeProfile, StageStatus, TestRunner, VerificationReport,
+    DEFAULT_PYTHON_DOCKER_IMAGE, DEFAULT_TYPESCRIPT_DOCKER_IMAGE,
 };
 
 fn opts() -> VerifyOptions<'static> {
@@ -42,8 +41,7 @@ fn opts() -> VerifyOptions<'static> {
     }
 }
 
-/// Helper: run verify, return whether the execute stage reported crashes.
-async fn fuzz_catches_bug(code: &str, language: &Language) -> bool {
+async fn fixture_report(code: &str, language: &Language) -> VerificationReport {
     let project = tempfile::tempdir().unwrap();
     let extension = match language {
         Language::Python => "py",
@@ -54,11 +52,48 @@ async fn fuzz_catches_bug(code: &str, language: &Language) -> bool {
     let mut options = opts();
     options.project_dir = Some(project.path().to_str().unwrap());
     options.source_file = Some(source.to_str().unwrap());
-    let report = verify(code, language, options).await;
+    verify(code, language, options).await
+}
+
+async fn fuzz_catches_bug(code: &str, language: &Language) -> bool {
+    let report = fixture_report(code, language).await;
     let exec_stage = report.stages.iter().find(|s| s.name == "execute");
     match exec_stage {
         Some(stage) => stage.status == StageStatus::Failed,
         None => false,
+    }
+}
+
+async fn exception_requires_admission(
+    code: &str,
+    admitted: &str,
+    language: &Language,
+    error_type: &str,
+) {
+    for (source, expected_status, classification) in [
+        (code, StageStatus::Inconclusive, "unknown"),
+        (admitted, StageStatus::Failed, "valid"),
+    ] {
+        let report = fixture_report(source, language).await;
+        let stage = report
+            .stages
+            .iter()
+            .find(|stage| stage.name == "execute")
+            .unwrap();
+        assert_eq!(stage.status, expected_status, "{error_type}: {report:#?}");
+        let findings = stage.detail.as_ref().unwrap()["findings"]
+            .as_array()
+            .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding["error_type"] == error_type
+                    && finding["input_classification"] == classification),
+            "{error_type}: {findings:?}"
+        );
+        if classification == "unknown" {
+            assert_eq!(report.summary.findings.gating, 0);
+        }
     }
 }
 
@@ -70,10 +105,11 @@ async fn catches_empty_string_crash() {
 def first_char(s: str) -> str:
     return s[0]
 "#;
-    assert!(
-        fuzz_catches_bug(code, &Language::Python).await,
-        "should catch IndexError on empty string"
+    let admitted = format!(
+        "from typing import Literal\n{}",
+        code.replace("s: str", "s: Literal['', 'a']")
     );
+    exception_requires_admission(code, &admitted, &Language::Python, "IndexError").await;
 }
 
 #[tokio::test]
@@ -82,10 +118,11 @@ async fn catches_division_by_zero() {
 def inverse(x: int) -> float:
     return 1 / x
 "#;
-    assert!(
-        fuzz_catches_bug(code, &Language::Python).await,
-        "should catch ZeroDivisionError"
+    let admitted = format!(
+        "from typing import Literal\n{}",
+        code.replace("x: int", "x: Literal[0, 1]")
     );
+    exception_requires_admission(code, &admitted, &Language::Python, "ZeroDivisionError").await;
 }
 
 #[tokio::test]
@@ -96,10 +133,11 @@ def get_length(s: str) -> int:
         s = None
     return len(s)
 "#;
-    assert!(
-        fuzz_catches_bug(code, &Language::Python).await,
-        "should catch TypeError on None.len()"
+    let admitted = format!(
+        "from typing import Literal\n{}",
+        code.replace("s: str", "s: Literal['', 'a']")
     );
+    exception_requires_admission(code, &admitted, &Language::Python, "TypeError").await;
 }
 
 #[tokio::test]
@@ -108,10 +146,11 @@ async fn catches_index_out_of_bounds() {
 def last_char(s: str) -> str:
     return s[len(s)]
 "#;
-    assert!(
-        fuzz_catches_bug(code, &Language::Python).await,
-        "should catch IndexError (off-by-one)"
+    let admitted = format!(
+        "from typing import Literal\n{}",
+        code.replace("s: str", "s: Literal['', 'a']")
     );
+    exception_requires_admission(code, &admitted, &Language::Python, "IndexError").await;
 }
 
 #[tokio::test]
@@ -138,10 +177,11 @@ def get_value(key: str) -> str:
     d = {"hello": "world", "foo": "bar"}
     return d[key]
 "#;
-    assert!(
-        fuzz_catches_bug(code, &Language::Python).await,
-        "should catch KeyError on random string"
+    let admitted = format!(
+        "from typing import Literal\n{}",
+        code.replace("key: str", "key: Literal['hello', 'missing']")
     );
+    exception_requires_admission(code, &admitted, &Language::Python, "KeyError").await;
 }
 
 #[tokio::test]
@@ -152,10 +192,11 @@ def factorial(n: int) -> int:
         return 1
     return n * factorial(n - 1)
 "#;
-    assert!(
-        fuzz_catches_bug(code, &Language::Python).await,
-        "should catch RecursionError on negative input"
+    let admitted = format!(
+        "from typing import Literal\n{}",
+        code.replace("n: int", "n: Literal[-1, 0]")
     );
+    exception_requires_admission(code, &admitted, &Language::Python, "RecursionError").await;
 }
 
 #[tokio::test]
@@ -164,10 +205,11 @@ async fn catches_unicode_encode_error() {
 def to_ascii(s: str) -> bytes:
     return s.encode("ascii")
 "#;
-    assert!(
-        fuzz_catches_bug(code, &Language::Python).await,
-        "should catch UnicodeEncodeError on non-ASCII input"
+    let admitted = format!(
+        "from typing import Literal\n{}",
+        code.replace("s: str", "s: Literal['a', 'é']")
     );
+    exception_requires_admission(code, &admitted, &Language::Python, "UnicodeEncodeError").await;
 }
 
 // ── Python: verify robust functions DON'T false-positive ────────────────────
@@ -217,10 +259,8 @@ function getLength(s: string | null): number {
     return s!.length;
 }
 "#;
-    assert!(
-        fuzz_catches_bug(code, &Language::TypeScript).await,
-        "should catch Cannot read properties of null"
-    );
+    let admitted = code.replace("s: string | null", "s: 'a' | null");
+    exception_requires_admission(code, &admitted, &Language::TypeScript, "TypeError").await;
 }
 
 #[tokio::test]
