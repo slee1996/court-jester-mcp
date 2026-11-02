@@ -87,7 +87,7 @@ release-check:
     cargo test --locked --tests -- --test-threads=1
     cargo test --locked --test doctor_test -- --ignored --test-threads=1
     cargo test --locked --lib cancelled_real_container_worker -- --ignored --test-threads=1
-    python3 -m unittest bench.test_run_matrix bench.test_runner bench.test_summarize_runs bench.test_agent_trace bench.test_evidence bench.test_materialize_mutation bench.test_fuzz_effectiveness
+    python3 -m unittest bench.test_run_matrix bench.test_runner bench.test_output_retention bench.test_summarize_runs bench.test_agent_trace bench.test_evidence bench.test_materialize_mutation bench.test_fuzz_effectiveness
     python3 -m unittest discover -s tests -p 'release_test.py'
     python3 -m unittest discover -s tests -p 'repair_contract_test.py'
     python3 -m unittest discover -s tests -p 'onboarding_test.py'

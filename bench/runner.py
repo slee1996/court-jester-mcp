@@ -280,6 +280,9 @@ def run_single(
         result["failure_category"] = "setup_error"
         result["failure_details"] = {"failure_reason": f"Task fixture not found: {fixture}"}
         return finish_run_result(run_dir, result, shadow_records)
+    if dry_run:
+        result["status"] = "dry_run"
+        return finish_run_result(run_dir, result, shadow_records)
     try:
         shutil.copytree(fixture, workspace)
     except OSError as exc:
@@ -288,11 +291,6 @@ def run_single(
         result["failure_category"] = "setup_error"
         result["failure_details"] = {"failure_reason": f"Failed to copy task fixture: {exc}"}
         return finish_run_result(run_dir, result, shadow_records)
-    if dry_run:
-        result["status"] = "dry_run"
-        return finish_run_result(run_dir, result, shadow_records)
-
-
     try:
         setup_result = prepare_workspace_for_run(task, workspace, run_dir)
     except Exception as exc:
@@ -381,52 +379,53 @@ def run_single(
             provider_call_count = 1
         else:
             max_provider_retries = provider_retry_limit() if supports_provider_retry(model) else 0
-            backup_dir = run_dir / f".provider_backup_attempt_{attempt}"
-            while True:
-                if max_provider_retries > 0 and provider_call_count <= max_provider_retries:
-                    snapshot_workspace_for_retry(workspace, backup_dir)
-                provider_started = time.time()
-                try:
-                    provider_candidate = provider.apply(
-                        workspace,
-                        task,
-                        feedback=feedback,
-                        attempt=attempt,
-                        history=attempt_history if policy.replay_attempt_history else None,
-                        env_overrides=trace_environment.env_updates if trace_environment is not None else None,
+            with tempfile.TemporaryDirectory(prefix=".provider-backup-", dir=run_dir) as backup_root:
+                backup_dir = Path(backup_root) / "workspace"
+                while True:
+                    if max_provider_retries > 0 and provider_call_count <= max_provider_retries:
+                        snapshot_workspace_for_retry(workspace, backup_dir)
+                    provider_started = time.time()
+                    try:
+                        provider_candidate = provider.apply(
+                            workspace,
+                            task,
+                            feedback=feedback,
+                            attempt=attempt,
+                            history=attempt_history if policy.replay_attempt_history else None,
+                            env_overrides=trace_environment.env_updates if trace_environment is not None else None,
+                        )
+                    except Exception as exc:
+                        provider_candidate = ProviderResult(
+                            failed=True,
+                            failure_reason=f"Provider execution raised {type(exc).__name__}: {exc}",
+                        )
+                    provider_apply_ms += int((time.time() - provider_started) * 1000)
+                    provider_call_count += 1
+                    provider_error_kind = (
+                        classify_provider_failure(provider_candidate) if provider_candidate.failed else None
                     )
-                except Exception as exc:
-                    provider_candidate = ProviderResult(
-                        failed=True,
-                        failure_reason=f"Provider execution raised {type(exc).__name__}: {exc}",
-                    )
-                provider_apply_ms += int((time.time() - provider_started) * 1000)
-                provider_call_count += 1
-                provider_error_kind = (
-                    classify_provider_failure(provider_candidate) if provider_candidate.failed else None
-                )
-                if (
-                    provider_candidate.failed
-                    and provider_error_kind is not None
-                    and should_retry_provider_failure(provider_error_kind)
-                    and len(provider_retry_records) < max_provider_retries
-                ):
-                    restore_workspace_from_retry_snapshot(backup_dir, workspace)
-                    delay_seconds = provider_retry_delay_seconds(provider_error_kind, len(provider_retry_records))
-                    provider_retry_records.append(
-                        {
-                            "retry_index": len(provider_retry_records),
-                            "provider_error_kind": provider_error_kind,
-                            "failure_reason": provider_candidate.failure_reason,
-                            "delay_seconds": delay_seconds,
-                        }
-                    )
-                    if delay_seconds > 0:
-                        result["timings"]["provider_retry_backoff_ms"] += int(delay_seconds * 1000)
-                        time.sleep(delay_seconds)
-                    continue
-                provider_result = provider_candidate
-                break
+                    if (
+                        provider_candidate.failed
+                        and provider_error_kind is not None
+                        and should_retry_provider_failure(provider_error_kind)
+                        and len(provider_retry_records) < max_provider_retries
+                    ):
+                        restore_workspace_from_retry_snapshot(backup_dir, workspace)
+                        delay_seconds = provider_retry_delay_seconds(provider_error_kind, len(provider_retry_records))
+                        provider_retry_records.append(
+                            {
+                                "retry_index": len(provider_retry_records),
+                                "provider_error_kind": provider_error_kind,
+                                "failure_reason": provider_candidate.failure_reason,
+                                "delay_seconds": delay_seconds,
+                            }
+                        )
+                        if delay_seconds > 0:
+                            result["timings"]["provider_retry_backoff_ms"] += int(delay_seconds * 1000)
+                            time.sleep(delay_seconds)
+                        continue
+                    provider_result = provider_candidate
+                    break
         if trace_environment is not None:
             trace_summary_started = time.time()
             attempt_trace_summary = summarize_agent_trace(Path(trace_environment.trace_dir))
@@ -1302,7 +1301,40 @@ def finish_run_result(
     finalize_result(result)
     write_json(run_dir / "result.json", result)
     append_shadow_record(shadow_records, result, patch_digest=patch_digest)
+    # Reports, logs and patch chronology are durable evidence. A clean passing
+    # workspace is only a disposable execution copy; failures still need replay.
+    # Publish the evidence first so a persistence error never destroys the copy.
+    if can_discard_workspace(result):
+        try:
+            shutil.rmtree(run_dir / "workspace")
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            result["workspace_cleanup_error"] = str(exc)
+            write_json(run_dir / "result.json", result)
     return result
+
+
+def can_discard_workspace(result: dict[str, Any]) -> bool:
+    if result.get("status") != "completed" or result.get("success") is not True:
+        return False
+    if result.get("verify_failed") or result.get("verify_inconclusive"):
+        return False
+    for attempt in result.get("attempts", []):
+        if attempt.get("public_failed") or attempt.get("hidden_failed"):
+            return False
+        verification = attempt.get("court_jester", {})
+        if verification.get("verify_failed") or verification.get("verify_inconclusive"):
+            return False
+        for entry in verification.get("results", []):
+            report = entry.get("response")
+            if report_verdict(report) != "pass" or _report_findings(report):
+                return False
+            for stage in report["stages"]:
+                detail = stage.get("detail")
+                if isinstance(detail, dict) and detail.get("suppressed_findings"):
+                    return False
+    return True
 
 
 def finalize_result(result: dict[str, Any]) -> None:
