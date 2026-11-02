@@ -757,6 +757,7 @@ class RepairPolicyTest(unittest.TestCase):
                     "counter = Path('public_count.txt')\n"
                     "count = int(counter.read_text()) if counter.exists() else 0\n"
                     "counter.write_text(str(count + 1))\n"
+                    "print(count + 1)\n"
                 )
             )
 
@@ -831,7 +832,8 @@ class RepairPolicyTest(unittest.TestCase):
             self.assertTrue(result["attempts"][0]["public_checks_deferred"])
             self.assertTrue((result["attempts"][0]["court_jester"] or {}).get("skipped"))
             self.assertEqual(len(result["attempts"][1]["public_checks"]), 1)
-            self.assertEqual((tmp_path / "out" / result["run_id"] / "workspace" / "public_count.txt").read_text(), "1")
+            self.assertEqual(Path(result["attempts"][1]["public_checks"][0]["stdout_path"]).read_text(), "1\n")
+            self.assertFalse((tmp_path / "out" / result["run_id"] / "workspace").exists())
 
     def test_verify_test_is_materialized_from_verify_assets_and_removed_after_call(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

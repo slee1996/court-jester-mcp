@@ -193,6 +193,16 @@ Each run directory now records more than the final outcome:
 - `agent_trace/attempt_<n>/events.jsonl`: best-effort command trace for CLI agents
 - `agent_trace/attempt_<n>/summary.json`: compact command/category summary for that attempt
 
+Dry runs validate fixture availability and write metadata without copying a workspace.
+Provider retry snapshots are removed after the active attempt on normal completion or
+Python exception unwinding, including `KeyboardInterrupt`; abrupt termination can leave them behind.
+After result and shadow-record persistence, clean successful runs discard their execution
+workspace. Runs with failed checks, inconclusive verification, or verifier findings in
+any attempt keep their workspace for investigation and replay, even if a later repair
+succeeds. Reports, logs, diffs, and historical run directories are retained; this is
+not an age or size limit on evidence history or setup caches. A failed workspace
+cleanup is recorded as `workspace_cleanup_error` in `result.json`.
+
 The CLI trace is intentionally best-effort. It captures shell/tool commands reached through the benchmark's shimmed `PATH` and is useful for reconstructing searches, file reads, and command flow, but it is not a perfect internal reasoning trace.
 
 CLI tracing is now opt-in. Set `CJ_AGENT_TRACE=1` when launching `bench.run_matrix` if you want per-attempt command traces. The default is off because trace shims add real process and CPU overhead, especially on long CLI startup paths.
